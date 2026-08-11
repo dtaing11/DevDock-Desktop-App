@@ -1151,3 +1151,19 @@ mod tests {
         assert!(parse_branch("origin/HEAD\tabc\tdate\tsubj", "main").is_none());
     }
 }
+
+/// Intentional mistake for demonstrating local CI: this function claims to
+/// add two numbers but subtracts. The accompanying test will fail.
+pub fn demo_add(a: i32, b: i32) -> i32 {
+    a - b // BUG: should be a + b
+}
+
+#[cfg(test)]
+mod demo_tests {
+    use super::demo_add;
+
+    #[test]
+    fn demo_add_works() {
+        assert_eq!(demo_add(2, 3), 5);
+    }
+}

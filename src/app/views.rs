@@ -722,7 +722,7 @@ fn changes_tab(app: &mut App, ui: &mut egui::Ui) {
     let files = app.status.as_ref().map(|s| s.files.clone()).unwrap_or_default();
 
     // File list fills the space above the commit box.
-    let commit_box_height = 190.0;
+    let commit_box_height = 215.0;
     let list_height = (ui.available_height() - commit_box_height).max(60.0);
     ScrollArea::vertical().max_height(list_height).auto_shrink([false, false]).show(
         ui,
@@ -831,12 +831,16 @@ fn commit_box(app: &mut App, ui: &mut egui::Ui) {
             .hint_text("Summary (required)")
             .desired_width(f32::INFINITY),
     );
-    ui.add(
-        egui::TextEdit::multiline(&mut app.commit_description)
-            .hint_text("Description")
-            .desired_rows(3)
-            .desired_width(f32::INFINITY),
-    );
+    // Fixed-height, scrollable description so long text never pushes the
+    // buttons below off screen.
+    ScrollArea::vertical().max_height(72.0).id_salt("commit-desc").show(ui, |ui| {
+        ui.add(
+            egui::TextEdit::multiline(&mut app.commit_description)
+                .hint_text("Description")
+                .desired_rows(3)
+                .desired_width(f32::INFINITY),
+        );
+    });
 
     ui.horizontal(|ui| {
         let ai_enabled = !app.ai_busy && app.repo.is_some();

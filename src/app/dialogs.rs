@@ -1007,35 +1007,8 @@ fn claude_settings(app: &mut App, ui: &mut egui::Ui) {
                 app.toast("Claude signed out.", false);
             }
         });
-        // Model picker (models fetched from the account's /v1/models)
-        ui.horizontal(|ui| {
-            ui.label("Model");
-            let selected = app
-                .config
-                .claude_model
-                .clone()
-                .unwrap_or_else(|| claude::DEFAULT_MODEL.to_string());
-            let models: Vec<String> = if app.claude.models.is_empty() {
-                claude::FALLBACK_MODELS.iter().map(|s| s.to_string()).collect()
-            } else {
-                app.claude.models.clone()
-            };
-            egui::ComboBox::from_id_salt("claude-model").selected_text(selected).show_ui(
-                ui,
-                |ui| {
-                    for name in &models {
-                        let is_sel = app.config.claude_model.as_deref() == Some(name.as_str());
-                        if ui.selectable_label(is_sel, name).clicked() {
-                            app.config.claude_model = Some(name.clone());
-                            app.config.save();
-                        }
-                    }
-                },
-            );
-            if ui.small_button("Refresh").on_hover_text("Reload available models").clicked() {
-                app.load_claude_models();
-            }
-        });
+        // Model choice lives in the AI pickers next to the AI buttons
+        // (commit box and PR dialog), not here.
         return;
     }
 

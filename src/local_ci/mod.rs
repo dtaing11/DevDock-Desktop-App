@@ -20,9 +20,12 @@
 //! host shell. Docker containers are Linux environments; for macOS/Windows
 //! runners use hosted CI, since Docker cannot emulate those OSes.
 
+pub mod runner;
+
+pub use runner::{DockerRunner, ExecOutput, ExecRequest, HostRunner, Runner, RunnerRegistry};
+
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::process::Command;
 use std::time::Instant;
 
 /// Config file name at the repository root.
@@ -55,6 +58,30 @@ pub struct Job {
     /// host environment. Values never live in the committed config.
     #[serde(default)]
     pub secrets: Vec<String>,
+    /// Runner id: "host" (default), "docker", or a custom registered runner.
+    /// When omitted, `image = ...` implies "docker".
+    #[serde(default)]
+    pub runner: Option<String>,
+    /// Runner-specific target (e.g. SSH host). For Docker, `image` is used.
+    #[serde(default)]
+    pub runner_target: Option<String>,
+}
+
+impl Job {
+    /// Effective runner id: explicit `runner`, else "docker" when an image
+    /// is set, else "host".
+    pub fn runner_id(&self) -> &str {
+        match (&self.runner, &self.image) {
+            (Some(id), _) => id,
+            (None, Some(_)) => "docker",
+            (None, None) => "host",
+        }
+    }
+
+    /// Effective runner target: `runner_target`, falling back to `image`.
+    pub fn target(&self) -> Option<&str> {
+        self.runner_target.as_deref().or(self.image.as_deref())
+    }
 }
 
 /// The parsed config file.
@@ -141,11 +168,7 @@ commands = ["echo hello from local CI"]
 
 /// Whether the Docker CLI is available on this machine.
 pub fn docker_available() -> bool {
-    Command::new("docker")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    DockerRunner.available().is_ok()
 }
 
 /// Loads secrets from [`SECRETS_FILE`] (KEY=VALUE lines, `#` comments).
@@ -190,65 +213,51 @@ fn resolve_secrets(
 
 const MAX_OUTPUT: usize = 64 * 1024;
 
-/// Runs one job to completion (blocking; call from a worker thread).
+/// Runs one job with the default (built-in) runners.
 pub fn run_job(repo_root: &Path, job: &Job) -> JobResult {
+    run_job_with(&RunnerRegistry::with_builtins(), repo_root, job)
+}
+
+/// Runs one job using `registry` to resolve its runner. Blocking; call from
+/// a worker thread. Custom tools embed their own registry here.
+pub fn run_job_with(registry: &RunnerRegistry, repo_root: &Path, job: &Job) -> JobResult {
     let started = Instant::now();
+    let fail = |output: String| JobResult {
+        name: job.name.clone(),
+        ok: false,
+        output,
+        duration_secs: started.elapsed().as_secs_f32(),
+    };
+
+    // 1. Resolve the runner.
+    let runner_id = job.runner_id();
+    let Some(runner) = registry.get(runner_id) else {
+        return fail(format!(
+            "Unknown runner \"{runner_id}\". Available: {}",
+            registry.ids().join(", ")
+        ));
+    };
+    if let Err(message) = runner.available() {
+        return fail(message);
+    }
+
+    // 2. Resolve environment (config env + secrets).
+    let mut env: Vec<(String, String)> =
+        job.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    match resolve_secrets(repo_root, job) {
+        Ok(secrets) => env.extend(secrets),
+        Err(message) => return fail(message),
+    }
+
+    // 3. Execute.
     let script = job.commands.join(" && ");
-
-    let secrets = match resolve_secrets(repo_root, job) {
-        Ok(secrets) => secrets,
-        Err(message) => {
-            return JobResult {
-                name: job.name.clone(),
-                ok: false,
-                output: message,
-                duration_secs: 0.0,
-            };
-        }
-    };
-
-    let output = if let Some(image) = &job.image {
-        if !docker_available() {
-            return JobResult {
-                name: job.name.clone(),
-                ok: false,
-                output: "Docker is not available. Install Docker or remove `image` \
-                         from this job to run it on the host."
-                    .into(),
-                duration_secs: 0.0,
-            };
-        }
-        let mut cmd = Command::new("docker");
-        cmd.args(["run", "--rm", "-v"])
-            .arg(format!("{}:/work", repo_root.display()))
-            .args(["-w", "/work"]);
-        for (key, value) in &job.env {
-            cmd.arg("-e").arg(format!("{key}={value}"));
-        }
-        for (key, value) in &secrets {
-            cmd.arg("-e").arg(format!("{key}={value}"));
-        }
-        cmd.arg(image).args(["sh", "-c", &script]);
-        cmd.output()
-    } else {
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", &script]).current_dir(repo_root);
-        for (key, value) in &job.env {
-            cmd.env(key, value);
-        }
-        for (key, value) in &secrets {
-            cmd.env(key, value);
-        }
-        cmd.output()
-    };
-
-    match output {
+    let request = ExecRequest { repo_root, script: &script, env: &env, target: job.target() };
+    match runner.exec(&request) {
         Ok(out) => {
-            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if !stderr.trim().is_empty() {
+            let mut text = out.stdout;
+            if !out.stderr.trim().is_empty() {
                 text.push_str("\n--- stderr ---\n");
-                text.push_str(&stderr);
+                text.push_str(&out.stderr);
             }
             if text.len() > MAX_OUTPUT {
                 let mut end = MAX_OUTPUT;
@@ -260,20 +269,14 @@ pub fn run_job(repo_root: &Path, job: &Job) -> JobResult {
             }
             JobResult {
                 name: job.name.clone(),
-                ok: out.status.success(),
+                ok: out.success,
                 output: text.trim().to_string(),
                 duration_secs: started.elapsed().as_secs_f32(),
             }
         }
-        Err(e) => JobResult {
-            name: job.name.clone(),
-            ok: false,
-            output: format!("failed to start: {e}"),
-            duration_secs: started.elapsed().as_secs_f32(),
-        },
+        Err(message) => fail(message),
     }
 }
-
 
 /// Runs all configured jobs headlessly, printing results to stdout.
 /// Returns `true` when everything passed. Used by the `ci` CLI subcommand
@@ -384,6 +387,8 @@ env = { FOO = "bar" }
             image: None,
             env: Default::default(),
             secrets: Vec::new(),
+            runner: None,
+            runner_target: None,
         };
         let result = run_job(tmp.path(), &pass);
         assert!(result.ok);
@@ -395,6 +400,8 @@ env = { FOO = "bar" }
             image: None,
             env: Default::default(),
             secrets: Vec::new(),
+            runner: None,
+            runner_target: None,
         };
         let result = run_job(tmp.path(), &fail);
         assert!(!result.ok);
@@ -408,7 +415,15 @@ env = { FOO = "bar" }
         let mut env = std::collections::HashMap::new();
         env.insert("MY_VAR".to_string(), "custom-value".to_string());
         let job =
-            Job { name: "env".into(), commands: vec!["echo $MY_VAR".into()], image: None, env, secrets: Vec::new() };
+            Job {
+                name: "env".into(),
+                commands: vec!["echo $MY_VAR".into()],
+                image: None,
+                env,
+                secrets: Vec::new(),
+                runner: None,
+                runner_target: None,
+            };
         let result = run_job(tmp.path(), &job);
         assert!(result.ok);
         assert!(result.output.contains("custom-value"));
@@ -437,6 +452,8 @@ env = { FOO = "bar" }
             image: None,
             env: Default::default(),
             secrets: vec!["API_TOKEN".into()],
+            runner: None,
+            runner_target: None,
         };
         let result = run_job(tmp.path(), &job);
         assert!(result.ok, "{}", result.output);
@@ -452,6 +469,8 @@ env = { FOO = "bar" }
             image: None,
             env: Default::default(),
             secrets: vec!["DEFINITELY_NOT_SET_ANYWHERE_XYZ".into()],
+            runner: None,
+            runner_target: None,
         };
         let result = run_job(tmp.path(), &job);
         assert!(!result.ok);

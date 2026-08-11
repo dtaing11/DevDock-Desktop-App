@@ -48,7 +48,8 @@ Optional: `make install` installs the binary plus a `.desktop` entry.
 
 Define per-repo checks in `.git-manage-ci.toml` and run them from the
 Pull Request dialog, on your machine or inside Docker containers, with
-secrets support. See the full guide: [docs/local-ci.md](docs/local-ci.md).
+secrets support. See the full guide: [docs/local-ci.md](docs/local-ci.md)
+and the extension API: [docs/extending-local-ci.md](docs/extending-local-ci.md).
 
 ## GitHub sign-in
 

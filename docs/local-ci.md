@@ -277,6 +277,12 @@ workflow (`.github/workflows/ci.yml`) validate after pushing.
   caches (fast); fresh containers download dependencies each run unless you
   bake them into a custom image.
 
+## Building on top of the engine
+
+The CI engine is a library with a pluggable `Runner` trait: add SSH/Podman/
+custom environments, override built-ins, or embed the engine in your own
+tools. See [extending-local-ci.md](extending-local-ci.md).
+
 ## Troubleshooting
 
 | Symptom | Fix |

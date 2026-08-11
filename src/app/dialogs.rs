@@ -590,6 +590,9 @@ fn settings(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         repo_prompt_settings(app, ui);
 
         ui.separator();
+        hook_settings(app, ui);
+
+        ui.separator();
         ui.label(RichText::new("AI PROVIDER FOR COMMIT MESSAGES").color(theme::EMBER).small());
         ui.horizontal(|ui| {
             let provider = app.config.ai_provider.clone().unwrap_or_else(|| "ollama".into());
@@ -945,6 +948,45 @@ fn local_ci_panel(app: &mut App, ui: &mut egui::Ui) {
                 .small(),
         );
     }
+}
+
+/// Git hook integration: install/remove the pre-push local CI hook so
+/// terminal pushes are gated by the same checks as in-app pushes.
+fn hook_settings(app: &mut App, ui: &mut egui::Ui) {
+    use crate::local_ci;
+    ui.label(RichText::new("GIT PRE-PUSH HOOK").color(theme::EMBER).small());
+    let Some(repo) = app.repo.as_ref() else {
+        ui.label(RichText::new("Open a repository first.").color(theme::FG_DIM));
+        return;
+    };
+    let root = repo.path().to_path_buf();
+    let installed = local_ci::hook_installed(&root);
+
+    ui.horizontal(|ui| {
+        if installed {
+            ui.label(RichText::new("Installed").color(theme::ADD).small());
+            if ui.small_button("Remove").clicked() {
+                let hook = root.join(".git").join("hooks").join("pre-push");
+                match std::fs::remove_file(&hook) {
+                    Ok(()) => app.toast("pre-push hook removed.", false),
+                    Err(e) => app.toast(e.to_string(), true),
+                }
+            }
+        } else if ui.small_button("Install pre-push hook").clicked() {
+            match local_ci::install_pre_push_hook(&root) {
+                Ok(()) => app.toast("pre-push hook installed.", false),
+                Err(e) => app.toast(e.to_string(), true),
+            }
+        }
+    });
+    ui.label(
+        RichText::new(
+            "Runs the local CI jobs before every `git push` from any terminal, \
+             not just from this app. Failing checks abort the push.",
+        )
+        .color(theme::FG_DIM)
+        .small(),
+    );
 }
 
 /// Claude account section inside Settings: OAuth sign-in or API key.

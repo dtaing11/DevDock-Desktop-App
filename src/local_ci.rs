@@ -274,6 +274,82 @@ pub fn run_job(repo_root: &Path, job: &Job) -> JobResult {
     }
 }
 
+
+/// Runs all configured jobs headlessly, printing results to stdout.
+/// Returns `true` when everything passed. Used by the `ci` CLI subcommand
+/// (which the git pre-push hook invokes).
+pub fn run_all_cli(repo_root: &Path) -> Result<bool> {
+    let Some(config) = load_config(repo_root)? else {
+        println!("devdock ci: no {CONFIG_FILE} found, nothing to run");
+        return Ok(true);
+    };
+    if config.jobs.is_empty() {
+        println!("devdock ci: no jobs configured");
+        return Ok(true);
+    }
+    let mut all_ok = true;
+    for job in &config.jobs {
+        print!("devdock ci: {} ... ", job.name);
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        let result = run_job(repo_root, job);
+        if result.ok {
+            println!("PASS ({:.1}s)", result.duration_secs);
+        } else {
+            all_ok = false;
+            println!("FAIL ({:.1}s)", result.duration_secs);
+            for line in result.output.lines() {
+                println!("    {line}");
+            }
+        }
+    }
+    Ok(all_ok)
+}
+
+/// Installs a git `pre-push` hook that runs the local CI via this binary.
+/// Overwrites only hooks previously written by DevDock.
+pub fn install_pre_push_hook(repo_root: &Path) -> Result<()> {
+    let hook_dir = repo_root.join(".git").join("hooks");
+    std::fs::create_dir_all(&hook_dir).map_err(|e| CiError(e.to_string()))?;
+    let hook_path = hook_dir.join("pre-push");
+
+    if hook_path.exists() {
+        let existing = std::fs::read_to_string(&hook_path).unwrap_or_default();
+        if !existing.contains("devdock-local-ci") {
+            return Err(CiError(
+                "A pre-push hook already exists (not created by DevDock). \
+                 Merge manually or remove .git/hooks/pre-push first."
+                    .into(),
+            ));
+        }
+    }
+
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "git-manage".into());
+    let script = format!(
+        "#!/bin/sh\n\
+         # devdock-local-ci: runs .git-manage-ci.toml jobs before every push.\n\
+         # Regenerate from the DevDock app; delete this file to disable.\n\
+         exec \"{exe}\" ci\n"
+    );
+    std::fs::write(&hook_path, script).map_err(|e| CiError(e.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| CiError(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Whether the DevDock pre-push hook is installed in this repository.
+pub fn hook_installed(repo_root: &Path) -> bool {
+    std::fs::read_to_string(repo_root.join(".git").join("hooks").join("pre-push"))
+        .map(|s| s.contains("devdock-local-ci"))
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

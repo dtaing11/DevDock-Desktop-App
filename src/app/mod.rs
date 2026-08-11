@@ -682,7 +682,16 @@ impl App {
                 Err(e) => self.toast(e.to_string(), true),
             },
             Msg::RepoOpened(Err(e)) => self.toast(e, true),
-            Msg::Status(Ok(status)) => self.status = Some(status),
+            Msg::Status(Ok(status)) => {
+                // If the file shown in the diff viewport no longer has
+                // changes (discarded, stashed, committed), clear the view.
+                if let Some(path) = self.selected_file.clone() {
+                    if !status.files.iter().any(|f| f.path == path) {
+                        views::clear_diff_view(self);
+                    }
+                }
+                self.status = Some(status);
+            }
             Msg::Status(Err(e)) => self.toast(e, true),
             Msg::Branches(Ok(branches)) => self.branches = Some(branches),
             Msg::Branches(Err(e)) => self.toast(e, true),

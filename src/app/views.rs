@@ -865,7 +865,12 @@ fn changes_tab(app: &mut App, ui: &mut egui::Ui) {
                         .on_hover_text(&file.path)
                         .clicked()
                     {
-                        select_file(app, &file.path, file.staged && !file.unstaged);
+                        if selected {
+                            // Clicking the viewed file again deselects it.
+                            clear_diff_view(app);
+                        } else {
+                            select_file(app, &file.path, file.staged && !file.unstaged);
+                        }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
@@ -930,6 +935,10 @@ pub fn load_file_diff(app: &mut App) {
 
 fn discard_file(app: &mut App, path: &str) {
     let Some(repo) = app.repo.clone() else { return };
+    // Clear the viewport when the discarded file is being viewed.
+    if app.selected_file.as_deref() == Some(path) {
+        clear_diff_view(app);
+    }
     let path = path.to_string();
     app.worker.spawn(move || Msg::Done {
         message: strerr(
@@ -938,6 +947,18 @@ fn discard_file(app: &mut App, path: &str) {
         ),
         refresh: true,
     });
+}
+
+/// Resets the diff viewport to its empty state.
+pub fn clear_diff_view(app: &mut App) {
+    app.selected_file = None;
+    app.selected_commit = None;
+    app.diff_title.clear();
+    app.diff_text.clear();
+    app.hunks.clear();
+    app.line_sel.clear();
+    app.blame = None;
+    app.commit_file_list.clear();
 }
 
 fn commit_box(app: &mut App, ui: &mut egui::Ui) {

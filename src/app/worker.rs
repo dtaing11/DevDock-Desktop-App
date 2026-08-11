@@ -30,6 +30,8 @@ pub enum Msg {
     Tags(Result<Vec<String>, String>),
     /// Claude models available to the signed-in account.
     ClaudeModels(Vec<String>),
+    /// One local CI job finished.
+    CiJobDone { index: usize, result: crate::local_ci::JobResult },
 
     GhDeviceCode(Result<DeviceCode, String>),
     GhSignedIn(Result<User, String>),

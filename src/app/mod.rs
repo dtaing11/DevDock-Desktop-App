@@ -211,6 +211,35 @@ pub struct ConflictState {
     pub resolved: Vec<String>,
 }
 
+/// Local CI run state shown in the PR dialog.
+#[derive(Default)]
+pub struct LocalCiState {
+    /// Jobs from the repo's config file.
+    pub jobs: Vec<crate::local_ci::Job>,
+    /// Result slots, one per job; None while running/pending.
+    pub results: Vec<Option<crate::local_ci::JobResult>>,
+    pub running: bool,
+    /// Which job's output is expanded.
+    pub expanded: Option<usize>,
+}
+
+impl LocalCiState {
+    /// All jobs finished and passed.
+    pub fn all_passed(&self) -> bool {
+        !self.jobs.is_empty()
+            && self.results.iter().all(|r| r.as_ref().map(|x| x.ok).unwrap_or(false))
+    }
+
+    /// Any job failed.
+    pub fn any_failed(&self) -> bool {
+        self.results.iter().any(|r| r.as_ref().map(|x| !x.ok).unwrap_or(false))
+    }
+
+    pub fn finished(&self) -> usize {
+        self.results.iter().filter(|r| r.is_some()).count()
+    }
+}
+
 /// Top-level application state.
 pub struct App {
     pub worker: Worker,
@@ -276,6 +305,7 @@ pub struct App {
     pub gh: GhState,
     pub claude: ClaudeState,
     pub pr: PrState,
+    pub local_ci: LocalCiState,
     pub conflicts: ConflictState,
     pub ollama_url_input: String,
     pub ollama_models: Vec<ollama::Model>,
@@ -339,6 +369,7 @@ impl App {
             gh: Default::default(),
             claude: Default::default(),
             pr: Default::default(),
+            local_ci: Default::default(),
             conflicts: Default::default(),
             ollama_models: Vec::new(),
             toast: None,
@@ -794,6 +825,20 @@ impl App {
                 self.pr.checks.insert(number, summary);
             }
 
+            Msg::CiJobDone { index, result } => {
+                if let Some(slot) = self.local_ci.results.get_mut(index) {
+                    *slot = Some(result);
+                }
+                if self.local_ci.finished() == self.local_ci.jobs.len() {
+                    self.local_ci.running = false;
+                    if self.local_ci.all_passed() {
+                        self.toast("All local CI checks passed.", false);
+                    } else {
+                        self.toast("Some local CI checks failed.", true);
+                    }
+                }
+            }
+
             Msg::Noop => {}
 
             Msg::OllamaModels(Ok(models)) => {
@@ -839,6 +884,33 @@ impl App {
                 .unwrap_or_default();
             Msg::ClaudeModels(models)
         });
+    }
+
+    /// Loads the repo's local CI config into state (jobs + empty results).
+    pub fn load_local_ci(&mut self) {
+        self.local_ci = Default::default();
+        let Some(repo) = self.repo.as_ref() else { return };
+        if let Ok(Some(config)) = crate::local_ci::load_config(repo.path()) {
+            self.local_ci.results = vec![None; config.jobs.len()];
+            self.local_ci.jobs = config.jobs;
+        }
+    }
+
+    /// Runs all configured local CI jobs on worker threads.
+    pub fn run_local_ci(&mut self) {
+        let Some(repo) = self.repo.clone() else { return };
+        if self.local_ci.jobs.is_empty() || self.local_ci.running {
+            return;
+        }
+        self.local_ci.results = vec![None; self.local_ci.jobs.len()];
+        self.local_ci.running = true;
+        for (index, job) in self.local_ci.jobs.clone().into_iter().enumerate() {
+            let root = repo.path().to_path_buf();
+            self.worker.spawn(move || Msg::CiJobDone {
+                index,
+                result: crate::local_ci::run_job(&root, &job),
+            });
+        }
     }
 
     /// Reloads the stash list.

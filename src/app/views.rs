@@ -676,6 +676,7 @@ fn open_pr_dialog(app: &mut App) {
         app.dialog = Dialog::GitHub;
         return;
     }
+    app.load_local_ci();
     app.pr.head = app.status.as_ref().map(|s| s.branch.clone()).unwrap_or_default();
     app.pr.base = app
         .branches

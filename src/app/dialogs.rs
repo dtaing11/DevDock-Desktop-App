@@ -278,6 +278,9 @@ fn pull_requests(app: &mut App, ctx: &egui::Context, open: &mut bool) {
     modal(ctx, "Pull requests", open, |ui| {
         ui.set_min_width(460.0);
 
+        local_ci_panel(app, ui);
+        ui.separator();
+
         ui.label("Title");
         ui.add(egui::TextEdit::singleline(&mut app.pr.title).desired_width(f32::INFINITY));
         ui.label("Description");
@@ -826,6 +829,122 @@ fn repo_prompt_settings(app: &mut App, ui: &mut egui::Ui) {
         .color(theme::FG_DIM)
         .small(),
     );
+}
+
+/// Local CI section at the top of the PR dialog: configured jobs, run
+/// button, per-job status with expandable output, and Docker/host modes.
+fn local_ci_panel(app: &mut App, ui: &mut egui::Ui) {
+    use crate::local_ci;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("LOCAL CHECKS").color(theme::EMBER).small());
+        if app.local_ci.jobs.is_empty() {
+            if ui
+                .small_button("Create config")
+                .on_hover_text(format!(
+                    "Writes {} with an example job. Add `image = \"...\"` to run in Docker.",
+                    local_ci::CONFIG_FILE
+                ))
+                .clicked()
+            {
+                if let Some(repo) = app.repo.as_ref() {
+                    match local_ci::write_template(repo.path()) {
+                        Ok(()) => {
+                            app.toast(format!("{} created.", local_ci::CONFIG_FILE), false);
+                            app.load_local_ci();
+                        }
+                        Err(e) => app.toast(e.to_string(), true),
+                    }
+                }
+            }
+        } else {
+            let label = if app.local_ci.running {
+                format!("Running… ({}/{})", app.local_ci.finished(), app.local_ci.jobs.len())
+            } else {
+                "Run all checks".into()
+            };
+            if ui.add_enabled(!app.local_ci.running, egui::Button::new(label).small()).clicked()
+            {
+                app.run_local_ci();
+            }
+            if ui.small_button("Reload").on_hover_text("Re-read the config file").clicked() {
+                app.load_local_ci();
+            }
+        }
+    });
+
+    if app.local_ci.jobs.is_empty() {
+        ui.label(
+            RichText::new(format!(
+                "No checks configured. {} defines jobs that run locally (or in a \
+                 Docker container of your choice) before you create a PR.",
+                local_ci::CONFIG_FILE
+            ))
+            .color(theme::FG_DIM)
+            .small(),
+        );
+        return;
+    }
+
+    let jobs = app.local_ci.jobs.clone();
+    for (i, job) in jobs.iter().enumerate() {
+        ui.horizontal(|ui| {
+            let (status, color) = match app.local_ci.results.get(i).and_then(|r| r.as_ref()) {
+                Some(result) if result.ok => {
+                    (format!("[pass {:.1}s]", result.duration_secs), theme::ADD)
+                }
+                Some(result) => (format!("[fail {:.1}s]", result.duration_secs), theme::DANGER),
+                None if app.local_ci.running => ("[running]".into(), theme::WARN),
+                None => ("[pending]".into(), theme::FG_DIM),
+            };
+            ui.label(RichText::new(status).color(color).small().monospace());
+            let env = job
+                .image
+                .as_deref()
+                .map(|img| format!(" (docker: {img})"))
+                .unwrap_or_else(|| " (host)".into());
+            let expanded = app.local_ci.expanded == Some(i);
+            if ui
+                .selectable_label(expanded, format!("{}{env}", job.name))
+                .on_hover_text("Click to show/hide output")
+                .clicked()
+            {
+                app.local_ci.expanded = if expanded { None } else { Some(i) };
+            }
+        });
+        if app.local_ci.expanded == Some(i) {
+            if let Some(Some(result)) = app.local_ci.results.get(i) {
+                ScrollArea::vertical().max_height(140.0).id_salt(("ci-out", i)).show(ui, |ui| {
+                    egui::Frame::new()
+                        .fill(theme::BG)
+                        .inner_margin(egui::Margin::symmetric(8, 6))
+                        .show(ui, |ui| {
+                            for line in result.output.lines() {
+                                ui.label(RichText::new(line).monospace().small());
+                            }
+                        });
+                });
+            }
+        }
+    }
+
+    if app.local_ci.any_failed() {
+        ui.label(
+            RichText::new("Checks failed. You can still create the PR, but consider fixing first.")
+                .color(theme::DANGER)
+                .small(),
+        );
+    } else if app.local_ci.all_passed() {
+        ui.label(RichText::new("All checks passed.").color(theme::ADD).small());
+    }
+    if !crate::local_ci::docker_available()
+        && app.local_ci.jobs.iter().any(|j| j.image.is_some())
+    {
+        ui.label(
+            RichText::new("Docker not found: container jobs will fail until it is installed.")
+                .color(theme::WARN)
+                .small(),
+        );
+    }
 }
 
 /// Claude account section inside Settings: OAuth sign-in or API key.

@@ -592,27 +592,6 @@ fn settings(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         ui.separator();
         hook_settings(app, ui);
 
-        ui.separator();
-        ui.label(RichText::new("AI PROVIDER FOR COMMIT MESSAGES").color(theme::EMBER).small());
-        ui.horizontal(|ui| {
-            let provider = app.config.ai_provider.clone().unwrap_or_else(|| "ollama".into());
-            if ui.selectable_label(provider == "ollama", "Ollama (local)").clicked() {
-                app.config.ai_provider = Some("ollama".into());
-                app.config.save();
-            }
-            let claude_ready = app.claude.auth_label.is_some();
-            let resp = ui.add_enabled(
-                claude_ready,
-                egui::SelectableLabel::new(provider == "claude", "Claude"),
-            );
-            if resp.clicked() {
-                app.config.ai_provider = Some("claude".into());
-                app.config.save();
-            }
-            if !claude_ready {
-                resp.on_hover_text("Sign in to Claude below first");
-            }
-        });
     });
 }
 

@@ -14,13 +14,13 @@ lint:
 
 install: build
 	mkdir -p $(PREFIX)/bin
-	install -m 755 target/release/git-manage $(PREFIX)/bin/git-manage
+	install -m 755 target/release/devdock $(PREFIX)/bin/devdock
 ifeq ($(UNAME_S),Linux)
 	mkdir -p $(PREFIX)/share/applications $(PREFIX)/share/icons/hicolor/256x256/apps
 	install -m 644 assets/git-manage.desktop $(PREFIX)/share/applications/git-manage.desktop
 	install -m 644 assets/icons/git-manage-256.png $(PREFIX)/share/icons/hicolor/256x256/apps/git-manage.png
 endif
-	@echo "Installed to $(PREFIX)/bin/git-manage"
+	@echo "Installed to $(PREFIX)/bin/devdock"
 
 clean:
 	cargo clean

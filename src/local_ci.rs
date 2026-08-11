@@ -326,7 +326,7 @@ pub fn install_pre_push_hook(repo_root: &Path) -> Result<()> {
 
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "git-manage".into());
+        .unwrap_or_else(|_| "devdock".into());
     let script = format!(
         "#!/bin/sh\n\
          # devdock-local-ci: runs .git-manage-ci.toml jobs before every push.\n\

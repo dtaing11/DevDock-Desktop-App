@@ -1,7 +1,7 @@
 [Desktop Entry]
 Name=DevDock
 Comment=Native git client with GitHub and AI integration
-Exec=git-manage
+Exec=devdock
 Icon=git-manage
 Terminal=false
 Type=Application

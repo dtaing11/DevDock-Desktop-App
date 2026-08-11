@@ -59,4 +59,4 @@ jobs:
           name: git-manage-linux
           path: |
             target/debian/*.deb
-            target/release/git-manage
+            target/release/devdock

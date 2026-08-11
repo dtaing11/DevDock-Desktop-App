@@ -31,7 +31,7 @@ sudo apt install build-essential libgtk-3-dev libxcb-render0-dev \
   libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
 
 cargo build --release
-./target/release/git-manage
+./target/release/devdock
 ```
 
 Optional: `make install` installs the binary plus a `.desktop` entry.

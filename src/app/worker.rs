@@ -1,0 +1,72 @@
+//! Background worker: runs blocking operations off the UI thread.
+//!
+//! GUI code calls [`Worker::spawn`] with a closure producing a [`Msg`]; the
+//! result is delivered to the UI thread via an mpsc channel and a repaint
+//! request. This keeps the egui update loop responsive during git and
+//! network operations.
+
+use crate::git::{Branch, BranchList, Commit, ConflictFile, OpOutcome, Status};
+use crate::github::{DeviceCode, PullRequest, User};
+use crate::ollama::{CommitSuggestion, Model};
+use std::sync::mpsc::{Receiver, Sender};
+
+/// Messages sent from background tasks back to the UI thread.
+#[derive(Debug)]
+pub enum Msg {
+    /// Repository opened (or open failed).
+    RepoOpened(Result<String, String>),
+    Status(Result<Status, String>),
+    Branches(Result<BranchList, String>),
+    Log(Result<Vec<Commit>, String>),
+    Diff { title: String, text: String },
+    /// A git operation finished; message shown as a toast. `refresh` reloads state.
+    Done { message: Result<String, String>, refresh: bool },
+    MergeOutcome(OpOutcome),
+    Conflicts(Result<Vec<ConflictFile>, String>),
+
+    GhDeviceCode(Result<DeviceCode, String>),
+    GhSignedIn(Result<User, String>),
+    GhUser(Option<User>),
+    GhPrs(Result<Vec<PullRequest>, String>),
+    GhPrCreated(Result<PullRequest, String>),
+
+    OllamaModels(Result<Vec<Model>, String>),
+    OllamaSuggestion(Result<CommitSuggestion, String>),
+}
+
+/// Handle for spawning background tasks that report back as [`Msg`]s.
+pub struct Worker {
+    tx: Sender<Msg>,
+    ctx: egui::Context,
+}
+
+impl Worker {
+    /// Creates a worker plus the receiver the UI thread drains each frame.
+    pub fn new(ctx: egui::Context) -> (Self, Receiver<Msg>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (Self { tx, ctx }, rx)
+    }
+
+    /// Runs `job` on a new thread and delivers its message to the UI.
+    pub fn spawn(&self, job: impl FnOnce() -> Msg + Send + 'static) {
+        let tx = self.tx.clone();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let msg = job();
+            // Receiver is only dropped on shutdown; ignore send failures then.
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+}
+
+/// Convenience: formats any displayable error into the `Result<_, String>`
+/// shape carried by [`Msg`].
+pub fn strerr<T, E: std::fmt::Display>(r: Result<T, E>) -> Result<T, String> {
+    r.map_err(|e| e.to_string())
+}
+
+/// Branches from local + remote lists, current first, for pickers.
+pub fn pickable_branches(list: &BranchList) -> Vec<Branch> {
+    list.local.iter().chain(list.remote.iter()).filter(|b| !b.current).cloned().collect()
+}

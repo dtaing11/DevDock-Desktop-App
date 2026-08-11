@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Git Manage
+Comment=Native git client with GitHub and Ollama integration
+Exec=git-manage
+Terminal=false
+Type=Application
+Categories=Development;RevisionControl;
+Keywords=git;github;commit;branch;merge;

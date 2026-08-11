@@ -1,0 +1,796 @@
+//! Typed, synchronous wrapper around the `git` command-line tool.
+//!
+//! The entry point is [`Repo`], a lightweight handle to a working directory:
+//!
+//! ```no_run
+//! use git_manage::git::Repo;
+//!
+//! let repo = Repo::open("/path/to/project")?;
+//! let status = repo.status()?;
+//! println!("{} files changed on {}", status.files.len(), status.branch);
+//! # Ok::<(), git_manage::git::GitError>(())
+//! ```
+//!
+//! All operations shell out to `git`, so behaviour always matches the user's
+//! installed git version and configuration (hooks, credentials, aliases).
+
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// Errors produced by git operations.
+#[derive(Debug, thiserror::Error)]
+pub enum GitError {
+    /// `git` exited with a non-zero status. Contains the trimmed stderr/stdout.
+    #[error("{0}")]
+    Command(String),
+    /// The `git` binary could not be spawned or the filesystem failed.
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+    /// The given path is not (inside) a git repository.
+    #[error("not a git repository: {0}")]
+    NotARepo(String),
+}
+
+/// Convenience alias used across this module.
+pub type Result<T> = std::result::Result<T, GitError>;
+
+// ---------------------------------------------------------------------------
+// Data types
+// ---------------------------------------------------------------------------
+
+/// A single changed file reported by `git status`.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FileEntry {
+    pub path: String,
+    /// Previous path for renames/copies.
+    pub orig_path: Option<String>,
+    /// Status of the index side (staged), e.g. `modified`, `added`.
+    pub index_status: Option<FileStatus>,
+    /// Status of the worktree side (unstaged).
+    pub work_status: Option<FileStatus>,
+    pub staged: bool,
+    pub unstaged: bool,
+    pub conflicted: bool,
+}
+
+/// Normalized file status letters from `git status --porcelain`.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FileStatus {
+    Modified,
+    Added,
+    Deleted,
+    Renamed,
+    Copied,
+    Conflicted,
+    Untracked,
+    Ignored,
+    Typechange,
+}
+
+impl FileStatus {
+    fn from_porcelain(c: char) -> Option<Self> {
+        match c {
+            'M' => Some(Self::Modified),
+            'A' => Some(Self::Added),
+            'D' => Some(Self::Deleted),
+            'R' => Some(Self::Renamed),
+            'C' => Some(Self::Copied),
+            'U' => Some(Self::Conflicted),
+            '?' => Some(Self::Untracked),
+            '!' => Some(Self::Ignored),
+            'T' => Some(Self::Typechange),
+            _ => None,
+        }
+    }
+}
+
+/// Snapshot of the working tree returned by [`Repo::status`].
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Status {
+    pub files: Vec<FileEntry>,
+    pub branch: String,
+    /// Commits ahead of the upstream branch.
+    pub ahead: u32,
+    /// Commits behind the upstream branch.
+    pub behind: u32,
+    pub has_upstream: bool,
+    pub state: RepoState,
+}
+
+/// Whether a multi-step operation (merge, rebase, ...) is in progress.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RepoState {
+    Clean,
+    Merging,
+    Rebasing,
+    CherryPicking,
+}
+
+/// A local or remote branch.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Branch {
+    pub name: String,
+    pub sha: String,
+    /// ISO-8601 committer date of the branch tip.
+    pub date: String,
+    /// Subject line of the tip commit.
+    pub subject: String,
+    pub current: bool,
+}
+
+/// Local and remote branches, plus the current branch name.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct BranchList {
+    pub current: String,
+    pub local: Vec<Branch>,
+    pub remote: Vec<Branch>,
+}
+
+/// Outcome of a merge/rebase style operation that may hit conflicts.
+///
+/// These operations "fail" routinely as part of normal workflows, so they
+/// return this type instead of an `Err`.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct OpOutcome {
+    pub ok: bool,
+    pub conflict: bool,
+    pub message: String,
+}
+
+impl OpOutcome {
+    fn from(result: Result<String>) -> Self {
+        match result {
+            Ok(out) => Self { ok: true, conflict: false, message: out.trim().to_string() },
+            Err(e) => {
+                let message = e.to_string();
+                Self { ok: false, conflict: message.to_lowercase().contains("conflict"), message }
+            }
+        }
+    }
+}
+
+/// One commit from [`Repo::log`].
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Commit {
+    pub sha: String,
+    pub short_sha: String,
+    pub author: String,
+    pub email: String,
+    /// ISO-8601 author date.
+    pub date: String,
+    pub subject: String,
+    pub body: String,
+    pub parents: Vec<String>,
+}
+
+/// A conflicted file with all three stages plus the current working copy,
+/// ready to feed a merge editor.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ConflictFile {
+    pub path: String,
+    /// Common ancestor version (stage 1).
+    pub base: Option<String>,
+    /// Current-branch version (stage 2).
+    pub ours: Option<String>,
+    /// Incoming version (stage 3).
+    pub theirs: Option<String>,
+    /// Content currently on disk, including conflict markers.
+    pub working: Option<String>,
+}
+
+/// How to resolve a single conflicted file.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Resolution {
+    /// Keep the current branch's version.
+    Ours,
+    /// Keep the incoming version.
+    Theirs,
+    /// Write the provided content.
+    Manual(String),
+}
+
+/// A configured remote.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Remote {
+    pub name: String,
+    pub url: String,
+}
+
+// ---------------------------------------------------------------------------
+// Repo
+// ---------------------------------------------------------------------------
+
+/// Handle to a git repository on disk.
+///
+/// Cheap to clone; holds only the worktree root path.
+#[derive(Debug, Clone)]
+pub struct Repo {
+    root: PathBuf,
+}
+
+impl Repo {
+    // -- construction -------------------------------------------------------
+
+    /// Opens an existing repository. `path` may be anywhere inside the worktree.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Err(GitError::NotARepo(path.display().to_string()));
+        }
+        let out = run_git(path, &["rev-parse", "--show-toplevel"], &[])
+            .map_err(|_| GitError::NotARepo(path.display().to_string()))?;
+        Ok(Self { root: PathBuf::from(out.trim()) })
+    }
+
+    /// Initializes a new repository at `path`, creating directories as needed.
+    pub fn init(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        std::fs::create_dir_all(path)?;
+        run_git(path, &["init"], &[])?;
+        Self::open(path)
+    }
+
+    /// Clones `url` into `dest` and opens the result.
+    pub fn clone(url: &str, dest: impl AsRef<Path>) -> Result<Self> {
+        let dest = dest.as_ref();
+        let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let dest_str = dest.to_string_lossy();
+        run_git(parent, &["clone", url, &dest_str], &[])?;
+        Self::open(dest)
+    }
+
+    /// Worktree root.
+    pub fn path(&self) -> &Path {
+        &self.root
+    }
+
+    /// Directory name of the worktree root, used as a display name.
+    pub fn name(&self) -> String {
+        self.root
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.root.display().to_string())
+    }
+
+    /// Runs an arbitrary git command in this repository and returns stdout.
+    pub fn git(&self, args: &[&str]) -> Result<String> {
+        run_git(&self.root, args, &[])
+    }
+
+    fn git_env(&self, args: &[&str], env: &[(&str, &str)]) -> Result<String> {
+        run_git(&self.root, args, env)
+    }
+
+    // -- status -------------------------------------------------------------
+
+    /// Full working-tree status: changed files, branch, ahead/behind, state.
+    pub fn status(&self) -> Result<Status> {
+        let out = self.git(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])?;
+        let files = parse_porcelain(&out);
+        let (ahead, behind, has_upstream) = self.ahead_behind();
+        Ok(Status {
+            files,
+            branch: self.current_branch(),
+            ahead,
+            behind,
+            has_upstream,
+            state: self.state()?,
+        })
+    }
+
+    /// Reports whether a merge/rebase/cherry-pick is in progress.
+    pub fn state(&self) -> Result<RepoState> {
+        let git_dir = self.git(&["rev-parse", "--git-dir"])?.trim().to_string();
+        let git_dir = if Path::new(&git_dir).is_absolute() {
+            PathBuf::from(git_dir)
+        } else {
+            self.root.join(git_dir)
+        };
+        let state = if git_dir.join("MERGE_HEAD").exists() {
+            RepoState::Merging
+        } else if git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists() {
+            RepoState::Rebasing
+        } else if git_dir.join("CHERRY_PICK_HEAD").exists() {
+            RepoState::CherryPicking
+        } else {
+            RepoState::Clean
+        };
+        Ok(state)
+    }
+
+    fn ahead_behind(&self) -> (u32, u32, bool) {
+        let Ok(out) = self.git(&["rev-list", "--left-right", "--count", "@{upstream}...HEAD"])
+        else {
+            return (0, 0, false);
+        };
+        let counts: Vec<u32> = out.split_whitespace().filter_map(|s| s.parse().ok()).collect();
+        match counts.as_slice() {
+            [behind, ahead] => (*ahead, *behind, true),
+            _ => (0, 0, false),
+        }
+    }
+
+    // -- staging ------------------------------------------------------------
+
+    /// Stages the given paths.
+    pub fn stage(&self, files: &[String]) -> Result<()> {
+        self.run_on_files(&["add", "--"], files)
+    }
+
+    /// Unstages the given paths.
+    pub fn unstage(&self, files: &[String]) -> Result<()> {
+        self.run_on_files(&["reset", "HEAD", "--"], files)
+    }
+
+    /// Stages every change, including untracked files.
+    pub fn stage_all(&self) -> Result<()> {
+        self.git(&["add", "-A"]).map(drop)
+    }
+
+    /// Clears the index without touching the worktree.
+    pub fn unstage_all(&self) -> Result<()> {
+        self.git(&["reset", "HEAD"]).map(drop)
+    }
+
+    /// Discards changes: restores tracked files, deletes untracked ones.
+    pub fn discard(&self, files: &[String]) -> Result<()> {
+        let status = self.status()?;
+        let untracked: HashSet<&str> = status
+            .files
+            .iter()
+            .filter(|f| {
+                f.index_status == Some(FileStatus::Untracked)
+                    || f.work_status == Some(FileStatus::Untracked)
+            })
+            .map(|f| f.path.as_str())
+            .collect();
+
+        let tracked: Vec<String> = files
+            .iter()
+            .filter(|f| !untracked.contains(f.as_str()))
+            .cloned()
+            .collect();
+        if !tracked.is_empty() {
+            self.run_on_files(&["checkout", "--"], &tracked)?;
+        }
+        for file in files.iter().filter(|f| untracked.contains(f.as_str())) {
+            let target = self.root.join(file);
+            if target.is_dir() {
+                std::fs::remove_dir_all(&target)?;
+            } else if target.exists() {
+                std::fs::remove_file(&target)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn run_on_files(&self, prefix: &[&str], files: &[String]) -> Result<()> {
+        let mut args: Vec<&str> = prefix.to_vec();
+        args.extend(files.iter().map(String::as_str));
+        self.git(&args).map(drop)
+    }
+
+    // -- commits ------------------------------------------------------------
+
+    /// Creates a commit from the index. Returns the new commit's SHA.
+    ///
+    /// `description`, when non-empty, becomes the commit body.
+    pub fn commit(&self, summary: &str, description: &str, amend: bool) -> Result<String> {
+        let message = if description.trim().is_empty() {
+            summary.to_string()
+        } else {
+            format!("{summary}\n\n{description}")
+        };
+        let mut args = vec!["commit", "-m", &message];
+        if amend {
+            args.push("--amend");
+        }
+        self.git(&args)?;
+        Ok(self.git(&["rev-parse", "HEAD"])?.trim().to_string())
+    }
+
+    /// Commit history, newest first.
+    pub fn log(&self, limit: u32, branch: Option<&str>) -> Result<Vec<Commit>> {
+        // Unit/record separators cannot appear in commit metadata.
+        const FIELD: char = '\u{1f}';
+        const RECORD: char = '\u{1e}';
+        let format =
+            format!("--format=%H{FIELD}%h{FIELD}%an{FIELD}%ae{FIELD}%aI{FIELD}%s{FIELD}%b{FIELD}%P{RECORD}");
+        let max_count = format!("--max-count={limit}");
+        let mut args = vec!["log", max_count.as_str(), format.as_str()];
+        if let Some(branch) = branch {
+            args.push(branch);
+        }
+        let Ok(out) = self.git(&args) else {
+            return Ok(Vec::new()); // repository without commits
+        };
+        Ok(out
+            .split(RECORD)
+            .filter(|r| !r.trim().is_empty())
+            .filter_map(|record| parse_commit(record.trim_start_matches('\n'), FIELD))
+            .collect())
+    }
+
+    // -- diffs --------------------------------------------------------------
+
+    /// Unified diff for one file. Untracked files diff against `/dev/null`.
+    pub fn diff_file(&self, file: &str, staged: bool) -> Result<String> {
+        if !staged && self.is_untracked(file)? {
+            return self.diff_untracked(file);
+        }
+        let mut args = vec!["diff"];
+        if staged {
+            args.push("--cached");
+        }
+        args.extend(["--", file]);
+        self.git(&args)
+    }
+
+    /// Unified diff of the whole tree (staged or unstaged side).
+    pub fn diff_all(&self, staged: bool) -> Result<String> {
+        if staged {
+            self.git(&["diff", "--cached"])
+        } else {
+            self.git(&["diff"])
+        }
+    }
+
+    /// Patch + stats for one commit, as shown in history views.
+    pub fn diff_commit(&self, sha: &str) -> Result<String> {
+        self.git(&["show", "--stat", "--patch", "--format=fuller", sha])
+    }
+
+    /// Best-effort diff for AI commit-message generation: staged changes,
+    /// else unstaged changes, else untracked file contents (first 20 files).
+    pub fn diff_for_ai(&self) -> Result<String> {
+        let staged = self.git(&["diff", "--cached"])?;
+        if !staged.trim().is_empty() {
+            return Ok(staged);
+        }
+        let unstaged = self.git(&["diff"])?;
+        if !unstaged.trim().is_empty() {
+            return Ok(unstaged);
+        }
+        let status = self.status()?;
+        let diffs: Vec<String> = status
+            .files
+            .iter()
+            .filter(|f| f.work_status == Some(FileStatus::Untracked))
+            .take(20)
+            .filter_map(|f| self.diff_untracked(&f.path).ok())
+            .collect();
+        Ok(diffs.join("\n"))
+    }
+
+    fn is_untracked(&self, file: &str) -> Result<bool> {
+        let status = self.status()?;
+        Ok(status
+            .files
+            .iter()
+            .any(|f| f.path == file && f.work_status == Some(FileStatus::Untracked)))
+    }
+
+    fn diff_untracked(&self, file: &str) -> Result<String> {
+        // `git diff --no-index` exits 1 when files differ, so bypass run_git.
+        let out = Command::new("git")
+            .args(["diff", "--no-index", "--", "/dev/null", file])
+            .current_dir(&self.root)
+            .output()?;
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    // -- branches -----------------------------------------------------------
+
+    /// Current branch name, or a descriptive placeholder when detached/empty.
+    pub fn current_branch(&self) -> String {
+        if let Ok(out) = self.git(&["symbolic-ref", "--short", "HEAD"]) {
+            return out.trim().to_string();
+        }
+        match self.git(&["rev-parse", "--short", "HEAD"]) {
+            Ok(sha) => format!("(detached: {})", sha.trim()),
+            Err(_) => "(no commits)".to_string(),
+        }
+    }
+
+    /// All local and remote branches, sorted by most recent commit.
+    pub fn branches(&self) -> Result<BranchList> {
+        let current = self.current_branch();
+        Ok(BranchList {
+            local: self.list_refs("refs/heads", &current),
+            remote: self.list_refs("refs/remotes", &current),
+            current,
+        })
+    }
+
+    fn list_refs(&self, namespace: &str, current: &str) -> Vec<Branch> {
+        const FORMAT: &str =
+            "--format=%(refname:short)\t%(objectname:short)\t%(committerdate:iso8601)\t%(subject)";
+        let out = self
+            .git(&["for-each-ref", "--sort=-committerdate", FORMAT, namespace])
+            .unwrap_or_default();
+        out.lines().filter_map(|line| parse_branch(line, current)).collect()
+    }
+
+    /// Creates a branch, optionally checking it out.
+    pub fn create_branch(&self, name: &str, checkout: bool) -> Result<()> {
+        let args: &[&str] =
+            if checkout { &["checkout", "-b", name] } else { &["branch", name] };
+        self.git(args).map(drop)
+    }
+
+    /// Checks out a branch (or any committish).
+    pub fn checkout(&self, name: &str) -> Result<()> {
+        self.git(&["checkout", name]).map(drop)
+    }
+
+    /// Deletes a local branch. `force` uses `-D`.
+    pub fn delete_branch(&self, name: &str, force: bool) -> Result<()> {
+        self.git(&["branch", if force { "-D" } else { "-d" }, name]).map(drop)
+    }
+
+    // -- merge / rebase -----------------------------------------------------
+
+    /// Merges `branch` into the current branch.
+    pub fn merge(&self, branch: &str) -> OpOutcome {
+        OpOutcome::from(self.git(&["merge", "--no-edit", branch]))
+    }
+
+    /// Aborts an in-progress merge.
+    pub fn merge_abort(&self) -> Result<()> {
+        self.git(&["merge", "--abort"]).map(drop)
+    }
+
+    /// Commits a resolved merge with the default message.
+    pub fn merge_continue(&self) -> OpOutcome {
+        OpOutcome::from(self.git_env(&["commit", "--no-edit"], &[("GIT_EDITOR", "true")]))
+    }
+
+    /// Rebases the current branch onto `onto`.
+    pub fn rebase(&self, onto: &str) -> OpOutcome {
+        OpOutcome::from(self.git(&["rebase", onto]))
+    }
+
+    /// Continues a rebase after conflicts were staged.
+    pub fn rebase_continue(&self) -> OpOutcome {
+        OpOutcome::from(self.git_env(&["rebase", "--continue"], &[("GIT_EDITOR", "true")]))
+    }
+
+    /// Aborts an in-progress rebase.
+    pub fn rebase_abort(&self) -> Result<()> {
+        self.git(&["rebase", "--abort"]).map(drop)
+    }
+
+    // -- conflicts ----------------------------------------------------------
+
+    /// All conflicted files with base/ours/theirs/working contents.
+    pub fn conflicts(&self) -> Result<Vec<ConflictFile>> {
+        let status = self.status()?;
+        Ok(status
+            .files
+            .iter()
+            .filter(|f| f.conflicted)
+            .map(|f| ConflictFile {
+                base: self.show_stage(1, &f.path),
+                ours: self.show_stage(2, &f.path),
+                theirs: self.show_stage(3, &f.path),
+                working: std::fs::read_to_string(self.root.join(&f.path)).ok(),
+                path: f.path.clone(),
+            })
+            .collect())
+    }
+
+    fn show_stage(&self, stage: u8, path: &str) -> Option<String> {
+        self.git(&["show", &format!(":{stage}:{path}")]).ok()
+    }
+
+    /// Resolves one conflicted file and stages the result.
+    pub fn resolve(&self, file: &str, resolution: &Resolution) -> Result<()> {
+        match resolution {
+            Resolution::Ours => self.git(&["checkout", "--ours", "--", file]).map(drop)?,
+            Resolution::Theirs => self.git(&["checkout", "--theirs", "--", file]).map(drop)?,
+            Resolution::Manual(content) => std::fs::write(self.root.join(file), content)?,
+        }
+        self.git(&["add", "--", file]).map(drop)
+    }
+
+    // -- remotes ------------------------------------------------------------
+
+    /// Configured remotes (deduplicated fetch/push pairs).
+    pub fn remotes(&self) -> Result<Vec<Remote>> {
+        let out = self.git(&["remote", "-v"]).unwrap_or_default();
+        let mut seen = HashSet::new();
+        Ok(out
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split_whitespace();
+                let name = parts.next()?;
+                let url = parts.next()?;
+                seen.insert(name.to_string())
+                    .then(|| Remote { name: name.to_string(), url: url.to_string() })
+            })
+            .collect())
+    }
+
+    /// Fetches all remotes, pruning removed branches.
+    ///
+    /// `auth` supplies a GitHub token used for github.com HTTPS remotes.
+    pub fn fetch(&self, auth: Option<&str>) -> Result<()> {
+        if let Some(url) = self.authed_origin_url(auth) {
+            let refspec = "+refs/heads/*:refs/remotes/origin/*";
+            return self.git(&["fetch", "--prune", &url, refspec]).map(drop);
+        }
+        self.git(&["fetch", "--all", "--prune"]).map(drop)
+    }
+
+    /// Pulls the current branch. See [`Repo::fetch`] for `auth`.
+    pub fn pull(&self, auth: Option<&str>) -> Result<String> {
+        if let Some(url) = self.authed_origin_url(auth) {
+            let branch = self.current_branch();
+            return Ok(self.git(&["pull", "--no-edit", &url, &branch])?.trim().to_string());
+        }
+        Ok(self.git(&["pull", "--no-edit"])?.trim().to_string())
+    }
+
+    /// Pushes the current branch. See [`Repo::fetch`] for `auth`.
+    pub fn push(&self, set_upstream: bool, auth: Option<&str>) -> Result<String> {
+        let branch = self.current_branch();
+        if let Some(url) = self.authed_origin_url(auth) {
+            let refspec = format!("{branch}:{branch}");
+            let out = self.git(&["push", &url, &refspec])?;
+            if set_upstream {
+                let upstream = format!("origin/{branch}");
+                let _ = self.git(&["branch", "--set-upstream-to", &upstream, &branch]);
+            }
+            return Ok(out.trim().to_string());
+        }
+        let out = if set_upstream {
+            self.git(&["push", "--set-upstream", "origin", &branch])?
+        } else {
+            self.git(&["push"])?
+        };
+        Ok(out.trim().to_string())
+    }
+
+    /// Origin URL rewritten to carry the token, when it points at github.com.
+    fn authed_origin_url(&self, token: Option<&str>) -> Option<String> {
+        let token = token?;
+        let url = self.git(&["remote", "get-url", "origin"]).ok()?;
+        let url = url.trim();
+        let rest = url
+            .strip_prefix("https://github.com/")
+            .or_else(|| url.strip_prefix("git@github.com:"))?;
+        Some(format!("https://x-access-token:{token}@github.com/{rest}"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Free helpers
+// ---------------------------------------------------------------------------
+
+fn run_git(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String> {
+    let mut cmd = Command::new("git");
+    cmd.args(args).current_dir(dir).env("GIT_TERMINAL_PROMPT", "0");
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    let out = cmd.output()?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let message = if stderr.trim().is_empty() { stdout } else { stderr };
+        Err(GitError::Command(message.trim().to_string()))
+    }
+}
+
+fn parse_porcelain(out: &str) -> Vec<FileEntry> {
+    let entries: Vec<&str> = out.split('\0').filter(|s| !s.is_empty()).collect();
+    let mut files = Vec::new();
+    let mut iter = entries.iter().peekable();
+    while let Some(entry) = iter.next() {
+        if entry.len() < 4 {
+            continue;
+        }
+        let mut chars = entry.chars();
+        let (Some(x), Some(y)) = (chars.next(), chars.next()) else { continue };
+        let path = entry[3..].to_string();
+        // Renames/copies are followed by the original path as its own record.
+        let orig_path = matches!(x, 'R' | 'C')
+            .then(|| iter.next().map(|s| s.to_string()))
+            .flatten();
+        files.push(FileEntry {
+            path,
+            orig_path,
+            index_status: FileStatus::from_porcelain(x),
+            work_status: FileStatus::from_porcelain(y),
+            staged: x != ' ' && x != '?',
+            unstaged: y != ' ',
+            conflicted: x == 'U' || y == 'U' || (x == 'A' && y == 'A') || (x == 'D' && y == 'D'),
+        });
+    }
+    files
+}
+
+fn parse_branch(line: &str, current: &str) -> Option<Branch> {
+    let mut parts = line.splitn(4, '\t');
+    let name = parts.next()?.to_string();
+    if name.is_empty() || name.ends_with("/HEAD") {
+        return None;
+    }
+    Some(Branch {
+        current: name == current,
+        name,
+        sha: parts.next().unwrap_or_default().to_string(),
+        date: parts.next().unwrap_or_default().to_string(),
+        subject: parts.next().unwrap_or_default().to_string(),
+    })
+}
+
+fn parse_commit(record: &str, field_sep: char) -> Option<Commit> {
+    let parts: Vec<&str> = record.split(field_sep).collect();
+    let [sha, short_sha, author, email, date, subject, body, parents] = parts.as_slice() else {
+        return None;
+    };
+    Some(Commit {
+        sha: sha.to_string(),
+        short_sha: short_sha.to_string(),
+        author: author.to_string(),
+        email: email.to_string(),
+        date: date.to_string(),
+        subject: subject.to_string(),
+        body: body.trim().to_string(),
+        parents: parents.split_whitespace().map(String::from).collect(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn porcelain_parses_untracked_and_modified() {
+        let out = "?? new.txt\0 M changed.txt\0";
+        let files = parse_porcelain(out);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].work_status, Some(FileStatus::Untracked));
+        assert!(!files[0].staged);
+        assert_eq!(files[1].work_status, Some(FileStatus::Modified));
+        assert!(!files[1].staged);
+    }
+
+    #[test]
+    fn porcelain_parses_rename_with_orig_path() {
+        let out = "R  new-name.txt\0old-name.txt\0";
+        let files = parse_porcelain(out);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].orig_path.as_deref(), Some("old-name.txt"));
+        assert!(files[0].staged);
+    }
+
+    #[test]
+    fn porcelain_flags_conflicts() {
+        let out = "UU both.txt\0AA added-both.txt\0";
+        let files = parse_porcelain(out);
+        assert!(files.iter().all(|f| f.conflicted));
+    }
+
+    #[test]
+    fn branch_line_parses() {
+        let b = parse_branch("main\tabc123\t2026-01-01 00:00:00 +0000\tinitial", "main").unwrap();
+        assert!(b.current);
+        assert_eq!(b.sha, "abc123");
+        assert_eq!(b.subject, "initial");
+    }
+
+    #[test]
+    fn branch_head_pointer_is_skipped() {
+        assert!(parse_branch("origin/HEAD\tabc\tdate\tsubj", "main").is_none());
+    }
+}

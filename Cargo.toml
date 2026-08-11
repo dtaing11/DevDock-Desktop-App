@@ -1,0 +1,31 @@
+[package]
+name = "git-manage"
+version = "0.1.0"
+description = "Native GitHub-Desktop-style git client for Linux with Ollama-powered commit messages"
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "git_manage"
+path = "src/lib.rs"
+
+[[bin]]
+name = "git-manage"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.31"
+egui = "0.31"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+ureq = { version = "2", features = ["json"] }
+open = "5"
+dirs = "6"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+strip = true
+lto = true

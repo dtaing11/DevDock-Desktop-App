@@ -671,7 +671,8 @@ fn shortcut_settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
 /// Per-repository custom AI instructions for commit and PR generation.
 ///
 /// Stored per worktree path, so each repository can have its own style
-/// rules (ticket prefixes, language, tone, required sections, ...).
+/// rules. Instructions can be typed inline or loaded from a Markdown file
+/// (re-read on every generation, so edits to the file apply immediately).
 fn repo_prompt_settings(app: &mut App, ui: &mut egui::Ui) {
     ui.label(RichText::new("CUSTOM AI INSTRUCTIONS (THIS REPOSITORY)").color(theme::EMBER).small());
 
@@ -680,36 +681,141 @@ fn repo_prompt_settings(app: &mut App, ui: &mut egui::Ui) {
         return;
     };
     let key = repo.path().display().to_string();
+    let repo_root = repo.path().to_path_buf();
     let prompts = app.config.repo_prompts.entry(key).or_default();
     let mut changed = false;
+    let mut error: Option<String> = None;
 
-    ui.label(RichText::new("Commit messages").color(theme::FG_DIM).small());
-    changed |= ui
-        .add(
-            egui::TextEdit::multiline(&mut prompts.commit)
-                .hint_text("e.g. Prefix the summary with the JIRA ticket from the branch name. Write in present tense.")
-                .desired_rows(2)
-                .desired_width(f32::INFINITY),
-        )
-        .changed();
+    /// Opens an .md-only file picker and returns the chosen path.
+    fn pick_md_file(start_dir: &std::path::Path) -> Result<Option<String>, String> {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Choose a Markdown instructions file")
+            .add_filter("Markdown", &["md", "markdown"])
+            .set_directory(start_dir)
+            .pick_file()
+        else {
+            return Ok(None);
+        };
+        // The filter guides the dialog, but verify the extension anyway.
+        let is_md = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
+            .unwrap_or(false);
+        if !is_md {
+            return Err("Only Markdown (.md) files are allowed.".into());
+        }
+        Ok(Some(path.display().to_string()))
+    }
 
-    ui.label(RichText::new("Pull request title/description").color(theme::FG_DIM).small());
-    changed |= ui
-        .add(
-            egui::TextEdit::multiline(&mut prompts.pull_request)
-                .hint_text("e.g. Include a Testing section listing manual steps. Address reviewers formally.")
-                .desired_rows(2)
-                .desired_width(f32::INFINITY),
-        )
-        .changed();
+    /// One prompt slot: inline text + optional linked .md file.
+    fn prompt_slot(
+        ui: &mut egui::Ui,
+        label: &str,
+        hint: &str,
+        text: &mut String,
+        file: &mut Option<String>,
+        repo_root: &std::path::Path,
+        changed: &mut bool,
+        error: &mut Option<String>,
+    ) {
+        ui.label(RichText::new(label).color(theme::FG_DIM).small());
+        *changed |= ui
+            .add(
+                egui::TextEdit::multiline(text)
+                    .hint_text(hint)
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY),
+            )
+            .changed();
+        ui.horizontal(|ui| {
+            match file {
+                Some(path) => {
+                    let name = std::path::Path::new(path.as_str())
+                        .file_name()
+                        .map(|f| f.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path.clone());
+                    let exists = std::path::Path::new(path.as_str()).exists();
+                    let label_text = if exists {
+                        RichText::new(format!("File: {name}")).color(theme::TEAL).small()
+                    } else {
+                        RichText::new(format!("File: {name} (missing)"))
+                            .color(theme::DANGER)
+                            .small()
+                    };
+                    ui.label(label_text).on_hover_text(path.as_str());
+                    if ui.small_button("Change…").clicked() {
+                        match pick_md_file(repo_root) {
+                            Ok(Some(new_path)) => {
+                                *file = Some(new_path);
+                                *changed = true;
+                            }
+                            Ok(None) => {}
+                            Err(e) => *error = Some(e),
+                        }
+                    }
+                    if ui.small_button("Remove").clicked() {
+                        *file = None;
+                        *changed = true;
+                    }
+                }
+                None => {
+                    if ui
+                        .small_button("Attach .md file…")
+                        .on_hover_text(
+                            "Use an existing Markdown file as instructions. \
+                             Re-read on each generation, so edits apply immediately.",
+                        )
+                        .clicked()
+                    {
+                        match pick_md_file(repo_root) {
+                            Ok(Some(new_path)) => {
+                                *file = Some(new_path);
+                                *changed = true;
+                            }
+                            Ok(None) => {}
+                            Err(e) => *error = Some(e),
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    prompt_slot(
+        ui,
+        "Commit messages",
+        "e.g. Prefix the summary with the JIRA ticket from the branch name.",
+        &mut prompts.commit,
+        &mut prompts.commit_file,
+        &repo_root,
+        &mut changed,
+        &mut error,
+    );
+    prompt_slot(
+        ui,
+        "Pull request title/description",
+        "e.g. Include a Testing section listing manual steps.",
+        &mut prompts.pull_request,
+        &mut prompts.pull_request_file,
+        &repo_root,
+        &mut changed,
+        &mut error,
+    );
 
     if changed {
         app.config.save();
     }
+    if let Some(e) = error {
+        app.toast(e, true);
+    }
     ui.label(
-        RichText::new("Appended to the AI prompt for this repository only. Saved automatically.")
-            .color(theme::FG_DIM)
-            .small(),
+        RichText::new(
+            "Inline text and file contents are both appended to the AI prompt \
+             for this repository only. Saved automatically.",
+        )
+        .color(theme::FG_DIM)
+        .small(),
     );
 }
 

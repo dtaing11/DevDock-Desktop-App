@@ -85,6 +85,12 @@ pub struct RepoPrompts {
     /// Appended to the system prompt for PR title/body generation.
     #[serde(default)]
     pub pull_request: String,
+    /// Optional Markdown file whose contents are appended for commits.
+    #[serde(default)]
+    pub commit_file: Option<String>,
+    /// Optional Markdown file whose contents are appended for PRs.
+    #[serde(default)]
+    pub pull_request_file: Option<String>,
 }
 
 /// A provider/model pair chosen for one AI task.
@@ -541,16 +547,29 @@ impl App {
         self.generate_ai(worker::AiTarget::PullRequest, Vec::new());
     }
 
-    /// Custom AI instructions for the current repo and task, if any.
+    /// Custom AI instructions for the current repo and task: inline text
+    /// plus the contents of a linked Markdown file, when configured.
     fn repo_prompt(&self, target: worker::AiTarget) -> Option<String> {
         let repo = self.repo.as_ref()?;
         let prompts = self.config.repo_prompts.get(&repo.path().display().to_string())?;
-        let text = match target {
-            worker::AiTarget::Commit => &prompts.commit,
-            worker::AiTarget::PullRequest => &prompts.pull_request,
+        let (inline, file) = match target {
+            worker::AiTarget::Commit => (&prompts.commit, &prompts.commit_file),
+            worker::AiTarget::PullRequest => (&prompts.pull_request, &prompts.pull_request_file),
         };
-        let text = text.trim();
-        (!text.is_empty()).then(|| text.to_string())
+        let mut parts: Vec<String> = Vec::new();
+        let inline = inline.trim();
+        if !inline.is_empty() {
+            parts.push(inline.to_string());
+        }
+        if let Some(path) = file {
+            match std::fs::read_to_string(path) {
+                Ok(contents) if !contents.trim().is_empty() => {
+                    parts.push(contents.trim().to_string());
+                }
+                _ => {} // missing/unreadable file: fall back to inline text only
+            }
+        }
+        (!parts.is_empty()).then(|| parts.join("\n\n"))
     }
 
     /// Shared AI generation path for the commit box and the PR form. Each

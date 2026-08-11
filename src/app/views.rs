@@ -76,6 +76,11 @@ pub fn toolbar(app: &mut App, ctx: &egui::Context) {
         });
 }
 
+/// Dim, italic hint text for input fields, clearly distinct from content.
+pub fn dim_hint(text: &str) -> RichText {
+    RichText::new(text).color(theme::FG_DIM.linear_multiply(0.5)).italics()
+}
+
 /// Repository dropdown: recent repositories saved in the local config, with
 /// repair options for missing paths and an "Add repository" entry.
 fn repo_menu(app: &mut App, ui: &mut egui::Ui) {
@@ -233,7 +238,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut app.new_branch_name)
-                    .hint_text("New branch name")
+                    .hint_text(dim_hint("New branch name"))
                     .desired_width(190.0),
             );
             if ui.button("Create").clicked() && !app.new_branch_name.trim().is_empty() {
@@ -256,7 +261,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
         // Filter + branch lists
         ui.add(
             egui::TextEdit::singleline(&mut app.branch_filter)
-                .hint_text("Filter branches…")
+                .hint_text(dim_hint("Filter branches…"))
                 .desired_width(f32::INFINITY),
         );
         let filter = app.branch_filter.to_lowercase();
@@ -395,7 +400,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
             ui.horizontal(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut app.tag_name_input)
-                        .hint_text("v1.0.0")
+                        .hint_text(dim_hint("v1.0.0"))
                         .desired_width(120.0),
                 );
                 if ui.button("Tag HEAD").clicked() && !app.tag_name_input.trim().is_empty() {
@@ -462,7 +467,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut app.rename_branch_input)
-                    .hint_text("Rename current to…")
+                    .hint_text(dim_hint("Rename current to…"))
                     .desired_width(150.0),
             );
             if ui.button("Rename").clicked() && !app.rename_branch_input.trim().is_empty() {
@@ -882,7 +887,7 @@ fn commit_box(app: &mut App, ui: &mut egui::Ui) {
     ui.label(RichText::new("COMMIT").color(theme::EMBER).small());
     ui.add(
         egui::TextEdit::singleline(&mut app.commit_summary)
-            .hint_text("Summary (required)")
+            .hint_text(dim_hint("Summary (required)"))
             .desired_width(f32::INFINITY),
     );
     // Fixed-height, scrollable description so long text never pushes the
@@ -890,7 +895,7 @@ fn commit_box(app: &mut App, ui: &mut egui::Ui) {
     ScrollArea::vertical().max_height(72.0).id_salt("commit-desc").show(ui, |ui| {
         ui.add(
             egui::TextEdit::multiline(&mut app.commit_description)
-                .hint_text("Description")
+                .hint_text(dim_hint("Description"))
                 .desired_rows(3)
                 .desired_width(f32::INFINITY),
         );

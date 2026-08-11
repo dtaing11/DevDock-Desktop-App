@@ -74,7 +74,7 @@ fn repo_picker(app: &mut App, ctx: &egui::Context, open: &mut bool) {
             }
             ui.add(
                 egui::TextEdit::singleline(&mut app.repo_path_input)
-                    .hint_text("/home/user/my-project")
+                    .hint_text(super::views::dim_hint("/home/user/my-project"))
                     .desired_width(f32::INFINITY),
             );
         });
@@ -96,7 +96,7 @@ fn repo_picker(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         ui.label("Clone from URL");
         ui.add(
             egui::TextEdit::singleline(&mut app.clone_url_input)
-                .hint_text("https://github.com/user/repo.git")
+                .hint_text(super::views::dim_hint("https://github.com/user/repo.git"))
                 .desired_width(f32::INFINITY),
         );
         ui.horizontal(|ui| {
@@ -118,7 +118,7 @@ fn repo_picker(app: &mut App, ctx: &egui::Context, open: &mut bool) {
             }
             ui.add(
                 egui::TextEdit::singleline(&mut app.clone_dest_input)
-                    .hint_text("Destination directory")
+                    .hint_text(super::views::dim_hint("Destination directory"))
                     .desired_width(f32::INFINITY),
             );
         });
@@ -246,7 +246,7 @@ fn github_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         ui.add(
             egui::TextEdit::singleline(&mut app.gh.token_input)
                 .password(true)
-                .hint_text("ghp_… or github_pat_…")
+                .hint_text(super::views::dim_hint("ghp_… or github_pat_…"))
                 .desired_width(f32::INFINITY),
         );
         ui.horizontal(|ui| {
@@ -709,21 +709,26 @@ fn repo_prompt_settings(app: &mut App, ui: &mut egui::Ui) {
     }
 
     /// One prompt slot: inline text + optional linked .md file.
+    struct PromptSlot<'a> {
+        label: &'a str,
+        hint: &'a str,
+        text: &'a mut String,
+        file: &'a mut Option<String>,
+    }
+
     fn prompt_slot(
         ui: &mut egui::Ui,
-        label: &str,
-        hint: &str,
-        text: &mut String,
-        file: &mut Option<String>,
+        slot: PromptSlot<'_>,
         repo_root: &std::path::Path,
         changed: &mut bool,
         error: &mut Option<String>,
     ) {
+        let PromptSlot { label, hint, text, file } = slot;
         ui.label(RichText::new(label).color(theme::FG_DIM).small());
         *changed |= ui
             .add(
                 egui::TextEdit::multiline(text)
-                    .hint_text(hint)
+                    .hint_text(super::views::dim_hint(hint))
                     .desired_rows(2)
                     .desired_width(f32::INFINITY),
             )
@@ -784,20 +789,24 @@ fn repo_prompt_settings(app: &mut App, ui: &mut egui::Ui) {
 
     prompt_slot(
         ui,
-        "Commit messages",
-        "e.g. Prefix the summary with the JIRA ticket from the branch name.",
-        &mut prompts.commit,
-        &mut prompts.commit_file,
+        PromptSlot {
+            label: "Commit messages",
+            hint: "e.g. Prefix the summary with the JIRA ticket from the branch name.",
+            text: &mut prompts.commit,
+            file: &mut prompts.commit_file,
+        },
         &repo_root,
         &mut changed,
         &mut error,
     );
     prompt_slot(
         ui,
-        "Pull request title/description",
-        "e.g. Include a Testing section listing manual steps.",
-        &mut prompts.pull_request,
-        &mut prompts.pull_request_file,
+        PromptSlot {
+            label: "Pull request title/description",
+            hint: "e.g. Include a Testing section listing manual steps.",
+            text: &mut prompts.pull_request,
+            file: &mut prompts.pull_request_file,
+        },
         &repo_root,
         &mut changed,
         &mut error,
@@ -882,7 +891,7 @@ fn claude_settings(app: &mut App, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut app.claude.code_input)
-                    .hint_text("code or code#state")
+                    .hint_text(super::views::dim_hint("code or code#state"))
                     .desired_width(260.0),
             );
             if ui.button("Connect").clicked() && !app.claude.code_input.trim().is_empty() {
@@ -914,7 +923,7 @@ fn claude_settings(app: &mut App, ui: &mut egui::Ui) {
         ui.add(
             egui::TextEdit::singleline(&mut app.claude.api_key_input)
                 .password(true)
-                .hint_text("or paste an API key (sk-ant-…)")
+                .hint_text(super::views::dim_hint("or paste an API key (sk-ant-…)"))
                 .desired_width(260.0),
         );
         if ui.button("Save key").clicked() && !app.claude.api_key_input.trim().is_empty() {
@@ -946,7 +955,7 @@ fn add_remote(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         ui.label("This repository has no remote yet. Add one to publish your branch:");
         ui.add(
             egui::TextEdit::singleline(&mut app.remote_url_input)
-                .hint_text("https://github.com/user/repo.git")
+                .hint_text(super::views::dim_hint("https://github.com/user/repo.git"))
                 .desired_width(f32::INFINITY),
         );
         ui.horizontal(|ui| {

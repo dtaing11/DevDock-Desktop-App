@@ -138,6 +138,7 @@ impl Config {
 pub enum Tab {
     Changes,
     History,
+    Checks,
 }
 
 /// Which modal dialog is open, if any.
@@ -221,6 +222,40 @@ pub struct LocalCiState {
     /// A push waiting for the current CI run to finish:
     /// (action, set_upstream). Executed when all jobs pass.
     pub pending_push: Option<(String, bool)>,
+    /// Completed runs, newest first, for the Checks tab.
+    pub history: Vec<CiRun>,
+    /// When the current run started.
+    pub run_started: Option<Instant>,
+    /// What triggered the current run.
+    pub trigger: CiTrigger,
+}
+
+/// What started a CI run.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub enum CiTrigger {
+    #[default]
+    Manual,
+    Push,
+    PullRequest,
+}
+
+impl CiTrigger {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Push => "push",
+            Self::PullRequest => "pull request",
+        }
+    }
+}
+
+/// One finished CI run for the Checks tab history.
+pub struct CiRun {
+    pub when: std::time::SystemTime,
+    pub trigger: CiTrigger,
+    pub results: Vec<crate::local_ci::JobResult>,
+    pub passed: bool,
+    pub total_secs: f32,
 }
 
 impl LocalCiState {
@@ -677,6 +712,10 @@ impl App {
                     self.diff_text.clear();
                     self.diff_title.clear();
                     self.unchecked.clear();
+                    self.branch_checks = None;
+                    // CI state and history belong to the previous repo.
+                    self.local_ci = Default::default();
+                    self.load_local_ci();
                     self.refresh();
                 }
                 Err(e) => self.toast(e.to_string(), true),
@@ -689,6 +728,20 @@ impl App {
                     if !status.files.iter().any(|f| f.path == path) {
                         views::clear_diff_view(self);
                     }
+                }
+                // Branch switch: stale per-branch state must reset.
+                let branch_changed = self
+                    .status
+                    .as_ref()
+                    .map(|old| old.branch != status.branch)
+                    .unwrap_or(false);
+                if branch_changed {
+                    self.branch_checks = None;
+                    self.last_checks_refresh = None;
+                    views::clear_diff_view(self);
+                    self.unchecked.clear();
+                    // Reload CI config from the new branch's worktree state.
+                    self.load_local_ci();
                 }
                 self.status = Some(status);
             }
@@ -841,6 +894,26 @@ impl App {
                 if self.local_ci.finished() == self.local_ci.jobs.len() {
                     self.local_ci.running = false;
                     let passed = self.local_ci.all_passed();
+                    // Record the run in the Checks tab history.
+                    let results: Vec<crate::local_ci::JobResult> =
+                        self.local_ci.results.iter().flatten().cloned().collect();
+                    let total_secs = self
+                        .local_ci
+                        .run_started
+                        .take()
+                        .map(|t| t.elapsed().as_secs_f32())
+                        .unwrap_or_else(|| results.iter().map(|r| r.duration_secs).sum());
+                    self.local_ci.history.insert(
+                        0,
+                        CiRun {
+                            when: std::time::SystemTime::now(),
+                            trigger: self.local_ci.trigger,
+                            results,
+                            passed,
+                            total_secs,
+                        },
+                    );
+                    self.local_ci.history.truncate(50);
                     // A push may be waiting on this run.
                     if let Some((action, set_upstream)) = self.local_ci.pending_push.take() {
                         if passed {
@@ -911,9 +984,12 @@ impl App {
         });
     }
 
-    /// Loads the repo's local CI config into state (jobs + empty results).
+    /// Loads the repo's local CI config into state (jobs + empty results),
+    /// preserving the run history.
     pub fn load_local_ci(&mut self) {
+        let history = std::mem::take(&mut self.local_ci.history);
         self.local_ci = Default::default();
+        self.local_ci.history = history;
         let Some(repo) = self.repo.as_ref() else { return };
         if let Ok(Some(config)) = crate::local_ci::load_config(repo.path()) {
             self.local_ci.results = vec![None; config.jobs.len()];
@@ -930,6 +1006,7 @@ impl App {
         }
         self.local_ci.results = vec![None; self.local_ci.jobs.len()];
         self.local_ci.running = true;
+        self.local_ci.run_started = Some(Instant::now());
         for (index, job) in self.local_ci.jobs.clone().into_iter().enumerate() {
             let root = repo.path().to_path_buf();
             self.worker.spawn(move || Msg::CiJobDone {
@@ -943,8 +1020,11 @@ impl App {
     /// checks run first and the push executes only if they pass (or
     /// unconditionally when `block_on_failure = false`).
     pub fn push_with_ci(&mut self, action: &str, set_upstream: bool) {
-        // Re-read the config so edits apply without reopening dialogs.
-        self.load_local_ci();
+        // Re-read the config so edits apply without reopening dialogs
+        // (but never clobber a run already in flight).
+        if !self.local_ci.running {
+            self.load_local_ci();
+        }
         let ci = &self.local_ci;
         if ci.on_push.run && !ci.jobs.is_empty() && !ci.running {
             self.toast(
@@ -952,6 +1032,7 @@ impl App {
                 false,
             );
             self.local_ci.pending_push = Some((action.to_string(), set_upstream));
+            self.local_ci.trigger = CiTrigger::Push;
             self.run_local_ci();
             return;
         }

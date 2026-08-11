@@ -867,6 +867,7 @@ fn local_ci_panel(app: &mut App, ui: &mut egui::Ui) {
             };
             if ui.add_enabled(!app.local_ci.running, egui::Button::new(label).small()).clicked()
             {
+                app.local_ci.trigger = crate::app::CiTrigger::PullRequest;
                 app.run_local_ci();
             }
             if ui.small_button("Reload").on_hover_text("Re-read the config file").clicked() {

@@ -779,11 +779,24 @@ pub fn sidebar(app: &mut App, ctx: &egui::Context) {
                     app.tab = Tab::History;
                     app.refresh();
                 }
+                let checks_label = match (&app.local_ci.running, app.local_ci.history.first()) {
+                    (true, _) => "Checks (running)".to_string(),
+                    (false, Some(run)) if run.passed => "Checks (pass)".to_string(),
+                    (false, Some(_)) => "Checks (fail)".to_string(),
+                    (false, None) => "Checks".to_string(),
+                };
+                if ui.selectable_label(app.tab == Tab::Checks, checks_label).clicked() {
+                    app.tab = Tab::Checks;
+                    if !app.local_ci.running {
+                        app.load_local_ci();
+                    }
+                }
             });
             ui.separator();
             match app.tab {
                 Tab::Changes => changes_tab(app, ui),
                 Tab::History => history_tab(app, ui),
+                Tab::Checks => checks_tab(app, ui),
             }
         });
 }
@@ -1160,6 +1173,150 @@ pub fn ai_model_picker(app: &mut App, ui: &mut egui::Ui, target: crate::app::wor
             }
         }
     });
+}
+
+/// Checks tab: live status of the current CI run plus a history of past
+/// runs with per-job timing and expandable logs.
+fn checks_tab(app: &mut App, ui: &mut egui::Ui) {
+    use crate::app::CiTrigger;
+
+    // Controls
+    ui.horizontal(|ui| {
+        let can_run = !app.local_ci.jobs.is_empty() && !app.local_ci.running;
+        let run_label = if app.local_ci.running {
+            format!("Running… {}/{}", app.local_ci.finished(), app.local_ci.jobs.len())
+        } else {
+            "Run checks".to_string()
+        };
+        if ui.add_enabled(can_run, egui::Button::new(run_label)).clicked() {
+            app.local_ci.trigger = CiTrigger::Manual;
+            app.run_local_ci();
+        }
+        if ui.small_button("Reload config").clicked() {
+            app.load_local_ci();
+        }
+    });
+
+    if app.local_ci.jobs.is_empty() {
+        ui.add_space(12.0);
+        ui.label(
+            RichText::new(format!(
+                "No checks configured.\nCreate {} in the repository root\n(see the Pull Request dialog or docs/local-ci.md).",
+                crate::local_ci::CONFIG_FILE
+            ))
+            .color(theme::FG_DIM),
+        );
+        return;
+    }
+
+    // Current run (live)
+    if app.local_ci.running || app.local_ci.results.iter().any(|r| r.is_some()) {
+        ui.separator();
+        ui.label(RichText::new("CURRENT RUN").color(theme::EMBER).small());
+        let jobs = app.local_ci.jobs.clone();
+        for (i, job) in jobs.iter().enumerate() {
+            ui.horizontal(|ui| {
+                let (status, color) =
+                    match app.local_ci.results.get(i).and_then(|r| r.as_ref()) {
+                        Some(r) if r.ok => (format!("[pass {:.1}s]", r.duration_secs), theme::ADD),
+                        Some(r) => (format!("[fail {:.1}s]", r.duration_secs), theme::DANGER),
+                        None if app.local_ci.running => ("[running]".into(), theme::WARN),
+                        None => ("[pending]".into(), theme::FG_DIM),
+                    };
+                ui.label(RichText::new(status).color(color).small().monospace());
+                let expanded = app.local_ci.expanded == Some(i);
+                if ui.selectable_label(expanded, &job.name).clicked() {
+                    app.local_ci.expanded = if expanded { None } else { Some(i) };
+                }
+            });
+            if app.local_ci.expanded == Some(i) {
+                if let Some(Some(result)) = app.local_ci.results.get(i) {
+                    ci_log_box(ui, i, &result.output);
+                }
+            }
+        }
+    }
+
+    // History
+    ui.separator();
+    ui.label(RichText::new("RUN HISTORY").color(theme::EMBER).small());
+    if app.local_ci.history.is_empty() {
+        ui.label(RichText::new("No runs yet in this session.").color(theme::FG_DIM).small());
+        return;
+    }
+    let history_len = app.local_ci.history.len();
+    ScrollArea::vertical().auto_shrink([false, false]).id_salt("ci-history").show(ui, |ui| {
+        for run_idx in 0..history_len {
+            let (passed, total_secs, trigger, when, results) = {
+                let run = &app.local_ci.history[run_idx];
+                (run.passed, run.total_secs, run.trigger, run.when, run.results.clone())
+            };
+            let (badge, color) = if passed {
+                ("PASS", theme::ADD)
+            } else {
+                ("FAIL", theme::DANGER)
+            };
+            let age = when.elapsed().map(format_age).unwrap_or_else(|_| "?".into());
+            egui::CollapsingHeader::new(
+                RichText::new(format!(
+                    "{badge}  {age} ago · {} · {:.1}s",
+                    trigger.label(),
+                    total_secs
+                ))
+                .color(color)
+                .small(),
+            )
+            .id_salt(("ci-run", run_idx))
+            .show(ui, |ui| {
+                for (j, result) in results.iter().enumerate() {
+                    let (glyph, jcolor) = if result.ok {
+                        ("[pass]", theme::ADD)
+                    } else {
+                        ("[fail]", theme::DANGER)
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(glyph).color(jcolor).small().monospace());
+                        ui.label(RichText::new(format!(
+                            "{} ({:.1}s)",
+                            result.name, result.duration_secs
+                        ))
+                        .small());
+                    });
+                    if !result.ok && !result.output.is_empty() {
+                        ci_log_box(ui, run_idx * 100 + j, &result.output);
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// Monospace log box for CI output.
+fn ci_log_box(ui: &mut egui::Ui, salt: usize, output: &str) {
+    ScrollArea::vertical().max_height(140.0).id_salt(("ci-log", salt)).show(ui, |ui| {
+        egui::Frame::new()
+            .fill(theme::BG)
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                for line in output.lines() {
+                    ui.label(RichText::new(line).monospace().small());
+                }
+            });
+    });
+}
+
+/// Rough human-readable age: "3m", "2h", "5d".
+fn format_age(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
 }
 
 fn history_tab(app: &mut App, ui: &mut egui::Ui) {

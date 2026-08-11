@@ -397,9 +397,9 @@ impl App {
             let repo = repo.clone();
             self.worker.spawn(move || Msg::Branches(strerr(repo.branches())));
         }
-        if self.tab == Tab::History {
-            self.worker.spawn(move || Msg::Log(strerr(repo.log(200, None))));
-        }
+        // Always load history: the Undo button needs the last commit's
+        // subject even on the Changes tab.
+        self.worker.spawn(move || Msg::Log(strerr(repo.log(200, None))));
         self.load_stashes();
         self.load_tags();
         self.refresh_branch_checks();

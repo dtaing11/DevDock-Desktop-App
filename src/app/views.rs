@@ -921,6 +921,34 @@ fn commit_box(app: &mut App, ui: &mut egui::Ui) {
     if ui.add_enabled(can_commit, commit_btn).clicked() {
         app.do_commit();
     }
+
+    // Undo button, GitHub Desktop style: shows the last commit's summary.
+    // Only offered while the commit hasn't been pushed yet (ahead > 0).
+    let unpushed = app.status.as_ref().map(|s| s.ahead > 0).unwrap_or(false);
+    if unpushed {
+        if let Some(last) = app.log.first() {
+            let subject = truncate(&last.subject, 32);
+            let undo_btn = egui::Button::new(
+                RichText::new(format!("Undo commit \"{subject}\"")).small(),
+            )
+            .min_size(egui::vec2(ui.available_width(), 24.0));
+            if ui
+                .add(undo_btn)
+                .on_hover_text("Soft reset: removes the commit but keeps its changes staged")
+                .clicked()
+            {
+                if let Some(repo) = app.repo.clone() {
+                    app.worker.spawn(move || Msg::Done {
+                        message: strerr(
+                            repo.undo_last_commit()
+                                .map(|_| "Commit undone. Changes kept.".to_string()),
+                        ),
+                        refresh: true,
+                    });
+                }
+            }
+        }
+    }
 }
 
 /// Standardized AI controls: generate button + model picker with one shared

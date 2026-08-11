@@ -843,10 +843,15 @@ fn commit_box(app: &mut App, ui: &mut egui::Ui) {
     });
 
     ui.horizontal(|ui| {
+        // Match the ComboBox's interact height so button and picker align.
+        let h = ui.spacing().interact_size.y;
         let ai_enabled = !app.ai_busy && app.repo.is_some();
         let ai_text = if app.ai_busy { "Generating…" } else { "AI message" };
+        let ai_btn = egui::Button::new(ai_text)
+            .fill(theme::TEAL.linear_multiply(0.25))
+            .min_size(egui::vec2(0.0, h));
         if ui
-            .add_enabled(ai_enabled, egui::Button::new(ai_text).fill(theme::TEAL.linear_multiply(0.25)))
+            .add_enabled(ai_enabled, ai_btn)
             .on_hover_text("Generate a commit message with the selected model")
             .clicked()
         {

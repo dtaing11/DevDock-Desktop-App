@@ -314,9 +314,11 @@ fn pull_requests(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         });
 
         ui.horizontal(|ui| {
+            let h = ui.spacing().interact_size.y;
             let ai_text = if app.ai_busy { "Generating…" } else { "AI title/body" };
+            let ai_btn = egui::Button::new(ai_text).min_size(egui::vec2(0.0, h));
             if ui
-                .add_enabled(!app.ai_busy, egui::Button::new(ai_text))
+                .add_enabled(!app.ai_busy, ai_btn)
                 .on_hover_text("Generate from the current diff with the selected model")
                 .clicked()
             {

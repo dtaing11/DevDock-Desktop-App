@@ -4,27 +4,67 @@ use super::theme;
 use super::worker::{pickable_branches, strerr, Msg};
 use super::{App, Dialog, Tab};
 use crate::git::{FileStatus, RepoState};
-use egui::{Color32, RichText, ScrollArea};
+use egui::text::LayoutJob;
+use egui::{Color32, FontId, RichText, ScrollArea, TextFormat};
 
 // ---------------------------------------------------------------------------
-// Toolbar
+// Toolbar (GitHub Desktop style: three large segments)
 // ---------------------------------------------------------------------------
 
-/// Top toolbar: repo/branch pickers, sync buttons, merge/rebase, GitHub.
+/// Builds the two-line text used by toolbar segments: a small dim caption
+/// above a bold value, like GitHub Desktop's header buttons.
+fn segment_text(caption: &str, value: &str) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    job.append(
+        caption,
+        0.0,
+        TextFormat { font_id: FontId::proportional(10.0), color: theme::FG_DIM, ..Default::default() },
+    );
+    job.append(
+        &format!("\n{value}"),
+        0.0,
+        TextFormat { font_id: FontId::proportional(14.0), color: theme::FG, ..Default::default() },
+    );
+    job
+}
+
+fn segment(ui: &mut egui::Ui, caption: &str, value: &str, min_width: f32) -> egui::Response {
+    let button = egui::Button::new(segment_text(caption, value))
+        .min_size(egui::vec2(min_width, 46.0))
+        .fill(theme::PANEL);
+    ui.add(button)
+}
+
+/// Top toolbar: repository, branch, and one context-aware sync action,
+/// plus pull request / GitHub / settings on the right.
 pub fn toolbar(app: &mut App, ctx: &egui::Context) {
     egui::TopBottomPanel::top("toolbar")
-        .frame(egui::Frame::new().fill(theme::BG).inner_margin(10.0))
+        .frame(egui::Frame::new().fill(theme::BG).inner_margin(8.0))
         .show(ctx, |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
             ui.horizontal(|ui| {
-                repo_button(app, ui);
-                branch_menu(app, ui);
-                sync_buttons(app, ui);
-                merge_rebase_menus(app, ui);
-                if ui.button("⇄ Pull Request").clicked() {
-                    open_pr_dialog(app);
+                // 1. Current repository
+                let repo_name = app
+                    .repo
+                    .as_ref()
+                    .map(|r| r.name())
+                    .unwrap_or_else(|| "Choose…".into());
+                if segment(ui, "CURRENT REPOSITORY", &repo_name, 200.0)
+                    .on_hover_text("Change repository")
+                    .clicked()
+                {
+                    app.dialog = Dialog::RepoPicker;
                 }
+
+                // 2. Current branch (menu)
+                branch_menu(app, ui);
+
+                // 3. Context-aware sync action
+                sync_segment(app, ui);
+
+                // Right side
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("⚙").on_hover_text("Settings").clicked() {
+                    if ui.button("Settings").on_hover_text("Settings").clicked() {
                         app.dialog = Dialog::Settings;
                     }
                     let gh_label = app
@@ -33,25 +73,16 @@ pub fn toolbar(app: &mut App, ctx: &egui::Context) {
                         .as_ref()
                         .map(|u| u.login.clone())
                         .unwrap_or_else(|| "Sign in".into());
-                    if ui.button(format!("🐙 {gh_label}")).on_hover_text("GitHub").clicked() {
+                    if ui.button(gh_label.clone()).on_hover_text("GitHub").clicked() {
                         app.dialog = Dialog::GitHub;
+                    }
+                    if ui.button("Pull Request").clicked() {
+                        open_pr_dialog(app);
                     }
                 });
             });
             state_banner(app, ui);
         });
-}
-
-fn repo_button(app: &mut App, ui: &mut egui::Ui) {
-    let name = app
-        .repo
-        .as_ref()
-        .map(|r| r.name())
-        .unwrap_or_else(|| "Open repository…".into());
-    let text = RichText::new(format!("📁 {name}")).strong();
-    if ui.button(text).on_hover_text("Change repository").clicked() {
-        app.dialog = Dialog::RepoPicker;
-    }
 }
 
 fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
@@ -60,13 +91,18 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
         .as_ref()
         .map(|s| s.branch.clone())
         .unwrap_or_else(|| "—".into());
-    let label = RichText::new(format!("⑂ {current}")).strong();
 
-    ui.menu_button(label, |ui| {
-        ui.set_min_width(300.0);
+    let response = ui.menu_button(segment_text("CURRENT BRANCH", &current), |ui| {
+        ui.set_min_width(320.0);
+
+        // New branch
         ui.horizontal(|ui| {
-            ui.text_edit_singleline(&mut app.new_branch_name);
-            if ui.button("＋ Create").clicked() && !app.new_branch_name.trim().is_empty() {
+            ui.add(
+                egui::TextEdit::singleline(&mut app.new_branch_name)
+                    .hint_text("New branch name")
+                    .desired_width(190.0),
+            );
+            if ui.button("Create").clicked() && !app.new_branch_name.trim().is_empty() {
                 if let Some(repo) = app.repo.clone() {
                     let name = app.new_branch_name.trim().to_string();
                     app.new_branch_name.clear();
@@ -82,36 +118,78 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
             }
         });
         ui.separator();
-        ui.text_edit_singleline(&mut app.branch_filter);
-        let filter = app.branch_filter.to_lowercase();
 
+        // Filter + branch lists
+        ui.add(
+            egui::TextEdit::singleline(&mut app.branch_filter)
+                .hint_text("Filter branches…")
+                .desired_width(f32::INFINITY),
+        );
+        let filter = app.branch_filter.to_lowercase();
         let (locals, remotes) = app
             .branches
             .as_ref()
             .map(|b| (b.local.clone(), b.remote.clone()))
             .unwrap_or_default();
 
-        ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+        ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
             ui.label(RichText::new("LOCAL").color(theme::EMBER).small());
             for branch in locals.iter().filter(|b| b.name.to_lowercase().contains(&filter)) {
-                let marker = if branch.current { "✔ " } else { "" };
+                let marker = if branch.current { "» " } else { "    " };
                 if ui.button(format!("{marker}{}", branch.name)).clicked() {
                     checkout(app, &branch.name);
                     ui.close_menu();
                 }
             }
-            ui.label(RichText::new("REMOTE").color(theme::EMBER).small());
-            for branch in remotes.iter().filter(|b| b.name.to_lowercase().contains(&filter)) {
+            if !remotes.is_empty() {
+                ui.label(RichText::new("REMOTE").color(theme::EMBER).small());
+                for branch in remotes.iter().filter(|b| b.name.to_lowercase().contains(&filter))
+                {
+                    if ui.button(format!("    {}", branch.name)).clicked() {
+                        let local =
+                            branch.name.split_once('/').map(|(_, l)| l).unwrap_or(&branch.name);
+                        checkout(app, local);
+                        ui.close_menu();
+                    }
+                }
+            }
+        });
+
+        // Branch actions, like GitHub Desktop's Branch menu
+        ui.separator();
+        let others = app.branches.as_ref().map(pickable_branches).unwrap_or_default();
+        ui.menu_button(format!("Merge into {current}…"), |ui| {
+            ui.set_min_width(240.0);
+            for branch in &others {
                 if ui.button(&branch.name).clicked() {
-                    // Prefer creating a local tracking branch.
-                    let local =
-                        branch.name.split_once('/').map(|(_, l)| l).unwrap_or(&branch.name);
-                    checkout(app, local);
+                    if let Some(repo) = app.repo.clone() {
+                        let name = branch.name.clone();
+                        app.busy = true;
+                        app.worker.spawn(move || Msg::MergeOutcome(repo.merge(&name)));
+                    }
                     ui.close_menu();
                 }
             }
         });
+        ui.menu_button(format!("Rebase {current} onto…"), |ui| {
+            ui.set_min_width(240.0);
+            for branch in &others {
+                if ui.button(&branch.name).clicked() {
+                    if let Some(repo) = app.repo.clone() {
+                        let name = branch.name.clone();
+                        app.busy = true;
+                        app.worker.spawn(move || Msg::MergeOutcome(repo.rebase(&name)));
+                    }
+                    ui.close_menu();
+                }
+            }
+        });
+        if ui.button("Create Pull Request…").clicked() {
+            open_pr_dialog(app);
+            ui.close_menu();
+        }
     });
+    response.response.on_hover_text("Switch branches or start branch actions");
 }
 
 fn checkout(app: &mut App, name: &str) {
@@ -123,29 +201,46 @@ fn checkout(app: &mut App, name: &str) {
     });
 }
 
-fn sync_buttons(app: &mut App, ui: &mut egui::Ui) {
+/// One context-aware sync segment, like GitHub Desktop's third header button:
+/// Publish when there is no upstream, Pull when behind, Push when ahead,
+/// otherwise Fetch.
+fn sync_segment(app: &mut App, ui: &mut egui::Ui) {
     let (ahead, behind, has_upstream) = app
         .status
         .as_ref()
         .map(|s| (s.ahead, s.behind, s.has_upstream))
         .unwrap_or((0, 0, false));
 
-    if ui.button("⟳ Fetch").clicked() {
-        run_sync(app, "fetch");
-    }
-    let pull_label = if behind > 0 { format!("⇣ Pull ({behind})") } else { "⇣ Pull".into() };
-    if ui.button(pull_label).clicked() {
-        run_sync(app, "pull");
-    }
-    let push_label = if !has_upstream {
-        "⇡ Publish".to_string()
+    let (caption, value, action) = if app.repo.is_none() {
+        ("REMOTE", "Fetch origin".to_string(), "fetch")
+    } else if !has_upstream {
+        ("PUBLISH", "Publish branch".to_string(), "push")
+    } else if behind > 0 {
+        ("PULL", format!("Pull origin ({behind})"), "pull")
     } else if ahead > 0 {
-        format!("⇡ Push ({ahead})")
+        ("PUSH", format!("Push origin ({ahead})"), "push")
     } else {
-        "⇡ Push".to_string()
+        ("REMOTE", "Fetch origin".to_string(), "fetch")
     };
-    if ui.button(push_label).clicked() {
-        run_sync(app, "push");
+
+    let response = segment(ui, caption, &value, 170.0)
+        .on_hover_text("Right-click for all sync actions");
+    response.context_menu(|ui| {
+        if ui.button("Fetch").clicked() {
+            run_sync(app, "fetch");
+            ui.close_menu();
+        }
+        if ui.button("Pull").clicked() {
+            run_sync(app, "pull");
+            ui.close_menu();
+        }
+        if ui.button("Push").clicked() {
+            run_sync(app, "push");
+            ui.close_menu();
+        }
+    });
+    if response.clicked() {
+        run_sync(app, action);
     }
 }
 
@@ -168,43 +263,6 @@ fn run_sync(app: &mut App, action: &'static str) {
             _ => unreachable!(),
         };
         Msg::Done { message: strerr(result), refresh: true }
-    });
-}
-
-fn merge_rebase_menus(app: &mut App, ui: &mut egui::Ui) {
-    let branches =
-        app.branches.as_ref().map(pickable_branches).unwrap_or_default();
-
-    ui.menu_button("⑃ Merge", |ui| {
-        ui.set_min_width(240.0);
-        ui.label(RichText::new("Merge into current branch").color(theme::FG_DIM).small());
-        for branch in &branches {
-            if ui.button(&branch.name).clicked() {
-                let repo = app.repo.clone();
-                let name = branch.name.clone();
-                if let Some(repo) = repo {
-                    app.busy = true;
-                    app.worker.spawn(move || Msg::MergeOutcome(repo.merge(&name)));
-                }
-                ui.close_menu();
-            }
-        }
-    });
-
-    ui.menu_button("⤴ Rebase", |ui| {
-        ui.set_min_width(240.0);
-        ui.label(RichText::new("Rebase current branch onto").color(theme::FG_DIM).small());
-        for branch in &branches {
-            if ui.button(&branch.name).clicked() {
-                let repo = app.repo.clone();
-                let name = branch.name.clone();
-                if let Some(repo) = repo {
-                    app.busy = true;
-                    app.worker.spawn(move || Msg::MergeOutcome(repo.rebase(&name)));
-                }
-                ui.close_menu();
-            }
-        }
     });
 }
 
@@ -395,7 +453,7 @@ fn changes_tab(app: &mut App, ui: &mut egui::Ui) {
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .small_button("⨯")
+                            .small_button("x")
                             .on_hover_text("Discard changes (irreversible)")
                             .clicked()
                         {
@@ -454,7 +512,7 @@ fn commit_box(app: &mut App, ui: &mut egui::Ui) {
 
     ui.horizontal(|ui| {
         let ai_enabled = !app.ai_busy && app.repo.is_some();
-        let ai_text = if app.ai_busy { "⏳ Generating…" } else { "✨ AI message" };
+        let ai_text = if app.ai_busy { "Generating…" } else { "AI message" };
         if ui
             .add_enabled(ai_enabled, egui::Button::new(ai_text).fill(theme::TEAL.linear_multiply(0.25)))
             .on_hover_text("Generate commit message with Ollama")
@@ -504,7 +562,7 @@ fn history_tab(app: &mut App, ui: &mut egui::Ui) {
             let selected = app.selected_commit.as_deref() == Some(&commit.sha);
             let heading = RichText::new(&commit.subject).strong();
             let meta = RichText::new(format!(
-                "● {} · {} · {}",
+                "{} · {} · {}",
                 commit.short_sha,
                 commit.author,
                 commit.date.get(..10).unwrap_or(&commit.date)

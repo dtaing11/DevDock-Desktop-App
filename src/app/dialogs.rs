@@ -40,7 +40,7 @@ fn repo_picker(app: &mut App, ctx: &egui::Context) {
 
         ui.label("Local path");
         ui.horizontal(|ui| {
-            if ui.button("📁 Browse…").on_hover_text("Pick a folder").clicked() {
+            if ui.button("Browse…").on_hover_text("Pick a folder").clicked() {
                 if let Some(folder) = rfd::FileDialog::new()
                     .set_title("Choose a repository folder")
                     .pick_folder()
@@ -79,7 +79,7 @@ fn repo_picker(app: &mut App, ctx: &egui::Context) {
                 .desired_width(f32::INFINITY),
         );
         ui.horizontal(|ui| {
-            if ui.button("📁").on_hover_text("Pick destination folder").clicked() {
+            if ui.button("Browse…").on_hover_text("Pick destination folder").clicked() {
                 if let Some(folder) = rfd::FileDialog::new()
                     .set_title("Choose where to clone")
                     .pick_folder()
@@ -172,7 +172,7 @@ fn github_dialog(app: &mut App, ctx: &egui::Context) {
                 }
             });
             ui.label(RichText::new("Waiting for authorization…").color(theme::FG_DIM));
-        } else if ui.button("🌐 Start browser sign-in").clicked() {
+        } else if ui.button("Start browser sign-in").clicked() {
             app.worker.spawn(|| {
                 Msg::GhDeviceCode(strerr(github::device_flow_start(github::DEFAULT_CLIENT_ID)))
             });
@@ -257,7 +257,7 @@ fn pull_requests(app: &mut App, ctx: &egui::Context) {
 
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(!app.ai_busy, egui::Button::new("✨ AI title/body"))
+                .add_enabled(!app.ai_busy, egui::Button::new("AI title/body"))
                 .on_hover_text("Generate from the current diff with Ollama")
                 .clicked()
             {
@@ -342,7 +342,7 @@ fn conflict_resolver(app: &mut App, ctx: &egui::Context) {
         ui.set_min_width(680.0);
 
         if app.conflicts.files.is_empty() {
-            ui.label(RichText::new("All conflicts resolved 🎉").color(theme::ADD));
+            ui.label(RichText::new("All conflicts resolved").color(theme::ADD));
         }
 
         // File list
@@ -355,7 +355,7 @@ fn conflict_resolver(app: &mut App, ctx: &egui::Context) {
             .collect();
         for (i, path) in &files {
             let resolved = app.conflicts.resolved.contains(path);
-            let marker = if resolved { "✔" } else { "⚠" };
+            let marker = if resolved { "[resolved]" } else { "[conflict]" };
             let text = RichText::new(format!("{marker} {path}")).color(if resolved {
                 theme::ADD
             } else {

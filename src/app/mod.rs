@@ -920,9 +920,15 @@ impl App {
                             self.toast("Checks passed. Pushing…", false);
                             self.execute_push(&action, set_upstream);
                         } else if self.local_ci.on_push.block_on_failure {
+                            // Surface the failure prominently.
+                            self.tab = Tab::Checks;
+                            self.local_ci.expanded = self
+                                .local_ci
+                                .results
+                                .iter()
+                                .position(|r| r.as_ref().map(|x| !x.ok).unwrap_or(false));
                             self.toast(
-                                "Push cancelled: local CI checks failed. \
-                                 See the Pull Request dialog for logs.",
+                                "Push cancelled: checks failed. See the Checks tab.",
                                 true,
                             );
                         } else {
@@ -1027,13 +1033,18 @@ impl App {
         }
         let ci = &self.local_ci;
         if ci.on_push.run && !ci.jobs.is_empty() && !ci.running {
-            self.toast(
-                format!("Running {} local check(s) before push…", self.local_ci.jobs.len()),
-                false,
-            );
             self.local_ci.pending_push = Some((action.to_string(), set_upstream));
             self.local_ci.trigger = CiTrigger::Push;
             self.run_local_ci();
+            // Show progress where the user can see it.
+            self.tab = Tab::Checks;
+            self.toast(
+                format!(
+                    "Running {} check(s) before push. Watch the Checks tab.",
+                    self.local_ci.jobs.len()
+                ),
+                false,
+            );
             return;
         }
         self.execute_push(action, set_upstream);

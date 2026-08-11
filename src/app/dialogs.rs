@@ -860,17 +860,24 @@ fn local_ci_panel(app: &mut App, ui: &mut egui::Ui) {
                 }
             }
         } else {
-            let label = if app.local_ci.running {
+            let running = app.local_ci.running;
+            let label = if running {
                 format!("Running… ({}/{})", app.local_ci.finished(), app.local_ci.jobs.len())
             } else {
                 "Run all checks".into()
             };
-            if ui.add_enabled(!app.local_ci.running, egui::Button::new(label).small()).clicked()
-            {
+            if super::views::panel_button(ui, &label, !running).clicked() {
                 app.local_ci.trigger = crate::app::CiTrigger::PullRequest;
                 app.run_local_ci();
             }
-            if ui.small_button("Reload").on_hover_text("Re-read the config file").clicked() {
+            if super::views::panel_button(ui, "Reload", !running)
+                .on_hover_text(if running {
+                    "Disabled while checks are running"
+                } else {
+                    "Re-read the config file"
+                })
+                .clicked()
+            {
                 app.load_local_ci();
             }
         }

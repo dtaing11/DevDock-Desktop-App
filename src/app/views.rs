@@ -566,6 +566,22 @@ fn sync_segment(app: &mut App, ui: &mut egui::Ui) {
 
     let commits = |n: u32| if n == 1 { "1 commit".to_string() } else { format!("{n} commits") };
 
+    // A CI-gated push in flight: reflect it on the button.
+    if app.local_ci.pending_push.is_some() {
+        let _ = segment(
+            ui,
+            "PUSH",
+            &format!(
+                "Checks {}/{}…",
+                app.local_ci.finished(),
+                app.local_ci.jobs.len()
+            ),
+            170.0,
+        )
+        .on_hover_text("Running local checks before push. See the Checks tab.");
+        return;
+    }
+
     let (caption, value, action) = if app.repo.is_none() {
         ("REMOTE", "Fetch origin".to_string(), "fetch")
     } else if !has_remote {
@@ -1175,24 +1191,42 @@ pub fn ai_model_picker(app: &mut App, ui: &mut egui::Ui, target: crate::app::wor
     });
 }
 
+/// Uniform small control button for panel toolbars (consistent height).
+pub fn panel_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
+    let h = 24.0;
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(RichText::new(label).small()).min_size(egui::vec2(0.0, h)),
+    )
+}
+
 /// Checks tab: live status of the current CI run plus a history of past
 /// runs with per-job timing and expandable logs.
 fn checks_tab(app: &mut App, ui: &mut egui::Ui) {
     use crate::app::CiTrigger;
 
-    // Controls
+    // Controls: uniform size; reload is disabled while a run is active so
+    // it can never clobber live results.
     ui.horizontal(|ui| {
-        let can_run = !app.local_ci.jobs.is_empty() && !app.local_ci.running;
-        let run_label = if app.local_ci.running {
+        let running = app.local_ci.running;
+        let run_label = if running {
             format!("Running… {}/{}", app.local_ci.finished(), app.local_ci.jobs.len())
         } else {
             "Run checks".to_string()
         };
-        if ui.add_enabled(can_run, egui::Button::new(run_label)).clicked() {
+        let can_run = !app.local_ci.jobs.is_empty() && !running;
+        if panel_button(ui, &run_label, can_run).clicked() {
             app.local_ci.trigger = CiTrigger::Manual;
             app.run_local_ci();
         }
-        if ui.small_button("Reload config").clicked() {
+        if panel_button(ui, "Reload config", !running)
+            .on_hover_text(if running {
+                "Disabled while checks are running"
+            } else {
+                "Re-read .git-manage-ci.toml"
+            })
+            .clicked()
+        {
             app.load_local_ci();
         }
     });

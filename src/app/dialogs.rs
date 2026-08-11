@@ -21,6 +21,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         Dialog::Conflicts => conflict_resolver(app, ctx, &mut open),
         Dialog::Settings => settings(app, ctx, &mut open),
         Dialog::AddRemote => add_remote(app, ctx, &mut open),
+        Dialog::SwitchBranch(_) => switch_branch(app, ctx, &mut open),
     }
     // The window's X button was clicked.
     if !open {
@@ -1112,5 +1113,56 @@ fn add_remote(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                 }
             }
         });
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Switch branch with uncommitted changes
+// ---------------------------------------------------------------------------
+
+/// Asks how to handle uncommitted changes before a branch switch:
+/// bring them along, stash them, or cancel.
+fn switch_branch(app: &mut App, ctx: &egui::Context, open: &mut bool) {
+    use crate::app::CheckoutMode;
+    let Dialog::SwitchBranch(target) = app.dialog.clone() else { return };
+    let count = app.status.as_ref().map(|s| s.files.len()).unwrap_or(0);
+
+    modal(ctx, "Uncommitted changes", open, |ui| {
+        ui.set_min_width(380.0);
+        ui.label(format!(
+            "You have {count} changed file{} not yet committed.",
+            if count == 1 { "" } else { "s" }
+        ));
+        ui.label(
+            RichText::new(format!("Switching to \"{target}\""))
+                .color(theme::FG_DIM)
+                .small(),
+        );
+        ui.add_space(8.0);
+
+        let full = egui::vec2(ui.available_width(), 30.0);
+        if ui
+            .add(egui::Button::new("Bring changes to the new branch").min_size(full))
+            .on_hover_text(
+                "Keeps your edits in the working tree. Fails safely if a file \
+                 would be overwritten by the switch.",
+            )
+            .clicked()
+        {
+            app.checkout_now(&target, CheckoutMode::Bring);
+        }
+        if ui
+            .add(egui::Button::new("Stash changes and switch").min_size(full))
+            .on_hover_text(
+                "Saves your edits to the stash. Restore them any time from the \
+                 branch menu's Stashes list.",
+            )
+            .clicked()
+        {
+            app.checkout_now(&target, CheckoutMode::Stash);
+        }
+        if ui.add(egui::Button::new("Cancel").min_size(full)).clicked() {
+            app.dialog = Dialog::None;
+        }
     });
 }

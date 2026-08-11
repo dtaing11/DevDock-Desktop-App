@@ -152,6 +152,20 @@ pub enum Dialog {
     Settings,
     /// Ask for a remote URL before the first publish.
     AddRemote,
+    /// Uncommitted changes exist; ask how to handle them before switching
+    /// to the branch named inside.
+    SwitchBranch(String),
+}
+
+/// How to handle uncommitted changes during a branch switch.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CheckoutMode {
+    /// Clean tree, plain checkout.
+    Plain,
+    /// Carry the uncommitted changes into the new branch.
+    Bring,
+    /// Stash first, then switch with a clean tree.
+    Stash,
 }
 
 /// Transient toast notification.
@@ -1079,6 +1093,45 @@ impl App {
                     }
                 })
             };
+            Msg::Done { message: strerr(result), refresh: true }
+        });
+    }
+
+    /// Switches branch. With uncommitted changes present, opens a dialog
+    /// asking whether to bring them along or stash them first.
+    pub fn request_checkout(&mut self, name: &str) {
+        let dirty = self.status.as_ref().map(|s| !s.files.is_empty()).unwrap_or(false);
+        if dirty {
+            self.dialog = Dialog::SwitchBranch(name.to_string());
+        } else {
+            self.checkout_now(name, CheckoutMode::Plain);
+        }
+    }
+
+    /// Performs the checkout in the chosen mode.
+    pub fn checkout_now(&mut self, name: &str, mode: CheckoutMode) {
+        let Some(repo) = self.repo.clone() else { return };
+        let name = name.to_string();
+        self.dialog = Dialog::None;
+        self.worker.spawn(move || {
+            let result = (|| -> Result<String, crate::git::GitError> {
+                match mode {
+                    CheckoutMode::Plain | CheckoutMode::Bring => {
+                        // Git carries uncommitted changes across checkout and
+                        // refuses when they would be overwritten.
+                        repo.checkout(&name)?;
+                        Ok(format!("Switched to {name}"))
+                    }
+                    CheckoutMode::Stash => {
+                        repo.stash_save(&format!("auto-stash before switching to {name}"))?;
+                        repo.checkout(&name)?;
+                        Ok(format!(
+                            "Changes stashed, switched to {name}. \
+                             Restore them from the branch menu's Stashes."
+                        ))
+                    }
+                }
+            })();
             Msg::Done { message: strerr(result), refresh: true }
         });
     }

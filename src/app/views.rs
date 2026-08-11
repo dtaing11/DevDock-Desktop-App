@@ -560,12 +560,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
 }
 
 fn checkout(app: &mut App, name: &str) {
-    let Some(repo) = app.repo.clone() else { return };
-    let name = name.to_string();
-    app.worker.spawn(move || Msg::Done {
-        message: strerr(repo.checkout(&name).map(|_| format!("Switched to {name}"))),
-        refresh: true,
-    });
+    app.request_checkout(name);
 }
 
 /// One context-aware sync segment, like GitHub Desktop's third header button:

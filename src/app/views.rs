@@ -843,25 +843,12 @@ fn commit_box(app: &mut App, ui: &mut egui::Ui) {
         let ai_text = if app.ai_busy { "Generating…" } else { "AI message" };
         if ui
             .add_enabled(ai_enabled, egui::Button::new(ai_text).fill(theme::TEAL.linear_multiply(0.25)))
-            .on_hover_text("Generate commit message with Ollama")
+            .on_hover_text("Generate a commit message with the selected model")
             .clicked()
         {
             app.generate_ai_message();
         }
-        let model = app.config.ollama_model.clone().unwrap_or_else(|| "no model".into());
-        egui::ComboBox::from_id_salt("ai-model")
-            .selected_text(model)
-            .show_ui(ui, |ui| {
-                let names: Vec<String> =
-                    app.ollama_models.iter().map(|m| m.name.clone()).collect();
-                for name in names {
-                    let is_selected = app.config.ollama_model.as_deref() == Some(name.as_str());
-                    if ui.selectable_label(is_selected, &name).clicked() {
-                        app.config.ollama_model = Some(name.clone());
-                        app.config.save();
-                    }
-                }
-            });
+        ai_model_picker(app, ui);
         ui.checkbox(&mut app.amend, "Amend")
             .on_hover_text("Rewrite the last commit instead of creating a new one");
     });
@@ -880,6 +867,65 @@ fn commit_box(app: &mut App, ui: &mut egui::Ui) {
     if ui.add_enabled(can_commit, commit_btn).clicked() {
         app.do_commit();
     }
+}
+
+/// Unified AI model picker: lists Ollama models and Claude models (when
+/// signed in). Picking one also switches the active provider.
+fn ai_model_picker(app: &mut App, ui: &mut egui::Ui) {
+    let provider = app.config.ai_provider.clone().unwrap_or_else(|| "ollama".into());
+    let selected = if provider == "claude" {
+        format!(
+            "Claude: {}",
+            app.config.claude_model.clone().unwrap_or_else(|| "default".into())
+        )
+    } else {
+        match &app.config.ollama_model {
+            Some(m) => format!("Ollama: {m}"),
+            None => "Select a model…".into(),
+        }
+    };
+
+    egui::ComboBox::from_id_salt("ai-model").selected_text(selected).show_ui(ui, |ui| {
+        // Ollama section
+        ui.label(RichText::new("OLLAMA (LOCAL)").color(theme::EMBER).small());
+        if app.ollama_models.is_empty() {
+            ui.label(
+                RichText::new("No models. Is Ollama running? (Settings)").color(theme::FG_DIM),
+            );
+        }
+        let names: Vec<String> = app.ollama_models.iter().map(|m| m.name.clone()).collect();
+        for name in names {
+            let is_selected =
+                provider == "ollama" && app.config.ollama_model.as_deref() == Some(name.as_str());
+            if ui.selectable_label(is_selected, &name).clicked() {
+                app.config.ollama_model = Some(name.clone());
+                app.config.ai_provider = Some("ollama".into());
+                app.config.save();
+            }
+        }
+
+        // Claude section
+        ui.separator();
+        ui.label(RichText::new("CLAUDE").color(theme::EMBER).small());
+        if app.claude.auth_label.is_none() {
+            ui.label(RichText::new("Not signed in (Settings)").color(theme::FG_DIM));
+        } else {
+            let models: Vec<String> = if app.claude.models.is_empty() {
+                crate::claude::FALLBACK_MODELS.iter().map(|s| s.to_string()).collect()
+            } else {
+                app.claude.models.clone()
+            };
+            for name in models {
+                let is_selected = provider == "claude"
+                    && app.config.claude_model.as_deref() == Some(name.as_str());
+                if ui.selectable_label(is_selected, &name).clicked() {
+                    app.config.claude_model = Some(name.clone());
+                    app.config.ai_provider = Some("claude".into());
+                    app.config.save();
+                }
+            }
+        }
+    });
 }
 
 fn history_tab(app: &mut App, ui: &mut egui::Ui) {

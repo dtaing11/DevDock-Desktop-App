@@ -364,3 +364,29 @@ fn blame_reports_authors_per_line() {
     assert_eq!(blame[0].author, "Tester");
     assert_ne!(blame[0].sha, blame[1].sha);
 }
+
+#[test]
+fn new_branch_counts_only_unpushed_commits() {
+    let (_tmp, repo) = setup();
+    // Three commits pushed to origin on main.
+    commit_file(&repo, "a.txt", "1\n", "one");
+    commit_file(&repo, "a.txt", "2\n", "two");
+    commit_file(&repo, "a.txt", "3\n", "three");
+    repo.push(true, None).unwrap();
+
+    // A fresh branch from pushed history has zero unpushed commits.
+    repo.create_branch("feature", true).unwrap();
+    let status = repo.status().unwrap();
+    assert!(!status.has_upstream);
+    assert_eq!(status.ahead, 0, "new branch off pushed history must show 0, not all history");
+
+    // One new commit on the branch: exactly 1 unpushed.
+    commit_file(&repo, "b.txt", "x\n", "branch work");
+    assert_eq!(repo.status().unwrap().ahead, 1);
+
+    // After publishing, back to 0.
+    repo.push(true, None).unwrap();
+    let status = repo.status().unwrap();
+    assert!(status.has_upstream);
+    assert_eq!(status.ahead, 0);
+}

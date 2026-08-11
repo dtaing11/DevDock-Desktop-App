@@ -312,9 +312,10 @@ impl Repo {
         let (mut ahead, behind, has_upstream) = self.ahead_behind();
         let has_remote = !self.remotes()?.is_empty();
         if !has_upstream {
-            // No upstream yet: every local commit is unpushed.
+            // No upstream yet: unpushed commits are those not reachable from
+            // any remote-tracking branch (not the branch's full history).
             ahead = self
-                .git(&["rev-list", "--count", "HEAD"])
+                .git(&["rev-list", "--count", "HEAD", "--not", "--remotes"])
                 .ok()
                 .and_then(|s| s.trim().parse().ok())
                 .unwrap_or(0);

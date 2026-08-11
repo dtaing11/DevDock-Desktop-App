@@ -32,3 +32,15 @@ tempfile = "3"
 [profile.release]
 strip = true
 lto = true
+
+[package.metadata.deb]
+name = "git-manage"
+depends = "libgtk-3-0, libxkbcommon0, git"
+section = "devel"
+priority = "optional"
+extended-description = "Native GitHub-Desktop-style git client with GitHub sign-in, pull requests, conflict resolution, and AI commit messages (Ollama or Claude)."
+assets = [
+    ["target/release/git-manage", "usr/bin/", "755"],
+    ["assets/git-manage.desktop", "usr/share/applications/", "644"],
+    ["assets/icons/git-manage-256.png", "usr/share/icons/hicolor/256x256/apps/git-manage.png", "644"],
+]

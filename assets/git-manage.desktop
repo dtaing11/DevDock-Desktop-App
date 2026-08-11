@@ -1,7 +1,8 @@
 [Desktop Entry]
 Name=Git Manage
-Comment=Native git client with GitHub and Ollama integration
+Comment=Native git client with GitHub and AI integration
 Exec=git-manage
+Icon=git-manage
 Terminal=false
 Type=Application
 Categories=Development;RevisionControl;

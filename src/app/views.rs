@@ -543,6 +543,14 @@ fn sync_segment(app: &mut App, ui: &mut egui::Ui) {
             run_sync(app, "push");
             ui.close_menu();
         }
+        if ui
+            .button("Force push (with lease)")
+            .on_hover_text("Needed after amend/rebase of pushed commits. Fails safely if the remote moved.")
+            .clicked()
+        {
+            run_sync(app, "force-push");
+            ui.close_menu();
+        }
     });
     if response.clicked() {
         if action == "add-remote" {
@@ -569,7 +577,28 @@ fn run_sync(app: &mut App, action: &'static str) {
             "pull" => repo.pull(auth).map(|out| {
                 out.lines().last().unwrap_or("Pulled.").to_string()
             }),
-            "push" => repo.push(set_upstream, auth).map(|_| "Pushed.".to_string()),
+            "push" => repo.push(set_upstream, auth).map(|_| "Pushed.".to_string()).map_err(
+                |e| {
+                    let msg = e.to_string();
+                    if msg.contains("rejected") || msg.contains("non-fast-forward") {
+                        crate::git::GitError::Command(format!(
+                            "{msg}\n\nHint: after amend/rebase use Force push \
+                             (right-click the sync button)."
+                        ))
+                    } else if msg.contains("Permission denied (publickey") {
+                        crate::git::GitError::Command(format!(
+                            "{msg}\n\nHint: this remote uses SSH. Add your key to \
+                             ssh-agent or switch the remote to HTTPS and sign in \
+                             to GitHub in this app."
+                        ))
+                    } else {
+                        e
+                    }
+                },
+            ),
+            "force-push" => repo
+                .force_push(auth)
+                .map(|_| "Force-pushed (with lease).".to_string()),
             _ => unreachable!(),
         };
         Msg::Done { message: strerr(result), refresh: true }
@@ -638,9 +667,18 @@ fn state_banner(app: &mut App, ui: &mut egui::Ui) {
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 let text = match state {
-                    RepoState::Merging => "Merge in progress.",
-                    RepoState::Rebasing => "Rebase in progress.",
-                    RepoState::CherryPicking => "Cherry-pick in progress.",
+                    RepoState::Merging => "Merge in progress.".to_string(),
+                    RepoState::Rebasing => {
+                        // Show applied/total commits during a rebase.
+                        app.repo
+                            .as_ref()
+                            .and_then(|r| r.rebase_progress())
+                            .map(|(done, total)| {
+                                format!("Rebase in progress ({done} of {total} commits).")
+                            })
+                            .unwrap_or_else(|| "Rebase in progress.".to_string())
+                    }
+                    RepoState::CherryPicking => "Cherry-pick in progress.".to_string(),
                     RepoState::Clean => unreachable!(),
                 };
                 ui.label(RichText::new(text).strong());
@@ -731,6 +769,12 @@ fn changes_tab(app: &mut App, ui: &mut egui::Ui) {
                 ui.add_space(16.0);
                 ui.vertical_centered(|ui| {
                     ui.label(RichText::new("No local changes").color(theme::FG_DIM));
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("Edit files in this repository and they will appear here.\nCtrl+Enter commits, Ctrl+R refreshes.")
+                            .color(theme::FG_DIM)
+                            .small(),
+                    );
                 });
             }
             for file in &files {
@@ -798,8 +842,18 @@ pub fn load_file_diff(app: &mut App) {
         let text = repo
             .diff_file(&path, staged)
             .unwrap_or_else(|e| format!("(cannot diff: {e})"));
-        let text =
-            if text.trim().is_empty() { "(no textual diff, possibly binary)".into() } else { text };
+        let text = if text.trim().is_empty() {
+            if repo.is_binary(&path) {
+                let size = std::fs::metadata(repo.path().join(&path))
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                format!("(binary file, {} bytes; no textual diff)", size)
+            } else {
+                "(no changes on this side; toggle Staged/Unstaged)".into()
+            }
+        } else {
+            text
+        };
         Msg::Diff { title: path, text }
     });
     if !staged {
@@ -970,6 +1024,12 @@ fn history_tab(app: &mut App, ui: &mut egui::Ui) {
             ui.add_space(16.0);
             ui.vertical_centered(|ui| {
                 ui.label(RichText::new("No commits yet").color(theme::FG_DIM));
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("Make your first commit from the Changes tab.")
+                        .color(theme::FG_DIM)
+                        .small(),
+                );
             });
         }
         for commit in &commits {
@@ -986,6 +1046,20 @@ fn history_tab(app: &mut App, ui: &mut egui::Ui) {
             let response = ui.selectable_label(selected, heading);
             ui.label(meta);
             ui.separator();
+            // Right-click: revert (safe for pushed commits).
+            response.context_menu(|ui| {
+                if ui
+                    .button("Revert this commit")
+                    .on_hover_text("Creates a new commit that undoes this one")
+                    .clicked()
+                {
+                    if let Some(repo) = app.repo.clone() {
+                        let sha = commit.sha.clone();
+                        app.worker.spawn(move || Msg::MergeOutcome(repo.revert_commit(&sha)));
+                    }
+                    ui.close_menu();
+                }
+            });
             if response.clicked() {
                 app.selected_commit = Some(commit.sha.clone());
                 app.selected_file = None;
@@ -1087,29 +1161,84 @@ pub fn diff_panel(app: &mut App, ctx: &egui::Context) {
             // Hunk staging bar for the unstaged view.
             if app.selected_file.is_some() && !app.show_staged && !app.hunks.is_empty() {
                 hunk_bar(app, ui);
+                interactive_diff(app, ui);
+                return;
             }
 
-            ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-                ui.add_space(4.0);
-                for line in app.diff_text.lines() {
-                    let (color, bg) = diff_line_style(line);
-                    let text = RichText::new(line).monospace().color(color);
-                    match bg {
-                        Some(bg) => {
-                            egui::Frame::new().fill(bg).show(ui, |ui| {
+            // Plain diff: virtualized so huge diffs stay responsive.
+            let lines: Vec<&str> = app.diff_text.lines().collect();
+            let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+            ScrollArea::both().auto_shrink([false, false]).show_rows(
+                ui,
+                row_height,
+                lines.len(),
+                |ui, range| {
+                    for line in &lines[range] {
+                        let (color, bg) = diff_line_style(line);
+                        let text = RichText::new(*line).monospace().color(color);
+                        match bg {
+                            Some(bg) => {
+                                egui::Frame::new().fill(bg).show(ui, |ui| {
+                                    ui.label(text);
+                                });
+                            }
+                            None => {
                                 ui.label(text);
-                            });
-                        }
-                        None => {
-                            ui.label(text);
+                            }
                         }
                     }
-                }
-            });
+                },
+            );
         });
 }
 
-/// Buttons to stage individual hunks of the selected file.
+/// Diff view with per-line checkboxes on changed lines for line staging.
+fn interactive_diff(app: &mut App, ui: &mut egui::Ui) {
+    let hunks = app.hunks.clone();
+    ScrollArea::both().auto_shrink([false, false]).id_salt("interactive-diff").show(
+        ui,
+        |ui| {
+            ui.add_space(4.0);
+            for (hi, hunk) in hunks.iter().enumerate() {
+                let (color, bg) = diff_line_style(&hunk.header);
+                let _ = bg;
+                ui.label(RichText::new(&hunk.header).monospace().color(color));
+                for (li, line) in hunk.text.lines().skip(1).enumerate() {
+                    let changed = line.starts_with('+') || line.starts_with('-');
+                    let (color, bg) = diff_line_style(line);
+                    ui.horizontal(|ui| {
+                        if changed {
+                            let key = (hi, li);
+                            let mut on = app.line_sel.contains(&key);
+                            if ui.checkbox(&mut on, "").on_hover_text("Select line to stage").changed() {
+                                if on {
+                                    app.line_sel.insert(key);
+                                } else {
+                                    app.line_sel.remove(&key);
+                                }
+                            }
+                        } else {
+                            ui.add_space(26.0);
+                        }
+                        let text = RichText::new(line).monospace().color(color);
+                        match bg {
+                            Some(bg) => {
+                                egui::Frame::new().fill(bg).show(ui, |ui| {
+                                    ui.label(text);
+                                });
+                            }
+                            None => {
+                                ui.label(text);
+                            }
+                        }
+                    });
+                }
+            }
+        },
+    );
+}
+
+/// Buttons to stage hunks or the selected lines of the current file.
 fn hunk_bar(app: &mut App, ui: &mut egui::Ui) {
     egui::Frame::new()
         .fill(theme::PANEL)
@@ -1132,6 +1261,7 @@ fn hunk_bar(app: &mut App, ui: &mut egui::Ui) {
                             match repo.stage_hunk(hunk) {
                                 Ok(()) => {
                                     app.toast(format!("Staged hunk {}", i + 1), false);
+                                    app.line_sel.clear();
                                     load_file_diff(app);
                                     app.refresh();
                                 }
@@ -1140,8 +1270,47 @@ fn hunk_bar(app: &mut App, ui: &mut egui::Ui) {
                         }
                     }
                 }
+                // Line-level staging of the checkbox selection.
+                let selected = app.line_sel.len();
+                if selected > 0
+                    && ui
+                        .small_button(format!("Stage {selected} selected line(s)"))
+                        .on_hover_text("Stage only the checked lines")
+                        .clicked()
+                {
+                    stage_selected_lines(app);
+                }
             });
         });
+}
+
+/// Applies the checkbox selection as per-hunk partial patches.
+fn stage_selected_lines(app: &mut App) {
+    let Some(repo) = app.repo.clone() else { return };
+    let hunks = app.hunks.clone();
+    let mut errors = Vec::new();
+    for (hi, hunk) in hunks.iter().enumerate() {
+        let lines: Vec<usize> = app
+            .line_sel
+            .iter()
+            .filter(|(h, _)| *h == hi)
+            .map(|(_, l)| *l)
+            .collect();
+        if lines.is_empty() {
+            continue;
+        }
+        if let Err(e) = repo.stage_lines(hunk, &lines) {
+            errors.push(e.to_string());
+        }
+    }
+    if errors.is_empty() {
+        app.toast("Selected lines staged.", false);
+    } else {
+        app.toast(errors.join("; "), true);
+    }
+    app.line_sel.clear();
+    load_file_diff(app);
+    app.refresh();
 }
 
 /// Horizontal strip listing files changed in the selected commit.
@@ -1253,7 +1422,9 @@ fn diff_line_style(line: &str) -> (Color32, Option<Color32>) {
 // Toasts
 // ---------------------------------------------------------------------------
 
-/// Bottom-center transient notifications.
+/// Bottom-center transient notifications. Long messages (API errors etc.)
+/// wrap vertically inside a fixed max width instead of stretching across
+/// the screen.
 pub fn toasts(app: &mut App, ctx: &egui::Context) {
     let Some(toast) = &app.toast else { return };
     if std::time::Instant::now() > toast.until {
@@ -1262,15 +1433,17 @@ pub fn toasts(app: &mut App, ctx: &egui::Context) {
     }
     let (border, color) =
         if toast.error { (theme::DANGER, theme::DANGER) } else { (theme::TEAL, theme::FG) };
+    let max_width = (ctx.screen_rect().width() * 0.5).clamp(280.0, 560.0);
     egui::Area::new("toast".into())
         .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -24.0])
         .show(ctx, |ui| {
             egui::Frame::new()
                 .fill(theme::PANEL)
                 .stroke(egui::Stroke::new(1.0_f32, border))
-                .corner_radius(999.0)
+                .corner_radius(12.0)
                 .inner_margin(egui::Margin::symmetric(18, 10))
                 .show(ui, |ui| {
+                    ui.set_max_width(max_width);
                     ui.label(RichText::new(&toast.text).color(color));
                 });
         });

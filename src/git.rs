@@ -689,12 +689,26 @@ impl Repo {
 
     /// Pushes the current branch. See [`Repo::fetch`] for `auth`.
     pub fn push(&self, set_upstream: bool, auth: Option<&str>) -> Result<String> {
+        self.push_inner(set_upstream, false, auth)
+    }
+
+    /// Force-pushes with `--force-with-lease` (safe force: fails if the
+    /// remote moved since the last fetch). Needed after amend/rebase of
+    /// already-pushed commits.
+    pub fn force_push(&self, auth: Option<&str>) -> Result<String> {
+        self.push_inner(false, true, auth)
+    }
+
+    fn push_inner(&self, set_upstream: bool, force: bool, auth: Option<&str>) -> Result<String> {
         let branch = self.current_branch();
-        let out = if set_upstream {
-            self.git_auth(&["push", "--set-upstream", "origin", &branch], auth)?
-        } else {
-            self.git_auth(&["push"], auth)?
-        };
+        let mut args: Vec<&str> = vec!["push"];
+        if force {
+            args.push("--force-with-lease");
+        }
+        if set_upstream {
+            args.extend(["--set-upstream", "origin", &branch]);
+        }
+        let out = self.git_auth(&args, auth)?;
         Ok(out.trim().to_string())
     }
 
@@ -775,6 +789,31 @@ impl Repo {
         self.git(&["reset", "--soft", "HEAD~1"]).map(drop)
     }
 
+    /// Reverts a commit by creating an inverse commit. Safe for pushed
+    /// history, unlike undo.
+    pub fn revert_commit(&self, sha: &str) -> OpOutcome {
+        OpOutcome::from(self.git_env(&["revert", "--no-edit", sha], &[("GIT_EDITOR", "true")]))
+    }
+
+    /// Progress of an in-progress rebase: `(done, total)` commits applied.
+    pub fn rebase_progress(&self) -> Option<(u32, u32)> {
+        let git_dir = self.git(&["rev-parse", "--git-dir"]).ok()?;
+        let git_dir = git_dir.trim();
+        let base = if Path::new(git_dir).is_absolute() {
+            PathBuf::from(git_dir)
+        } else {
+            self.root.join(git_dir)
+        };
+        let dir = ["rebase-merge", "rebase-apply"]
+            .iter()
+            .map(|d| base.join(d))
+            .find(|p| p.exists())?;
+        let read_num = |name: &str| -> Option<u32> {
+            std::fs::read_to_string(dir.join(name)).ok()?.trim().parse().ok()
+        };
+        Some((read_num("msgnum")?, read_num("end")?))
+    }
+
     // -- hunks / partial staging ---------------------------------------------
 
     /// Parses the unstaged diff of one file into hunks for partial staging.
@@ -787,24 +826,42 @@ impl Repo {
     /// index. `hunk` must come from [`Repo::hunks`] for the same file state.
     pub fn stage_hunk(&self, hunk: &Hunk) -> Result<()> {
         let patch = format!("{}{}", hunk.file_header, hunk.text);
+        self.apply_cached(&patch)
+    }
+
+    /// Stages only the selected changed lines of a hunk.
+    ///
+    /// `selected` holds indices into the hunk body (lines after the `@@`
+    /// header) for the `+`/`-` lines to keep. Unselected additions are
+    /// dropped; unselected deletions become context.
+    pub fn stage_lines(&self, hunk: &Hunk, selected: &[usize]) -> Result<()> {
+        let patch = build_partial_patch(hunk, selected)
+            .ok_or_else(|| GitError::Command("No lines selected".into()))?;
+        self.apply_cached(&patch)
+    }
+
+    fn apply_cached(&self, patch: &str) -> Result<()> {
         let mut child = Command::new("git")
-            .args(["apply", "--cached", "--unidiff-zero", "-"])
+            .args(["apply", "--cached", "--unidiff-zero", "--recount", "-"])
             .current_dir(&self.root)
             .stdin(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()?;
         use std::io::Write as _;
-        child
-            .stdin
-            .take()
-            .expect("stdin piped")
-            .write_all(patch.as_bytes())?;
+        child.stdin.take().expect("stdin piped").write_all(patch.as_bytes())?;
         let out = child.wait_with_output()?;
         if out.status.success() {
             Ok(())
         } else {
             Err(GitError::Command(String::from_utf8_lossy(&out.stderr).trim().to_string()))
         }
+    }
+
+    /// Whether git treats the file as binary (no textual diff).
+    pub fn is_binary(&self, file: &str) -> bool {
+        self.git(&["diff", "--numstat", "--", file])
+            .map(|out| out.lines().any(|l| l.starts_with("-\t-\t")))
+            .unwrap_or(false)
     }
 
     // -- history details ------------------------------------------------------
@@ -994,6 +1051,43 @@ fn parse_hunks(diff: &str) -> Vec<Hunk> {
         h.file_header = file_header.clone();
     }
     hunks
+}
+
+/// Builds a patch containing only the selected changed lines of `hunk`.
+///
+/// `selected` indexes the hunk body lines (excluding the `@@` header).
+/// Unselected `+` lines are omitted; unselected `-` lines turn into context.
+/// Returns `None` when no changed line is selected. Uses `--recount`-friendly
+/// output, so header line counts need not be adjusted.
+fn build_partial_patch(hunk: &Hunk, selected: &[usize]) -> Option<String> {
+    let selected: std::collections::HashSet<usize> = selected.iter().copied().collect();
+    let mut body_lines: Vec<String> = Vec::new();
+    let mut any_change = false;
+
+    for (i, line) in hunk.text.lines().skip(1).enumerate() {
+        let first = line.chars().next().unwrap_or(' ');
+        match first {
+            '+' if selected.contains(&i) => {
+                any_change = true;
+                body_lines.push(line.to_string());
+            }
+            '+' => { /* unselected addition: drop */ }
+            '-' if selected.contains(&i) => {
+                any_change = true;
+                body_lines.push(line.to_string());
+            }
+            '-' => {
+                // Unselected deletion: keep the line as context.
+                body_lines.push(format!(" {}", &line[1..]));
+            }
+            _ => body_lines.push(line.to_string()),
+        }
+    }
+    if !any_change {
+        return None;
+    }
+    let header = hunk.text.lines().next()?.to_string();
+    Some(format!("{}{}\n{}\n", hunk.file_header, header, body_lines.join("\n")))
 }
 
 fn parse_commit(record: &str, field_sep: char) -> Option<Commit> {

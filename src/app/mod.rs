@@ -30,7 +30,8 @@ pub fn run() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([900.0, 600.0])
-            .with_title("Git Manage"),
+            .with_title("Git Manage")
+            .with_icon(load_icon()),
         ..Default::default()
     };
     eframe::run_native(
@@ -41,6 +42,12 @@ pub fn run() -> eframe::Result<()> {
             Ok(Box::new(App::new(&cc.egui_ctx)))
         }),
     )
+}
+
+/// Window/taskbar icon, embedded into the binary.
+fn load_icon() -> egui::IconData {
+    let png = include_bytes!("../../assets/icons/git-manage-256.png");
+    eframe::icon_data::from_png_bytes(png).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +223,8 @@ pub struct App {
     pub diff_text: String,
     /// Hunks of the currently selected file (for partial staging).
     pub hunks: Vec<crate::git::Hunk>,
+    /// Selected changed lines per hunk index (for line-level staging).
+    pub line_sel: std::collections::HashSet<(usize, usize)>,
     /// Which diff side is shown for the selected file.
     pub show_staged: bool,
     /// Blame lines when blame view is active.
@@ -284,6 +293,7 @@ impl App {
             diff_title: String::new(),
             diff_text: String::new(),
             hunks: Vec::new(),
+            line_sel: Default::default(),
             show_staged: false,
             blame: None,
             commit_file_list: Vec::new(),
@@ -789,6 +799,62 @@ impl App {
         self.worker.spawn(move || Msg::Tags(strerr(repo.tags())));
     }
 
+    /// Global keyboard shortcuts:
+    /// Ctrl/Cmd+Enter commit, Ctrl/Cmd+R refresh, Ctrl/Cmd+P push,
+    /// Ctrl/Cmd+Shift+P pull, Ctrl/Cmd+K repo picker, Escape closes dialogs.
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        let (commit, refresh, push, pull, repo_picker, escape) = ctx.input_mut(|i| {
+            let cmd = egui::Modifiers::COMMAND;
+            (
+                i.consume_key(cmd, egui::Key::Enter),
+                i.consume_key(cmd, egui::Key::R),
+                i.consume_key(cmd, egui::Key::P),
+                i.consume_key(cmd | egui::Modifiers::SHIFT, egui::Key::P),
+                i.consume_key(cmd, egui::Key::K),
+                i.key_pressed(egui::Key::Escape),
+            )
+        });
+        if commit {
+            self.do_commit();
+        }
+        if refresh {
+            self.refresh();
+            self.toast("Refreshed.", false);
+        }
+        if pull {
+            // Check pull before push: the push shortcut matches without shift.
+            self.shortcut_sync("pull");
+        } else if push {
+            self.shortcut_sync("push");
+        }
+        if repo_picker {
+            self.dialog = Dialog::RepoPicker;
+        }
+        if escape && self.dialog != Dialog::None {
+            if self.dialog == Dialog::GitHub {
+                self.gh.device = None;
+                self.gh.polling = false;
+            }
+            self.dialog = Dialog::None;
+        }
+    }
+
+    fn shortcut_sync(&mut self, action: &str) {
+        let Some(repo) = self.repo.clone() else { return };
+        let token = self.gh_token();
+        let set_upstream = !self.status.as_ref().map(|s| s.has_upstream).unwrap_or(false);
+        let action = action.to_string();
+        self.worker.spawn(move || {
+            let auth = token.as_deref();
+            let result = if action == "pull" {
+                repo.pull(auth).map(|_| "Pulled.".to_string())
+            } else {
+                repo.push(set_upstream, auth).map(|_| "Pushed.".to_string())
+            };
+            Msg::Done { message: strerr(result), refresh: true }
+        });
+    }
+
     /// Polls the GitHub device flow at the interval GitHub requested.
     fn poll_github(&mut self) {
         let Some(device) = self.gh.device.clone() else { return };
@@ -820,6 +886,7 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_messages();
+        self.handle_shortcuts(ctx);
 
         // Device-flow polling needs periodic wakeups.
         if self.gh.device.is_some() {

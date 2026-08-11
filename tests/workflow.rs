@@ -390,3 +390,99 @@ fn new_branch_counts_only_unpushed_commits() {
     assert!(status.has_upstream);
     assert_eq!(status.ahead, 0);
 }
+
+#[test]
+fn force_push_with_lease_after_amend() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "v1\n", "original");
+    repo.push(true, None).unwrap();
+
+    // Amend the pushed commit; plain push now fails, force-with-lease works.
+    write(&repo, "a.txt", "v2\n");
+    repo.stage_all().unwrap();
+    repo.commit("amended", "", true).unwrap();
+    assert!(repo.push(false, None).is_err(), "plain push should be rejected");
+    repo.force_push(None).unwrap();
+    let status = repo.status().unwrap();
+    assert_eq!(status.ahead, 0);
+    assert_eq!(status.behind, 0);
+}
+
+#[test]
+fn revert_creates_inverse_commit() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "keep\n", "base");
+    commit_file(&repo, "a.txt", "bad change\n", "bad commit");
+    let bad_sha = repo.log(1, None).unwrap()[0].sha.clone();
+
+    let outcome = repo.revert_commit(&bad_sha);
+    assert!(outcome.ok, "revert failed: {}", outcome.message);
+    assert_eq!(read(&repo, "a.txt"), "keep\n");
+    let log = repo.log(5, None).unwrap();
+    assert_eq!(log.len(), 3);
+    assert!(log[0].subject.starts_with("Revert"));
+}
+
+#[test]
+fn stage_individual_lines() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "f.txt", "one\ntwo\nthree\n", "base");
+    // Two additions in the same hunk.
+    write(&repo, "f.txt", "one\nADDED-A\ntwo\nADDED-B\nthree\n");
+    let hunks = repo.hunks("f.txt").unwrap();
+    assert_eq!(hunks.len(), 1);
+
+    // Find body indices of the two '+' lines; select only the first.
+    let plus_lines: Vec<usize> = hunks[0]
+        .text
+        .lines()
+        .skip(1)
+        .enumerate()
+        .filter(|(_, l)| l.starts_with('+'))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(plus_lines.len(), 2);
+    repo.stage_lines(&hunks[0], &plus_lines[..1]).unwrap();
+
+    let staged = repo.diff_all(true).unwrap();
+    assert!(staged.contains("ADDED-A"), "staged: {staged}");
+    assert!(!staged.contains("ADDED-B"), "staged: {staged}");
+    let unstaged = repo.diff_all(false).unwrap();
+    assert!(unstaged.contains("ADDED-B"));
+}
+
+#[test]
+fn rebase_progress_reports_counts() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "base.txt", "base\n", "base");
+    // Branch with two commits that will conflict on rebase.
+    repo.create_branch("topic", true).unwrap();
+    commit_file(&repo, "conflict.txt", "topic-1\n", "topic 1");
+    commit_file(&repo, "other.txt", "x\n", "topic 2");
+    repo.checkout("main").unwrap();
+    commit_file(&repo, "conflict.txt", "main-1\n", "main 1");
+    repo.checkout("topic").unwrap();
+
+    let outcome = repo.rebase("main");
+    assert!(!outcome.ok && outcome.conflict);
+    let (done, total) = repo.rebase_progress().expect("progress during rebase");
+    assert_eq!(total, 2);
+    assert!(done >= 1);
+    repo.rebase_abort().unwrap();
+    assert!(repo.rebase_progress().is_none());
+}
+
+#[test]
+fn binary_detection() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "text.txt", "hello\n", "base");
+    // Modify text file: not binary.
+    write(&repo, "text.txt", "hello world\n");
+    assert!(!repo.is_binary("text.txt"));
+    // Commit a binary file then modify it.
+    std::fs::write(repo.path().join("bin.dat"), [0u8, 159, 146, 150, 0, 1, 2]).unwrap();
+    repo.stage_all().unwrap();
+    repo.commit("add binary", "", false).unwrap();
+    std::fs::write(repo.path().join("bin.dat"), [7u8, 0, 3, 0, 255]).unwrap();
+    assert!(repo.is_binary("bin.dat"));
+}

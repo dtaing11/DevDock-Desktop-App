@@ -92,11 +92,14 @@ impl FileStatus {
 pub struct Status {
     pub files: Vec<FileEntry>,
     pub branch: String,
-    /// Commits ahead of the upstream branch.
+    /// Commits ahead of the upstream branch (or total unpushed commits when
+    /// the branch has no upstream yet).
     pub ahead: u32,
     /// Commits behind the upstream branch.
     pub behind: u32,
     pub has_upstream: bool,
+    /// Whether any remote is configured at all.
+    pub has_remote: bool,
     pub state: RepoState,
 }
 
@@ -273,13 +276,23 @@ impl Repo {
     pub fn status(&self) -> Result<Status> {
         let out = self.git(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])?;
         let files = parse_porcelain(&out);
-        let (ahead, behind, has_upstream) = self.ahead_behind();
+        let (mut ahead, behind, has_upstream) = self.ahead_behind();
+        let has_remote = !self.remotes()?.is_empty();
+        if !has_upstream {
+            // No upstream yet: every local commit is unpushed.
+            ahead = self
+                .git(&["rev-list", "--count", "HEAD"])
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0);
+        }
         Ok(Status {
             files,
             branch: self.current_branch(),
             ahead,
             behind,
             has_upstream,
+            has_remote,
             state: self.state()?,
         })
     }
@@ -615,6 +628,15 @@ impl Repo {
                     .then(|| Remote { name: name.to_string(), url: url.to_string() })
             })
             .collect())
+    }
+
+    /// Adds (or replaces) a named remote.
+    pub fn add_remote(&self, name: &str, url: &str) -> Result<()> {
+        if self.remotes()?.iter().any(|r| r.name == name) {
+            self.git(&["remote", "set-url", name, url]).map(drop)
+        } else {
+            self.git(&["remote", "add", name, url]).map(drop)
+        }
     }
 
     /// Fetches all remotes, pruning removed branches.

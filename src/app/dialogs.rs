@@ -12,20 +12,44 @@ use egui::{RichText, ScrollArea};
 
 /// Renders whichever dialog is open.
 pub fn show(app: &mut App, ctx: &egui::Context) {
+    let mut open = true;
     match app.dialog {
         Dialog::None => {}
-        Dialog::RepoPicker => repo_picker(app, ctx),
-        Dialog::GitHub => github_dialog(app, ctx),
-        Dialog::PullRequests => pull_requests(app, ctx),
-        Dialog::Conflicts => conflict_resolver(app, ctx),
-        Dialog::Settings => settings(app, ctx),
+        Dialog::RepoPicker => repo_picker(app, ctx, &mut open),
+        Dialog::GitHub => github_dialog(app, ctx, &mut open),
+        Dialog::PullRequests => pull_requests(app, ctx, &mut open),
+        Dialog::Conflicts => conflict_resolver(app, ctx, &mut open),
+        Dialog::Settings => settings(app, ctx, &mut open),
+        Dialog::AddRemote => add_remote(app, ctx, &mut open),
+    }
+    // The window's X button was clicked.
+    if !open {
+        if app.dialog == Dialog::GitHub {
+            app.gh.device = None;
+            app.gh.polling = false;
+        }
+        if app.dialog == Dialog::Settings {
+            app.config.ollama_url = Some(app.ollama_url_input.trim().to_string());
+            app.config.save();
+        }
+        app.dialog = Dialog::None;
     }
 }
 
-fn modal(ctx: &egui::Context, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
+/// Modal window with a title bar and an X close button.
+///
+/// `open` is set to `false` when the user clicks the X; callers translate
+/// that into closing the dialog (plus any cleanup).
+fn modal(
+    ctx: &egui::Context,
+    title: &str,
+    open: &mut bool,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
     egui::Window::new(RichText::new(title).color(theme::EMBER).strong())
         .collapsible(false)
         .resizable(false)
+        .open(open)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, add_contents);
 }
@@ -34,8 +58,8 @@ fn modal(ctx: &egui::Context, title: &str, add_contents: impl FnOnce(&mut egui::
 // Repository picker
 // ---------------------------------------------------------------------------
 
-fn repo_picker(app: &mut App, ctx: &egui::Context) {
-    modal(ctx, "Open repository", |ui| {
+fn repo_picker(app: &mut App, ctx: &egui::Context, open: &mut bool) {
+    modal(ctx, "Open repository", open, |ui| {
         ui.set_min_width(420.0);
 
         ui.label("Local path");
@@ -65,9 +89,6 @@ fn repo_picker(app: &mut App, ctx: &egui::Context) {
                     Ok(repo) => Msg::RepoOpened(Ok(repo.path().display().to_string())),
                     Err(e) => Msg::RepoOpened(Err(e.to_string())),
                 });
-            }
-            if app.repo.is_some() && ui.button("Cancel").clicked() {
-                app.dialog = Dialog::None;
             }
         });
 
@@ -132,8 +153,8 @@ fn repo_picker(app: &mut App, ctx: &egui::Context) {
 // GitHub sign-in
 // ---------------------------------------------------------------------------
 
-fn github_dialog(app: &mut App, ctx: &egui::Context) {
-    modal(ctx, "GitHub", |ui| {
+fn github_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
+    modal(ctx, "GitHub", open, |ui| {
         ui.set_min_width(420.0);
 
         if let Some(user) = app.gh.user.clone() {
@@ -144,9 +165,6 @@ fn github_dialog(app: &mut App, ctx: &egui::Context) {
                     let _ = github::TokenStore::clear();
                     app.gh = Default::default();
                     app.toast("Signed out.", false);
-                }
-                if ui.button("Close").clicked() {
-                    app.dialog = Dialog::None;
                 }
             });
             return;
@@ -203,11 +221,6 @@ fn github_dialog(app: &mut App, ctx: &egui::Context) {
                     }
                 });
             }
-            if ui.button("Close").clicked() {
-                app.gh.device = None;
-                app.gh.polling = false;
-                app.dialog = Dialog::None;
-            }
         });
     });
 }
@@ -216,8 +229,8 @@ fn github_dialog(app: &mut App, ctx: &egui::Context) {
 // Pull requests
 // ---------------------------------------------------------------------------
 
-fn pull_requests(app: &mut App, ctx: &egui::Context) {
-    modal(ctx, "Pull requests", |ui| {
+fn pull_requests(app: &mut App, ctx: &egui::Context, open: &mut bool) {
+    modal(ctx, "Pull requests", open, |ui| {
         ui.set_min_width(460.0);
 
         ui.label("Title");
@@ -271,9 +284,6 @@ fn pull_requests(app: &mut App, ctx: &egui::Context) {
                 .clicked()
             {
                 create_pr(app);
-            }
-            if ui.button("Close").clicked() {
-                app.dialog = Dialog::None;
             }
         });
 
@@ -337,8 +347,8 @@ fn create_pr(app: &mut App) {
 // Conflict resolver
 // ---------------------------------------------------------------------------
 
-fn conflict_resolver(app: &mut App, ctx: &egui::Context) {
-    modal(ctx, "Resolve conflicts", |ui| {
+fn conflict_resolver(app: &mut App, ctx: &egui::Context, open: &mut bool) {
+    modal(ctx, "Resolve conflicts", open, |ui| {
         ui.set_min_width(680.0);
 
         if app.conflicts.files.is_empty() {
@@ -409,9 +419,6 @@ fn conflict_resolver(app: &mut App, ctx: &egui::Context) {
             {
                 finish_conflicts(app);
             }
-            if ui.button("Close").clicked() {
-                app.dialog = Dialog::None;
-            }
         });
     });
 }
@@ -447,8 +454,8 @@ fn finish_conflicts(app: &mut App) {
 // Settings
 // ---------------------------------------------------------------------------
 
-fn settings(app: &mut App, ctx: &egui::Context) {
-    modal(ctx, "Settings", |ui| {
+fn settings(app: &mut App, ctx: &egui::Context, open: &mut bool) {
+    modal(ctx, "Settings", open, |ui| {
         ui.set_min_width(420.0);
 
         ui.label("Ollama server URL");
@@ -487,11 +494,6 @@ fn settings(app: &mut App, ctx: &egui::Context) {
                     .spawn(move || Msg::OllamaModels(strerr(ollama::Client::new(url).models())));
                 app.toast("Checking Ollama…", false);
             }
-            if ui.button("Close").clicked() {
-                app.config.ollama_url = Some(app.ollama_url_input.trim().to_string());
-                app.config.save();
-                app.dialog = Dialog::None;
-            }
         });
 
         if !app.ollama_models.is_empty() {
@@ -500,5 +502,41 @@ fn settings(app: &mut App, ctx: &egui::Context) {
                     .color(theme::ADD),
             );
         }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Add remote
+// ---------------------------------------------------------------------------
+
+fn add_remote(app: &mut App, ctx: &egui::Context, open: &mut bool) {
+    modal(ctx, "Publish: add a remote", open, |ui| {
+        ui.set_min_width(420.0);
+        ui.label("This repository has no remote yet. Add one to publish your branch:");
+        ui.add(
+            egui::TextEdit::singleline(&mut app.remote_url_input)
+                .hint_text("https://github.com/user/repo.git")
+                .desired_width(f32::INFINITY),
+        );
+        ui.horizontal(|ui| {
+            let can_add = !app.remote_url_input.trim().is_empty();
+            if ui
+                .add_enabled(can_add, egui::Button::new("Add remote and publish").fill(theme::EMBER))
+                .clicked()
+            {
+                let url = app.remote_url_input.trim().to_string();
+                if let Some(repo) = app.repo.clone() {
+                    let token = app.gh_token();
+                    app.dialog = Dialog::None;
+                    app.worker.spawn(move || {
+                        let result = repo
+                            .add_remote("origin", &url)
+                            .and_then(|_| repo.push(true, token.as_deref()))
+                            .map(|_| "Branch published.".to_string());
+                        Msg::Done { message: strerr(result), refresh: true }
+                    });
+                }
+            }
+        });
     });
 }

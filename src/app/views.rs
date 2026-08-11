@@ -203,22 +203,35 @@ fn checkout(app: &mut App, name: &str) {
 
 /// One context-aware sync segment, like GitHub Desktop's third header button:
 /// Publish when there is no upstream, Pull when behind, Push when ahead,
-/// otherwise Fetch.
+/// otherwise Fetch. Publishing without any remote asks for a remote URL.
 fn sync_segment(app: &mut App, ui: &mut egui::Ui) {
-    let (ahead, behind, has_upstream) = app
+    let (ahead, behind, has_upstream, has_remote) = app
         .status
         .as_ref()
-        .map(|s| (s.ahead, s.behind, s.has_upstream))
-        .unwrap_or((0, 0, false));
+        .map(|s| (s.ahead, s.behind, s.has_upstream, s.has_remote))
+        .unwrap_or((0, 0, false, false));
+
+    let commits = |n: u32| if n == 1 { "1 commit".to_string() } else { format!("{n} commits") };
 
     let (caption, value, action) = if app.repo.is_none() {
         ("REMOTE", "Fetch origin".to_string(), "fetch")
+    } else if !has_remote {
+        // No remote at all: publishing first needs a URL.
+        if ahead > 0 {
+            ("PUBLISH", format!("Publish {}", commits(ahead)), "add-remote")
+        } else {
+            ("PUBLISH", "Publish branch".to_string(), "add-remote")
+        }
     } else if !has_upstream {
-        ("PUBLISH", "Publish branch".to_string(), "push")
+        if ahead > 0 {
+            ("PUBLISH", format!("Publish {}", commits(ahead)), "push")
+        } else {
+            ("PUBLISH", "Publish branch".to_string(), "push")
+        }
     } else if behind > 0 {
-        ("PULL", format!("Pull origin ({behind})"), "pull")
+        ("PULL", format!("Pull {}", commits(behind)), "pull")
     } else if ahead > 0 {
-        ("PUSH", format!("Push origin ({ahead})"), "push")
+        ("PUSH", format!("Push {}", commits(ahead)), "push")
     } else {
         ("REMOTE", "Fetch origin".to_string(), "fetch")
     };
@@ -240,7 +253,12 @@ fn sync_segment(app: &mut App, ui: &mut egui::Ui) {
         }
     });
     if response.clicked() {
-        run_sync(app, action);
+        if action == "add-remote" {
+            app.remote_url_input.clear();
+            app.dialog = Dialog::AddRemote;
+        } else {
+            run_sync(app, action);
+        }
     }
 }
 

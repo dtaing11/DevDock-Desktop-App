@@ -107,6 +107,8 @@ pub enum Dialog {
     PullRequests,
     Conflicts,
     Settings,
+    /// Ask for a remote URL before the first publish.
+    AddRemote,
 }
 
 /// Transient toast notification.
@@ -181,6 +183,7 @@ pub struct App {
     pub repo_path_input: String,
     pub clone_url_input: String,
     pub clone_dest_input: String,
+    pub remote_url_input: String,
     pub branch_filter: String,
     pub new_branch_name: String,
     pub gh: GhState,
@@ -225,6 +228,7 @@ impl App {
             repo_path_input: String::new(),
             clone_url_input: String::new(),
             clone_dest_input: String::new(),
+            remote_url_input: String::new(),
             branch_filter: String::new(),
             new_branch_name: String::new(),
             gh: Default::default(),

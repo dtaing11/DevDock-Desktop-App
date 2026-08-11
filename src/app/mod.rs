@@ -166,6 +166,8 @@ pub struct App {
     /// CI checks for the current branch head, refreshed with status.
     pub branch_checks: Option<github::ChecksSummary>,
     last_checks_refresh: Option<Instant>,
+    /// Last background fetch, so remote changes surface automatically.
+    last_auto_fetch: Option<Instant>,
 
     // sidebar
     pub tab: Tab,
@@ -221,6 +223,7 @@ impl App {
             last_refresh: Instant::now(),
             branch_checks: None,
             last_checks_refresh: None,
+            last_auto_fetch: None,
             tab: Tab::Changes,
             checked: Default::default(),
             unchecked: Default::default(),
@@ -299,6 +302,31 @@ impl App {
             self.worker.spawn(move || Msg::Log(strerr(repo.log(200, None))));
         }
         self.refresh_branch_checks();
+    }
+
+    /// Background fetch every 60 seconds so ahead/behind counts (and the
+    /// sync button) update when the remote gains new commits, GitHub
+    /// Desktop style. Skipped while a dialog is open or an op is running.
+    fn auto_fetch(&mut self) {
+        let due = self
+            .last_auto_fetch
+            .map(|t| t.elapsed() > Duration::from_secs(60))
+            .unwrap_or(true);
+        if !due || self.busy || self.dialog != Dialog::None {
+            return;
+        }
+        let Some(repo) = self.repo.clone() else { return };
+        let Some(status) = self.status.as_ref() else { return };
+        if !status.has_remote {
+            return;
+        }
+        self.last_auto_fetch = Some(Instant::now());
+        let token = self.gh_token();
+        self.worker.spawn(move || {
+            // Quiet: no toast, but refresh counts afterwards.
+            let _ = repo.fetch(token.as_deref());
+            Msg::Done { message: Ok(String::new()), refresh: true }
+        });
     }
 
     /// Fetches CI check status for the current branch head from GitHub,
@@ -620,6 +648,7 @@ impl eframe::App for App {
         {
             self.refresh();
         }
+        self.auto_fetch();
         ctx.request_repaint_after(Duration::from_secs(3));
 
         views::toolbar(self, ctx);

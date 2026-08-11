@@ -642,52 +642,53 @@ impl Repo {
     /// Fetches all remotes, pruning removed branches.
     ///
     /// `auth` supplies a GitHub token used for github.com HTTPS remotes.
+    /// Operations always go through the named remote so tracking refs
+    /// (`refs/remotes/origin/*`) and ahead/behind counts stay correct.
     pub fn fetch(&self, auth: Option<&str>) -> Result<()> {
-        if let Some(url) = self.authed_origin_url(auth) {
-            let refspec = "+refs/heads/*:refs/remotes/origin/*";
-            return self.git(&["fetch", "--prune", &url, refspec]).map(drop);
-        }
-        self.git(&["fetch", "--all", "--prune"]).map(drop)
+        self.git_auth(&["fetch", "--all", "--prune"], auth).map(drop)
     }
 
     /// Pulls the current branch. See [`Repo::fetch`] for `auth`.
     pub fn pull(&self, auth: Option<&str>) -> Result<String> {
-        if let Some(url) = self.authed_origin_url(auth) {
-            let branch = self.current_branch();
-            return Ok(self.git(&["pull", "--no-edit", &url, &branch])?.trim().to_string());
-        }
-        Ok(self.git(&["pull", "--no-edit"])?.trim().to_string())
+        Ok(self.git_auth(&["pull", "--no-edit"], auth)?.trim().to_string())
     }
 
     /// Pushes the current branch. See [`Repo::fetch`] for `auth`.
     pub fn push(&self, set_upstream: bool, auth: Option<&str>) -> Result<String> {
         let branch = self.current_branch();
-        if let Some(url) = self.authed_origin_url(auth) {
-            let refspec = format!("{branch}:{branch}");
-            let out = self.git(&["push", &url, &refspec])?;
-            if set_upstream {
-                let upstream = format!("origin/{branch}");
-                let _ = self.git(&["branch", "--set-upstream-to", &upstream, &branch]);
-            }
-            return Ok(out.trim().to_string());
-        }
         let out = if set_upstream {
-            self.git(&["push", "--set-upstream", "origin", &branch])?
+            self.git_auth(&["push", "--set-upstream", "origin", &branch], auth)?
         } else {
-            self.git(&["push"])?
+            self.git_auth(&["push"], auth)?
         };
         Ok(out.trim().to_string())
     }
 
-    /// Origin URL rewritten to carry the token, when it points at github.com.
-    fn authed_origin_url(&self, token: Option<&str>) -> Option<String> {
-        let token = token?;
-        let url = self.git(&["remote", "get-url", "origin"]).ok()?;
-        let url = url.trim();
-        let rest = url
-            .strip_prefix("https://github.com/")
-            .or_else(|| url.strip_prefix("git@github.com:"))?;
-        Some(format!("https://x-access-token:{token}@github.com/{rest}"))
+    /// Runs a git command, injecting a GitHub token as an HTTP Basic header
+    /// via `-c http.<url>.extraheader` when `auth` is provided. This keeps
+    /// the named remote in use (so tracking refs update) and never writes
+    /// the token to disk or the remote URL.
+    fn git_auth(&self, args: &[&str], auth: Option<&str>) -> Result<String> {
+        match auth {
+            Some(token) if self.origin_is_github() => {
+                use base64::Engine as _;
+                let basic = base64::engine::general_purpose::STANDARD
+                    .encode(format!("x-access-token:{token}"));
+                let header =
+                    format!("http.https://github.com/.extraheader=AUTHORIZATION: basic {basic}");
+                let mut full: Vec<&str> = vec!["-c", &header];
+                full.extend(args);
+                self.git(&full)
+            }
+            _ => self.git(args),
+        }
+    }
+
+    /// Whether `origin` points at github.com over HTTPS (token auth applies).
+    fn origin_is_github(&self) -> bool {
+        self.git(&["remote", "get-url", "origin"])
+            .map(|url| url.trim().starts_with("https://github.com/"))
+            .unwrap_or(false)
     }
 }
 

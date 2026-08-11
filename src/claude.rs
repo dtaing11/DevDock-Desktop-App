@@ -305,20 +305,40 @@ impl Client {
     }
 
     /// Generates a commit message for `diff`.
-    pub fn commit_message(&self, diff: &str) -> Result<CommitSuggestion> {
+    ///
+    /// `extra_instructions` is appended to the system prompt for per-repo
+    /// style customization.
+    pub fn commit_message(
+        &self,
+        diff: &str,
+        extra_instructions: Option<&str>,
+    ) -> Result<CommitSuggestion> {
         if diff.trim().is_empty() {
             return Err(ClaudeError(
                 "No changes to describe. Stage or modify some files first.".into(),
             ));
         }
+        let system = match extra_instructions.filter(|s| !s.trim().is_empty()) {
+            Some(extra) => format!("{SYSTEM_PROMPT}\n\nAdditional instructions:\n{extra}"),
+            None => SYSTEM_PROMPT.to_string(),
+        };
         let truncated = truncate_utf8(diff, MAX_DIFF_CHARS);
         let prompt =
             format!("Write a commit message for this diff:\n\n```diff\n{truncated}\n```");
-        let text = self.request(&prompt, 1024)?;
+        let text = self.request_with_system(&system, &prompt, 1024)?;
         Ok(crate::ollama::parse_suggestion_text(&text))
     }
 
     fn request(&self, prompt: &str, max_tokens: u32) -> Result<String> {
+        self.request_with_system(SYSTEM_PROMPT, prompt, max_tokens)
+    }
+
+    fn request_with_system(
+        &self,
+        system: &str,
+        prompt: &str,
+        max_tokens: u32,
+    ) -> Result<String> {
         #[derive(Deserialize)]
         struct Content {
             text: Option<String>,
@@ -331,7 +351,7 @@ impl Client {
         let payload = serde_json::json!({
             "model": self.model,
             "max_tokens": max_tokens,
-            "system": SYSTEM_PROMPT,
+            "system": system,
             "messages": [{"role": "user", "content": prompt}],
         });
         let mut req = ureq::AgentBuilder::new()

@@ -584,6 +584,9 @@ fn settings(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         shortcut_settings(app, ui, ctx);
 
         ui.separator();
+        repo_prompt_settings(app, ui);
+
+        ui.separator();
         ui.label(RichText::new("AI PROVIDER FOR COMMIT MESSAGES").color(theme::EMBER).small());
         ui.horizontal(|ui| {
             let provider = app.config.ai_provider.clone().unwrap_or_else(|| "ollama".into());
@@ -663,6 +666,51 @@ fn shortcut_settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             );
         }
     });
+}
+
+/// Per-repository custom AI instructions for commit and PR generation.
+///
+/// Stored per worktree path, so each repository can have its own style
+/// rules (ticket prefixes, language, tone, required sections, ...).
+fn repo_prompt_settings(app: &mut App, ui: &mut egui::Ui) {
+    ui.label(RichText::new("CUSTOM AI INSTRUCTIONS (THIS REPOSITORY)").color(theme::EMBER).small());
+
+    let Some(repo) = app.repo.as_ref() else {
+        ui.label(RichText::new("Open a repository to customize its prompts.").color(theme::FG_DIM));
+        return;
+    };
+    let key = repo.path().display().to_string();
+    let prompts = app.config.repo_prompts.entry(key).or_default();
+    let mut changed = false;
+
+    ui.label(RichText::new("Commit messages").color(theme::FG_DIM).small());
+    changed |= ui
+        .add(
+            egui::TextEdit::multiline(&mut prompts.commit)
+                .hint_text("e.g. Prefix the summary with the JIRA ticket from the branch name. Write in present tense.")
+                .desired_rows(2)
+                .desired_width(f32::INFINITY),
+        )
+        .changed();
+
+    ui.label(RichText::new("Pull request title/description").color(theme::FG_DIM).small());
+    changed |= ui
+        .add(
+            egui::TextEdit::multiline(&mut prompts.pull_request)
+                .hint_text("e.g. Include a Testing section listing manual steps. Address reviewers formally.")
+                .desired_rows(2)
+                .desired_width(f32::INFINITY),
+        )
+        .changed();
+
+    if changed {
+        app.config.save();
+    }
+    ui.label(
+        RichText::new("Appended to the AI prompt for this repository only. Saved automatically.")
+            .color(theme::FG_DIM)
+            .small(),
+    );
 }
 
 /// Claude account section inside Settings: OAuth sign-in or API key.

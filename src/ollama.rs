@@ -72,12 +72,24 @@ impl Client {
     }
 
     /// Generates a commit message for `diff` using `model`.
-    pub fn commit_message(&self, model: &str, diff: &str) -> Result<CommitSuggestion> {
+    ///
+    /// `extra_instructions` is appended to the system prompt, letting users
+    /// customize style per repository (e.g. ticket prefixes, language).
+    pub fn commit_message(
+        &self,
+        model: &str,
+        diff: &str,
+        extra_instructions: Option<&str>,
+    ) -> Result<CommitSuggestion> {
         if diff.trim().is_empty() {
             return Err(OllamaError(
                 "No changes to describe. Stage or modify some files first.".into(),
             ));
         }
+        let system = match extra_instructions.filter(|s| !s.trim().is_empty()) {
+            Some(extra) => format!("{SYSTEM_PROMPT}\n\nAdditional instructions:\n{extra}"),
+            None => SYSTEM_PROMPT.to_string(),
+        };
         let prompt = format!(
             "Write a commit message for this diff:\n\n```diff\n{}\n```",
             truncate_utf8(diff, MAX_DIFF_CHARS)
@@ -85,7 +97,7 @@ impl Client {
         let payload = serde_json::json!({
             "model": model,
             "prompt": prompt,
-            "system": SYSTEM_PROMPT,
+            "system": system,
             "stream": false,
             "format": {
                 "type": "object",

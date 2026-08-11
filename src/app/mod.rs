@@ -71,6 +71,20 @@ pub struct Config {
     /// Keyboard shortcuts; missing/invalid entries fall back to defaults.
     #[serde(default)]
     pub shortcuts: shortcuts::Shortcuts,
+    /// Per-repository custom AI instructions, keyed by worktree root path.
+    #[serde(default)]
+    pub repo_prompts: std::collections::HashMap<String, RepoPrompts>,
+}
+
+/// Custom AI prompt additions for one repository.
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub struct RepoPrompts {
+    /// Appended to the system prompt for commit messages.
+    #[serde(default)]
+    pub commit: String,
+    /// Appended to the system prompt for PR title/body generation.
+    #[serde(default)]
+    pub pull_request: String,
 }
 
 /// A provider/model pair chosen for one AI task.
@@ -527,14 +541,28 @@ impl App {
         self.generate_ai(worker::AiTarget::PullRequest, Vec::new());
     }
 
+    /// Custom AI instructions for the current repo and task, if any.
+    fn repo_prompt(&self, target: worker::AiTarget) -> Option<String> {
+        let repo = self.repo.as_ref()?;
+        let prompts = self.config.repo_prompts.get(&repo.path().display().to_string())?;
+        let text = match target {
+            worker::AiTarget::Commit => &prompts.commit,
+            worker::AiTarget::PullRequest => &prompts.pull_request,
+        };
+        let text = text.trim();
+        (!text.is_empty()).then(|| text.to_string())
+    }
+
     /// Shared AI generation path for the commit box and the PR form. Each
-    /// target has its own provider/model selection.
+    /// target has its own provider/model selection and optional per-repo
+    /// custom instructions.
     fn generate_ai(&mut self, target: worker::AiTarget, stage_files: Vec<String>) {
         let Some(repo) = self.repo.clone() else { return };
         let Some(sel) = self.ai_selection(target) else {
             self.toast("No AI model selected. Pick one next to the AI button.", true);
             return;
         };
+        let custom = self.repo_prompt(target);
         self.ai_busy = true;
 
         if sel.provider == "claude" {
@@ -548,7 +576,7 @@ impl App {
                     let diff = strerr(repo.diff_for_ai())?;
                     let client = claude::Client::from_store(model)
                         .ok_or("Claude is not signed in. Open Settings.")?;
-                    strerr(client.commit_message(&diff))
+                    strerr(client.commit_message(&diff, custom.as_deref()))
                 })();
                 Msg::AiSuggestion { target, result }
             });
@@ -564,7 +592,7 @@ impl App {
                     strerr(repo.stage(&stage_files))?;
                 }
                 let diff = strerr(repo.diff_for_ai())?;
-                strerr(ollama::Client::new(url).commit_message(&model, &diff))
+                strerr(ollama::Client::new(url).commit_message(&model, &diff, custom.as_deref()))
             })();
             Msg::AiSuggestion { target, result }
         });

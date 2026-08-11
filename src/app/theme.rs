@@ -1,7 +1,19 @@
-//! Visual identity for Git Manage: deep indigo-slate base with ember/copper
-//! primary accent and teal highlights. Intentionally not a GitHub Desktop look.
+//! Visual identity for DevDock.
+//!
+//! Direction: a "dock at night" instrument panel. Deep indigo base, a single
+//! ember accent spent only on primary actions and the current selection,
+//! teal reserved for remote/informational accents. Everything else stays
+//! quiet: muted text, hairline borders, generous spacing.
+//!
+//! The design system lives here: color tokens, a 4px spacing grid, a type
+//! scale, and shared component constants. Views should consume these
+//! instead of inventing values.
 
-use egui::{Color32, CornerRadius, FontData, FontDefinitions, FontFamily, Stroke, Visuals};
+use egui::{Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Stroke, Visuals};
+
+// ---------------------------------------------------------------------------
+// Color tokens
+// ---------------------------------------------------------------------------
 
 pub const BG: Color32 = Color32::from_rgb(0x0f, 0x12, 0x18);
 pub const PANEL: Color32 = Color32::from_rgb(0x17, 0x1c, 0x26);
@@ -17,7 +29,52 @@ pub const ADD: Color32 = Color32::from_rgb(0x7e, 0xe7, 0x87);
 pub const DEL: Color32 = Color32::from_rgb(0xff, 0x7b, 0x72);
 pub const WARN: Color32 = Color32::from_rgb(0xf0, 0xb4, 0x29);
 
-/// Applies the Git Manage theme to the egui context.
+/// Subtle hover wash (teal at low alpha) used by list rows.
+pub const HOVER_WASH: Color32 = Color32::from_rgba_premultiplied(10, 36, 36, 40);
+/// Selection wash (ember at low alpha) used by selected rows.
+pub const SELECT_WASH: Color32 = Color32::from_rgba_premultiplied(48, 30, 14, 60);
+
+// ---------------------------------------------------------------------------
+// Spacing grid (4px base) and component constants
+// ---------------------------------------------------------------------------
+
+/// Base spacing unit; use multiples of this everywhere.
+pub const UNIT: f32 = 4.0;
+/// Standard control height for small panel buttons.
+pub const CONTROL_SM: f32 = 24.0;
+/// Standard control height for primary inputs/buttons.
+pub const CONTROL_MD: f32 = 30.0;
+/// Toolbar segment height.
+pub const SEGMENT_H: f32 = 48.0;
+/// Corner radius scale.
+pub const RADIUS_SM: u8 = 6;
+pub const RADIUS_MD: u8 = 8;
+pub const RADIUS_LG: u8 = 12;
+
+// ---------------------------------------------------------------------------
+// Type scale
+// ---------------------------------------------------------------------------
+
+/// Section headers inside panels (small caps feel via spacing + color).
+pub fn overline(text: &str) -> egui::RichText {
+    egui::RichText::new(text.to_uppercase())
+        .size(10.0)
+        .color(FG_DIM)
+        .letter_spacing_note()
+}
+
+/// Extension trait workaround: egui has no letter spacing; emulate the
+/// overline style with size + weight only.
+trait OverlineExt {
+    fn letter_spacing_note(self) -> Self;
+}
+impl OverlineExt for egui::RichText {
+    fn letter_spacing_note(self) -> Self {
+        self.strong()
+    }
+}
+
+/// Applies the DevDock theme to the egui context.
 pub fn apply(ctx: &egui::Context) {
     install_fonts(ctx);
     let mut visuals = Visuals::dark();
@@ -29,19 +86,31 @@ pub fn apply(ctx: &egui::Context) {
 
     visuals.override_text_color = Some(FG);
     visuals.window_stroke = Stroke::new(1.0_f32, BORDER);
-    visuals.window_corner_radius = CornerRadius::same(12);
-    visuals.menu_corner_radius = CornerRadius::same(10);
+    visuals.window_corner_radius = CornerRadius::same(RADIUS_LG);
+    visuals.menu_corner_radius = CornerRadius::same(RADIUS_MD);
+    visuals.window_shadow = egui::epaint::Shadow {
+        offset: [0, 8],
+        blur: 24,
+        spread: 0,
+        color: Color32::from_black_alpha(120),
+    };
+    visuals.popup_shadow = egui::epaint::Shadow {
+        offset: [0, 4],
+        blur: 12,
+        spread: 0,
+        color: Color32::from_black_alpha(100),
+    };
 
     visuals.widgets.noninteractive.bg_fill = PANEL;
     visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
     visuals.widgets.inactive.bg_fill = PANEL2;
-    visuals.widgets.inactive.corner_radius = CornerRadius::same(8);
+    visuals.widgets.inactive.corner_radius = CornerRadius::same(RADIUS_MD);
     visuals.widgets.hovered.bg_fill = PANEL2;
     visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, TEAL);
-    visuals.widgets.hovered.corner_radius = CornerRadius::same(8);
+    visuals.widgets.hovered.corner_radius = CornerRadius::same(RADIUS_MD);
     visuals.widgets.active.bg_fill = BORDER;
     visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, EMBER);
-    visuals.widgets.active.corner_radius = CornerRadius::same(8);
+    visuals.widgets.active.corner_radius = CornerRadius::same(RADIUS_MD);
     visuals.widgets.open.bg_fill = PANEL2;
 
     visuals.selection.bg_fill = EMBER_DEEP.linear_multiply(0.35);
@@ -51,8 +120,21 @@ pub fn apply(ctx: &egui::Context) {
     ctx.set_visuals(visuals);
 
     let mut style = (*ctx.style()).clone();
-    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-    style.spacing.button_padding = egui::vec2(12.0, 6.0);
+    // 4px grid: consistent rhythm everywhere.
+    style.spacing.item_spacing = egui::vec2(2.0 * UNIT, 1.5 * UNIT);
+    style.spacing.button_padding = egui::vec2(3.0 * UNIT, 1.5 * UNIT);
+    style.spacing.menu_margin = egui::Margin::same((2.0 * UNIT) as i8);
+    style.spacing.window_margin = egui::Margin::same((4.0 * UNIT) as i8);
+    style.spacing.interact_size = egui::vec2(40.0, CONTROL_SM);
+
+    // Type scale: clear hierarchy between body, small, and headings.
+    use egui::TextStyle::*;
+    style.text_styles.insert(Heading, FontId::proportional(17.0));
+    style.text_styles.insert(Body, FontId::proportional(13.5));
+    style.text_styles.insert(Button, FontId::proportional(13.0));
+    style.text_styles.insert(Small, FontId::proportional(11.0));
+    style.text_styles.insert(Monospace, FontId::monospace(12.5));
+
     ctx.set_style(style);
 }
 
@@ -67,7 +149,6 @@ fn install_fonts(ctx: &egui::Context) {
     fonts.font_data.insert("inter".into(), FontData::from_static(INTER).into());
     fonts.font_data.insert("jetbrains-mono".into(), FontData::from_static(MONO).into());
 
-    // Put our fonts first; egui's built-ins stay as fallback for symbols.
     fonts
         .families
         .entry(FontFamily::Proportional)

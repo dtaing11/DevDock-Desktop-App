@@ -40,18 +40,31 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
 ///
 /// `open` is set to `false` when the user clicks the X; callers translate
 /// that into closing the dialog (plus any cleanup).
+///
+/// The window is constrained to the app viewport: on small windows the
+/// content scrolls inside the dialog instead of overflowing off-screen.
 fn modal(
     ctx: &egui::Context,
     title: &str,
     open: &mut bool,
     add_contents: impl FnOnce(&mut egui::Ui),
 ) {
-    egui::Window::new(RichText::new(title).color(theme::EMBER).strong())
+    let screen = ctx.screen_rect();
+    let max_height = (screen.height() - 60.0).max(200.0);
+    let max_width = (screen.width() - 40.0).max(280.0);
+    egui::Window::new(RichText::new(title).strong())
         .collapsible(false)
         .resizable(false)
         .open(open)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .show(ctx, add_contents);
+        .max_width(max_width)
+        .max_height(max_height)
+        .show(ctx, |ui| {
+            ScrollArea::vertical()
+                .max_height(max_height - 40.0)
+                .auto_shrink([false, true])
+                .show(ui, add_contents);
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -138,7 +151,7 @@ fn repo_picker(app: &mut App, ctx: &egui::Context, open: &mut bool) {
 
         if !app.config.recent_repos.is_empty() {
             ui.separator();
-            ui.label(RichText::new("RECENT").color(theme::EMBER).small());
+            ui.label(theme::overline("RECENT"));
             let recents = app.config.recent_repos.clone();
             for path in recents {
                 if ui.link(&path).clicked() {
@@ -151,7 +164,7 @@ fn repo_picker(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         if app.gh.user.is_some() {
             ui.separator();
             ui.horizontal(|ui| {
-                ui.label(RichText::new("YOUR GITHUB REPOSITORIES").color(theme::EMBER).small());
+                ui.label(theme::overline("YOUR GITHUB REPOSITORIES"));
                 if ui.small_button("Load").clicked() {
                     app.gh_repos_loading = true;
                     app.worker.spawn(|| {
@@ -335,7 +348,7 @@ fn pull_requests(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         });
 
         ui.separator();
-        ui.label(RichText::new("OPEN PULL REQUESTS").color(theme::EMBER).small());
+        ui.label(theme::overline("OPEN PULL REQUESTS"));
         if app.pr.loading {
             ui.label(RichText::new("Loading…").color(theme::FG_DIM));
         } else if app.pr.open_prs.is_empty() {
@@ -598,7 +611,7 @@ fn settings(app: &mut App, ctx: &egui::Context, open: &mut bool) {
 /// Keyboard shortcut editor: click a binding, press the new keys.
 fn shortcut_settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     use crate::app::shortcuts::{self, Action};
-    ui.label(RichText::new("KEYBOARD SHORTCUTS").color(theme::EMBER).small());
+    ui.label(theme::overline("KEYBOARD SHORTCUTS"));
 
     // Capture the next key combo while rebinding.
     if let Some(action) = app.rebinding {
@@ -659,7 +672,7 @@ fn shortcut_settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
 /// rules. Instructions can be typed inline or loaded from a Markdown file
 /// (re-read on every generation, so edits to the file apply immediately).
 fn repo_prompt_settings(app: &mut App, ui: &mut egui::Ui) {
-    ui.label(RichText::new("CUSTOM AI INSTRUCTIONS (THIS REPOSITORY)").color(theme::EMBER).small());
+    ui.label(theme::overline("CUSTOM AI INSTRUCTIONS (THIS REPOSITORY)"));
 
     let Some(repo) = app.repo.as_ref() else {
         ui.label(RichText::new("Open a repository to customize its prompts.").color(theme::FG_DIM));
@@ -818,7 +831,7 @@ fn repo_prompt_settings(app: &mut App, ui: &mut egui::Ui) {
 fn local_ci_panel(app: &mut App, ui: &mut egui::Ui) {
     use crate::local_ci;
     ui.horizontal(|ui| {
-        ui.label(RichText::new("LOCAL CHECKS").color(theme::EMBER).small());
+        ui.label(theme::overline("LOCAL CHECKS"));
         if app.local_ci.jobs.is_empty() {
             if ui
                 .small_button("Create config")
@@ -941,7 +954,7 @@ fn local_ci_panel(app: &mut App, ui: &mut egui::Ui) {
 /// terminal pushes are gated by the same checks as in-app pushes.
 fn hook_settings(app: &mut App, ui: &mut egui::Ui) {
     use crate::local_ci;
-    ui.label(RichText::new("GIT PRE-PUSH HOOK").color(theme::EMBER).small());
+    ui.label(theme::overline("GIT PRE-PUSH HOOK"));
     let Some(repo) = app.repo.as_ref() else {
         ui.label(RichText::new("Open a repository first.").color(theme::FG_DIM));
         return;
@@ -979,7 +992,7 @@ fn hook_settings(app: &mut App, ui: &mut egui::Ui) {
 /// Claude account section inside Settings: OAuth sign-in or API key.
 fn claude_settings(app: &mut App, ui: &mut egui::Ui) {
     use crate::claude;
-    ui.label(RichText::new("CLAUDE ACCOUNT").color(theme::EMBER).small());
+    ui.label(theme::overline("CLAUDE ACCOUNT"));
 
     if let Some(label) = app.claude.auth_label {
         ui.horizontal(|ui| {

@@ -16,22 +16,42 @@ use egui::{Color32, FontId, RichText, ScrollArea, TextFormat};
 fn segment_text(caption: &str, value: &str) -> LayoutJob {
     let mut job = LayoutJob::default();
     job.append(
-        caption,
+        &caption.to_uppercase(),
         0.0,
-        TextFormat { font_id: FontId::proportional(10.0), color: theme::FG_DIM, ..Default::default() },
+        TextFormat { font_id: FontId::proportional(9.5), color: theme::FG_DIM, ..Default::default() },
     );
     job.append(
         &format!("\n{value}"),
         0.0,
-        TextFormat { font_id: FontId::proportional(14.0), color: theme::FG, ..Default::default() },
+        TextFormat { font_id: FontId::proportional(14.5), color: theme::FG, ..Default::default() },
     );
     job
 }
 
+/// Uniform width for all toolbar segments.
+const SEGMENT_W: f32 = 190.0;
+
+/// Menu-style toolbar segment: same size as `segment`, opens a dropdown.
+fn segment_menu<R>(
+    ui: &mut egui::Ui,
+    caption: &str,
+    value: &str,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<Option<R>> {
+    ui.scope(|ui| {
+        ui.spacing_mut().interact_size = egui::vec2(SEGMENT_W, theme::SEGMENT_H);
+        ui.spacing_mut().button_padding = egui::vec2(12.0, 6.0);
+        ui.menu_button(segment_text(caption, value), add_contents)
+    })
+    .inner
+}
+
 fn segment(ui: &mut egui::Ui, caption: &str, value: &str, min_width: f32) -> egui::Response {
     let button = egui::Button::new(segment_text(caption, value))
-        .min_size(egui::vec2(min_width, 46.0))
-        .fill(theme::PANEL);
+        .min_size(egui::vec2(min_width, theme::SEGMENT_H))
+        .fill(theme::PANEL)
+        .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+        .corner_radius(theme::RADIUS_MD as f32);
     ui.add(button)
 }
 
@@ -90,9 +110,9 @@ fn repo_menu(app: &mut App, ui: &mut egui::Ui) {
         .map(|r| r.name())
         .unwrap_or_else(|| "Choose…".into());
 
-    ui.menu_button(segment_text("CURRENT REPOSITORY", &repo_name), |ui| {
+    segment_menu(ui, "CURRENT REPOSITORY", &repo_name, |ui| {
         ui.set_min_width(320.0);
-        ui.label(RichText::new("RECENT REPOSITORIES").color(theme::EMBER).small());
+        ui.label(theme::overline("RECENT REPOSITORIES"));
 
         let current_path = app.repo.as_ref().map(|r| r.path().display().to_string());
         let recents = app.config.recent_repos.clone();
@@ -172,10 +192,10 @@ fn checks_badge(app: &mut App, ui: &mut egui::Ui) {
         CheckState::Pending => ("RUNNING", theme::WARN),
         CheckState::None => unreachable!(),
     };
-    let text = format!("CI {symbol} ({}/{})", summary.passed, summary.total);
-    let label = RichText::new(text).color(color).small();
+    let text = format!("{symbol} ({}/{})", summary.passed, summary.total);
+    let _ = color; // status color shown inside the dropdown rows
 
-    ui.menu_button(label, |ui| {
+    segment_menu(ui, "CI STATUS", &text, |ui| {
         ui.set_min_width(340.0);
         ui.label(
             RichText::new(format!(
@@ -231,7 +251,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
         .map(|s| s.branch.clone())
         .unwrap_or_else(|| "—".into());
 
-    let response = ui.menu_button(segment_text("CURRENT BRANCH", &current), |ui| {
+    let response = segment_menu(ui, "CURRENT BRANCH", &current, |ui| {
         ui.set_min_width(320.0);
 
         // New branch
@@ -287,10 +307,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
                 .inner_margin(egui::Margin::symmetric(8, 4))
                 .show(ui, |ui| {
                     ui.label(
-                        RichText::new(format!("LOCAL BRANCHES ({})", local_matches.len()))
-                            .color(theme::EMBER)
-                            .small()
-                            .strong(),
+                        theme::overline(&format!("Local branches ({})", local_matches.len())),
                     );
                 });
             if local_matches.is_empty() {
@@ -322,10 +339,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
                 .inner_margin(egui::Margin::symmetric(8, 4))
                 .show(ui, |ui| {
                     ui.label(
-                        RichText::new(format!("REMOTE BRANCHES ({})", remote_matches.len()))
-                            .color(theme::TEAL)
-                            .small()
-                            .strong(),
+                        theme::overline(&format!("Remote branches ({})", remote_matches.len())).color(theme::TEAL),
                     );
                 });
             if remote_matches.is_empty() {
@@ -576,7 +590,7 @@ fn sync_segment(app: &mut App, ui: &mut egui::Ui) {
                 app.local_ci.finished(),
                 app.local_ci.jobs.len()
             ),
-            170.0,
+            SEGMENT_W,
         )
         .on_hover_text("Running local checks before push. See the Checks tab.");
         return;
@@ -605,7 +619,7 @@ fn sync_segment(app: &mut App, ui: &mut egui::Ui) {
         ("REMOTE", "Fetch origin".to_string(), "fetch")
     };
 
-    let response = segment(ui, caption, &value, 170.0)
+    let response = segment(ui, caption, &value, SEGMENT_W)
         .on_hover_text("Right-click for all sync actions");
     response.context_menu(|ui| {
         if ui.button("Fetch").clicked() {
@@ -1025,7 +1039,7 @@ pub fn clear_diff_view(app: &mut App) {
 }
 
 fn commit_box(app: &mut App, ui: &mut egui::Ui) {
-    ui.label(RichText::new("COMMIT").color(theme::EMBER).small());
+    ui.label(theme::overline("COMMIT"));
     ui.add(
         egui::TextEdit::singleline(&mut app.commit_summary)
             .hint_text(dim_hint("Summary (required)"))
@@ -1146,7 +1160,7 @@ pub fn ai_model_picker(app: &mut App, ui: &mut egui::Ui, target: crate::app::wor
 
     egui::ComboBox::from_id_salt(salt).selected_text(selected).show_ui(ui, |ui| {
         // Ollama section
-        ui.label(RichText::new("OLLAMA (LOCAL)").color(theme::EMBER).small());
+        ui.label(theme::overline("OLLAMA (LOCAL)"));
         if app.ollama_models.is_empty() {
             ui.label(
                 RichText::new("No models. Is Ollama running? (Settings)").color(theme::FG_DIM),
@@ -1167,7 +1181,7 @@ pub fn ai_model_picker(app: &mut App, ui: &mut egui::Ui, target: crate::app::wor
 
         // Claude section
         ui.separator();
-        ui.label(RichText::new("CLAUDE").color(theme::EMBER).small());
+        ui.label(theme::overline("CLAUDE"));
         if app.claude.auth_label.is_none() {
             ui.label(RichText::new("Not signed in (Settings)").color(theme::FG_DIM));
         } else {
@@ -1193,10 +1207,10 @@ pub fn ai_model_picker(app: &mut App, ui: &mut egui::Ui, target: crate::app::wor
 
 /// Uniform small control button for panel toolbars (consistent height).
 pub fn panel_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
-    let h = 24.0;
     ui.add_enabled(
         enabled,
-        egui::Button::new(RichText::new(label).small()).min_size(egui::vec2(0.0, h)),
+        egui::Button::new(RichText::new(label).small())
+            .min_size(egui::vec2(0.0, theme::CONTROL_SM)),
     )
 }
 
@@ -1246,7 +1260,7 @@ fn checks_tab(app: &mut App, ui: &mut egui::Ui) {
     // Current run (live)
     if app.local_ci.running || app.local_ci.results.iter().any(|r| r.is_some()) {
         ui.separator();
-        ui.label(RichText::new("CURRENT RUN").color(theme::EMBER).small());
+        ui.label(theme::overline("CURRENT RUN"));
         let jobs = app.local_ci.jobs.clone();
         for (i, job) in jobs.iter().enumerate() {
             ui.horizontal(|ui| {
@@ -1273,7 +1287,7 @@ fn checks_tab(app: &mut App, ui: &mut egui::Ui) {
 
     // History
     ui.separator();
-    ui.label(RichText::new("RUN HISTORY").color(theme::EMBER).small());
+    ui.label(theme::overline("RUN HISTORY"));
     if app.local_ci.history.is_empty() {
         ui.label(RichText::new("No runs yet in this session.").color(theme::FG_DIM).small());
         return;
@@ -1442,7 +1456,7 @@ pub fn diff_panel(app: &mut App, ctx: &egui::Context) {
                         } else {
                             &app.diff_title
                         };
-                        ui.label(RichText::new(title).color(theme::EMBER).strong());
+                        ui.label(RichText::new(title).strong());
                         // File-level controls only when a working file is selected.
                         if app.selected_file.is_some() {
                             ui.with_layout(

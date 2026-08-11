@@ -153,7 +153,8 @@ fn repo_menu(app: &mut App, ui: &mut egui::Ui) {
     .on_hover_text("Switch repository");
 }
 
-/// Small CI status badge for the current branch (GitHub Actions check runs).
+/// CI status badge for the current branch, with a dropdown listing every
+/// check run (failures first). Clicking a run opens its page on GitHub.
 fn checks_badge(app: &mut App, ui: &mut egui::Ui) {
     use crate::github::CheckState;
     let Some(summary) = app.branch_checks.clone() else { return };
@@ -167,24 +168,55 @@ fn checks_badge(app: &mut App, ui: &mut egui::Ui) {
         CheckState::None => unreachable!(),
     };
     let text = format!("CI {symbol} ({}/{})", summary.passed, summary.total);
-    let badge = egui::Button::new(RichText::new(text).color(color).small())
-        .fill(theme::PANEL)
-        .min_size(egui::vec2(0.0, 46.0));
-    let hover = format!(
-        "GitHub Actions: {} passed, {} failed, {} running",
-        summary.passed, summary.failed, summary.pending
-    );
-    if ui.add(badge).on_hover_text(hover).clicked() {
-        // Open the branch's checks page on GitHub.
-        if let (Some(repo), Some(status)) = (app.repo.as_ref(), app.status.as_ref()) {
-            if let Some(slug) = origin_slug(repo) {
-                let _ = open::that(format!(
-                    "https://github.com/{}/{}/actions?query=branch%3A{}",
-                    slug.owner, slug.repo, status.branch
-                ));
+    let label = RichText::new(text).color(color).small();
+
+    ui.menu_button(label, |ui| {
+        ui.set_min_width(340.0);
+        ui.label(
+            RichText::new(format!(
+                "{} passed, {} failed, {} running",
+                summary.passed, summary.failed, summary.pending
+            ))
+            .color(theme::FG_DIM)
+            .small(),
+        );
+        ui.separator();
+        for run in &summary.runs {
+            let (glyph, run_color) = match (run.status.as_str(), run.conclusion.as_str()) {
+                ("completed", "success" | "neutral" | "skipped") => ("[pass]", theme::ADD),
+                ("completed", _) => ("[fail]", theme::DANGER),
+                _ => ("[running]", theme::WARN),
+            };
+            let detail = if run.status == "completed" {
+                run.conclusion.clone()
+            } else {
+                run.status.replace('_', " ")
+            };
+            let row = RichText::new(format!("{glyph} {} ({detail})", run.name)).color(run_color);
+            if ui
+                .button(row)
+                .on_hover_text("Open this check run on GitHub")
+                .clicked()
+            {
+                if !run.html_url.is_empty() {
+                    let _ = open::that(&run.html_url);
+                }
+                ui.close_menu();
             }
         }
-    }
+        ui.separator();
+        if ui.button("Open all checks on GitHub").clicked() {
+            if let (Some(repo), Some(status)) = (app.repo.as_ref(), app.status.as_ref()) {
+                if let Some(slug) = origin_slug(repo) {
+                    let _ = open::that(format!(
+                        "https://github.com/{}/{}/actions?query=branch%3A{}",
+                        slug.owner, slug.repo, status.branch
+                    ));
+                }
+            }
+            ui.close_menu();
+        }
+    });
 }
 
 fn branch_menu(app: &mut App, ui: &mut egui::Ui) {

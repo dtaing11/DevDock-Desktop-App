@@ -220,6 +220,20 @@ pub struct ChecksSummary {
     pub passed: u32,
     pub failed: u32,
     pub pending: u32,
+    /// Individual check runs, failures first.
+    pub runs: Vec<CheckRun>,
+}
+
+/// One CI check run (e.g. a GitHub Actions job).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CheckRun {
+    pub name: String,
+    /// `queued`, `in_progress`, or `completed`.
+    pub status: String,
+    /// `success`, `failure`, `cancelled`, ... (empty while running).
+    pub conclusion: String,
+    /// Link to the run's page on GitHub.
+    pub html_url: String,
 }
 
 /// A repository visible to the signed-in user (for the clone picker).
@@ -310,12 +324,32 @@ impl Client {
             .cloned()
             .unwrap_or_default();
 
-        let mut summary =
-            ChecksSummary { state: CheckState::None, total: 0, passed: 0, failed: 0, pending: 0 };
+        let mut summary = ChecksSummary {
+            state: CheckState::None,
+            total: 0,
+            passed: 0,
+            failed: 0,
+            pending: 0,
+            runs: Vec::new(),
+        };
         for run in &runs {
             summary.total += 1;
             let status = run.get("status").and_then(|s| s.as_str()).unwrap_or("");
             let conclusion = run.get("conclusion").and_then(|c| c.as_str()).unwrap_or("");
+            summary.runs.push(CheckRun {
+                name: run
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("(unnamed check)")
+                    .to_string(),
+                status: status.to_string(),
+                conclusion: conclusion.to_string(),
+                html_url: run
+                    .get("html_url")
+                    .and_then(|u| u.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            });
             if status != "completed" {
                 summary.pending += 1;
             } else {
@@ -325,6 +359,12 @@ impl Client {
                 }
             }
         }
+        // Failures first, then running, then passed, for scannability.
+        summary.runs.sort_by_key(|r| match (r.status.as_str(), r.conclusion.as_str()) {
+            ("completed", "success" | "neutral" | "skipped") => 2,
+            ("completed", _) => 0,
+            _ => 1,
+        });
         summary.state = if summary.total == 0 {
             CheckState::None
         } else if summary.failed > 0 {

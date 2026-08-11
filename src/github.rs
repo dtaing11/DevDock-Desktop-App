@@ -56,7 +56,8 @@ fn read_json(resp: std::result::Result<ureq::Response, ureq::Error>) -> Result<s
 // Token storage
 // ---------------------------------------------------------------------------
 
-/// Persists the OAuth/PAT token at `~/.config/git-manage/auth.json` (mode 600).
+/// Persists the OAuth/PAT token at `~/.config/git-manage/auth.json`,
+/// AES-256-GCM encrypted with a key held in the OS keychain.
 pub struct TokenStore;
 
 impl TokenStore {
@@ -67,25 +68,15 @@ impl TokenStore {
             .join("auth.json")
     }
 
-    /// Saves the token, creating the config directory if needed.
+    /// Saves the token, encrypted at rest (see [`crate::secure_store`]).
     pub fn save(token: &str) -> Result<()> {
-        let path = Self::path();
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| GhError(e.to_string()))?;
-        }
         let json = serde_json::json!({ "token": token }).to_string();
-        std::fs::write(&path, json).map_err(|e| GhError(e.to_string()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
-        Ok(())
+        crate::secure_store::write(&Self::path(), &json).map_err(|e| GhError(e.to_string()))
     }
 
     /// Loads the stored token, if any.
     pub fn load() -> Option<String> {
-        let data = std::fs::read_to_string(Self::path()).ok()?;
+        let data = crate::secure_store::read(&Self::path())?;
         serde_json::from_str::<serde_json::Value>(&data)
             .ok()?
             .get("token")?
@@ -95,11 +86,7 @@ impl TokenStore {
 
     /// Deletes the stored token.
     pub fn clear() -> Result<()> {
-        let path = Self::path();
-        if path.exists() {
-            std::fs::remove_file(path).map_err(|e| GhError(e.to_string()))?;
-        }
-        Ok(())
+        crate::secure_store::remove(&Self::path()).map_err(|e| GhError(e.to_string()))
     }
 }
 

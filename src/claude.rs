@@ -61,7 +61,8 @@ pub struct OAuthTokens {
     pub expires_at: u64,
 }
 
-/// Persists credentials at `~/.config/git-manage/claude.json` (mode 600).
+/// Persists credentials at `~/.config/git-manage/claude.json`,
+/// AES-256-GCM encrypted with a key held in the OS keychain.
 pub struct CredentialStore;
 
 impl CredentialStore {
@@ -73,33 +74,19 @@ impl CredentialStore {
     }
 
     pub fn load() -> Credentials {
-        std::fs::read_to_string(Self::path())
-            .ok()
+        crate::secure_store::read(&Self::path())
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
     }
 
     pub fn save(creds: &Credentials) -> Result<()> {
-        let path = Self::path();
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| ClaudeError(e.to_string()))?;
-        }
         let json = serde_json::to_string(creds).map_err(|e| ClaudeError(e.to_string()))?;
-        std::fs::write(&path, json).map_err(|e| ClaudeError(e.to_string()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
-        Ok(())
+        crate::secure_store::write(&Self::path(), &json)
+            .map_err(|e| ClaudeError(e.to_string()))
     }
 
     pub fn clear() -> Result<()> {
-        let path = Self::path();
-        if path.exists() {
-            std::fs::remove_file(path).map_err(|e| ClaudeError(e.to_string()))?;
-        }
-        Ok(())
+        crate::secure_store::remove(&Self::path()).map_err(|e| ClaudeError(e.to_string()))
     }
 }
 

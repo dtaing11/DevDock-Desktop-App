@@ -16,3 +16,4 @@ pub mod git;
 pub mod github;
 pub mod local_ci;
 pub mod ollama;
+pub mod secure_store;

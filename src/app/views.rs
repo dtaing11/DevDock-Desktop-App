@@ -803,6 +803,46 @@ fn status_glyph(status: Option<FileStatus>, conflicted: bool) -> (&'static str, 
     }
 }
 
+/// Shortens a path to fit `max_chars`, keeping the most informative parts:
+/// the filename always survives, then as many trailing directories as fit,
+/// with the front elided: `…/src/app/document.rs`.
+fn elide_path(path: &str, max_chars: usize) -> String {
+    if path.chars().count() <= max_chars {
+        return path.to_string();
+    }
+    let parts: Vec<&str> = path.split('/').collect();
+    let file = parts.last().copied().unwrap_or(path);
+
+    // Even the filename alone is too long: keep its end (extension matters).
+    let file_len = file.chars().count();
+    if file_len + 2 >= max_chars {
+        let keep = max_chars.saturating_sub(1).max(1);
+        let tail: String = file
+            .chars()
+            .rev()
+            .take(keep)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        return format!("…{tail}");
+    }
+
+    // Add trailing directories while they fit.
+    let mut kept: Vec<&str> = vec![file];
+    let mut used = file_len + 2; // "…/" prefix
+    for dir in parts.iter().rev().skip(1) {
+        let cost = dir.chars().count() + 1; // "/"
+        if used + cost > max_chars {
+            break;
+        }
+        kept.push(dir);
+        used += cost;
+    }
+    kept.reverse();
+    format!("…/{}", kept.join("/"))
+}
+
 fn changes_tab(app: &mut App, ui: &mut egui::Ui) {
     let files = app.status.as_ref().map(|s| s.files.clone()).unwrap_or_default();
 
@@ -840,14 +880,23 @@ fn changes_tab(app: &mut App, ui: &mut egui::Ui) {
                     );
                     ui.label(RichText::new(glyph).color(color).strong().monospace());
                     let selected = app.selected_file.as_deref() == Some(&file.path);
-                    let display = file
+                    // Fit the path to the panel: measure remaining width and
+                    // convert to a character budget using the mono advance.
+                    let char_width = ui.fonts(|f| {
+                        f.glyph_width(&egui::TextStyle::Body.resolve(ui.style()), '0')
+                    });
+                    let reserved = 30.0; // discard button on the right
+                    let max_chars =
+                        ((ui.available_width() - reserved) / char_width).max(8.0) as usize;
+                    let full = file
                         .orig_path
                         .as_ref()
                         .map(|o| format!("{o} → {}", file.path))
                         .unwrap_or_else(|| file.path.clone());
+                    let display = elide_path(&full, max_chars);
                     if ui
                         .selectable_label(selected, RichText::new(display))
-                        .on_hover_text(&file.path)
+                        .on_hover_text(&full)
                         .clicked()
                     {
                         if selected {
@@ -1543,4 +1592,42 @@ pub fn toasts(app: &mut App, ctx: &egui::Context) {
                     ui.label(RichText::new(&toast.text).color(color));
                 });
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::elide_path;
+
+    #[test]
+    fn short_paths_untouched() {
+        assert_eq!(elide_path("src/main.rs", 40), "src/main.rs");
+    }
+
+    #[test]
+    fn long_paths_keep_tail_directories() {
+        let p = "very/long/nested/directory/structure/src/document.rs";
+        let e = elide_path(p, 25);
+        assert!(e.starts_with("…/"), "{e}");
+        assert!(e.ends_with("document.rs"), "{e}");
+        assert!(e.chars().count() <= 25, "{e} = {} chars", e.chars().count());
+        assert!(e.contains("src/"), "should keep closest dir: {e}");
+    }
+
+    #[test]
+    fn very_long_filename_keeps_extension_end() {
+        let p = "a/really_extremely_unreasonably_long_file_name_indeed.rs";
+        let e = elide_path(p, 20);
+        assert!(e.starts_with('…'), "{e}");
+        assert!(e.ends_with(".rs"), "{e}");
+        assert!(e.chars().count() <= 20, "{e}");
+    }
+
+    #[test]
+    fn budget_growth_adds_more_directories() {
+        let p = "one/two/three/four/five/file.rs";
+        let narrow = elide_path(p, 14);
+        let wide = elide_path(p, 28);
+        assert!(narrow.chars().count() < wide.chars().count());
+        assert!(wide.contains("four/five"), "{wide}");
+    }
 }

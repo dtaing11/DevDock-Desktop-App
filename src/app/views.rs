@@ -48,6 +48,7 @@ pub fn toolbar(app: &mut App, ctx: &egui::Context) {
 
                 // 2. Current branch (menu)
                 branch_menu(app, ui);
+                checks_badge(app, ui);
 
                 // 3. Context-aware sync action
                 sync_segment(app, ui);
@@ -150,6 +151,40 @@ fn repo_menu(app: &mut App, ui: &mut egui::Ui) {
     })
     .response
     .on_hover_text("Switch repository");
+}
+
+/// Small CI status badge for the current branch (GitHub Actions check runs).
+fn checks_badge(app: &mut App, ui: &mut egui::Ui) {
+    use crate::github::CheckState;
+    let Some(summary) = app.branch_checks.clone() else { return };
+    if summary.state == CheckState::None {
+        return;
+    }
+    let (symbol, color) = match summary.state {
+        CheckState::Passing => ("OK", theme::ADD),
+        CheckState::Failing => ("FAIL", theme::DANGER),
+        CheckState::Pending => ("RUNNING", theme::WARN),
+        CheckState::None => unreachable!(),
+    };
+    let text = format!("CI {symbol} ({}/{})", summary.passed, summary.total);
+    let badge = egui::Button::new(RichText::new(text).color(color).small())
+        .fill(theme::PANEL)
+        .min_size(egui::vec2(0.0, 46.0));
+    let hover = format!(
+        "GitHub Actions: {} passed, {} failed, {} running",
+        summary.passed, summary.failed, summary.pending
+    );
+    if ui.add(badge).on_hover_text(hover).clicked() {
+        // Open the branch's checks page on GitHub.
+        if let (Some(repo), Some(status)) = (app.repo.as_ref(), app.status.as_ref()) {
+            if let Some(slug) = origin_slug(repo) {
+                let _ = open::that(format!(
+                    "https://github.com/{}/{}/actions?query=branch%3A{}",
+                    slug.owner, slug.repo, status.branch
+                ));
+            }
+        }
+    }
 }
 
 fn branch_menu(app: &mut App, ui: &mut egui::Ui) {

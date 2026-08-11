@@ -297,12 +297,29 @@ fn pull_requests(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         let prs = app.pr.open_prs.clone();
         ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
             for pr in &prs {
-                if ui
-                    .link(format!("#{} {}  ({} → {})", pr.number, pr.title, pr.head, pr.base))
-                    .clicked()
-                {
-                    let _ = open::that(&pr.html_url);
-                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .link(format!("#{} {}  ({} → {})", pr.number, pr.title, pr.head, pr.base))
+                        .clicked()
+                    {
+                        let _ = open::that(&pr.html_url);
+                    }
+                    if let Some(checks) = app.pr.checks.get(&pr.number) {
+                        use crate::github::CheckState;
+                        let (label, color) = match checks.state {
+                            CheckState::Passing => ("[CI passing]", theme::ADD),
+                            CheckState::Failing => ("[CI failing]", theme::DANGER),
+                            CheckState::Pending => ("[CI running]", theme::WARN),
+                            CheckState::None => ("[no CI]", theme::FG_DIM),
+                        };
+                        ui.label(RichText::new(label).color(color).small()).on_hover_text(
+                            format!(
+                                "{} passed, {} failed, {} running",
+                                checks.passed, checks.failed, checks.pending
+                            ),
+                        );
+                    }
+                });
             }
         });
     });

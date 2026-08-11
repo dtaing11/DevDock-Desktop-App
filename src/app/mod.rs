@@ -136,6 +136,8 @@ pub struct PrState {
     pub head: String,
     pub base: String,
     pub open_prs: Vec<github::PullRequest>,
+    /// CI check summaries keyed by PR number.
+    pub checks: std::collections::HashMap<u64, github::ChecksSummary>,
     pub loading: bool,
     pub creating: bool,
 }
@@ -161,6 +163,9 @@ pub struct App {
     pub branches: Option<BranchList>,
     pub log: Vec<Commit>,
     pub last_refresh: Instant,
+    /// CI checks for the current branch head, refreshed with status.
+    pub branch_checks: Option<github::ChecksSummary>,
+    last_checks_refresh: Option<Instant>,
 
     // sidebar
     pub tab: Tab,
@@ -214,6 +219,8 @@ impl App {
             branches: None,
             log: Vec::new(),
             last_refresh: Instant::now(),
+            branch_checks: None,
+            last_checks_refresh: None,
             tab: Tab::Changes,
             checked: Default::default(),
             unchecked: Default::default(),
@@ -291,6 +298,40 @@ impl App {
         if self.tab == Tab::History {
             self.worker.spawn(move || Msg::Log(strerr(repo.log(200, None))));
         }
+        self.refresh_branch_checks();
+    }
+
+    /// Fetches CI check status for the current branch head from GitHub,
+    /// throttled to once every 30 seconds.
+    fn refresh_branch_checks(&mut self) {
+        if self.gh.user.is_none() {
+            return;
+        }
+        let throttled = self
+            .last_checks_refresh
+            .map(|t| t.elapsed() < Duration::from_secs(30))
+            .unwrap_or(false);
+        if throttled {
+            return;
+        }
+        let Some(repo) = self.repo.clone() else { return };
+        let Some(branch) = self.status.as_ref().map(|s| s.branch.clone()) else { return };
+        if branch.starts_with('(') {
+            return; // detached / no commits
+        }
+        self.last_checks_refresh = Some(Instant::now());
+        self.worker.spawn(move || {
+            let result = (|| -> Option<(String, github::ChecksSummary)> {
+                let client = github::Client::from_store()?;
+                let slug = views::origin_slug(&repo)?;
+                let summary = client.checks(&slug, &branch).ok()?;
+                Some((branch, summary))
+            })();
+            match result {
+                Some((branch, summary)) => Msg::GhBranchChecks { branch, summary },
+                None => Msg::Noop,
+            }
+        });
     }
 
     /// Files that will be included in the next commit.
@@ -456,7 +497,26 @@ impl App {
             Msg::GhPrs(result) => {
                 self.pr.loading = false;
                 match result {
-                    Ok(prs) => self.pr.open_prs = prs,
+                    Ok(prs) => {
+                        // Kick off a checks lookup per PR.
+                        if let Some(repo) = self.repo.clone() {
+                            for pr in &prs {
+                                let sha = pr.head_sha.clone();
+                                let number = pr.number;
+                                let repo = repo.clone();
+                                self.worker.spawn(move || {
+                                    let summary = github::Client::from_store()
+                                        .zip(views::origin_slug(&repo))
+                                        .and_then(|(c, slug)| c.checks(&slug, &sha).ok());
+                                    match summary {
+                                        Some(summary) => Msg::GhPrChecks { number, summary },
+                                        None => Msg::Noop,
+                                    }
+                                });
+                            }
+                        }
+                        self.pr.open_prs = prs;
+                    }
                     Err(e) => self.toast(e, true),
                 }
             }
@@ -471,6 +531,18 @@ impl App {
                     Err(e) => self.toast(e, true),
                 }
             }
+
+            Msg::GhBranchChecks { branch, summary } => {
+                let current = self.status.as_ref().map(|s| s.branch.as_str());
+                if current == Some(branch.as_str()) {
+                    self.branch_checks = Some(summary);
+                }
+            }
+            Msg::GhPrChecks { number, summary } => {
+                self.pr.checks.insert(number, summary);
+            }
+
+            Msg::Noop => {}
 
             Msg::OllamaModels(Ok(models)) => {
                 if self.config.ollama_model.is_none() {

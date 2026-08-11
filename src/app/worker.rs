@@ -6,7 +6,7 @@
 //! network operations.
 
 use crate::git::{Branch, BranchList, Commit, ConflictFile, OpOutcome, Status};
-use crate::github::{DeviceCode, PullRequest, User};
+use crate::github::{ChecksSummary, DeviceCode, PullRequest, User};
 use crate::ollama::{CommitSuggestion, Model};
 use std::sync::mpsc::{Receiver, Sender};
 
@@ -29,9 +29,16 @@ pub enum Msg {
     GhUser(Option<User>),
     GhPrs(Result<Vec<PullRequest>, String>),
     GhPrCreated(Result<PullRequest, String>),
+    /// CI checks for the current branch's head (branch name, summary).
+    GhBranchChecks { branch: String, summary: ChecksSummary },
+    /// CI checks for one PR head SHA.
+    GhPrChecks { number: u64, summary: ChecksSummary },
 
     OllamaModels(Result<Vec<Model>, String>),
     OllamaSuggestion(Result<CommitSuggestion, String>),
+
+    /// Background task finished with nothing to report.
+    Noop,
 }
 
 /// Handle for spawning background tasks that report back as [`Msg`]s.

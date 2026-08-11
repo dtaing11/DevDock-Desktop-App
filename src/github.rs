@@ -179,10 +179,47 @@ pub struct PullRequest {
     pub state: String,
     /// Source branch.
     pub head: String,
+    /// SHA of the head commit (used for CI check lookups).
+    pub head_sha: String,
     /// Target branch.
     pub base: String,
     /// Author login.
     pub user: String,
+}
+
+/// Aggregated CI (GitHub Actions / checks) state for one commit.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckState {
+    /// All check runs finished successfully.
+    Passing,
+    /// At least one check run failed or was cancelled/timed out.
+    Failing,
+    /// Check runs exist but some are still queued or running.
+    Pending,
+    /// No check runs reported for this commit.
+    None,
+}
+
+impl CheckState {
+    /// Short human-readable label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Passing => "checks passing",
+            Self::Failing => "checks failing",
+            Self::Pending => "checks running",
+            Self::None => "no checks",
+        }
+    }
+}
+
+/// Summary of the check runs on a commit.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChecksSummary {
+    pub state: CheckState,
+    pub total: u32,
+    pub passed: u32,
+    pub failed: u32,
+    pub pending: u32,
 }
 
 /// `owner/repo` pair identifying a GitHub repository.
@@ -250,6 +287,48 @@ impl Client {
         parse_pull_request(&value).ok_or_else(|| GhError("Unexpected PR response".into()))
     }
 
+    /// Summarizes GitHub Actions / check-run results for a commit or branch.
+    ///
+    /// `git_ref` may be a SHA, branch name, or tag.
+    pub fn checks(&self, slug: &RepoSlug, git_ref: &str) -> Result<ChecksSummary> {
+        let path = format!(
+            "/repos/{}/{}/commits/{}/check-runs?per_page=100",
+            slug.owner, slug.repo, git_ref
+        );
+        let value = self.get(&path)?;
+        let runs = value
+            .get("check_runs")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let mut summary =
+            ChecksSummary { state: CheckState::None, total: 0, passed: 0, failed: 0, pending: 0 };
+        for run in &runs {
+            summary.total += 1;
+            let status = run.get("status").and_then(|s| s.as_str()).unwrap_or("");
+            let conclusion = run.get("conclusion").and_then(|c| c.as_str()).unwrap_or("");
+            if status != "completed" {
+                summary.pending += 1;
+            } else {
+                match conclusion {
+                    "success" | "neutral" | "skipped" => summary.passed += 1,
+                    _ => summary.failed += 1,
+                }
+            }
+        }
+        summary.state = if summary.total == 0 {
+            CheckState::None
+        } else if summary.failed > 0 {
+            CheckState::Failing
+        } else if summary.pending > 0 {
+            CheckState::Pending
+        } else {
+            CheckState::Passing
+        };
+        Ok(summary)
+    }
+
     fn get(&self, path: &str) -> Result<serde_json::Value> {
         let resp = agent()
             .get(&format!("{API_BASE}{path}"))
@@ -276,6 +355,7 @@ fn parse_pull_request(value: &serde_json::Value) -> Option<PullRequest> {
         html_url: value.get("html_url")?.as_str()?.to_string(),
         state: value.get("state")?.as_str()?.to_string(),
         head: value.pointer("/head/ref")?.as_str()?.to_string(),
+        head_sha: value.pointer("/head/sha")?.as_str()?.to_string(),
         base: value.pointer("/base/ref")?.as_str()?.to_string(),
         user: value.pointer("/user/login")?.as_str()?.to_string(),
     })

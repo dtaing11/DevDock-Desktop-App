@@ -10,6 +10,7 @@
 //! back through [`worker::Msg`], keeping the UI responsive.
 
 pub mod dialogs;
+pub mod shortcuts;
 pub mod theme;
 pub mod views;
 pub mod worker;
@@ -67,6 +68,9 @@ pub struct Config {
     pub commit_ai: Option<AiSelection>,
     /// Model used for PR title/body (may be a stronger model).
     pub pr_ai: Option<AiSelection>,
+    /// Keyboard shortcuts; missing/invalid entries fall back to defaults.
+    #[serde(default)]
+    pub shortcuts: shortcuts::Shortcuts,
 }
 
 /// A provider/model pair chosen for one AI task.
@@ -259,6 +263,8 @@ pub struct App {
     // feedback
     pub toast: Option<Toast>,
     pub busy: bool,
+    /// Action currently being rebound in Settings, if any.
+    pub rebinding: Option<shortcuts::Action>,
 }
 
 impl App {
@@ -317,6 +323,7 @@ impl App {
             ollama_models: Vec::new(),
             toast: None,
             busy: false,
+            rebinding: None,
         };
         app.startup();
         app.claude.auth_label = claude::Client::auth_label();
@@ -799,36 +806,33 @@ impl App {
         self.worker.spawn(move || Msg::Tags(strerr(repo.tags())));
     }
 
-    /// Global keyboard shortcuts:
-    /// Ctrl/Cmd+Enter commit, Ctrl/Cmd+R refresh, Ctrl/Cmd+P push,
-    /// Ctrl/Cmd+Shift+P pull, Ctrl/Cmd+K repo picker, Escape closes dialogs.
+    /// Global keyboard shortcuts, using the user-configurable bindings
+    /// from Settings. Escape always closes dialogs.
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let (commit, refresh, push, pull, repo_picker, escape) = ctx.input_mut(|i| {
-            let cmd = egui::Modifiers::COMMAND;
-            (
-                i.consume_key(cmd, egui::Key::Enter),
-                i.consume_key(cmd, egui::Key::R),
-                i.consume_key(cmd, egui::Key::P),
-                i.consume_key(cmd | egui::Modifiers::SHIFT, egui::Key::P),
-                i.consume_key(cmd, egui::Key::K),
-                i.key_pressed(egui::Key::Escape),
-            )
+        // While rebinding in Settings, keys are captured there instead.
+        if self.rebinding.is_some() {
+            return;
+        }
+        let bindings = self.config.shortcuts.clone();
+        let (actions, escape) = ctx.input_mut(|i| {
+            (bindings.pressed(i), i.key_pressed(egui::Key::Escape))
         });
-        if commit {
-            self.do_commit();
-        }
-        if refresh {
-            self.refresh();
-            self.toast("Refreshed.", false);
-        }
-        if pull {
-            // Check pull before push: the push shortcut matches without shift.
-            self.shortcut_sync("pull");
-        } else if push {
-            self.shortcut_sync("push");
-        }
-        if repo_picker {
-            self.dialog = Dialog::RepoPicker;
+        for action in actions {
+            use shortcuts::Action;
+            match action {
+                Action::Commit => self.do_commit(),
+                Action::Refresh => {
+                    self.refresh();
+                    self.toast("Refreshed.", false);
+                }
+                Action::Push => self.shortcut_sync("push"),
+                Action::Pull => self.shortcut_sync("pull"),
+                Action::RepoPicker => self.dialog = Dialog::RepoPicker,
+                Action::ToggleHistory => {
+                    self.tab = if self.tab == Tab::Changes { Tab::History } else { Tab::Changes };
+                    self.refresh();
+                }
+            }
         }
         if escape && self.dialog != Dialog::None {
             if self.dialog == Dialog::GitHub {

@@ -581,6 +581,9 @@ fn settings(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         claude_settings(app, ui);
 
         ui.separator();
+        shortcut_settings(app, ui, ctx);
+
+        ui.separator();
         ui.label(RichText::new("AI PROVIDER FOR COMMIT MESSAGES").color(theme::EMBER).small());
         ui.horizontal(|ui| {
             let provider = app.config.ai_provider.clone().unwrap_or_else(|| "ollama".into());
@@ -601,6 +604,64 @@ fn settings(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                 resp.on_hover_text("Sign in to Claude below first");
             }
         });
+    });
+}
+
+/// Keyboard shortcut editor: click a binding, press the new keys.
+fn shortcut_settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
+    use crate::app::shortcuts::{self, Action};
+    ui.label(RichText::new("KEYBOARD SHORTCUTS").color(theme::EMBER).small());
+
+    // Capture the next key combo while rebinding.
+    if let Some(action) = app.rebinding {
+        let (captured, cancelled) = ctx.input(|i| {
+            (shortcuts::capture(i), i.key_pressed(egui::Key::Escape))
+        });
+        if cancelled {
+            app.rebinding = None;
+        } else if let Some(binding) = captured {
+            app.config.shortcuts.set(action, binding);
+            app.config.save();
+            app.rebinding = None;
+            app.toast(format!("{} is now {}", action.label(), binding.display()), false);
+        }
+    }
+
+    for action in Action::ALL {
+        ui.horizontal(|ui| {
+            ui.label(action.label());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let rebinding_this = app.rebinding == Some(*action);
+                let text = if rebinding_this {
+                    "Press keys… (Esc cancels)".to_string()
+                } else {
+                    app.config.shortcuts.get(*action).display()
+                };
+                let button = egui::Button::new(RichText::new(text).monospace().small());
+                if ui
+                    .add(button)
+                    .on_hover_text("Click, then press the new key combination")
+                    .clicked()
+                {
+                    app.rebinding = if rebinding_this { None } else { Some(*action) };
+                }
+            });
+        });
+    }
+
+    ui.horizontal(|ui| {
+        if ui.small_button("Reset to defaults").clicked() {
+            app.config.shortcuts = Default::default();
+            app.config.save();
+            app.toast("Shortcuts reset.", false);
+        }
+        if let Some((a, b)) = app.config.shortcuts.conflict() {
+            ui.label(
+                RichText::new(format!("Conflict: {} and {} share a binding", a.label(), b.label()))
+                    .color(theme::DANGER)
+                    .small(),
+            );
+        }
     });
 }
 

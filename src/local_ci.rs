@@ -28,6 +28,10 @@ use std::time::Instant;
 /// Config file name at the repository root.
 pub const CONFIG_FILE: &str = ".git-manage-ci.toml";
 
+/// Local, non-committed secrets file at the repository root.
+/// Simple KEY=VALUE lines; add it to .gitignore.
+pub const SECRETS_FILE: &str = ".git-manage-ci.secrets";
+
 /// Errors from config parsing or job execution.
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -44,9 +48,13 @@ pub struct Job {
     /// Optional Docker image; when set the job runs inside the container.
     #[serde(default)]
     pub image: Option<String>,
-    /// Extra environment variables.
+    /// Extra environment variables (committed with the config; no secrets).
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
+    /// Names of secrets this job needs, loaded from [`SECRETS_FILE`] or the
+    /// host environment. Values never live in the committed config.
+    #[serde(default)]
+    pub secrets: Vec<String>,
 }
 
 /// The parsed config file.
@@ -92,6 +100,11 @@ commands = ["echo hello from local CI"]
 # name = "tests in container"
 # image = "rust:latest"
 # commands = ["cargo test"]
+
+# [[job]]
+# name = "integration tests with a secret"
+# commands = ["./scripts/integration.sh"]
+# secrets = ["API_TOKEN"]        # values come from .git-manage-ci.secrets
 "#;
     std::fs::write(repo_root.join(CONFIG_FILE), template).map_err(|e| CiError(e.to_string()))
 }
@@ -105,12 +118,64 @@ pub fn docker_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Loads secrets from [`SECRETS_FILE`] (KEY=VALUE lines, `#` comments).
+pub fn load_secrets(repo_root: &Path) -> std::collections::HashMap<String, String> {
+    let Ok(text) = std::fs::read_to_string(repo_root.join(SECRETS_FILE)) else {
+        return Default::default();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| {
+            let (k, v) = l.split_once('=')?;
+            Some((k.trim().to_string(), v.trim().to_string()))
+        })
+        .collect()
+}
+
+/// Resolves a job's secrets from the secrets file, falling back to the
+/// host environment. Returns an error naming any missing secret.
+fn resolve_secrets(
+    repo_root: &Path,
+    job: &Job,
+) -> std::result::Result<Vec<(String, String)>, String> {
+    let file_secrets = load_secrets(repo_root);
+    let mut resolved = Vec::new();
+    let mut missing = Vec::new();
+    for name in &job.secrets {
+        match file_secrets.get(name).cloned().or_else(|| std::env::var(name).ok()) {
+            Some(value) => resolved.push((name.clone(), value)),
+            None => missing.push(name.clone()),
+        }
+    }
+    if missing.is_empty() {
+        Ok(resolved)
+    } else {
+        Err(format!(
+            "Missing secret(s): {}. Add them to {SECRETS_FILE} (KEY=VALUE) or export them.",
+            missing.join(", ")
+        ))
+    }
+}
+
 const MAX_OUTPUT: usize = 64 * 1024;
 
 /// Runs one job to completion (blocking; call from a worker thread).
 pub fn run_job(repo_root: &Path, job: &Job) -> JobResult {
     let started = Instant::now();
     let script = job.commands.join(" && ");
+
+    let secrets = match resolve_secrets(repo_root, job) {
+        Ok(secrets) => secrets,
+        Err(message) => {
+            return JobResult {
+                name: job.name.clone(),
+                ok: false,
+                output: message,
+                duration_secs: 0.0,
+            };
+        }
+    };
 
     let output = if let Some(image) = &job.image {
         if !docker_available() {
@@ -130,12 +195,18 @@ pub fn run_job(repo_root: &Path, job: &Job) -> JobResult {
         for (key, value) in &job.env {
             cmd.arg("-e").arg(format!("{key}={value}"));
         }
+        for (key, value) in &secrets {
+            cmd.arg("-e").arg(format!("{key}={value}"));
+        }
         cmd.arg(image).args(["sh", "-c", &script]);
         cmd.output()
     } else {
         let mut cmd = Command::new("sh");
         cmd.args(["-c", &script]).current_dir(repo_root);
         for (key, value) in &job.env {
+            cmd.env(key, value);
+        }
+        for (key, value) in &secrets {
             cmd.env(key, value);
         }
         cmd.output()
@@ -206,6 +277,7 @@ env = { FOO = "bar" }
             commands: vec!["echo output-here".into()],
             image: None,
             env: Default::default(),
+            secrets: Vec::new(),
         };
         let result = run_job(tmp.path(), &pass);
         assert!(result.ok);
@@ -216,6 +288,7 @@ env = { FOO = "bar" }
             commands: vec!["echo before".into(), "false".into(), "echo after".into()],
             image: None,
             env: Default::default(),
+            secrets: Vec::new(),
         };
         let result = run_job(tmp.path(), &fail);
         assert!(!result.ok);
@@ -229,7 +302,7 @@ env = { FOO = "bar" }
         let mut env = std::collections::HashMap::new();
         env.insert("MY_VAR".to_string(), "custom-value".to_string());
         let job =
-            Job { name: "env".into(), commands: vec!["echo $MY_VAR".into()], image: None, env };
+            Job { name: "env".into(), commands: vec!["echo $MY_VAR".into()], image: None, env, secrets: Vec::new() };
         let result = run_job(tmp.path(), &job);
         assert!(result.ok);
         assert!(result.output.contains("custom-value"));
@@ -242,6 +315,42 @@ env = { FOO = "bar" }
         let config = load_config(tmp.path()).unwrap().expect("config written");
         assert_eq!(config.jobs.len(), 1);
         assert_eq!(config.jobs[0].name, "example");
+    }
+
+    #[test]
+    fn secrets_from_file_reach_the_job() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(SECRETS_FILE),
+            "# comment line\nAPI_TOKEN = sekrit-123\n",
+        )
+        .unwrap();
+        let job = Job {
+            name: "secret".into(),
+            commands: vec!["echo token=$API_TOKEN".into()],
+            image: None,
+            env: Default::default(),
+            secrets: vec!["API_TOKEN".into()],
+        };
+        let result = run_job(tmp.path(), &job);
+        assert!(result.ok, "{}", result.output);
+        assert!(result.output.contains("token=sekrit-123"));
+    }
+
+    #[test]
+    fn missing_secret_fails_with_clear_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let job = Job {
+            name: "no-secret".into(),
+            commands: vec!["echo hi".into()],
+            image: None,
+            env: Default::default(),
+            secrets: vec!["DEFINITELY_NOT_SET_ANYWHERE_XYZ".into()],
+        };
+        let result = run_job(tmp.path(), &job);
+        assert!(!result.ok);
+        assert!(result.output.contains("DEFINITELY_NOT_SET_ANYWHERE_XYZ"));
+        assert!(result.output.contains(SECRETS_FILE));
     }
 
     #[test]

@@ -44,6 +44,12 @@ Optional: `make install` installs the binary plus a `.desktop` entry.
 3. Click **✨ AI message** in the commit box. The model reads the staged diff and
    fills in the summary and description.
 
+## Local CI (checks before a PR)
+
+Define per-repo checks in `.git-manage-ci.toml` and run them from the
+Pull Request dialog, on your machine or inside Docker containers, with
+secrets support. See the full guide: [docs/local-ci.md](docs/local-ci.md).
+
 ## GitHub sign-in
 
 Click the **🐙** button. Either:

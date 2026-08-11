@@ -43,18 +43,8 @@ pub fn toolbar(app: &mut App, ctx: &egui::Context) {
         .show(ctx, |ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             ui.horizontal(|ui| {
-                // 1. Current repository
-                let repo_name = app
-                    .repo
-                    .as_ref()
-                    .map(|r| r.name())
-                    .unwrap_or_else(|| "Choose…".into());
-                if segment(ui, "CURRENT REPOSITORY", &repo_name, 200.0)
-                    .on_hover_text("Change repository")
-                    .clicked()
-                {
-                    app.dialog = Dialog::RepoPicker;
-                }
+                // 1. Current repository (dropdown of recent repos)
+                repo_menu(app, ui);
 
                 // 2. Current branch (menu)
                 branch_menu(app, ui);
@@ -83,6 +73,83 @@ pub fn toolbar(app: &mut App, ctx: &egui::Context) {
             });
             state_banner(app, ui);
         });
+}
+
+/// Repository dropdown: recent repositories saved in the local config, with
+/// repair options for missing paths and an "Add repository" entry.
+fn repo_menu(app: &mut App, ui: &mut egui::Ui) {
+    let repo_name = app
+        .repo
+        .as_ref()
+        .map(|r| r.name())
+        .unwrap_or_else(|| "Choose…".into());
+
+    ui.menu_button(segment_text("CURRENT REPOSITORY", &repo_name), |ui| {
+        ui.set_min_width(320.0);
+        ui.label(RichText::new("RECENT REPOSITORIES").color(theme::EMBER).small());
+
+        let current_path = app.repo.as_ref().map(|r| r.path().display().to_string());
+        let recents = app.config.recent_repos.clone();
+        let mut remove: Option<String> = None;
+
+        for path in &recents {
+            let exists = std::path::Path::new(path).exists();
+            let name = std::path::Path::new(path)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.clone());
+            let is_current = current_path.as_deref() == Some(path.as_str());
+
+            ui.horizontal(|ui| {
+                if exists {
+                    let marker = if is_current { "» " } else { "    " };
+                    if ui
+                        .button(format!("{marker}{name}"))
+                        .on_hover_text(path)
+                        .clicked()
+                    {
+                        app.open_repo(path);
+                        ui.close_menu();
+                    }
+                } else {
+                    // Missing on disk: offer repair or removal.
+                    ui.label(
+                        RichText::new(format!("    {name} (missing)")).color(theme::FG_DIM),
+                    )
+                    .on_hover_text(path);
+                    if ui.small_button("Change path…").clicked() {
+                        if let Some(folder) = rfd::FileDialog::new()
+                            .set_title("Locate the repository folder")
+                            .pick_folder()
+                        {
+                            remove = Some(path.clone());
+                            app.open_repo(&folder.display().to_string());
+                        }
+                        ui.close_menu();
+                    }
+                    if ui.small_button("Remove").clicked() {
+                        remove = Some(path.clone());
+                    }
+                }
+            });
+        }
+        if recents.is_empty() {
+            ui.label(RichText::new("No recent repositories").color(theme::FG_DIM));
+        }
+
+        if let Some(path) = remove {
+            app.config.recent_repos.retain(|p| p != &path);
+            app.config.save();
+        }
+
+        ui.separator();
+        if ui.button("Add repository…").clicked() {
+            app.dialog = Dialog::RepoPicker;
+            ui.close_menu();
+        }
+    })
+    .response
+    .on_hover_text("Switch repository");
 }
 
 fn branch_menu(app: &mut App, ui: &mut egui::Ui) {

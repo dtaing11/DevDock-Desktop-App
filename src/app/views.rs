@@ -192,10 +192,37 @@ fn checks_badge(app: &mut App, ui: &mut egui::Ui) {
         CheckState::Pending => ("RUNNING", theme::WARN),
         CheckState::None => unreachable!(),
     };
-    let text = format!("{symbol} ({}/{})", summary.passed, summary.total);
-    let _ = color; // status color shown inside the dropdown rows
+    // Compose "OK (4/4) · main OK" with the main part colored.
+    let main_part = app.main_checks.as_ref().map(|(name, s)| {
+        let sym = match s.state {
+            CheckState::Passing => "OK",
+            CheckState::Failing => "FAIL",
+            CheckState::Pending => "RUN",
+            CheckState::None => "-",
+        };
+        (name.clone(), sym, s.state)
+    });
+    let text = match &main_part {
+        Some((name, sym, _)) => format!(
+            "{symbol} ({}/{}) · {name} {sym}",
+            summary.passed, summary.total
+        ),
+        None => format!("{symbol} ({}/{})", summary.passed, summary.total),
+    };
+    let _ = color; // per-run colors shown inside the dropdown
 
     segment_menu(ui, "CI STATUS", &text, |ui| {
+        // Default-branch summary row, green when healthy.
+        if let Some((name, _, state)) = &main_part {
+            let (label, mcolor) = match state {
+                CheckState::Passing => (format!("{name}: all checks passing"), theme::ADD),
+                CheckState::Failing => (format!("{name}: checks failing"), theme::DANGER),
+                CheckState::Pending => (format!("{name}: checks running"), theme::WARN),
+                CheckState::None => (format!("{name}: no checks"), theme::FG_DIM),
+            };
+            ui.label(RichText::new(label).color(mcolor).strong());
+            ui.separator();
+        }
         ui.set_min_width(340.0);
         ui.label(
             RichText::new(format!(

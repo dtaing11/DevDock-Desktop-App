@@ -303,6 +303,8 @@ pub struct App {
     pub last_refresh: Instant,
     /// CI checks for the current branch head, refreshed with status.
     pub branch_checks: Option<github::ChecksSummary>,
+    /// CI checks for the default branch (main/master), shown alongside.
+    pub main_checks: Option<(String, github::ChecksSummary)>,
     last_checks_refresh: Option<Instant>,
     /// Last background fetch, so remote changes surface automatically.
     last_auto_fetch: Option<Instant>,
@@ -384,6 +386,7 @@ impl App {
             log: Vec::new(),
             last_refresh: Instant::now(),
             branch_checks: None,
+            main_checks: None,
             last_checks_refresh: None,
             last_auto_fetch: None,
             tab: Tab::Changes,
@@ -511,7 +514,8 @@ impl App {
     }
 
     /// Fetches CI check status for the current branch head from GitHub,
-    /// throttled to once every 30 seconds.
+    /// plus the default branch (main) when different, throttled to once
+    /// every 30 seconds.
     fn refresh_branch_checks(&mut self) {
         if self.gh.user.is_none() {
             return;
@@ -529,18 +533,52 @@ impl App {
             return; // detached / no commits
         }
         self.last_checks_refresh = Some(Instant::now());
-        self.worker.spawn(move || {
-            let result = (|| -> Option<(String, github::ChecksSummary)> {
-                let client = github::Client::from_store()?;
-                let slug = views::origin_slug(&repo)?;
-                let summary = client.checks(&slug, &branch).ok()?;
-                Some((branch, summary))
-            })();
-            match result {
-                Some((branch, summary)) => Msg::GhBranchChecks { branch, summary },
-                None => Msg::Noop,
-            }
-        });
+        {
+            let repo = repo.clone();
+            self.worker.spawn(move || {
+                let result = (|| -> Option<(String, github::ChecksSummary)> {
+                    let client = github::Client::from_store()?;
+                    let slug = views::origin_slug(&repo)?;
+                    let summary = client.checks(&slug, &branch).ok()?;
+                    Some((branch, summary))
+                })();
+                match result {
+                    Some((branch, summary)) => Msg::GhBranchChecks { branch, summary },
+                    None => Msg::Noop,
+                }
+            });
+        }
+        // Default branch status (only when we're not already on it).
+        let main_branch = self.default_branch();
+        if self.status.as_ref().map(|s| s.branch != main_branch).unwrap_or(false) {
+            self.worker.spawn(move || {
+                let result = (|| -> Option<(String, github::ChecksSummary)> {
+                    let client = github::Client::from_store()?;
+                    let slug = views::origin_slug(&repo)?;
+                    let summary = client.checks(&slug, &main_branch).ok()?;
+                    Some((main_branch, summary))
+                })();
+                match result {
+                    Some((branch, summary)) => Msg::GhMainChecks { branch, summary },
+                    None => Msg::Noop,
+                }
+            });
+        } else {
+            self.main_checks = None;
+        }
+    }
+
+    /// Best guess at the default branch: a local `main` or `master`.
+    fn default_branch(&self) -> String {
+        self.branches
+            .as_ref()
+            .and_then(|b| {
+                b.local
+                    .iter()
+                    .find(|br| br.name == "main" || br.name == "master")
+                    .map(|br| br.name.clone())
+            })
+            .unwrap_or_else(|| "main".into())
     }
 
     /// Files that will be included in the next commit.
@@ -896,6 +934,9 @@ impl App {
                 if current == Some(branch.as_str()) {
                     self.branch_checks = Some(summary);
                 }
+            }
+            Msg::GhMainChecks { branch, summary } => {
+                self.main_checks = Some((branch, summary));
             }
             Msg::GhPrChecks { number, summary } => {
                 self.pr.checks.insert(number, summary);

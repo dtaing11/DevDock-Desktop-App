@@ -141,6 +141,8 @@ pub struct ClaudeState {
     pub api_key_input: String,
     /// "claude.ai account (OAuth)", "API key", or None.
     pub auth_label: Option<&'static str>,
+    /// Models available to the signed-in account (from /v1/models).
+    pub models: Vec<String>,
 }
 
 /// Pull-request dialog state.
@@ -296,6 +298,7 @@ impl App {
         };
         app.startup();
         app.claude.auth_label = claude::Client::auth_label();
+        app.load_claude_models();
         app
     }
 
@@ -603,6 +606,16 @@ impl App {
             }
             Msg::Tags(Ok(tags)) => self.tags = tags,
             Msg::Tags(Err(e)) => self.toast(e, true),
+            Msg::ClaudeModels(models) => {
+                // Keep the chosen model if still valid, else pick the first.
+                if let Some(current) = &self.config.claude_model {
+                    if !models.is_empty() && !models.contains(current) {
+                        self.config.claude_model = models.first().cloned();
+                        self.config.save();
+                    }
+                }
+                self.claude.models = models;
+            }
 
             Msg::GhDeviceCode(Ok(code)) => {
                 let _ = open::that(&code.verification_uri);
@@ -698,6 +711,19 @@ impl App {
     pub fn load_conflicts(&mut self) {
         let Some(repo) = self.repo.clone() else { return };
         self.worker.spawn(move || Msg::Conflicts(strerr(repo.conflicts())));
+    }
+
+    /// Fetches the Claude model list for the signed-in account.
+    pub fn load_claude_models(&mut self) {
+        if self.claude.auth_label.is_none() {
+            return;
+        }
+        self.worker.spawn(|| {
+            let models = claude::Client::from_store(claude::DEFAULT_MODEL)
+                .map(|c| c.models())
+                .unwrap_or_default();
+            Msg::ClaudeModels(models)
+        });
     }
 
     /// Reloads the stash list.

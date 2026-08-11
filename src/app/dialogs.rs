@@ -640,7 +640,7 @@ fn claude_settings(app: &mut App, ui: &mut egui::Ui) {
                 app.toast("Claude signed out.", false);
             }
         });
-        // Model picker
+        // Model picker (models fetched from the account's /v1/models)
         ui.horizontal(|ui| {
             ui.label("Model");
             let selected = app
@@ -648,18 +648,26 @@ fn claude_settings(app: &mut App, ui: &mut egui::Ui) {
                 .claude_model
                 .clone()
                 .unwrap_or_else(|| claude::DEFAULT_MODEL.to_string());
+            let models: Vec<String> = if app.claude.models.is_empty() {
+                claude::FALLBACK_MODELS.iter().map(|s| s.to_string()).collect()
+            } else {
+                app.claude.models.clone()
+            };
             egui::ComboBox::from_id_salt("claude-model").selected_text(selected).show_ui(
                 ui,
                 |ui| {
-                    for name in claude::MODELS {
-                        let is_sel = app.config.claude_model.as_deref() == Some(*name);
-                        if ui.selectable_label(is_sel, *name).clicked() {
-                            app.config.claude_model = Some(name.to_string());
+                    for name in &models {
+                        let is_sel = app.config.claude_model.as_deref() == Some(name.as_str());
+                        if ui.selectable_label(is_sel, name).clicked() {
+                            app.config.claude_model = Some(name.clone());
                             app.config.save();
                         }
                     }
                 },
             );
+            if ui.small_button("Refresh").on_hover_text("Reload available models").clicked() {
+                app.load_claude_models();
+            }
         });
         return;
     }
@@ -687,6 +695,7 @@ fn claude_settings(app: &mut App, ui: &mut egui::Ui) {
                         app.claude.auth_label = claude::Client::auth_label();
                         app.config.ai_provider = Some("claude".into());
                         app.config.save();
+                        app.load_claude_models();
                         app.toast("Claude connected.", false);
                     }
                     Err(e) => app.toast(e.to_string(), true),
@@ -721,6 +730,7 @@ fn claude_settings(app: &mut App, ui: &mut egui::Ui) {
                     app.claude.auth_label = claude::Client::auth_label();
                     app.config.ai_provider = Some("claude".into());
                     app.config.save();
+                    app.load_claude_models();
                     app.toast("Claude API key saved.", false);
                 }
                 Err(e) => app.toast(e.to_string(), true),

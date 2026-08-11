@@ -12,11 +12,11 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Default model, Anthropic's fast/cheap tier.
+/// Default model when none is chosen, Anthropic's fast/cheap tier.
 pub const DEFAULT_MODEL: &str = "claude-3-5-haiku-latest";
 
-/// Selectable models for the settings UI.
-pub const MODELS: &[&str] =
+/// Static fallback list, used only when the models API is unreachable.
+pub const FALLBACK_MODELS: &[&str] =
     &["claude-3-5-haiku-latest", "claude-sonnet-4-5", "claude-opus-4-1"];
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -269,6 +269,39 @@ impl Client {
     /// Cheap connectivity/authentication check.
     pub fn verify(&self) -> Result<()> {
         self.request("Say OK", 16).map(drop)
+    }
+
+    /// Models actually available to this account, from `/v1/models`.
+    /// Falls back to [`FALLBACK_MODELS`] when the endpoint is unavailable.
+    pub fn models(&self) -> Vec<String> {
+        let mut req = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .get("https://api.anthropic.com/v1/models?limit=50")
+            .set("anthropic-version", "2023-06-01");
+        req = match &self.auth {
+            Auth::ApiKey(key) => req.set("x-api-key", key),
+            Auth::OAuth(tokens) => req
+                .set("Authorization", &format!("Bearer {}", tokens.access_token))
+                .set("anthropic-beta", "oauth-2025-04-20"),
+        };
+        let models: Vec<String> = req
+            .call()
+            .ok()
+            .and_then(|r| r.into_json::<serde_json::Value>().ok())
+            .and_then(|v| {
+                v.get("data")?.as_array().map(|arr| {
+                    arr.iter()
+                        .filter_map(|m| m.get("id")?.as_str().map(String::from))
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
+        if models.is_empty() {
+            FALLBACK_MODELS.iter().map(|s| s.to_string()).collect()
+        } else {
+            models
+        }
     }
 
     /// Generates a commit message for `diff`.

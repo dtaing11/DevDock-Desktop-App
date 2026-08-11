@@ -28,6 +28,8 @@ pub enum Msg {
     CommitFiles { sha: String, files: Vec<CommitFileChange> },
     GhRepos(Result<Vec<RemoteRepo>, String>),
     Tags(Result<Vec<String>, String>),
+    /// Claude models available to the signed-in account.
+    ClaudeModels(Vec<String>),
 
     GhDeviceCode(Result<DeviceCode, String>),
     GhSignedIn(Result<User, String>),

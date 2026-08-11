@@ -1,5 +1,5 @@
 [Desktop Entry]
-Name=Git Manage
+Name=DevDock
 Comment=Native git client with GitHub and AI integration
 Exec=git-manage
 Icon=git-manage

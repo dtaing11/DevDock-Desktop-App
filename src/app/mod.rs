@@ -31,12 +31,12 @@ pub fn run() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([900.0, 600.0])
-            .with_title("Git Manage")
+            .with_title("DevDock")
             .with_icon(load_icon()),
         ..Default::default()
     };
     eframe::run_native(
-        "Git Manage",
+        "DevDock",
         options,
         Box::new(|cc| {
             theme::apply(&cc.egui_ctx);
@@ -216,6 +216,11 @@ pub struct LocalCiState {
     pub running: bool,
     /// Which job's output is expanded.
     pub expanded: Option<usize>,
+    /// Push integration from the config file.
+    pub on_push: crate::local_ci::OnPush,
+    /// A push waiting for the current CI run to finish:
+    /// (action, set_upstream). Executed when all jobs pass.
+    pub pending_push: Option<(String, bool)>,
 }
 
 impl LocalCiState {
@@ -835,7 +840,23 @@ impl App {
                 }
                 if self.local_ci.finished() == self.local_ci.jobs.len() {
                     self.local_ci.running = false;
-                    if self.local_ci.all_passed() {
+                    let passed = self.local_ci.all_passed();
+                    // A push may be waiting on this run.
+                    if let Some((action, set_upstream)) = self.local_ci.pending_push.take() {
+                        if passed {
+                            self.toast("Checks passed. Pushing…", false);
+                            self.execute_push(&action, set_upstream);
+                        } else if self.local_ci.on_push.block_on_failure {
+                            self.toast(
+                                "Push cancelled: local CI checks failed. \
+                                 See the Pull Request dialog for logs.",
+                                true,
+                            );
+                        } else {
+                            self.toast("Checks failed (non-blocking). Pushing anyway…", true);
+                            self.execute_push(&action, set_upstream);
+                        }
+                    } else if passed {
                         self.toast("All local CI checks passed.", false);
                     } else {
                         self.toast("Some local CI checks failed.", true);
@@ -897,6 +918,7 @@ impl App {
         if let Ok(Some(config)) = crate::local_ci::load_config(repo.path()) {
             self.local_ci.results = vec![None; config.jobs.len()];
             self.local_ci.jobs = config.jobs;
+            self.local_ci.on_push = config.on_push;
         }
     }
 
@@ -915,6 +937,58 @@ impl App {
                 result: crate::local_ci::run_job(&root, &job),
             });
         }
+    }
+
+    /// Pushes, honoring the repo's `on_push` local CI config: when enabled,
+    /// checks run first and the push executes only if they pass (or
+    /// unconditionally when `block_on_failure = false`).
+    pub fn push_with_ci(&mut self, action: &str, set_upstream: bool) {
+        // Re-read the config so edits apply without reopening dialogs.
+        self.load_local_ci();
+        let ci = &self.local_ci;
+        if ci.on_push.run && !ci.jobs.is_empty() && !ci.running {
+            self.toast(
+                format!("Running {} local check(s) before push…", self.local_ci.jobs.len()),
+                false,
+            );
+            self.local_ci.pending_push = Some((action.to_string(), set_upstream));
+            self.run_local_ci();
+            return;
+        }
+        self.execute_push(action, set_upstream);
+    }
+
+    /// Runs the actual push/force-push on a worker thread.
+    fn execute_push(&mut self, action: &str, set_upstream: bool) {
+        let Some(repo) = self.repo.clone() else { return };
+        let token = self.gh_token();
+        let force = action == "force-push";
+        self.busy = true;
+        self.worker.spawn(move || {
+            let auth = token.as_deref();
+            let result = if force {
+                repo.force_push(auth).map(|_| "Force-pushed (with lease).".to_string())
+            } else {
+                repo.push(set_upstream, auth).map(|_| "Pushed.".to_string()).map_err(|e| {
+                    let msg = e.to_string();
+                    if msg.contains("rejected") || msg.contains("non-fast-forward") {
+                        crate::git::GitError::Command(format!(
+                            "{msg}\n\nHint: after amend/rebase use Force push \
+                             (right-click the sync button)."
+                        ))
+                    } else if msg.contains("Permission denied (publickey") {
+                        crate::git::GitError::Command(format!(
+                            "{msg}\n\nHint: this remote uses SSH. Add your key to \
+                             ssh-agent or switch the remote to HTTPS and sign in \
+                             to GitHub in this app."
+                        ))
+                    } else {
+                        e
+                    }
+                })
+            };
+            Msg::Done { message: strerr(result), refresh: true }
+        });
     }
 
     /// Reloads the stash list.
@@ -968,16 +1042,15 @@ impl App {
 
     fn shortcut_sync(&mut self, action: &str) {
         let Some(repo) = self.repo.clone() else { return };
+        if action == "push" {
+            let set_upstream = !self.status.as_ref().map(|s| s.has_upstream).unwrap_or(false);
+            self.push_with_ci("push", set_upstream);
+            return;
+        }
         let token = self.gh_token();
-        let set_upstream = !self.status.as_ref().map(|s| s.has_upstream).unwrap_or(false);
-        let action = action.to_string();
         self.worker.spawn(move || {
             let auth = token.as_deref();
-            let result = if action == "pull" {
-                repo.pull(auth).map(|_| "Pulled.".to_string())
-            } else {
-                repo.push(set_upstream, auth).map(|_| "Pushed.".to_string())
-            };
+            let result = repo.pull(auth).map(|_| "Pulled.".to_string());
             Msg::Done { message: strerr(result), refresh: true }
         });
     }

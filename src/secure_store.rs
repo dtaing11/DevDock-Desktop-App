@@ -1,15 +1,11 @@
 //! Encrypted storage for all app data written to the user's device.
 //!
 //! Design:
-//! - A single random 256-bit master key is generated on first use and stored
-//!   in the **OS keychain** (macOS Keychain, Linux Secret Service/keyutils,
-//!   Windows Credential Manager) via the `keyring` crate.
+//! - A single random 256-bit master key is generated on first use and kept
+//!   in a mode-600 file in the config directory (no keychain prompts).
 //! - Every file the app writes (config, GitHub token, Claude credentials)
 //!   is encrypted with **AES-256-GCM** using that key and a fresh random
 //!   nonce per write.
-//! - If the keychain is unavailable (headless Linux without a secret
-//!   service), the key falls back to a mode-600 file next to the data,
-//!   which still protects against casual reads by other users.
 //! - Legacy plaintext files are migrated transparently: reads fall back to
 //!   plaintext once, and the next save encrypts.
 //!
@@ -18,10 +14,9 @@
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, Key, Nonce};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 const MAGIC: &[u8; 6] = b"GMENC1";
-const KEYRING_SERVICE: &str = "git-manage";
-const KEYRING_USER: &str = "master-key";
 
 /// Errors from encrypted storage.
 #[derive(Debug, thiserror::Error)]
@@ -43,44 +38,25 @@ pub fn config_dir() -> PathBuf {
 // Master key
 // ---------------------------------------------------------------------------
 
-/// Loads (or creates on first use) the master encryption key.
+/// Loads (or creates on first use) the master encryption key from a
+/// mode-600 file, cached in memory for the process lifetime.
 ///
-/// Prefers the OS keychain; falls back to a mode-600 key file when no
-/// keychain is available.
+/// A key file is used instead of the OS keychain deliberately: unsigned
+/// development builds change identity on every rebuild, which makes
+/// macOS re-prompt for keychain access each time (and the blocking
+/// prompt froze the UI). The file is owner-readable only and the data
+/// files remain AES-256-GCM encrypted.
 fn master_key() -> Result<[u8; 32]> {
-    use base64::Engine as _;
-    let b64 = base64::engine::general_purpose::STANDARD;
-
-    // 1. OS keychain
-    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
-        match entry.get_password() {
-            Ok(encoded) => {
-                if let Ok(bytes) = b64.decode(&encoded) {
-                    if bytes.len() == 32 {
-                        let mut key = [0u8; 32];
-                        key.copy_from_slice(&bytes);
-                        return Ok(key);
-                    }
-                }
-            }
-            Err(keyring::Error::NoEntry) => {
-                let key: [u8; 32] = Aes256Gcm::generate_key(OsRng).into();
-                if entry.set_password(&b64.encode(key)).is_ok() {
-                    return Ok(key);
-                }
-                // Keychain write failed: fall through to file fallback.
-            }
-            Err(_) => { /* keychain unavailable: fall through */ }
-        }
+    static KEY: OnceLock<[u8; 32]> = OnceLock::new();
+    if let Some(key) = KEY.get() {
+        return Ok(*key);
     }
-
-    // 2. File fallback (mode 600)
     let path = config_dir().join(".master.key");
     if let Ok(bytes) = std::fs::read(&path) {
         if bytes.len() == 32 {
             let mut key = [0u8; 32];
             key.copy_from_slice(&bytes);
-            return Ok(key);
+            return Ok(*KEY.get_or_init(|| key));
         }
     }
     let key: [u8; 32] = Aes256Gcm::generate_key(OsRng).into();
@@ -91,7 +67,7 @@ fn master_key() -> Result<[u8; 32]> {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
-    Ok(key)
+    Ok(*KEY.get_or_init(|| key))
 }
 
 // ---------------------------------------------------------------------------

@@ -62,6 +62,31 @@ pub struct Job {
 pub struct Config {
     #[serde(default, rename = "job")]
     pub jobs: Vec<Job>,
+    /// Push integration settings.
+    #[serde(default)]
+    pub on_push: OnPush,
+}
+
+/// How local CI hooks into pushing.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct OnPush {
+    /// Run all jobs automatically before every push from the app.
+    #[serde(default)]
+    pub run: bool,
+    /// When true, a failing job cancels the push. When false, failures
+    /// only warn and the push proceeds.
+    #[serde(default = "default_true")]
+    pub block_on_failure: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for OnPush {
+    fn default() -> Self {
+        Self { run: false, block_on_failure: true }
+    }
 }
 
 /// Outcome of one job run.
@@ -91,6 +116,11 @@ pub fn write_template(repo_root: &Path) -> Result<()> {
     let template = r#"# Local CI for Git Manage: jobs run before creating a pull request.
 # Jobs without `image` run on this machine. Jobs with `image` run inside
 # that Docker container (Linux) with the repository mounted at /work.
+
+# Run all jobs automatically before every push from the app:
+# [on_push]
+# run = true
+# block_on_failure = true   # failing jobs cancel the push
 
 [[job]]
 name = "example"

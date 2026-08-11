@@ -628,8 +628,15 @@ fn run_sync(app: &mut App, action: &'static str) {
         app.dialog = Dialog::RepoPicker;
         return;
     };
-    let token = app.gh_token();
     let set_upstream = !app.status.as_ref().map(|s| s.has_upstream).unwrap_or(false);
+
+    // Pushes go through the local-CI gate (on_push config).
+    if action == "push" || action == "force-push" {
+        app.push_with_ci(action, set_upstream);
+        return;
+    }
+
+    let token = app.gh_token();
     app.busy = true;
     app.worker.spawn(move || {
         let auth = token.as_deref();
@@ -638,28 +645,6 @@ fn run_sync(app: &mut App, action: &'static str) {
             "pull" => repo.pull(auth).map(|out| {
                 out.lines().last().unwrap_or("Pulled.").to_string()
             }),
-            "push" => repo.push(set_upstream, auth).map(|_| "Pushed.".to_string()).map_err(
-                |e| {
-                    let msg = e.to_string();
-                    if msg.contains("rejected") || msg.contains("non-fast-forward") {
-                        crate::git::GitError::Command(format!(
-                            "{msg}\n\nHint: after amend/rebase use Force push \
-                             (right-click the sync button)."
-                        ))
-                    } else if msg.contains("Permission denied (publickey") {
-                        crate::git::GitError::Command(format!(
-                            "{msg}\n\nHint: this remote uses SSH. Add your key to \
-                             ssh-agent or switch the remote to HTTPS and sign in \
-                             to GitHub in this app."
-                        ))
-                    } else {
-                        e
-                    }
-                },
-            ),
-            "force-push" => repo
-                .force_push(auth)
-                .map(|_| "Force-pushed (with lease).".to_string()),
             _ => unreachable!(),
         };
         Msg::Done { message: strerr(result), refresh: true }

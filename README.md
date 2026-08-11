@@ -1,4 +1,4 @@
-# Git Manage
+# DevDock
 
 A **native desktop git client** (no webview) with GitHub and Ollama integration.
 Built in Rust with [egui](https://github.com/emilk/egui). Runs on Linux (also

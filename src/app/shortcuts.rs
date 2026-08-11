@@ -58,13 +58,13 @@ impl Binding {
     fn modifiers(&self) -> egui::Modifiers {
         let mut m = egui::Modifiers::NONE;
         if self.command {
-            m = m | egui::Modifiers::COMMAND;
+            m |= egui::Modifiers::COMMAND;
         }
         if self.shift {
-            m = m | egui::Modifiers::SHIFT;
+            m |= egui::Modifiers::SHIFT;
         }
         if self.alt {
-            m = m | egui::Modifiers::ALT;
+            m |= egui::Modifiers::ALT;
         }
         m
     }

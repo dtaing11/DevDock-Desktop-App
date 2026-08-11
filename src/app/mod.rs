@@ -142,7 +142,7 @@ pub enum Tab {
 }
 
 /// Which modal dialog is open, if any.
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone)]
 pub enum Dialog {
     None,
     RepoPicker,

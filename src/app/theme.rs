@@ -1,7 +1,7 @@
 //! Visual identity for Git Manage: deep indigo-slate base with ember/copper
 //! primary accent and teal highlights. Intentionally not a GitHub Desktop look.
 
-use egui::{Color32, CornerRadius, Stroke, Visuals};
+use egui::{Color32, CornerRadius, FontData, FontDefinitions, FontFamily, Stroke, Visuals};
 
 pub const BG: Color32 = Color32::from_rgb(0x0f, 0x12, 0x18);
 pub const PANEL: Color32 = Color32::from_rgb(0x17, 0x1c, 0x26);
@@ -19,6 +19,7 @@ pub const WARN: Color32 = Color32::from_rgb(0xf0, 0xb4, 0x29);
 
 /// Applies the Git Manage theme to the egui context.
 pub fn apply(ctx: &egui::Context) {
+    install_fonts(ctx);
     let mut visuals = Visuals::dark();
 
     visuals.panel_fill = BG;
@@ -53,4 +54,30 @@ pub fn apply(ctx: &egui::Context) {
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
     style.spacing.button_padding = egui::vec2(12.0, 6.0);
     ctx.set_style(style);
+}
+
+/// Bundles Inter (UI) and JetBrains Mono (code/diffs) into the binary so the
+/// app looks the same on every machine, with egui's defaults as glyph
+/// fallback (emoji, symbols).
+fn install_fonts(ctx: &egui::Context) {
+    const INTER: &[u8] = include_bytes!("../../assets/fonts/Inter-Regular.ttf");
+    const MONO: &[u8] = include_bytes!("../../assets/fonts/JetBrainsMono-Regular.ttf");
+
+    let mut fonts = FontDefinitions::default();
+    fonts.font_data.insert("inter".into(), FontData::from_static(INTER).into());
+    fonts.font_data.insert("jetbrains-mono".into(), FontData::from_static(MONO).into());
+
+    // Put our fonts first; egui's built-ins stay as fallback for symbols.
+    fonts
+        .families
+        .entry(FontFamily::Proportional)
+        .or_default()
+        .insert(0, "inter".into());
+    fonts
+        .families
+        .entry(FontFamily::Monospace)
+        .or_default()
+        .insert(0, "jetbrains-mono".into());
+
+    ctx.set_fonts(fonts);
 }

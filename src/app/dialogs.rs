@@ -39,11 +39,21 @@ fn repo_picker(app: &mut App, ctx: &egui::Context) {
         ui.set_min_width(420.0);
 
         ui.label("Local path");
-        ui.add(
-            egui::TextEdit::singleline(&mut app.repo_path_input)
-                .hint_text("/home/user/my-project")
-                .desired_width(f32::INFINITY),
-        );
+        ui.horizontal(|ui| {
+            if ui.button("📁 Browse…").on_hover_text("Pick a folder").clicked() {
+                if let Some(folder) = rfd::FileDialog::new()
+                    .set_title("Choose a repository folder")
+                    .pick_folder()
+                {
+                    app.repo_path_input = folder.display().to_string();
+                }
+            }
+            ui.add(
+                egui::TextEdit::singleline(&mut app.repo_path_input)
+                    .hint_text("/home/user/my-project")
+                    .desired_width(f32::INFINITY),
+            );
+        });
         ui.horizontal(|ui| {
             if ui.button("Open").clicked() && !app.repo_path_input.trim().is_empty() {
                 let path = app.repo_path_input.trim().to_string();
@@ -68,11 +78,29 @@ fn repo_picker(app: &mut App, ctx: &egui::Context) {
                 .hint_text("https://github.com/user/repo.git")
                 .desired_width(f32::INFINITY),
         );
-        ui.add(
-            egui::TextEdit::singleline(&mut app.clone_dest_input)
-                .hint_text("Destination directory")
-                .desired_width(f32::INFINITY),
-        );
+        ui.horizontal(|ui| {
+            if ui.button("📁").on_hover_text("Pick destination folder").clicked() {
+                if let Some(folder) = rfd::FileDialog::new()
+                    .set_title("Choose where to clone")
+                    .pick_folder()
+                {
+                    // Suggest <picked>/<repo-name> based on the URL.
+                    let repo_name = app
+                        .clone_url_input
+                        .rsplit('/')
+                        .next()
+                        .map(|s| s.trim_end_matches(".git"))
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("repo");
+                    app.clone_dest_input = folder.join(repo_name).display().to_string();
+                }
+            }
+            ui.add(
+                egui::TextEdit::singleline(&mut app.clone_dest_input)
+                    .hint_text("Destination directory")
+                    .desired_width(f32::INFINITY),
+            );
+        });
         if ui.button("Clone").clicked() {
             let url = app.clone_url_input.trim().to_string();
             let dest = app.clone_dest_input.trim().to_string();

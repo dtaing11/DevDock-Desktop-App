@@ -314,17 +314,12 @@ fn pull_requests(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         });
 
         ui.horizontal(|ui| {
-            let h = ui.spacing().interact_size.y;
-            let ai_text = if app.ai_busy { "Generating…" } else { "AI title/body" };
-            let ai_btn = egui::Button::new(ai_text).min_size(egui::vec2(0.0, h));
-            if ui
-                .add_enabled(!app.ai_busy, ai_btn)
-                .on_hover_text("Generate from the current diff with the selected model")
-                .clicked()
-            {
-                app.generate_pr_text();
-            }
-            super::views::ai_model_picker(app, ui, crate::app::worker::AiTarget::PullRequest);
+            super::views::ai_controls(
+                app,
+                ui,
+                crate::app::worker::AiTarget::PullRequest,
+                "AI title/body",
+            );
             let create_enabled = !app.pr.creating
                 && !app.pr.title.trim().is_empty()
                 && app.pr.head != app.pr.base;

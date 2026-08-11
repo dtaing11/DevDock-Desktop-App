@@ -843,21 +843,7 @@ fn commit_box(app: &mut App, ui: &mut egui::Ui) {
     });
 
     ui.horizontal(|ui| {
-        // Match the ComboBox's interact height so button and picker align.
-        let h = ui.spacing().interact_size.y;
-        let ai_enabled = !app.ai_busy && app.repo.is_some();
-        let ai_text = if app.ai_busy { "Generating…" } else { "AI message" };
-        let ai_btn = egui::Button::new(ai_text)
-            .fill(theme::TEAL.linear_multiply(0.25))
-            .min_size(egui::vec2(0.0, h));
-        if ui
-            .add_enabled(ai_enabled, ai_btn)
-            .on_hover_text("Generate a commit message with the selected model")
-            .clicked()
-        {
-            app.generate_ai_message();
-        }
-        ai_model_picker(app, ui, crate::app::worker::AiTarget::Commit);
+        ai_controls(app, ui, crate::app::worker::AiTarget::Commit, "AI message");
         ui.checkbox(&mut app.amend, "Amend")
             .on_hover_text("Rewrite the last commit instead of creating a new one");
     });
@@ -876,6 +862,45 @@ fn commit_box(app: &mut App, ui: &mut egui::Ui) {
     if ui.add_enabled(can_commit, commit_btn).clicked() {
         app.do_commit();
     }
+}
+
+/// Standardized AI controls: generate button + model picker with one shared
+/// height and color scheme, used by both the commit box and the PR dialog.
+pub fn ai_controls(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    target: crate::app::worker::AiTarget,
+    label: &str,
+) {
+    const HEIGHT: f32 = 28.0;
+    let fill = theme::TEAL.linear_multiply(0.25);
+    let fill_hover = theme::TEAL.linear_multiply(0.35);
+
+    ui.scope(|ui| {
+        // One interact height and one fill for both widgets.
+        ui.spacing_mut().interact_size.y = HEIGHT;
+        let visuals = ui.visuals_mut();
+        visuals.widgets.inactive.weak_bg_fill = fill;
+        visuals.widgets.inactive.bg_fill = fill;
+        visuals.widgets.hovered.weak_bg_fill = fill_hover;
+        visuals.widgets.hovered.bg_fill = fill_hover;
+        visuals.widgets.open.bg_fill = fill_hover;
+
+        let enabled = !app.ai_busy && app.repo.is_some();
+        let text = if app.ai_busy { "Generating…" } else { label };
+        let button = egui::Button::new(text).fill(fill).min_size(egui::vec2(0.0, HEIGHT));
+        if ui
+            .add_enabled(enabled, button)
+            .on_hover_text("Generate with the selected model")
+            .clicked()
+        {
+            match target {
+                crate::app::worker::AiTarget::Commit => app.generate_ai_message(),
+                crate::app::worker::AiTarget::PullRequest => app.generate_pr_text(),
+            }
+        }
+        ai_model_picker(app, ui, target);
+    });
 }
 
 /// Reusable AI model picker bound to one task (commit vs PR), so each task

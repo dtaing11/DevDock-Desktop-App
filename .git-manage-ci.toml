@@ -1,0 +1,18 @@
+# Local CI for DevDock: runs before every push and in the PR dialog.
+# Docs: docs/local-ci.md
+
+[on_push]
+run = true               # run all jobs automatically before every push
+block_on_failure = true  # failing jobs cancel the push
+
+[[job]]
+name = "lint"
+commands = ["cargo clippy --all-targets -- -D warnings"]
+
+[[job]]
+name = "tests"
+commands = ["cargo test"]
+
+[[job]]
+name = "release build"
+commands = ["cargo build --release"]

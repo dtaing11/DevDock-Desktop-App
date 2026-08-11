@@ -53,9 +53,21 @@ pub struct Config {
     pub recent_repos: Vec<String>,
     pub ollama_url: Option<String>,
     pub ollama_model: Option<String>,
-    /// AI provider for commit messages: "ollama" (default) or "claude".
+    /// Legacy global provider, kept as a fallback default.
     pub ai_provider: Option<String>,
     pub claude_model: Option<String>,
+    /// Model used for commit messages (independent from PR text).
+    pub commit_ai: Option<AiSelection>,
+    /// Model used for PR title/body (may be a stronger model).
+    pub pr_ai: Option<AiSelection>,
+}
+
+/// A provider/model pair chosen for one AI task.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct AiSelection {
+    /// "ollama" or "claude".
+    pub provider: String,
+    pub model: String,
 }
 
 impl Config {
@@ -458,6 +470,33 @@ impl App {
         });
     }
 
+    /// The provider/model pair for a task, falling back to the legacy
+    /// global settings when the task has no explicit selection yet.
+    pub fn ai_selection(&self, target: worker::AiTarget) -> Option<AiSelection> {
+        let explicit = match target {
+            worker::AiTarget::Commit => self.config.commit_ai.clone(),
+            worker::AiTarget::PullRequest => self.config.pr_ai.clone(),
+        };
+        explicit.or_else(|| {
+            let provider = self.config.ai_provider.clone().unwrap_or_else(|| "ollama".into());
+            let model = if provider == "claude" {
+                self.config.claude_model.clone()?
+            } else {
+                self.config.ollama_model.clone()?
+            };
+            Some(AiSelection { provider, model })
+        })
+    }
+
+    /// Stores the selection for a task.
+    pub fn set_ai_selection(&mut self, target: worker::AiTarget, sel: AiSelection) {
+        match target {
+            worker::AiTarget::Commit => self.config.commit_ai = Some(sel),
+            worker::AiTarget::PullRequest => self.config.pr_ai = Some(sel),
+        }
+        self.config.save();
+    }
+
     /// Generates a commit message into the commit box using the selected
     /// provider/model. Stages the checked files first so the AI sees the
     /// intended diff.
@@ -471,19 +510,18 @@ impl App {
         self.generate_ai(worker::AiTarget::PullRequest, Vec::new());
     }
 
-    /// Shared AI generation path for both the commit box and the PR form,
-    /// honoring the provider/model chosen in the unified model picker.
+    /// Shared AI generation path for the commit box and the PR form. Each
+    /// target has its own provider/model selection.
     fn generate_ai(&mut self, target: worker::AiTarget, stage_files: Vec<String>) {
         let Some(repo) = self.repo.clone() else { return };
-        let use_claude = self.config.ai_provider.as_deref() == Some("claude");
+        let Some(sel) = self.ai_selection(target) else {
+            self.toast("No AI model selected. Pick one next to the AI button.", true);
+            return;
+        };
         self.ai_busy = true;
 
-        if use_claude {
-            let model = self
-                .config
-                .claude_model
-                .clone()
-                .unwrap_or_else(|| claude::DEFAULT_MODEL.to_string());
+        if sel.provider == "claude" {
+            let model = sel.model;
             self.worker.spawn(move || {
                 let result = (|| -> Result<ollama::CommitSuggestion, String> {
                     if !stage_files.is_empty() {
@@ -500,12 +538,8 @@ impl App {
             return;
         }
 
-        let Some(model) = self.config.ollama_model.clone() else {
-            self.ai_busy = false;
-            self.toast("No AI model selected. Pick one next to the AI button.", true);
-            return;
-        };
         let url = self.effective_ollama_url();
+        let model = sel.model;
         self.worker.spawn(move || {
             let result = (|| -> Result<ollama::CommitSuggestion, String> {
                 if !stage_files.is_empty() {

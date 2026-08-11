@@ -852,7 +852,7 @@ fn commit_box(app: &mut App, ui: &mut egui::Ui) {
         {
             app.generate_ai_message();
         }
-        ai_model_picker(app, ui);
+        ai_model_picker(app, ui, crate::app::worker::AiTarget::Commit);
         ui.checkbox(&mut app.amend, "Amend")
             .on_hover_text("Rewrite the last commit instead of creating a new one");
     });
@@ -873,21 +873,17 @@ fn commit_box(app: &mut App, ui: &mut egui::Ui) {
     }
 }
 
-/// Unified AI model picker: lists Ollama models and Claude models (when
-/// signed in). Picking one also switches the active provider.
-pub fn ai_model_picker(app: &mut App, ui: &mut egui::Ui) {
+/// Reusable AI model picker bound to one task (commit vs PR), so each task
+/// can use a different provider/model (e.g. a small local model for commits,
+/// a stronger Claude model for PR descriptions).
+pub fn ai_model_picker(app: &mut App, ui: &mut egui::Ui, target: crate::app::worker::AiTarget) {
+    use crate::app::AiSelection;
     let salt = ui.id().with("ai-model-picker");
-    let provider = app.config.ai_provider.clone().unwrap_or_else(|| "ollama".into());
-    let selected = if provider == "claude" {
-        format!(
-            "Claude: {}",
-            app.config.claude_model.clone().unwrap_or_else(|| "default".into())
-        )
-    } else {
-        match &app.config.ollama_model {
-            Some(m) => format!("Ollama: {m}"),
-            None => "Select a model…".into(),
-        }
+    let current = app.ai_selection(target);
+    let selected = match &current {
+        Some(sel) if sel.provider == "claude" => format!("Claude: {}", sel.model),
+        Some(sel) => format!("Ollama: {}", sel.model),
+        None => "Select a model…".into(),
     };
 
     egui::ComboBox::from_id_salt(salt).selected_text(selected).show_ui(ui, |ui| {
@@ -900,12 +896,14 @@ pub fn ai_model_picker(app: &mut App, ui: &mut egui::Ui) {
         }
         let names: Vec<String> = app.ollama_models.iter().map(|m| m.name.clone()).collect();
         for name in names {
-            let is_selected =
-                provider == "ollama" && app.config.ollama_model.as_deref() == Some(name.as_str());
+            let is_selected = current
+                .as_ref()
+                .is_some_and(|s| s.provider == "ollama" && s.model == name);
             if ui.selectable_label(is_selected, &name).clicked() {
-                app.config.ollama_model = Some(name.clone());
-                app.config.ai_provider = Some("ollama".into());
-                app.config.save();
+                app.set_ai_selection(
+                    target,
+                    AiSelection { provider: "ollama".into(), model: name.clone() },
+                );
             }
         }
 
@@ -921,12 +919,14 @@ pub fn ai_model_picker(app: &mut App, ui: &mut egui::Ui) {
                 app.claude.models.clone()
             };
             for name in models {
-                let is_selected = provider == "claude"
-                    && app.config.claude_model.as_deref() == Some(name.as_str());
+                let is_selected = current
+                    .as_ref()
+                    .is_some_and(|s| s.provider == "claude" && s.model == name);
                 if ui.selectable_label(is_selected, &name).clicked() {
-                    app.config.claude_model = Some(name.clone());
-                    app.config.ai_provider = Some("claude".into());
-                    app.config.save();
+                    app.set_ai_selection(
+                        target,
+                        AiSelection { provider: "claude".into(), model: name.clone() },
+                    );
                 }
             }
         }

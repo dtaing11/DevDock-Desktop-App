@@ -322,7 +322,7 @@ fn pull_requests(app: &mut App, ctx: &egui::Context, open: &mut bool) {
             {
                 app.generate_pr_text();
             }
-            super::views::ai_model_picker(app, ui);
+            super::views::ai_model_picker(app, ui, crate::app::worker::AiTarget::PullRequest);
             let create_enabled = !app.pr.creating
                 && !app.pr.title.trim().is_empty()
                 && app.pr.head != app.pr.base;

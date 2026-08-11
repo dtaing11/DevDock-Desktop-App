@@ -12,6 +12,8 @@ const MAX_DIFF_CHARS: usize = 24_000;
 const SYSTEM_PROMPT: &str = "You are an expert software engineer writing git commit messages. \
 Given a diff, produce a concise conventional-commit style summary line (max 72 chars, imperative mood, \
 e.g. 'feat: add user login') and a short description body explaining what changed and why. \
+Write the description in GitHub-flavored Markdown (bullet lists, `code` spans, ### headings \
+where they help readability). \
 Respond only with JSON: {\"summary\": \"...\", \"description\": \"...\"}";
 
 /// Errors from Ollama requests. Messages are user-presentable.

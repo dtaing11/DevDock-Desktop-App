@@ -42,10 +42,20 @@ pub enum Msg {
     GhPrChecks { number: u64, summary: ChecksSummary },
 
     OllamaModels(Result<Vec<Model>, String>),
-    OllamaSuggestion(Result<CommitSuggestion, String>),
+    /// AI-generated text for the commit box or the PR form.
+    AiSuggestion { target: AiTarget, result: Result<CommitSuggestion, String> },
 
     /// Background task finished with nothing to report.
     Noop,
+}
+
+/// Where an AI suggestion should land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiTarget {
+    /// Commit summary/description fields.
+    Commit,
+    /// Pull request title/body fields.
+    PullRequest,
 }
 
 /// Handle for spawning background tasks that report back as [`Msg`]s.

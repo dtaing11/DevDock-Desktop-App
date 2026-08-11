@@ -458,11 +458,23 @@ impl App {
         });
     }
 
-    /// Generates a commit message with the configured AI provider
-    /// (Claude when selected and signed in, otherwise Ollama).
+    /// Generates a commit message into the commit box using the selected
+    /// provider/model. Stages the checked files first so the AI sees the
+    /// intended diff.
     pub fn generate_ai_message(&mut self) {
-        let Some(repo) = self.repo.clone() else { return };
         let files = self.files_for_commit();
+        self.generate_ai(worker::AiTarget::Commit, files);
+    }
+
+    /// Generates a PR title/body from the current diff (no restaging).
+    pub fn generate_pr_text(&mut self) {
+        self.generate_ai(worker::AiTarget::PullRequest, Vec::new());
+    }
+
+    /// Shared AI generation path for both the commit box and the PR form,
+    /// honoring the provider/model chosen in the unified model picker.
+    fn generate_ai(&mut self, target: worker::AiTarget, stage_files: Vec<String>) {
+        let Some(repo) = self.repo.clone() else { return };
         let use_claude = self.config.ai_provider.as_deref() == Some("claude");
         self.ai_busy = true;
 
@@ -474,36 +486,36 @@ impl App {
                 .unwrap_or_else(|| claude::DEFAULT_MODEL.to_string());
             self.worker.spawn(move || {
                 let result = (|| -> Result<ollama::CommitSuggestion, String> {
-                    if !files.is_empty() {
+                    if !stage_files.is_empty() {
                         repo.unstage_all().ok();
-                        strerr(repo.stage(&files))?;
+                        strerr(repo.stage(&stage_files))?;
                     }
                     let diff = strerr(repo.diff_for_ai())?;
                     let client = claude::Client::from_store(model)
                         .ok_or("Claude is not signed in. Open Settings.")?;
                     strerr(client.commit_message(&diff))
                 })();
-                Msg::OllamaSuggestion(result)
+                Msg::AiSuggestion { target, result }
             });
             return;
         }
 
         let Some(model) = self.config.ollama_model.clone() else {
             self.ai_busy = false;
-            self.toast("No Ollama model configured. Open Settings.", true);
+            self.toast("No AI model selected. Pick one next to the AI button.", true);
             return;
         };
         let url = self.effective_ollama_url();
         self.worker.spawn(move || {
             let result = (|| -> Result<ollama::CommitSuggestion, String> {
-                if !files.is_empty() {
+                if !stage_files.is_empty() {
                     repo.unstage_all().ok();
-                    strerr(repo.stage(&files))?;
+                    strerr(repo.stage(&stage_files))?;
                 }
                 let diff = strerr(repo.diff_for_ai())?;
                 strerr(ollama::Client::new(url).commit_message(&model, &diff))
             })();
-            Msg::OllamaSuggestion(result)
+            Msg::AiSuggestion { target, result }
         });
     }
 
@@ -694,15 +706,20 @@ impl App {
                 self.ollama_models = models;
             }
             Msg::OllamaModels(Err(_)) => self.ollama_models.clear(),
-            Msg::OllamaSuggestion(result) => {
+            Msg::AiSuggestion { target, result } => {
                 self.ai_busy = false;
-                match result {
-                    Ok(s) => {
+                match (target, result) {
+                    (worker::AiTarget::Commit, Ok(s)) => {
                         self.commit_summary = s.summary;
                         self.commit_description = s.description;
                         self.toast("Commit message generated.", false);
                     }
-                    Err(e) => self.toast(e, true),
+                    (worker::AiTarget::PullRequest, Ok(s)) => {
+                        self.pr.title = s.summary;
+                        self.pr.body = s.description;
+                        self.toast("PR title and description generated.", false);
+                    }
+                    (_, Err(e)) => self.toast(e, true),
                 }
             }
         }

@@ -875,7 +875,8 @@ fn commit_box(app: &mut App, ui: &mut egui::Ui) {
 
 /// Unified AI model picker: lists Ollama models and Claude models (when
 /// signed in). Picking one also switches the active provider.
-fn ai_model_picker(app: &mut App, ui: &mut egui::Ui) {
+pub fn ai_model_picker(app: &mut App, ui: &mut egui::Ui) {
+    let salt = ui.id().with("ai-model-picker");
     let provider = app.config.ai_provider.clone().unwrap_or_else(|| "ollama".into());
     let selected = if provider == "claude" {
         format!(
@@ -889,7 +890,7 @@ fn ai_model_picker(app: &mut App, ui: &mut egui::Ui) {
         }
     };
 
-    egui::ComboBox::from_id_salt("ai-model").selected_text(selected).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(salt).selected_text(selected).show_ui(ui, |ui| {
         // Ollama section
         ui.label(RichText::new("OLLAMA (LOCAL)").color(theme::EMBER).small());
         if app.ollama_models.is_empty() {

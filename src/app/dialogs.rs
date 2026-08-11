@@ -314,13 +314,15 @@ fn pull_requests(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         });
 
         ui.horizontal(|ui| {
+            let ai_text = if app.ai_busy { "Generating…" } else { "AI title/body" };
             if ui
-                .add_enabled(!app.ai_busy, egui::Button::new("AI title/body"))
-                .on_hover_text("Generate from the current diff with Ollama")
+                .add_enabled(!app.ai_busy, egui::Button::new(ai_text))
+                .on_hover_text("Generate from the current diff with the selected model")
                 .clicked()
             {
-                generate_pr_text(app);
+                app.generate_pr_text();
             }
+            super::views::ai_model_picker(app, ui);
             let create_enabled = !app.pr.creating
                 && !app.pr.title.trim().is_empty()
                 && app.pr.head != app.pr.base;
@@ -367,23 +369,6 @@ fn pull_requests(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                 });
             }
         });
-    });
-}
-
-fn generate_pr_text(app: &mut App) {
-    let Some(repo) = app.repo.clone() else { return };
-    let Some(model) = app.config.ollama_model.clone() else {
-        app.toast("No Ollama model configured. Open Settings.", true);
-        return;
-    };
-    let url = app.effective_ollama_url();
-    app.ai_busy = true;
-    app.worker.spawn(move || {
-        let result = (|| -> Result<ollama::CommitSuggestion, String> {
-            let diff = strerr(repo.diff_for_ai())?;
-            strerr(ollama::Client::new(url).commit_message(&model, &diff))
-        })();
-        Msg::OllamaSuggestion(result)
     });
 }
 

@@ -271,25 +271,81 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
             .map(|b| (b.local.clone(), b.remote.clone()))
             .unwrap_or_default();
 
+        // Local branches that track remotes; hide those remotes below.
+        let local_names: std::collections::HashSet<String> =
+            locals.iter().map(|b| b.name.clone()).collect();
+
         ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
-            ui.label(RichText::new("LOCAL").color(theme::EMBER).small());
-            for branch in locals.iter().filter(|b| b.name.to_lowercase().contains(&filter)) {
+            // -- Local section --
+            let local_matches: Vec<_> = locals
+                .iter()
+                .filter(|b| b.name.to_lowercase().contains(&filter))
+                .collect();
+            egui::Frame::new()
+                .fill(theme::PANEL2)
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin::symmetric(8, 4))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!("LOCAL BRANCHES ({})", local_matches.len()))
+                            .color(theme::EMBER)
+                            .small()
+                            .strong(),
+                    );
+                });
+            if local_matches.is_empty() {
+                ui.label(RichText::new("  none").color(theme::FG_DIM).small());
+            }
+            for branch in local_matches {
                 let marker = if branch.current { "» " } else { "    " };
                 if ui.button(format!("{marker}{}", branch.name)).clicked() {
                     checkout(app, &branch.name);
                     ui.close_menu();
                 }
             }
-            if !remotes.is_empty() {
-                ui.label(RichText::new("REMOTE").color(theme::EMBER).small());
-                for branch in remotes.iter().filter(|b| b.name.to_lowercase().contains(&filter))
+
+            // -- Remote section (only branches without a local counterpart) --
+            let remote_matches: Vec<_> = remotes
+                .iter()
+                .filter(|b| b.name.to_lowercase().contains(&filter))
+                .filter(|b| {
+                    let short =
+                        b.name.split_once('/').map(|(_, l)| l).unwrap_or(&b.name);
+                    !local_names.contains(short)
+                })
+                .collect();
+            ui.add_space(6.0);
+            ui.separator();
+            egui::Frame::new()
+                .fill(theme::PANEL2)
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin::symmetric(8, 4))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!("REMOTE BRANCHES ({})", remote_matches.len()))
+                            .color(theme::TEAL)
+                            .small()
+                            .strong(),
+                    );
+                });
+            if remote_matches.is_empty() {
+                ui.label(
+                    RichText::new("  none (all remotes have local branches)")
+                        .color(theme::FG_DIM)
+                        .small(),
+                );
+            }
+            for branch in remote_matches {
+                let label = RichText::new(format!("    {}", branch.name)).color(theme::TEAL);
+                if ui
+                    .button(label)
+                    .on_hover_text("Creates a local tracking branch and switches to it")
+                    .clicked()
                 {
-                    if ui.button(format!("    {}", branch.name)).clicked() {
-                        let local =
-                            branch.name.split_once('/').map(|(_, l)| l).unwrap_or(&branch.name);
-                        checkout(app, local);
-                        ui.close_menu();
-                    }
+                    let local =
+                        branch.name.split_once('/').map(|(_, l)| l).unwrap_or(&branch.name);
+                    checkout(app, local);
+                    ui.close_menu();
                 }
             }
         });

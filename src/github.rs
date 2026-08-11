@@ -222,6 +222,14 @@ pub struct ChecksSummary {
     pub pending: u32,
 }
 
+/// A repository visible to the signed-in user (for the clone picker).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RemoteRepo {
+    pub full_name: String,
+    pub clone_url: String,
+    pub private: bool,
+}
+
 /// `owner/repo` pair identifying a GitHub repository.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct RepoSlug {
@@ -327,6 +335,27 @@ impl Client {
             CheckState::Passing
         };
         Ok(summary)
+    }
+
+    /// Repositories the user can access, most recently pushed first.
+    pub fn my_repos(&self) -> Result<Vec<RemoteRepo>> {
+        let value =
+            self.get("/user/repos?sort=pushed&per_page=100&affiliation=owner,collaborator")?;
+        Ok(value
+            .as_array()
+            .map(|repos| {
+                repos
+                    .iter()
+                    .filter_map(|r| {
+                        Some(RemoteRepo {
+                            full_name: r.get("full_name")?.as_str()?.to_string(),
+                            clone_url: r.get("clone_url")?.as_str()?.to_string(),
+                            private: r.get("private")?.as_bool()?,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     fn get(&self, path: &str) -> Result<serde_json::Value> {

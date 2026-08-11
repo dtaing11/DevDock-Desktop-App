@@ -210,3 +210,157 @@ fn open_and_init() {
     assert!(Repo::open(repo.path()).is_ok());
     assert!(Repo::open("/nonexistent/nope").is_err());
 }
+
+#[test]
+fn stash_save_list_pop_drop() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "base\n", "init");
+
+    write(&repo, "a.txt", "wip\n");
+    write(&repo, "untracked.txt", "new\n");
+    repo.stash_save("my work in progress").unwrap();
+    assert_eq!(read(&repo, "a.txt"), "base\n");
+    assert!(!repo.path().join("untracked.txt").exists());
+
+    let stashes = repo.stash_list().unwrap();
+    assert_eq!(stashes.len(), 1);
+    assert!(stashes[0].message.contains("my work in progress"));
+
+    repo.stash_pop(0).unwrap();
+    assert_eq!(read(&repo, "a.txt"), "wip\n");
+    assert!(repo.path().join("untracked.txt").exists());
+    assert!(repo.stash_list().unwrap().is_empty());
+
+    // drop path
+    repo.stash_save("to drop").unwrap();
+    repo.stash_drop(0).unwrap();
+    assert!(repo.stash_list().unwrap().is_empty());
+}
+
+#[test]
+fn undo_last_commit_keeps_changes_staged() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "one\n", "first");
+    commit_file(&repo, "a.txt", "two\n", "second");
+    assert_eq!(repo.log(10, None).unwrap().len(), 2);
+
+    repo.undo_last_commit().unwrap();
+    let log = repo.log(10, None).unwrap();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].subject, "first");
+    // Changes from the undone commit are staged.
+    let status = repo.status().unwrap();
+    assert_eq!(status.files.len(), 1);
+    assert!(status.files[0].staged);
+    assert_eq!(read(&repo, "a.txt"), "two\n");
+}
+
+#[test]
+fn amend_commit_updates_message_and_content() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "one\n", "orig message");
+    write(&repo, "a.txt", "one\nplus amended line\n");
+    repo.stage_all().unwrap();
+    repo.commit("amended message", "", true).unwrap();
+    let log = repo.log(10, None).unwrap();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].subject, "amended message");
+    assert_eq!(read(&repo, "a.txt"), "one\nplus amended line\n");
+}
+
+#[test]
+fn hunks_parse_and_stage_partially() {
+    let (_tmp, repo) = setup();
+    // File with two widely separated regions so edits become two hunks.
+    let body: String = (1..=40).map(|i| format!("line {i}\n")).collect();
+    commit_file(&repo, "big.txt", &body, "init big");
+
+    let mut lines: Vec<String> = body.lines().map(String::from).collect();
+    lines[0] = "line 1 EDITED".into();
+    lines[39] = "line 40 EDITED".into();
+    write(&repo, "big.txt", &(lines.join("\n") + "\n"));
+
+    let hunks = repo.hunks("big.txt").unwrap();
+    assert_eq!(hunks.len(), 2, "expected 2 hunks: {hunks:?}");
+
+    // Stage only the first hunk.
+    repo.stage_hunk(&hunks[0]).unwrap();
+    let staged = repo.diff_all(true).unwrap();
+    let unstaged = repo.diff_all(false).unwrap();
+    assert!(staged.contains("line 1 EDITED"));
+    assert!(!staged.contains("line 40 EDITED"));
+    assert!(unstaged.contains("line 40 EDITED"));
+}
+
+#[test]
+fn commit_files_and_per_file_diff() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "a\n", "init");
+    write(&repo, "b.txt", "b\n");
+    write(&repo, "a.txt", "a changed\n");
+    repo.stage_all().unwrap();
+    let sha = repo.commit("touch two files", "", false).unwrap();
+
+    let mut files = repo.commit_files(&sha).unwrap();
+    files.sort_by(|x, y| x.path.cmp(&y.path));
+    assert_eq!(files.len(), 2);
+    assert_eq!(files[0].path, "a.txt");
+    assert_eq!(files[0].status, FileStatus::Modified);
+    assert_eq!(files[1].path, "b.txt");
+    assert_eq!(files[1].status, FileStatus::Added);
+
+    let diff = repo.diff_commit_file(&sha, "a.txt").unwrap();
+    assert!(diff.contains("+a changed"));
+    assert!(!diff.contains("+b"));
+}
+
+#[test]
+fn tags_create_list_push() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "a\n", "init");
+    repo.create_tag("v1.0.0", "first release").unwrap();
+    repo.create_tag("v1.1.0", "").unwrap();
+    let tags = repo.tags().unwrap();
+    assert!(tags.contains(&"v1.0.0".to_string()));
+    assert!(tags.contains(&"v1.1.0".to_string()));
+    repo.push_tag("v1.0.0", None).unwrap();
+}
+
+#[test]
+fn rename_branch_and_ignore() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "a\n", "init");
+
+    repo.rename_branch("main", "trunk").unwrap();
+    assert_eq!(repo.current_branch(), "trunk");
+
+    repo.ignore("*.log").unwrap();
+    repo.ignore("build/").unwrap();
+    let gitignore = read(&repo, ".gitignore");
+    assert!(gitignore.contains("*.log"));
+    assert!(gitignore.contains("build/"));
+    // Ignored files stay out of status.
+    write(&repo, "noise.log", "x\n");
+    assert!(!repo
+        .status()
+        .unwrap()
+        .files
+        .iter()
+        .any(|f| f.path == "noise.log"));
+}
+
+#[test]
+fn blame_reports_authors_per_line() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "first line\n", "one");
+    write(&repo, "a.txt", "first line\nsecond line\n");
+    repo.stage_all().unwrap();
+    repo.commit("two", "", false).unwrap();
+
+    let blame = repo.blame("a.txt").unwrap();
+    assert_eq!(blame.len(), 2);
+    assert_eq!(blame[0].line, "first line");
+    assert_eq!(blame[1].line, "second line");
+    assert_eq!(blame[0].author, "Tester");
+    assert_ne!(blame[0].sha, blame[1].sha);
+}

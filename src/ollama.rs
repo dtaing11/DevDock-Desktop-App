@@ -127,6 +127,11 @@ fn truncate_utf8(s: &str, max: usize) -> String {
 
 /// Extracts a [`CommitSuggestion`] from model output, tolerating extra prose
 /// around the JSON and falling back to first-line/rest splitting.
+/// Shared with the Claude client.
+pub fn parse_suggestion_text(text: &str) -> CommitSuggestion {
+    parse_suggestion(text)
+}
+
 fn parse_suggestion(text: &str) -> CommitSuggestion {
     if let Ok(s) = serde_json::from_str::<CommitSuggestion>(text) {
         return clamp(s);

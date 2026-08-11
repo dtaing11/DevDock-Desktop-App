@@ -204,6 +204,39 @@ pub struct Remote {
     pub url: String,
 }
 
+/// One entry in the stash list.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct StashEntry {
+    pub index: u32,
+    pub message: String,
+}
+
+/// One hunk of a unified diff, self-contained enough to apply as a patch.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Hunk {
+    /// `diff --git`/`---`/`+++` lines for the file, ending in a newline.
+    pub file_header: String,
+    /// The `@@` header line plus hunk body, ending in a newline.
+    pub text: String,
+    /// The `@@ -a,b +c,d @@` line for display.
+    pub header: String,
+}
+
+/// A file change inside a commit.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CommitFileChange {
+    pub path: String,
+    pub status: FileStatus,
+}
+
+/// One line of `git blame` output.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct BlameLine {
+    pub sha: String,
+    pub author: String,
+    pub line: String,
+}
+
 // ---------------------------------------------------------------------------
 // Repo
 // ---------------------------------------------------------------------------
@@ -690,6 +723,177 @@ impl Repo {
             .map(|url| url.trim().starts_with("https://github.com/"))
             .unwrap_or(false)
     }
+
+    // -- stash --------------------------------------------------------------
+
+    /// Stashes all local changes (including untracked files).
+    pub fn stash_save(&self, message: &str) -> Result<()> {
+        let msg = if message.trim().is_empty() { "git-manage stash" } else { message };
+        self.git(&["stash", "push", "--include-untracked", "-m", msg]).map(drop)
+    }
+
+    /// Stash entries, newest first: `(index, message)`.
+    pub fn stash_list(&self) -> Result<Vec<StashEntry>> {
+        let out = self.git(&["stash", "list", "--format=%gd\x1f%gs"]).unwrap_or_default();
+        Ok(out
+            .lines()
+            .filter_map(|line| {
+                let (rev, message) = line.split_once('\u{1f}')?;
+                let index = rev.strip_prefix("stash@{")?.strip_suffix('}')?.parse().ok()?;
+                Some(StashEntry { index, message: message.to_string() })
+            })
+            .collect())
+    }
+
+    /// Applies and removes the given stash entry.
+    pub fn stash_pop(&self, index: u32) -> Result<()> {
+        self.git(&["stash", "pop", &format!("stash@{{{index}}}")]).map(drop)
+    }
+
+    /// Deletes the given stash entry without applying it.
+    pub fn stash_drop(&self, index: u32) -> Result<()> {
+        self.git(&["stash", "drop", &format!("stash@{{{index}}}")]).map(drop)
+    }
+
+    // -- undo ---------------------------------------------------------------
+
+    /// Undoes the last commit, keeping its changes staged (soft reset).
+    /// Refuses when the commit has already been pushed to the upstream.
+    pub fn undo_last_commit(&self) -> Result<()> {
+        if let Ok(upstream) = self.git(&["rev-parse", "@{upstream}"]) {
+            let head = self.git(&["rev-parse", "HEAD"])?;
+            let merged = self
+                .git(&["merge-base", "--is-ancestor", "HEAD", upstream.trim()])
+                .is_ok();
+            if merged && upstream.trim() == head.trim() {
+                return Err(GitError::Command(
+                    "Last commit is already pushed. Revert it instead.".into(),
+                ));
+            }
+        }
+        self.git(&["reset", "--soft", "HEAD~1"]).map(drop)
+    }
+
+    // -- hunks / partial staging ---------------------------------------------
+
+    /// Parses the unstaged diff of one file into hunks for partial staging.
+    pub fn hunks(&self, file: &str) -> Result<Vec<Hunk>> {
+        let diff = self.diff_file(file, false)?;
+        Ok(parse_hunks(&diff))
+    }
+
+    /// Stages exactly one hunk of a file by applying a minimal patch to the
+    /// index. `hunk` must come from [`Repo::hunks`] for the same file state.
+    pub fn stage_hunk(&self, hunk: &Hunk) -> Result<()> {
+        let patch = format!("{}{}", hunk.file_header, hunk.text);
+        let mut child = Command::new("git")
+            .args(["apply", "--cached", "--unidiff-zero", "-"])
+            .current_dir(&self.root)
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        use std::io::Write as _;
+        child
+            .stdin
+            .take()
+            .expect("stdin piped")
+            .write_all(patch.as_bytes())?;
+        let out = child.wait_with_output()?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(GitError::Command(String::from_utf8_lossy(&out.stderr).trim().to_string()))
+        }
+    }
+
+    // -- history details ------------------------------------------------------
+
+    /// Files touched by a commit with their change status.
+    pub fn commit_files(&self, sha: &str) -> Result<Vec<CommitFileChange>> {
+        let out = self.git(&["show", "--name-status", "--format=", sha])?;
+        Ok(out
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|line| {
+                let mut parts = line.split('\t');
+                let status = parts.next()?.chars().next()?;
+                let path = parts.next_back()?.to_string();
+                Some(CommitFileChange { status: FileStatus::from_porcelain(status)?, path })
+            })
+            .collect())
+    }
+
+    /// Patch for a single file within a commit.
+    pub fn diff_commit_file(&self, sha: &str, file: &str) -> Result<String> {
+        self.git(&["show", "--patch", "--format=", sha, "--", file])
+    }
+
+    // -- tags ----------------------------------------------------------------
+
+    /// Tags, newest first.
+    pub fn tags(&self) -> Result<Vec<String>> {
+        let out = self.git(&["tag", "--sort=-creatordate"]).unwrap_or_default();
+        Ok(out.lines().map(String::from).collect())
+    }
+
+    /// Creates an annotated tag at HEAD.
+    pub fn create_tag(&self, name: &str, message: &str) -> Result<()> {
+        let msg = if message.trim().is_empty() { name } else { message };
+        self.git(&["tag", "-a", name, "-m", msg]).map(drop)
+    }
+
+    /// Pushes one tag to origin.
+    pub fn push_tag(&self, name: &str, auth: Option<&str>) -> Result<()> {
+        self.git_auth(&["push", "origin", name], auth).map(drop)
+    }
+
+    // -- misc ----------------------------------------------------------------
+
+    /// Renames a local branch.
+    pub fn rename_branch(&self, old: &str, new: &str) -> Result<()> {
+        self.git(&["branch", "-m", old, new]).map(drop)
+    }
+
+    /// Appends a pattern to the repository's .gitignore.
+    pub fn ignore(&self, pattern: &str) -> Result<()> {
+        use std::io::Write as _;
+        let path = self.root.join(".gitignore");
+        let needs_newline = std::fs::read_to_string(&path)
+            .map(|s| !s.is_empty() && !s.ends_with('\n'))
+            .unwrap_or(false);
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        if needs_newline {
+            writeln!(f)?;
+        }
+        writeln!(f, "{pattern}")?;
+        Ok(())
+    }
+
+    /// Per-line blame for a file: `(commit short sha, author, line)`.
+    pub fn blame(&self, file: &str) -> Result<Vec<BlameLine>> {
+        let out = self.git(&["blame", "--line-porcelain", "--", file])?;
+        let mut lines = Vec::new();
+        let mut sha = String::new();
+        let mut author = String::new();
+        for l in out.lines() {
+            if let Some(rest) = l.strip_prefix("author ") {
+                author = rest.to_string();
+            } else if let Some(stripped) = l.strip_prefix('\t') {
+                lines.push(BlameLine {
+                    sha: sha.chars().take(7).collect(),
+                    author: author.clone(),
+                    line: stripped.to_string(),
+                });
+            } else if !l.starts_with(' ') {
+                if let Some(first) = l.split(' ').next() {
+                    if first.len() == 40 && first.chars().all(|c| c.is_ascii_hexdigit()) {
+                        sha = first.to_string();
+                    }
+                }
+            }
+        }
+        Ok(lines)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -754,6 +958,41 @@ fn parse_branch(line: &str, current: &str) -> Option<Branch> {
         date: parts.next().unwrap_or_default().to_string(),
         subject: parts.next().unwrap_or_default().to_string(),
     })
+}
+
+/// Splits a single-file unified diff into hunks that can be applied
+/// independently with `git apply --cached`.
+fn parse_hunks(diff: &str) -> Vec<Hunk> {
+    let mut file_header = String::new();
+    let mut hunks: Vec<Hunk> = Vec::new();
+    let mut current: Option<Hunk> = None;
+
+    for line in diff.lines() {
+        if line.starts_with("@@") {
+            if let Some(h) = current.take() {
+                hunks.push(h);
+            }
+            current = Some(Hunk {
+                file_header: file_header.clone(),
+                header: line.to_string(),
+                text: format!("{line}\n"),
+            });
+        } else if let Some(h) = current.as_mut() {
+            h.text.push_str(line);
+            h.text.push('\n');
+        } else {
+            file_header.push_str(line);
+            file_header.push('\n');
+        }
+    }
+    if let Some(h) = current.take() {
+        hunks.push(h);
+    }
+    // Fix up headers captured before the first hunk for all hunks.
+    for h in &mut hunks {
+        h.file_header = file_header.clone();
+    }
+    hunks
 }
 
 fn parse_commit(record: &str, field_sep: char) -> Option<Commit> {

@@ -11,6 +11,7 @@
 //! - [`app`]: the egui desktop application built on top of the layers above.
 
 pub mod app;
+pub mod claude;
 pub mod git;
 pub mod github;
 pub mod ollama;

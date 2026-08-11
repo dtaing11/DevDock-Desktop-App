@@ -146,6 +146,51 @@ fn repo_picker(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                 }
             }
         }
+
+        // Clone from the signed-in GitHub account.
+        if app.gh.user.is_some() {
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("YOUR GITHUB REPOSITORIES").color(theme::EMBER).small());
+                if ui.small_button("Load").clicked() {
+                    app.gh_repos_loading = true;
+                    app.worker.spawn(|| {
+                        let result = crate::github::Client::from_store()
+                            .ok_or_else(|| "Not signed in".to_string())
+                            .and_then(|c| strerr(c.my_repos()));
+                        Msg::GhRepos(result)
+                    });
+                }
+            });
+            if app.gh_repos_loading {
+                ui.label(RichText::new("Loading…").color(theme::FG_DIM));
+            }
+            let repos = app.gh_repos.clone();
+            ScrollArea::vertical().max_height(180.0).id_salt("gh-repos").show(ui, |ui| {
+                for r in &repos {
+                    let lock = if r.private { " (private)" } else { "" };
+                    if ui.link(format!("{}{lock}", r.full_name)).clicked() {
+                        // Suggest destination next to existing repos or home.
+                        let base = app
+                            .config
+                            .recent_repos
+                            .first()
+                            .and_then(|p| {
+                                std::path::Path::new(p)
+                                    .parent()
+                                    .map(|d| d.to_path_buf())
+                            })
+                            .unwrap_or_else(|| {
+                                dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."))
+                            });
+                        let name =
+                            r.full_name.split('/').next_back().unwrap_or("repo").to_string();
+                        app.clone_url_input = r.clone_url.clone();
+                        app.clone_dest_input = base.join(name).display().to_string();
+                    }
+                }
+            });
+        }
     });
 }
 
@@ -400,6 +445,8 @@ fn conflict_resolver(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         // Editor for the selected file
         if let Some(i) = app.conflicts.selected {
             let path = app.conflicts.files[i].path.clone();
+            let ours = app.conflicts.files[i].ours.clone().unwrap_or_default();
+            let theirs = app.conflicts.files[i].theirs.clone().unwrap_or_default();
             ui.separator();
             ui.label(RichText::new(&path).color(theme::EMBER).strong());
             ui.horizontal(|ui| {
@@ -414,12 +461,40 @@ fn conflict_resolver(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                     resolve(app, &path, Resolution::Manual(content));
                 }
             });
-            ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+
+            // Side-by-side: ours | theirs (read-only context above the editor).
+            ui.columns(2, |cols| {
+                cols[0].label(RichText::new("OURS (current branch)").color(theme::TEAL).small());
+                ScrollArea::vertical().max_height(140.0).id_salt("ours").show(
+                    &mut cols[0],
+                    |ui| {
+                        for line in ours.lines() {
+                            ui.label(RichText::new(line).monospace().small());
+                        }
+                    },
+                );
+                cols[1].label(RichText::new("THEIRS (incoming)").color(theme::WARN).small());
+                ScrollArea::vertical().max_height(140.0).id_salt("theirs").show(
+                    &mut cols[1],
+                    |ui| {
+                        for line in theirs.lines() {
+                            ui.label(RichText::new(line).monospace().small());
+                        }
+                    },
+                );
+            });
+
+            ui.label(
+                RichText::new("MERGED RESULT (edit freely, then Save manual edit)")
+                    .color(theme::EMBER)
+                    .small(),
+            );
+            ScrollArea::vertical().max_height(200.0).id_salt("merged").show(ui, |ui| {
                 ui.add(
                     egui::TextEdit::multiline(&mut app.conflicts.editor)
                         .code_editor()
                         .desired_width(f32::INFINITY)
-                        .desired_rows(14),
+                        .desired_rows(10),
                 );
             });
         }
@@ -518,6 +593,138 @@ fn settings(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                 RichText::new(format!("Connected. {} model(s) available.", app.ollama_models.len()))
                     .color(theme::ADD),
             );
+        }
+
+        ui.separator();
+        claude_settings(app, ui);
+
+        ui.separator();
+        ui.label(RichText::new("AI PROVIDER FOR COMMIT MESSAGES").color(theme::EMBER).small());
+        ui.horizontal(|ui| {
+            let provider = app.config.ai_provider.clone().unwrap_or_else(|| "ollama".into());
+            if ui.selectable_label(provider == "ollama", "Ollama (local)").clicked() {
+                app.config.ai_provider = Some("ollama".into());
+                app.config.save();
+            }
+            let claude_ready = app.claude.auth_label.is_some();
+            let resp = ui.add_enabled(
+                claude_ready,
+                egui::SelectableLabel::new(provider == "claude", "Claude"),
+            );
+            if resp.clicked() {
+                app.config.ai_provider = Some("claude".into());
+                app.config.save();
+            }
+            if !claude_ready {
+                resp.on_hover_text("Sign in to Claude below first");
+            }
+        });
+    });
+}
+
+/// Claude account section inside Settings: OAuth sign-in or API key.
+fn claude_settings(app: &mut App, ui: &mut egui::Ui) {
+    use crate::claude;
+    ui.label(RichText::new("CLAUDE ACCOUNT").color(theme::EMBER).small());
+
+    if let Some(label) = app.claude.auth_label {
+        ui.horizontal(|ui| {
+            ui.label(format!("Signed in via {label}."));
+            if ui.small_button("Sign out").clicked() {
+                let _ = claude::CredentialStore::clear();
+                app.claude = Default::default();
+                if app.config.ai_provider.as_deref() == Some("claude") {
+                    app.config.ai_provider = Some("ollama".into());
+                    app.config.save();
+                }
+                app.toast("Claude signed out.", false);
+            }
+        });
+        // Model picker
+        ui.horizontal(|ui| {
+            ui.label("Model");
+            let selected = app
+                .config
+                .claude_model
+                .clone()
+                .unwrap_or_else(|| claude::DEFAULT_MODEL.to_string());
+            egui::ComboBox::from_id_salt("claude-model").selected_text(selected).show_ui(
+                ui,
+                |ui| {
+                    for name in claude::MODELS {
+                        let is_sel = app.config.claude_model.as_deref() == Some(*name);
+                        if ui.selectable_label(is_sel, *name).clicked() {
+                            app.config.claude_model = Some(name.to_string());
+                            app.config.save();
+                        }
+                    }
+                },
+            );
+        });
+        return;
+    }
+
+    // OAuth flow (claude.ai Pro/Max account)
+    if let Some(flow) = app.claude.flow.clone() {
+        ui.label("1. Approve access in the browser tab that opened.");
+        ui.horizontal(|ui| {
+            ui.label("If it didn't open:");
+            if ui.link("open sign-in page").clicked() {
+                let _ = open::that(&flow.url);
+            }
+        });
+        ui.label("2. Paste the code shown after approval:");
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut app.claude.code_input)
+                    .hint_text("code or code#state")
+                    .desired_width(260.0),
+            );
+            if ui.button("Connect").clicked() && !app.claude.code_input.trim().is_empty() {
+                match claude::finish_oauth(&flow, &app.claude.code_input) {
+                    Ok(()) => {
+                        app.claude = Default::default();
+                        app.claude.auth_label = claude::Client::auth_label();
+                        app.config.ai_provider = Some("claude".into());
+                        app.config.save();
+                        app.toast("Claude connected.", false);
+                    }
+                    Err(e) => app.toast(e.to_string(), true),
+                }
+            }
+            if ui.button("Cancel").clicked() {
+                app.claude.flow = None;
+                app.claude.code_input.clear();
+            }
+        });
+    } else if ui.button("Sign in with claude.ai account").clicked() {
+        let flow = claude::start_oauth();
+        let _ = open::that(&flow.url);
+        app.claude.flow = Some(flow);
+    }
+
+    // API key alternative
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut app.claude.api_key_input)
+                .password(true)
+                .hint_text("or paste an API key (sk-ant-…)")
+                .desired_width(260.0),
+        );
+        if ui.button("Save key").clicked() && !app.claude.api_key_input.trim().is_empty() {
+            let key = app.claude.api_key_input.trim().to_string();
+            app.claude.api_key_input.clear();
+            let mut creds = claude::CredentialStore::load();
+            creds.api_key = Some(key);
+            match claude::CredentialStore::save(&creds) {
+                Ok(()) => {
+                    app.claude.auth_label = claude::Client::auth_label();
+                    app.config.ai_provider = Some("claude".into());
+                    app.config.save();
+                    app.toast("Claude API key saved.", false);
+                }
+                Err(e) => app.toast(e.to_string(), true),
+            }
         }
     });
 }

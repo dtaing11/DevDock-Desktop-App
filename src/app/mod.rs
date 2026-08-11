@@ -17,6 +17,7 @@ pub mod worker;
 use crate::git::{BranchList, Commit, ConflictFile, Repo, Status};
 use crate::github;
 use crate::ollama;
+use crate::claude;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
@@ -52,6 +53,9 @@ pub struct Config {
     pub recent_repos: Vec<String>,
     pub ollama_url: Option<String>,
     pub ollama_model: Option<String>,
+    /// AI provider for commit messages: "ollama" (default) or "claude".
+    pub ai_provider: Option<String>,
+    pub claude_model: Option<String>,
 }
 
 impl Config {
@@ -128,6 +132,17 @@ pub struct GhState {
     pub polling: bool,
 }
 
+/// Claude sign-in state.
+#[derive(Default)]
+pub struct ClaudeState {
+    /// In-progress OAuth flow awaiting the pasted code.
+    pub flow: Option<claude::OAuthFlow>,
+    pub code_input: String,
+    pub api_key_input: String,
+    /// "claude.ai account (OAuth)", "API key", or None.
+    pub auth_label: Option<&'static str>,
+}
+
 /// Pull-request dialog state.
 #[derive(Default)]
 pub struct PrState {
@@ -179,11 +194,29 @@ pub struct App {
     // commit box
     pub commit_summary: String,
     pub commit_description: String,
+    pub amend: bool,
     pub ai_busy: bool,
 
     // diff view
     pub diff_title: String,
     pub diff_text: String,
+    /// Hunks of the currently selected file (for partial staging).
+    pub hunks: Vec<crate::git::Hunk>,
+    /// Which diff side is shown for the selected file.
+    pub show_staged: bool,
+    /// Blame lines when blame view is active.
+    pub blame: Option<Vec<crate::git::BlameLine>>,
+
+    // history details
+    pub commit_file_list: Vec<crate::git::CommitFileChange>,
+
+    // stash / tags / github repos
+    pub stashes: Vec<crate::git::StashEntry>,
+    pub tags: Vec<String>,
+    pub gh_repos: Vec<github::RemoteRepo>,
+    pub gh_repos_loading: bool,
+    pub tag_name_input: String,
+    pub rename_branch_input: String,
 
     // dialogs
     pub dialog: Dialog,
@@ -194,6 +227,7 @@ pub struct App {
     pub branch_filter: String,
     pub new_branch_name: String,
     pub gh: GhState,
+    pub claude: ClaudeState,
     pub pr: PrState,
     pub conflicts: ConflictState,
     pub ollama_url_input: String,
@@ -231,9 +265,20 @@ impl App {
             selected_commit: None,
             commit_summary: String::new(),
             commit_description: String::new(),
+            amend: false,
             ai_busy: false,
             diff_title: String::new(),
             diff_text: String::new(),
+            hunks: Vec::new(),
+            show_staged: false,
+            blame: None,
+            commit_file_list: Vec::new(),
+            stashes: Vec::new(),
+            tags: Vec::new(),
+            gh_repos: Vec::new(),
+            gh_repos_loading: false,
+            tag_name_input: String::new(),
+            rename_branch_input: String::new(),
             dialog: Dialog::None,
             repo_path_input: String::new(),
             clone_url_input: String::new(),
@@ -242,6 +287,7 @@ impl App {
             branch_filter: String::new(),
             new_branch_name: String::new(),
             gh: Default::default(),
+            claude: Default::default(),
             pr: Default::default(),
             conflicts: Default::default(),
             ollama_models: Vec::new(),
@@ -249,6 +295,7 @@ impl App {
             busy: false,
         };
         app.startup();
+        app.claude.auth_label = claude::Client::auth_label();
         app
     }
 
@@ -301,6 +348,8 @@ impl App {
         if self.tab == Tab::History {
             self.worker.spawn(move || Msg::Log(strerr(repo.log(200, None))));
         }
+        self.load_stashes();
+        self.load_tags();
         self.refresh_branch_checks();
     }
 
@@ -381,36 +430,67 @@ impl App {
         let summary = self.commit_summary.trim().to_string();
         let description = self.commit_description.trim().to_string();
         let files = self.files_for_commit();
-        if summary.is_empty() || files.is_empty() {
+        let amend = self.amend;
+        if summary.is_empty() || (files.is_empty() && !amend) {
             return;
         }
         self.commit_summary.clear();
         self.commit_description.clear();
+        self.amend = false;
         self.unchecked.clear();
         self.selected_file = None;
         self.diff_text.clear();
         self.diff_title.clear();
+        self.hunks.clear();
         self.worker.spawn(move || {
             let result = (|| -> Result<String, crate::git::GitError> {
-                repo.unstage_all().ok();
-                repo.stage(&files)?;
-                let sha = repo.commit(&summary, &description, false)?;
-                Ok(format!("Committed {}", &sha[..7]))
+                if !files.is_empty() {
+                    repo.unstage_all().ok();
+                    repo.stage(&files)?;
+                }
+                let sha = repo.commit(&summary, &description, amend)?;
+                Ok(format!("{} {}", if amend { "Amended" } else { "Committed" }, &sha[..7]))
             })();
             Msg::Done { message: strerr(result), refresh: true }
         });
     }
 
-    /// Stages checked files (so the AI sees the intended diff) and asks Ollama.
+    /// Generates a commit message with the configured AI provider
+    /// (Claude when selected and signed in, otherwise Ollama).
     pub fn generate_ai_message(&mut self) {
         let Some(repo) = self.repo.clone() else { return };
+        let files = self.files_for_commit();
+        let use_claude = self.config.ai_provider.as_deref() == Some("claude");
+        self.ai_busy = true;
+
+        if use_claude {
+            let model = self
+                .config
+                .claude_model
+                .clone()
+                .unwrap_or_else(|| claude::DEFAULT_MODEL.to_string());
+            self.worker.spawn(move || {
+                let result = (|| -> Result<ollama::CommitSuggestion, String> {
+                    if !files.is_empty() {
+                        repo.unstage_all().ok();
+                        strerr(repo.stage(&files))?;
+                    }
+                    let diff = strerr(repo.diff_for_ai())?;
+                    let client = claude::Client::from_store(model)
+                        .ok_or("Claude is not signed in. Open Settings.")?;
+                    strerr(client.commit_message(&diff))
+                })();
+                Msg::OllamaSuggestion(result)
+            });
+            return;
+        }
+
         let Some(model) = self.config.ollama_model.clone() else {
+            self.ai_busy = false;
             self.toast("No Ollama model configured. Open Settings.", true);
             return;
         };
         let url = self.effective_ollama_url();
-        let files = self.files_for_commit();
-        self.ai_busy = true;
         self.worker.spawn(move || {
             let result = (|| -> Result<ollama::CommitSuggestion, String> {
                 if !files.is_empty() {
@@ -502,6 +582,27 @@ impl App {
                 self.dialog = Dialog::Conflicts;
             }
             Msg::Conflicts(Err(e)) => self.toast(e, true),
+            Msg::Stashes(Ok(stashes)) => self.stashes = stashes,
+            Msg::Stashes(Err(e)) => self.toast(e, true),
+            Msg::Hunks { file, hunks } => {
+                if self.selected_file.as_deref() == Some(file.as_str()) {
+                    self.hunks = hunks;
+                }
+            }
+            Msg::CommitFiles { sha, files } => {
+                if self.selected_commit.as_deref() == Some(sha.as_str()) {
+                    self.commit_file_list = files;
+                }
+            }
+            Msg::GhRepos(result) => {
+                self.gh_repos_loading = false;
+                match result {
+                    Ok(repos) => self.gh_repos = repos,
+                    Err(e) => self.toast(e, true),
+                }
+            }
+            Msg::Tags(Ok(tags)) => self.tags = tags,
+            Msg::Tags(Err(e)) => self.toast(e, true),
 
             Msg::GhDeviceCode(Ok(code)) => {
                 let _ = open::that(&code.verification_uri);
@@ -597,6 +698,18 @@ impl App {
     pub fn load_conflicts(&mut self) {
         let Some(repo) = self.repo.clone() else { return };
         self.worker.spawn(move || Msg::Conflicts(strerr(repo.conflicts())));
+    }
+
+    /// Reloads the stash list.
+    pub fn load_stashes(&mut self) {
+        let Some(repo) = self.repo.clone() else { return };
+        self.worker.spawn(move || Msg::Stashes(strerr(repo.stash_list())));
+    }
+
+    /// Reloads the tag list.
+    pub fn load_tags(&mut self) {
+        let Some(repo) = self.repo.clone() else { return };
+        self.worker.spawn(move || Msg::Tags(strerr(repo.tags())));
     }
 
     /// Polls the GitHub device flow at the interval GitHub requested.

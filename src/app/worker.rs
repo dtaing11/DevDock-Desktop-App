@@ -5,8 +5,8 @@
 //! request. This keeps the egui update loop responsive during git and
 //! network operations.
 
-use crate::git::{Branch, BranchList, Commit, ConflictFile, OpOutcome, Status};
-use crate::github::{ChecksSummary, DeviceCode, PullRequest, User};
+use crate::git::{Branch, BranchList, Commit, CommitFileChange, ConflictFile, Hunk, OpOutcome, StashEntry, Status};
+use crate::github::{ChecksSummary, DeviceCode, PullRequest, RemoteRepo, User};
 use crate::ollama::{CommitSuggestion, Model};
 use std::sync::mpsc::{Receiver, Sender};
 
@@ -23,6 +23,11 @@ pub enum Msg {
     Done { message: Result<String, String>, refresh: bool },
     MergeOutcome(OpOutcome),
     Conflicts(Result<Vec<ConflictFile>, String>),
+    Stashes(Result<Vec<StashEntry>, String>),
+    Hunks { file: String, hunks: Vec<Hunk> },
+    CommitFiles { sha: String, files: Vec<CommitFileChange> },
+    GhRepos(Result<Vec<RemoteRepo>, String>),
+    Tags(Result<Vec<String>, String>),
 
     GhDeviceCode(Result<DeviceCode, String>),
     GhSignedIn(Result<User, String>),

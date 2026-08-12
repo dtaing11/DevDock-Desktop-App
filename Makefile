@@ -1,7 +1,7 @@
 PREFIX ?= $(HOME)/.local
 UNAME_S := $(shell uname -s)
 
-.PHONY: build install test lint clean deb
+.PHONY: build install test lint clean deb app
 
 build:
 	cargo build --release
@@ -28,3 +28,12 @@ clean:
 # Build a Debian package (requires: cargo install cargo-deb)
 deb:
 	cargo deb
+
+# Build DevDock.app (macOS bundle with icon and proper dock name)
+app: build
+	rm -rf dist/DevDock.app
+	mkdir -p dist/DevDock.app/Contents/MacOS dist/DevDock.app/Contents/Resources
+	cp packaging/Info.plist dist/DevDock.app/Contents/
+	cp target/release/devdock dist/DevDock.app/Contents/MacOS/
+	sh packaging/make-icns.sh assets/icons/git-manage-256.png dist/DevDock.app/Contents/Resources/DevDock.icns
+	@echo "Built dist/DevDock.app — drag it to /Applications"

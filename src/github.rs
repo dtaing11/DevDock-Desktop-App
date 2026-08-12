@@ -62,10 +62,7 @@ pub struct TokenStore;
 
 impl TokenStore {
     fn path() -> PathBuf {
-        dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("git-manage")
-            .join("auth.json")
+        crate::secure_store::config_dir().join("auth.json")
     }
 
     /// Saves the token, encrypted at rest (see [`crate::secure_store`]).
@@ -362,6 +359,24 @@ impl Client {
             CheckState::Passing
         };
         Ok(summary)
+    }
+
+    /// Merges a pull request (merge commit method). Returns GitHub's
+    /// message; fails with the API's reason when rules block the merge
+    /// (required reviews, failing checks, ...).
+    pub fn merge_pull_request(&self, slug: &RepoSlug, number: u64) -> Result<String> {
+        let path = format!("/repos/{}/{}/pulls/{number}/merge", slug.owner, slug.repo);
+        let resp = agent()
+            .put(&format!("{API_BASE}{path}"))
+            .set("Authorization", &format!("Bearer {}", self.token))
+            .set("Accept", "application/vnd.github+json")
+            .send_json(serde_json::json!({}));
+        let value = read_json(resp)?;
+        Ok(value
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("Pull request merged")
+            .to_string())
     }
 
     /// Whether a branch is protected by repository rules on GitHub.

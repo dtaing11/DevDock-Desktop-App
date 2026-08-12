@@ -103,10 +103,7 @@ pub struct AiSelection {
 
 impl Config {
     fn path() -> PathBuf {
-        dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("git-manage")
-            .join("config.json")
+        crate::secure_store::config_dir().join("config.json")
     }
 
     pub fn load() -> Self {

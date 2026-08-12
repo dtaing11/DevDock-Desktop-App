@@ -486,3 +486,27 @@ fn binary_detection() {
     std::fs::write(repo.path().join("bin.dat"), [7u8, 0, 3, 0, 255]).unwrap();
     assert!(repo.is_binary("bin.dat"));
 }
+
+#[test]
+fn merge_into_lands_commits_on_target() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "base\n", "base");
+
+    // Work happens on a feature branch.
+    repo.create_branch("feature", true).unwrap();
+    commit_file(&repo, "feat.txt", "work\n", "feature work");
+
+    // "Merge feature into main" from the feature branch.
+    let outcome = repo.merge_into("main");
+    assert!(outcome.ok, "{}", outcome.message);
+    // We end up on main with the feature commit present.
+    assert_eq!(repo.current_branch(), "main");
+    assert!(repo.path().join("feat.txt").exists());
+    let log = repo.log(5, None).unwrap();
+    assert!(log.iter().any(|c| c.subject == "feature work"));
+
+    // Degenerate case: same source and target.
+    let outcome = repo.merge_into("main");
+    assert!(!outcome.ok);
+    assert!(outcome.message.contains("same branch"));
+}

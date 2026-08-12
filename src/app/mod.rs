@@ -155,6 +155,100 @@ pub enum Dialog {
     /// Uncommitted changes exist; ask how to handle them before switching
     /// to the branch named inside.
     SwitchBranch(String),
+    /// Confirmation gate for a destructive action.
+    Confirm(ConfirmAction),
+}
+
+/// A destructive action awaiting user confirmation.
+///
+/// Every irreversible (or hard-to-reverse) operation routes through this
+/// gate so nothing is destroyed on a single misclick.
+#[derive(Clone, PartialEq, Eq)]
+pub enum ConfirmAction {
+    /// Discard working changes to one file (restore/delete).
+    DiscardFile(String),
+    /// Delete a stash entry without applying it.
+    DropStash(u32),
+    /// Delete a local branch.
+    DeleteBranch(String),
+    /// Abort the in-progress merge.
+    AbortMerge,
+    /// Abort the in-progress rebase.
+    AbortRebase,
+    /// Undo (soft reset) the last commit.
+    UndoCommit(String),
+    /// Create an inverse commit for the given sha/subject.
+    RevertCommit { sha: String, subject: String },
+    /// Discard every uncommitted change in the working tree.
+    DiscardAll(usize),
+}
+
+impl ConfirmAction {
+    /// Dialog title.
+    pub fn title(&self) -> &'static str {
+        match self {
+            Self::DiscardFile(_) => "Discard changes?",
+            Self::DropStash(_) => "Drop stash?",
+            Self::DeleteBranch(_) => "Delete branch?",
+            Self::AbortMerge => "Abort merge?",
+            Self::AbortRebase => "Abort rebase?",
+            Self::UndoCommit(_) => "Undo commit?",
+            Self::RevertCommit { .. } => "Revert commit?",
+            Self::DiscardAll(_) => "Discard all changes?",
+        }
+    }
+
+    /// Explanation of exactly what will happen.
+    pub fn body(&self) -> String {
+        match self {
+            Self::DiscardFile(path) => format!(
+                "Your uncommitted changes to \"{path}\" will be permanently lost.\n\
+                 Tracked files are restored to the last commit; untracked files are deleted."
+            ),
+            Self::DropStash(_) => {
+                "The stashed changes will be permanently deleted without being applied.".into()
+            }
+            Self::DeleteBranch(name) => format!(
+                "The local branch \"{name}\" will be deleted.\n\
+                 Fails safely if it has unmerged commits."
+            ),
+            Self::AbortMerge => {
+                "The merge stops and the branch returns to its state before the merge. \
+                 Any conflict resolutions you made are discarded.".into()
+            }
+            Self::AbortRebase => {
+                "The rebase stops and the branch returns to its state before the rebase. \
+                 Any conflict resolutions you made are discarded.".into()
+            }
+            Self::UndoCommit(subject) => format!(
+                "\"{subject}\" is removed from history. Its changes stay staged, \
+                 so you can edit and re-commit them."
+            ),
+            Self::RevertCommit { subject, .. } => format!(
+                "A new commit will be created that undoes \"{subject}\". \
+                 History is preserved; this is safe for pushed commits."
+            ),
+            Self::DiscardAll(count) => format!(
+                "All {count} changed file(s) will be permanently reset.\n\
+                 Tracked files return to the last commit; untracked files are deleted.\n\
+                 Consider stashing instead if you might want them back."
+            ),
+        }
+    }
+
+    /// Confirm button label (specific beats generic).
+    pub fn verb(&self) -> &'static str {
+        match self {
+            Self::DiscardFile(_) => "Discard changes",
+            Self::DropStash(_) => "Drop stash",
+            Self::DeleteBranch(_) => "Delete branch",
+            Self::AbortMerge => "Abort merge",
+            Self::AbortRebase => "Abort rebase",
+            Self::UndoCommit(_) => "Undo commit",
+            Self::RevertCommit { .. } => "Revert commit",
+            Self::DiscardAll(_) => "Discard everything",
+        }
+    }
 }
 
 /// How to handle uncommitted changes during a branch switch.
@@ -1136,6 +1230,85 @@ impl App {
             };
             Msg::Done { message: strerr(result), refresh: true }
         });
+    }
+
+    /// Opens the confirmation gate for a destructive action.
+    pub fn confirm(&mut self, action: ConfirmAction) {
+        self.dialog = Dialog::Confirm(action);
+    }
+
+    /// Executes a confirmed destructive action.
+    pub fn execute_confirmed(&mut self, action: ConfirmAction) {
+        self.dialog = Dialog::None;
+        let Some(repo) = self.repo.clone() else { return };
+        match action {
+            ConfirmAction::DiscardFile(path) => {
+                if self.selected_file.as_deref() == Some(path.as_str()) {
+                    views::clear_diff_view(self);
+                }
+                self.worker.spawn(move || Msg::Done {
+                    message: strerr(
+                        repo.discard(std::slice::from_ref(&path))
+                            .map(|_| format!("Discarded changes to {path}")),
+                    ),
+                    refresh: true,
+                });
+            }
+            ConfirmAction::DropStash(index) => {
+                self.worker.spawn(move || Msg::Done {
+                    message: strerr(
+                        repo.stash_drop(index).map(|_| "Stash dropped.".to_string()),
+                    ),
+                    refresh: true,
+                });
+            }
+            ConfirmAction::DeleteBranch(name) => {
+                self.worker.spawn(move || Msg::Done {
+                    message: strerr(
+                        repo.delete_branch(&name, false).map(|_| format!("Deleted {name}")),
+                    ),
+                    refresh: true,
+                });
+            }
+            ConfirmAction::AbortMerge => {
+                self.worker.spawn(move || Msg::Done {
+                    message: strerr(repo.merge_abort().map(|_| "Merge aborted.".to_string())),
+                    refresh: true,
+                });
+            }
+            ConfirmAction::AbortRebase => {
+                self.worker.spawn(move || Msg::Done {
+                    message: strerr(repo.rebase_abort().map(|_| "Rebase aborted.".to_string())),
+                    refresh: true,
+                });
+            }
+            ConfirmAction::UndoCommit(_) => {
+                self.worker.spawn(move || Msg::Done {
+                    message: strerr(
+                        repo.undo_last_commit()
+                            .map(|_| "Commit undone. Changes kept staged.".to_string()),
+                    ),
+                    refresh: true,
+                });
+            }
+            ConfirmAction::RevertCommit { sha, .. } => {
+                self.worker.spawn(move || Msg::MergeOutcome(repo.revert_commit(&sha)));
+            }
+            ConfirmAction::DiscardAll(_) => {
+                views::clear_diff_view(self);
+                let paths: Vec<String> = self
+                    .status
+                    .as_ref()
+                    .map(|s| s.files.iter().map(|f| f.path.clone()).collect())
+                    .unwrap_or_default();
+                self.worker.spawn(move || Msg::Done {
+                    message: strerr(
+                        repo.discard(&paths).map(|_| "All changes discarded.".to_string()),
+                    ),
+                    refresh: true,
+                });
+            }
+        }
     }
 
     /// Switches branch. With uncommitted changes present, opens a dialog

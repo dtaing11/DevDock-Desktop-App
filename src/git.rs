@@ -588,6 +588,35 @@ impl Repo {
         OpOutcome::from(self.git(&["merge", "--no-edit", branch]))
     }
 
+    /// Merges the current branch into `target`: checks out `target`, then
+    /// merges the previous branch into it. On success you end up on
+    /// `target` with the merge applied (push it to publish).
+    pub fn merge_into(&self, target: &str) -> OpOutcome {
+        let source = self.current_branch();
+        if source == target {
+            return OpOutcome {
+                ok: false,
+                conflict: false,
+                message: "Source and target are the same branch.".into(),
+            };
+        }
+        if let Err(e) = self.checkout(target) {
+            return OpOutcome { ok: false, conflict: false, message: e.to_string() };
+        }
+        let outcome = self.merge(&source);
+        if outcome.ok {
+            OpOutcome {
+                ok: true,
+                conflict: false,
+                message: format!(
+                    "Merged {source} into {target}. You are now on {target}; push to publish."
+                ),
+            }
+        } else {
+            outcome
+        }
+    }
+
     /// Aborts an in-progress merge.
     pub fn merge_abort(&self) -> Result<()> {
         self.git(&["merge", "--abort"]).map(drop)

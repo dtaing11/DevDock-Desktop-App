@@ -22,6 +22,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         Dialog::Settings => settings(app, ctx, &mut open),
         Dialog::AddRemote => add_remote(app, ctx, &mut open),
         Dialog::SwitchBranch(_) => switch_branch(app, ctx, &mut open),
+        Dialog::Confirm(_) => confirm_dialog(app, ctx, &mut open),
     }
     // The window's X button was clicked.
     if !open {
@@ -1164,5 +1165,44 @@ fn switch_branch(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         if ui.add(egui::Button::new("Cancel").min_size(full)).clicked() {
             app.dialog = Dialog::None;
         }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Destructive-action confirmation
+// ---------------------------------------------------------------------------
+
+/// One confirmation dialog for every destructive action: title, a plain
+/// explanation of consequences, a red confirm button, and Cancel.
+fn confirm_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
+    let Dialog::Confirm(action) = app.dialog.clone() else { return };
+
+    // Enter confirms, Escape cancels (Escape handled by global shortcuts).
+    let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+
+    modal(ctx, action.title(), open, |ui| {
+        ui.set_min_width(360.0);
+        ui.label(action.body());
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let confirm = egui::Button::new(
+                RichText::new(action.verb()).color(egui::Color32::WHITE).strong(),
+            )
+            .fill(theme::DANGER.linear_multiply(0.85))
+            .min_size(egui::vec2(0.0, theme::CONTROL_MD));
+            if ui.add(confirm).clicked() || enter {
+                app.execute_confirmed(action.clone());
+            }
+            let cancel = egui::Button::new("Cancel")
+                .min_size(egui::vec2(0.0, theme::CONTROL_MD));
+            if ui.add(cancel).clicked() {
+                app.dialog = Dialog::None;
+            }
+        });
+        ui.label(
+            RichText::new("Enter confirms · Esc cancels")
+                .color(theme::FG_DIM)
+                .small(),
+        );
     });
 }

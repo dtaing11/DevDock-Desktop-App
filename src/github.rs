@@ -62,10 +62,7 @@ pub struct TokenStore;
 
 impl TokenStore {
     fn path() -> PathBuf {
-        dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("git-manage")
-            .join("auth.json")
+        crate::secure_store::config_dir().join("auth.json")
     }
 
     /// Saves the token, encrypted at rest (see [`crate::secure_store`]).
@@ -362,6 +359,40 @@ impl Client {
             CheckState::Passing
         };
         Ok(summary)
+    }
+
+    /// Merges a pull request. `method` is "merge", "squash", or "rebase".
+    /// Fails with the API's reason when rules block the merge (required
+    /// reviews, failing checks, disallowed method, ...).
+    pub fn merge_pull_request(
+        &self,
+        slug: &RepoSlug,
+        number: u64,
+        method: &str,
+    ) -> Result<String> {
+        let path = format!("/repos/{}/{}/pulls/{number}/merge", slug.owner, slug.repo);
+        let resp = agent()
+            .put(&format!("{API_BASE}{path}"))
+            .set("Authorization", &format!("Bearer {}", self.token))
+            .set("Accept", "application/vnd.github+json")
+            .send_json(serde_json::json!({ "merge_method": method }));
+        let value = read_json(resp)?;
+        Ok(value
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("Pull request merged")
+            .to_string())
+    }
+
+    /// Whether a branch is protected by repository rules on GitHub.
+    ///
+    /// Uses the branch endpoint's `protected` flag, which reflects both
+    /// classic branch protection and repository rulesets that restrict
+    /// direct pushes.
+    pub fn branch_protected(&self, slug: &RepoSlug, branch: &str) -> Result<bool> {
+        let path = format!("/repos/{}/{}/branches/{branch}", slug.owner, slug.repo);
+        let value = self.get(&path)?;
+        Ok(value.get("protected").and_then(|p| p.as_bool()).unwrap_or(false))
     }
 
     /// Repositories the user can access, most recently pushed first.

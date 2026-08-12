@@ -192,10 +192,37 @@ fn checks_badge(app: &mut App, ui: &mut egui::Ui) {
         CheckState::Pending => ("RUNNING", theme::WARN),
         CheckState::None => unreachable!(),
     };
-    let text = format!("{symbol} ({}/{})", summary.passed, summary.total);
-    let _ = color; // status color shown inside the dropdown rows
+    // Compose "OK (4/4) · main OK" with the main part colored.
+    let main_part = app.main_checks.as_ref().map(|(name, s)| {
+        let sym = match s.state {
+            CheckState::Passing => "OK",
+            CheckState::Failing => "FAIL",
+            CheckState::Pending => "RUN",
+            CheckState::None => "-",
+        };
+        (name.clone(), sym, s.state)
+    });
+    let text = match &main_part {
+        Some((name, sym, _)) => format!(
+            "{symbol} ({}/{}) · {name} {sym}",
+            summary.passed, summary.total
+        ),
+        None => format!("{symbol} ({}/{})", summary.passed, summary.total),
+    };
+    let _ = color; // per-run colors shown inside the dropdown
 
     segment_menu(ui, "CI STATUS", &text, |ui| {
+        // Default-branch summary row, green when healthy.
+        if let Some((name, _, state)) = &main_part {
+            let (label, mcolor) = match state {
+                CheckState::Passing => (format!("{name}: all checks passing"), theme::ADD),
+                CheckState::Failing => (format!("{name}: checks failing"), theme::DANGER),
+                CheckState::Pending => (format!("{name}: checks running"), theme::WARN),
+                CheckState::None => (format!("{name}: no checks"), theme::FG_DIM),
+            };
+            ui.label(RichText::new(label).color(mcolor).strong());
+            ui.separator();
+        }
         ui.set_min_width(340.0);
         ui.label(
             RichText::new(format!(
@@ -367,8 +394,31 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
         // Branch actions, like GitHub Desktop's Branch menu
         ui.separator();
         let others = app.branches.as_ref().map(pickable_branches).unwrap_or_default();
-        ui.menu_button(format!("Merge into {current}…"), |ui| {
-            ui.set_min_width(240.0);
+        ui.menu_button(format!("Merge {current} into…"), |ui| {
+            ui.set_min_width(260.0);
+            ui.label(
+                RichText::new(format!(
+                    "Puts {current}'s commits onto the branch you pick"
+                ))
+                .color(theme::FG_DIM)
+                .small(),
+            );
+            let locals_only: Vec<_> =
+                others.iter().filter(|b| !b.name.contains('/')).collect();
+            for branch in locals_only {
+                if ui.button(&branch.name).clicked() {
+                    app.request_merge_into(&branch.name);
+                    ui.close_menu();
+                }
+            }
+        });
+        ui.menu_button(format!("Merge a branch into {current}…"), |ui| {
+            ui.set_min_width(260.0);
+            ui.label(
+                RichText::new(format!("Brings the picked branch's commits into {current}"))
+                    .color(theme::FG_DIM)
+                    .small(),
+            );
             for branch in &others {
                 if ui.button(&branch.name).clicked() {
                     if let Some(repo) = app.repo.clone() {
@@ -431,15 +481,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
                         ui.close_menu();
                     }
                     if ui.small_button("Drop").clicked() {
-                        if let Some(repo) = app.repo.clone() {
-                            let idx = stash.index;
-                            app.worker.spawn(move || Msg::Done {
-                                message: strerr(
-                                    repo.stash_drop(idx).map(|_| "Stash dropped.".to_string()),
-                                ),
-                                refresh: true,
-                            });
-                        }
+                        app.confirm(crate::app::ConfirmAction::DropStash(stash.index));
                         ui.close_menu();
                     }
                 });
@@ -452,15 +494,8 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
             .on_hover_text("Soft reset: keeps the changes staged")
             .clicked()
         {
-            if let Some(repo) = app.repo.clone() {
-                app.worker.spawn(move || Msg::Done {
-                    message: strerr(
-                        repo.undo_last_commit()
-                            .map(|_| "Last commit undone (changes kept).".to_string()),
-                    ),
-                    refresh: true,
-                });
-            }
+            let subject = app.log.first().map(|c| c.subject.clone()).unwrap_or_default();
+            app.confirm(crate::app::ConfirmAction::UndoCommit(subject));
             ui.close_menu();
         }
 
@@ -520,16 +555,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
             ui.set_min_width(200.0);
             for name in &manageable {
                 if ui.button(name).clicked() {
-                    if let Some(repo) = app.repo.clone() {
-                        let name = name.clone();
-                        app.worker.spawn(move || Msg::Done {
-                            message: strerr(
-                                repo.delete_branch(&name, false)
-                                    .map(|_| format!("Deleted {name}")),
-                            ),
-                            refresh: true,
-                        });
-                    }
+                    app.confirm(crate::app::ConfirmAction::DeleteBranch(name.clone()));
                     ui.close_menu();
                 }
             }
@@ -763,18 +789,11 @@ fn state_banner(app: &mut App, ui: &mut egui::Ui) {
                     }
                 }
                 if ui.button("Abort").clicked() {
-                    if let Some(repo) = app.repo.clone() {
-                        app.worker.spawn(move || {
-                            let result = match state {
-                                RepoState::Merging => repo.merge_abort(),
-                                _ => repo.rebase_abort(),
-                            };
-                            Msg::Done {
-                                message: strerr(result.map(|_| "Aborted.".to_string())),
-                                refresh: true,
-                            }
-                        });
-                    }
+                    app.confirm(if state == RepoState::Merging {
+                        crate::app::ConfirmAction::AbortMerge
+                    } else {
+                        crate::app::ConfirmAction::AbortRebase
+                    });
                 }
             });
         });
@@ -884,6 +903,40 @@ fn elide_path(path: &str, max_chars: usize) -> String {
 fn changes_tab(app: &mut App, ui: &mut egui::Ui) {
     let files = app.status.as_ref().map(|s| s.files.clone()).unwrap_or_default();
 
+    // Header: select-all checkbox, count, and gated discard-all.
+    if !files.is_empty() {
+        ui.horizontal(|ui| {
+            let mut all = files.iter().all(|f| !app.unchecked.contains(&f.path));
+            if ui
+                .checkbox(&mut all, "")
+                .on_hover_text("Select or deselect all files for the next commit")
+                .changed()
+            {
+                if all {
+                    app.unchecked.clear();
+                } else {
+                    app.unchecked = files.iter().map(|f| f.path.clone()).collect();
+                }
+            }
+            let selected = files.iter().filter(|f| !app.unchecked.contains(&f.path)).count();
+            ui.label(
+                RichText::new(format!("{selected} of {} selected", files.len()))
+                    .color(theme::FG_DIM)
+                    .small(),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button("Discard all…")
+                    .on_hover_text("Reset every change (asks first)")
+                    .clicked()
+                {
+                    app.confirm(crate::app::ConfirmAction::DiscardAll(files.len()));
+                }
+            });
+        });
+        ui.separator();
+    }
+
     // File list fills the space above the commit box.
     let commit_box_height = 215.0;
     let list_height = (ui.available_height() - commit_box_height).max(60.0);
@@ -947,7 +1000,7 @@ fn changes_tab(app: &mut App, ui: &mut egui::Ui) {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .small_button("x")
-                            .on_hover_text("Discard changes (irreversible)")
+                            .on_hover_text("Discard changes… (asks to confirm)")
                             .clicked()
                         {
                             discard_file(app, &file.path);
@@ -1006,19 +1059,7 @@ pub fn load_file_diff(app: &mut App) {
 }
 
 fn discard_file(app: &mut App, path: &str) {
-    let Some(repo) = app.repo.clone() else { return };
-    // Clear the viewport when the discarded file is being viewed.
-    if app.selected_file.as_deref() == Some(path) {
-        clear_diff_view(app);
-    }
-    let path = path.to_string();
-    app.worker.spawn(move || Msg::Done {
-        message: strerr(
-            repo.discard(std::slice::from_ref(&path))
-                .map(|_| format!("Discarded changes to {path}")),
-        ),
-        refresh: true,
-    });
+    app.confirm(crate::app::ConfirmAction::DiscardFile(path.to_string()));
 }
 
 /// Resets the diff viewport to its empty state.
@@ -1087,15 +1128,7 @@ fn commit_box(app: &mut App, ui: &mut egui::Ui) {
                 .on_hover_text("Soft reset: removes the commit but keeps its changes staged")
                 .clicked()
             {
-                if let Some(repo) = app.repo.clone() {
-                    app.worker.spawn(move || Msg::Done {
-                        message: strerr(
-                            repo.undo_last_commit()
-                                .map(|_| "Commit undone. Changes kept.".to_string()),
-                        ),
-                        refresh: true,
-                    });
-                }
+                app.confirm(crate::app::ConfirmAction::UndoCommit(last.subject.clone()));
             }
         }
     }
@@ -1398,10 +1431,10 @@ fn history_tab(app: &mut App, ui: &mut egui::Ui) {
                     .on_hover_text("Creates a new commit that undoes this one")
                     .clicked()
                 {
-                    if let Some(repo) = app.repo.clone() {
-                        let sha = commit.sha.clone();
-                        app.worker.spawn(move || Msg::MergeOutcome(repo.revert_commit(&sha)));
-                    }
+                    app.confirm(crate::app::ConfirmAction::RevertCommit {
+                        sha: commit.sha.clone(),
+                        subject: commit.subject.clone(),
+                    });
                     ui.close_menu();
                 }
             });

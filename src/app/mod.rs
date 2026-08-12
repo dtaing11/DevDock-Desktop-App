@@ -103,10 +103,7 @@ pub struct AiSelection {
 
 impl Config {
     fn path() -> PathBuf {
-        dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("git-manage")
-            .join("config.json")
+        crate::secure_store::config_dir().join("config.json")
     }
 
     pub fn load() -> Self {
@@ -155,6 +152,116 @@ pub enum Dialog {
     /// Uncommitted changes exist; ask how to handle them before switching
     /// to the branch named inside.
     SwitchBranch(String),
+    /// Confirmation gate for a destructive action.
+    Confirm(ConfirmAction),
+}
+
+/// A destructive action awaiting user confirmation.
+///
+/// Every irreversible (or hard-to-reverse) operation routes through this
+/// gate so nothing is destroyed on a single misclick.
+#[derive(Clone, PartialEq, Eq)]
+pub enum ConfirmAction {
+    /// Discard working changes to one file (restore/delete).
+    DiscardFile(String),
+    /// Delete a stash entry without applying it.
+    DropStash(u32),
+    /// Delete a local branch.
+    DeleteBranch(String),
+    /// Abort the in-progress merge.
+    AbortMerge,
+    /// Abort the in-progress rebase.
+    AbortRebase,
+    /// Undo (soft reset) the last commit.
+    UndoCommit(String),
+    /// Create an inverse commit for the given sha/subject.
+    RevertCommit { sha: String, subject: String },
+    /// Discard every uncommitted change in the working tree.
+    DiscardAll(usize),
+    /// Merge the current branch into `target`. `protected` reflects GitHub
+    /// branch rules on the target.
+    MergeInto { source: String, target: String, protected: bool },
+}
+
+impl ConfirmAction {
+    /// Dialog title.
+    pub fn title(&self) -> &'static str {
+        match self {
+            Self::DiscardFile(_) => "Discard changes?",
+            Self::DropStash(_) => "Drop stash?",
+            Self::DeleteBranch(_) => "Delete branch?",
+            Self::AbortMerge => "Abort merge?",
+            Self::AbortRebase => "Abort rebase?",
+            Self::UndoCommit(_) => "Undo commit?",
+            Self::RevertCommit { .. } => "Revert commit?",
+            Self::DiscardAll(_) => "Discard all changes?",
+            Self::MergeInto { .. } => "Confirm merge",
+        }
+    }
+
+    /// Explanation of exactly what will happen.
+    pub fn body(&self) -> String {
+        match self {
+            Self::DiscardFile(path) => format!(
+                "Your uncommitted changes to \"{path}\" will be permanently lost.\n\
+                 Tracked files are restored to the last commit; untracked files are deleted."
+            ),
+            Self::DropStash(_) => {
+                "The stashed changes will be permanently deleted without being applied.".into()
+            }
+            Self::DeleteBranch(name) => format!(
+                "The local branch \"{name}\" will be deleted.\n\
+                 Fails safely if it has unmerged commits."
+            ),
+            Self::AbortMerge => {
+                "The merge stops and the branch returns to its state before the merge. \
+                 Any conflict resolutions you made are discarded.".into()
+            }
+            Self::AbortRebase => {
+                "The rebase stops and the branch returns to its state before the rebase. \
+                 Any conflict resolutions you made are discarded.".into()
+            }
+            Self::UndoCommit(subject) => format!(
+                "\"{subject}\" is removed from history. Its changes stay staged, \
+                 so you can edit and re-commit them."
+            ),
+            Self::RevertCommit { subject, .. } => format!(
+                "A new commit will be created that undoes \"{subject}\". \
+                 History is preserved; this is safe for pushed commits."
+            ),
+            Self::MergeInto { protected, .. } => {
+                if *protected {
+                    "The target is protected on GitHub: the merged result may be \
+                     rejected on push. Prefer a pull request."
+                        .into()
+                } else {
+                    "You will end up on the target branch; push to publish.".into()
+                }
+            }
+            Self::DiscardAll(count) => format!(
+                "All {count} changed file(s) will be permanently reset.\n\
+                 Tracked files return to the last commit; untracked files are deleted.\n\
+                 Consider stashing instead if you might want them back."
+            ),
+        }
+    }
+
+    /// Confirm button label (specific beats generic).
+    pub fn verb(&self) -> &'static str {
+        match self {
+            Self::DiscardFile(_) => "Discard changes",
+            Self::DropStash(_) => "Drop stash",
+            Self::DeleteBranch(_) => "Delete branch",
+            Self::AbortMerge => "Abort merge",
+            Self::AbortRebase => "Abort rebase",
+            Self::UndoCommit(_) => "Undo commit",
+            Self::RevertCommit { .. } => "Revert commit",
+            Self::DiscardAll(_) => "Discard everything",
+            Self::MergeInto { protected, .. } => {
+                if *protected { "Merge anyway (may not push)" } else { "Merge" }
+            }
+        }
+    }
 }
 
 /// How to handle uncommitted changes during a branch switch.
@@ -303,6 +410,8 @@ pub struct App {
     pub last_refresh: Instant,
     /// CI checks for the current branch head, refreshed with status.
     pub branch_checks: Option<github::ChecksSummary>,
+    /// CI checks for the default branch (main/master), shown alongside.
+    pub main_checks: Option<(String, github::ChecksSummary)>,
     last_checks_refresh: Option<Instant>,
     /// Last background fetch, so remote changes surface automatically.
     last_auto_fetch: Option<Instant>,
@@ -384,6 +493,7 @@ impl App {
             log: Vec::new(),
             last_refresh: Instant::now(),
             branch_checks: None,
+            main_checks: None,
             last_checks_refresh: None,
             last_auto_fetch: None,
             tab: Tab::Changes,
@@ -511,7 +621,8 @@ impl App {
     }
 
     /// Fetches CI check status for the current branch head from GitHub,
-    /// throttled to once every 30 seconds.
+    /// plus the default branch (main) when different, throttled to once
+    /// every 30 seconds.
     fn refresh_branch_checks(&mut self) {
         if self.gh.user.is_none() {
             return;
@@ -529,18 +640,52 @@ impl App {
             return; // detached / no commits
         }
         self.last_checks_refresh = Some(Instant::now());
-        self.worker.spawn(move || {
-            let result = (|| -> Option<(String, github::ChecksSummary)> {
-                let client = github::Client::from_store()?;
-                let slug = views::origin_slug(&repo)?;
-                let summary = client.checks(&slug, &branch).ok()?;
-                Some((branch, summary))
-            })();
-            match result {
-                Some((branch, summary)) => Msg::GhBranchChecks { branch, summary },
-                None => Msg::Noop,
-            }
-        });
+        {
+            let repo = repo.clone();
+            self.worker.spawn(move || {
+                let result = (|| -> Option<(String, github::ChecksSummary)> {
+                    let client = github::Client::from_store()?;
+                    let slug = views::origin_slug(&repo)?;
+                    let summary = client.checks(&slug, &branch).ok()?;
+                    Some((branch, summary))
+                })();
+                match result {
+                    Some((branch, summary)) => Msg::GhBranchChecks { branch, summary },
+                    None => Msg::Noop,
+                }
+            });
+        }
+        // Default branch status (only when we're not already on it).
+        let main_branch = self.default_branch();
+        if self.status.as_ref().map(|s| s.branch != main_branch).unwrap_or(false) {
+            self.worker.spawn(move || {
+                let result = (|| -> Option<(String, github::ChecksSummary)> {
+                    let client = github::Client::from_store()?;
+                    let slug = views::origin_slug(&repo)?;
+                    let summary = client.checks(&slug, &main_branch).ok()?;
+                    Some((main_branch, summary))
+                })();
+                match result {
+                    Some((branch, summary)) => Msg::GhMainChecks { branch, summary },
+                    None => Msg::Noop,
+                }
+            });
+        } else {
+            self.main_checks = None;
+        }
+    }
+
+    /// Best guess at the default branch: a local `main` or `master`.
+    fn default_branch(&self) -> String {
+        self.branches
+            .as_ref()
+            .and_then(|b| {
+                b.local
+                    .iter()
+                    .find(|br| br.name == "main" || br.name == "master")
+                    .map(|br| br.name.clone())
+            })
+            .unwrap_or_else(|| "main".into())
     }
 
     /// Files that will be included in the next commit.
@@ -776,7 +921,19 @@ impl App {
                             self.toast(m, false);
                         }
                     }
-                    Err(e) => self.toast(e, true),
+                    Err(e) => {
+                        // Conflicts from stash apply / checkout land here:
+                        // open the resolver instead of only toasting.
+                        if e.to_lowercase().contains("conflict") {
+                            self.toast(
+                                "Conflicts detected. Opening the resolver…",
+                                true,
+                            );
+                            self.load_conflicts();
+                        } else {
+                            self.toast(e, true);
+                        }
+                    }
                 }
                 if refresh {
                     self.refresh();
@@ -896,6 +1053,13 @@ impl App {
                 if current == Some(branch.as_str()) {
                     self.branch_checks = Some(summary);
                 }
+            }
+            Msg::GhMainChecks { branch, summary } => {
+                self.main_checks = Some((branch, summary));
+            }
+            Msg::MergePrompt { source, target, protected } => {
+                self.busy = false;
+                self.confirm(ConfirmAction::MergeInto { source, target, protected });
             }
             Msg::GhPrChecks { number, summary } => {
                 self.pr.checks.insert(number, summary);
@@ -1077,7 +1241,13 @@ impl App {
             } else {
                 repo.push(set_upstream, auth).map(|_| "Pushed.".to_string()).map_err(|e| {
                     let msg = e.to_string();
-                    if msg.contains("rejected") || msg.contains("non-fast-forward") {
+                    if msg.contains("protected branch") || msg.contains("GH006") {
+                        crate::git::GitError::Command(format!(
+                            "{msg}\n\nGitHub rejected the push: this branch is protected \
+                             by repository rules. Open a pull request instead \
+                             (Pull Request button in the toolbar)."
+                        ))
+                    } else if msg.contains("rejected") || msg.contains("non-fast-forward") {
                         crate::git::GitError::Command(format!(
                             "{msg}\n\nHint: after amend/rebase use Force push \
                              (right-click the sync button)."
@@ -1095,6 +1265,108 @@ impl App {
             };
             Msg::Done { message: strerr(result), refresh: true }
         });
+    }
+
+    /// Starts a "merge current branch into target" flow: checks GitHub
+    /// branch protection first, then opens a confirmation dialog that
+    /// warns when repository rules restrict the target.
+    pub fn request_merge_into(&mut self, target: &str) {
+        let Some(repo) = self.repo.clone() else { return };
+        let source = self.status.as_ref().map(|s| s.branch.clone()).unwrap_or_default();
+        let target = target.to_string();
+        self.busy = true;
+        self.worker.spawn(move || {
+            let protected = (|| -> Option<bool> {
+                let client = github::Client::from_store()?;
+                let slug = views::origin_slug(&repo)?;
+                client.branch_protected(&slug, &target).ok()
+            })()
+            .unwrap_or(false); // offline/signed out: no warning, plain confirm
+            Msg::MergePrompt { source, target, protected }
+        });
+    }
+
+    /// Opens the confirmation gate for a destructive action.
+    pub fn confirm(&mut self, action: ConfirmAction) {
+        self.dialog = Dialog::Confirm(action);
+    }
+
+    /// Executes a confirmed destructive action.
+    pub fn execute_confirmed(&mut self, action: ConfirmAction) {
+        self.dialog = Dialog::None;
+        let Some(repo) = self.repo.clone() else { return };
+        match action {
+            ConfirmAction::DiscardFile(path) => {
+                if self.selected_file.as_deref() == Some(path.as_str()) {
+                    views::clear_diff_view(self);
+                }
+                self.worker.spawn(move || Msg::Done {
+                    message: strerr(
+                        repo.discard(std::slice::from_ref(&path))
+                            .map(|_| format!("Discarded changes to {path}")),
+                    ),
+                    refresh: true,
+                });
+            }
+            ConfirmAction::DropStash(index) => {
+                self.worker.spawn(move || Msg::Done {
+                    message: strerr(
+                        repo.stash_drop(index).map(|_| "Stash dropped.".to_string()),
+                    ),
+                    refresh: true,
+                });
+            }
+            ConfirmAction::DeleteBranch(name) => {
+                self.worker.spawn(move || Msg::Done {
+                    message: strerr(
+                        repo.delete_branch(&name, false).map(|_| format!("Deleted {name}")),
+                    ),
+                    refresh: true,
+                });
+            }
+            ConfirmAction::AbortMerge => {
+                self.worker.spawn(move || Msg::Done {
+                    message: strerr(repo.merge_abort().map(|_| "Merge aborted.".to_string())),
+                    refresh: true,
+                });
+            }
+            ConfirmAction::AbortRebase => {
+                self.worker.spawn(move || Msg::Done {
+                    message: strerr(repo.rebase_abort().map(|_| "Rebase aborted.".to_string())),
+                    refresh: true,
+                });
+            }
+            ConfirmAction::UndoCommit(_) => {
+                self.worker.spawn(move || Msg::Done {
+                    message: strerr(
+                        repo.undo_last_commit()
+                            .map(|_| "Commit undone. Changes kept staged.".to_string()),
+                    ),
+                    refresh: true,
+                });
+            }
+            ConfirmAction::RevertCommit { sha, .. } => {
+                self.worker.spawn(move || Msg::MergeOutcome(repo.revert_commit(&sha)));
+            }
+            ConfirmAction::MergeInto { target, .. } => {
+                self.busy = true;
+                self.worker.spawn(move || Msg::MergeOutcome(repo.merge_into(&target)));
+            }
+            ConfirmAction::DiscardAll(_) => {
+                views::clear_diff_view(self);
+                let paths: Vec<String> = self
+                    .status
+                    .as_ref()
+                    .map(|s| s.files.iter().map(|f| f.path.clone()).collect())
+                    .unwrap_or_default();
+                self.worker.spawn(move || Msg::Done {
+                    message: strerr(
+                        repo.discard(&paths).map(|_| "All changes discarded.".to_string()),
+                    ),
+                    refresh: true,
+                });
+            }
+        }
     }
 
     /// Switches branch. With uncommitted changes present, opens a dialog

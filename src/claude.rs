@@ -67,10 +67,7 @@ pub struct CredentialStore;
 
 impl CredentialStore {
     fn path() -> PathBuf {
-        dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("git-manage")
-            .join("claude.json")
+        crate::secure_store::config_dir().join("claude.json")
     }
 
     pub fn load() -> Credentials {

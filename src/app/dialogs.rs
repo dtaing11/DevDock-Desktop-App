@@ -22,6 +22,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         Dialog::Settings => settings(app, ctx, &mut open),
         Dialog::AddRemote => add_remote(app, ctx, &mut open),
         Dialog::SwitchBranch(_) => switch_branch(app, ctx, &mut open),
+        Dialog::Confirm(_) => confirm_dialog(app, ctx, &mut open),
     }
     // The window's X button was clicked.
     if !open {
@@ -365,6 +366,41 @@ fn pull_requests(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                     {
                         let _ = open::that(&pr.html_url);
                     }
+                    ui.menu_button("Merge", |ui| {
+                        ui.label(
+                            RichText::new(
+                                "GitHub enforces repository rules and reports back",
+                            )
+                            .color(theme::FG_DIM)
+                            .small(),
+                        );
+                        for (label, method) in [
+                            ("Create a merge commit", "merge"),
+                            ("Squash and merge", "squash"),
+                            ("Rebase and merge", "rebase"),
+                        ] {
+                            if ui.button(label).clicked() {
+                                let number = pr.number;
+                                let method = method.to_string();
+                                if let Some(repo) = app.repo.clone() {
+                                    app.worker.spawn(move || {
+                                        let result = (|| -> Result<String, String> {
+                                            let client =
+                                                crate::github::Client::from_store()
+                                                    .ok_or("Not signed in")?;
+                                            let slug = super::views::origin_slug(&repo)
+                                                .ok_or("No github.com remote")?;
+                                            client
+                                                .merge_pull_request(&slug, number, &method)
+                                                .map_err(|e| e.to_string())
+                                        })();
+                                        Msg::Done { message: result, refresh: true }
+                                    });
+                                }
+                                ui.close_menu();
+                            }
+                        }
+                    });
                     if let Some(checks) = app.pr.checks.get(&pr.number) {
                         use crate::github::CheckState;
                         let (label, color) = match checks.state {
@@ -1165,4 +1201,84 @@ fn switch_branch(app: &mut App, ctx: &egui::Context, open: &mut bool) {
             app.dialog = Dialog::None;
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// Destructive-action confirmation
+// ---------------------------------------------------------------------------
+
+/// One confirmation dialog for every destructive action: title, a plain
+/// explanation of consequences, a red confirm button, and Cancel.
+fn confirm_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
+    let Dialog::Confirm(action) = app.dialog.clone() else { return };
+
+    // Enter confirms, Escape cancels (Escape handled by global shortcuts).
+    let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+
+    modal(ctx, action.title(), open, |ui| {
+        ui.set_min_width(360.0);
+
+        // Merge gets a visual source -> target card so direction is obvious.
+        if let crate::app::ConfirmAction::MergeInto { source, target, protected } = &action {
+            egui::Frame::new()
+                .fill(theme::PANEL2)
+                .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+                .corner_radius(theme::RADIUS_MD as f32)
+                .inner_margin(egui::Margin::symmetric(14, 10))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        branch_chip(ui, source, theme::TEAL);
+                        ui.label(
+                            RichText::new("  merges into  ").color(theme::FG_DIM).small(),
+                        );
+                        branch_chip(
+                            ui,
+                            target,
+                            if *protected { theme::DANGER } else { theme::EMBER },
+                        );
+                        if *protected {
+                            ui.label(
+                                RichText::new(" protected").color(theme::DANGER).small(),
+                            );
+                        }
+                    });
+                });
+            ui.add_space(4.0);
+        }
+
+        ui.label(action.body());
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let confirm = egui::Button::new(
+                RichText::new(action.verb()).color(egui::Color32::WHITE).strong(),
+            )
+            .fill(theme::DANGER.linear_multiply(0.85))
+            .min_size(egui::vec2(0.0, theme::CONTROL_MD));
+            if ui.add(confirm).clicked() || enter {
+                app.execute_confirmed(action.clone());
+            }
+            let cancel = egui::Button::new("Cancel")
+                .min_size(egui::vec2(0.0, theme::CONTROL_MD));
+            if ui.add(cancel).clicked() {
+                app.dialog = Dialog::None;
+            }
+        });
+        ui.label(
+            RichText::new("Enter confirms · Esc cancels")
+                .color(theme::FG_DIM)
+                .small(),
+        );
+    });
+}
+
+/// Small pill showing a branch name, colored by role.
+fn branch_chip(ui: &mut egui::Ui, name: &str, color: egui::Color32) {
+    egui::Frame::new()
+        .fill(color.linear_multiply(0.15))
+        .stroke(egui::Stroke::new(1.0_f32, color))
+        .corner_radius(999.0)
+        .inner_margin(egui::Margin::symmetric(10, 3))
+        .show(ui, |ui| {
+            ui.label(RichText::new(name).color(color).strong().monospace());
+        });
 }

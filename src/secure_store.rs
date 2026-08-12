@@ -29,9 +29,19 @@ fn err<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError(e.to_string())
 }
 
-/// App config directory (`~/.config/git-manage` on Linux).
+/// App config directory (`~/.config/devdock`), migrating the legacy
+/// `git-manage` directory on first access after the rename.
 pub fn config_dir() -> PathBuf {
-    dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("git-manage")
+    let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+    let new_dir = base.join("devdock");
+    let old_dir = base.join("git-manage");
+    if !new_dir.exists() && old_dir.exists() {
+        // One-time move; on failure keep using the legacy directory.
+        if std::fs::rename(&old_dir, &new_dir).is_err() {
+            return old_dir;
+        }
+    }
+    new_dir
 }
 
 // ---------------------------------------------------------------------------

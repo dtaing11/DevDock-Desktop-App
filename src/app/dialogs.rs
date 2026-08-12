@@ -366,30 +366,41 @@ fn pull_requests(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                     {
                         let _ = open::that(&pr.html_url);
                     }
-                    if ui
-                        .small_button("Merge")
-                        .on_hover_text(
-                            "Merge this PR on GitHub. Repository rules (reviews, \
-                             checks) are enforced by GitHub and reported here.",
-                        )
-                        .clicked()
-                    {
-                        let number = pr.number;
-                        if let Some(repo) = app.repo.clone() {
-                            app.worker.spawn(move || {
-                                let result = (|| -> Result<String, String> {
-                                    let client = crate::github::Client::from_store()
-                                        .ok_or("Not signed in")?;
-                                    let slug = super::views::origin_slug(&repo)
-                                        .ok_or("No github.com remote")?;
-                                    client
-                                        .merge_pull_request(&slug, number)
-                                        .map_err(|e| e.to_string())
-                                })();
-                                Msg::Done { message: result, refresh: true }
-                            });
+                    ui.menu_button("Merge", |ui| {
+                        ui.label(
+                            RichText::new(
+                                "GitHub enforces repository rules and reports back",
+                            )
+                            .color(theme::FG_DIM)
+                            .small(),
+                        );
+                        for (label, method) in [
+                            ("Create a merge commit", "merge"),
+                            ("Squash and merge", "squash"),
+                            ("Rebase and merge", "rebase"),
+                        ] {
+                            if ui.button(label).clicked() {
+                                let number = pr.number;
+                                let method = method.to_string();
+                                if let Some(repo) = app.repo.clone() {
+                                    app.worker.spawn(move || {
+                                        let result = (|| -> Result<String, String> {
+                                            let client =
+                                                crate::github::Client::from_store()
+                                                    .ok_or("Not signed in")?;
+                                            let slug = super::views::origin_slug(&repo)
+                                                .ok_or("No github.com remote")?;
+                                            client
+                                                .merge_pull_request(&slug, number, &method)
+                                                .map_err(|e| e.to_string())
+                                        })();
+                                        Msg::Done { message: result, refresh: true }
+                                    });
+                                }
+                                ui.close_menu();
+                            }
                         }
-                    }
+                    });
                     if let Some(checks) = app.pr.checks.get(&pr.number) {
                         use crate::github::CheckState;
                         let (label, color) = match checks.state {

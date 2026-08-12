@@ -361,16 +361,21 @@ impl Client {
         Ok(summary)
     }
 
-    /// Merges a pull request (merge commit method). Returns GitHub's
-    /// message; fails with the API's reason when rules block the merge
-    /// (required reviews, failing checks, ...).
-    pub fn merge_pull_request(&self, slug: &RepoSlug, number: u64) -> Result<String> {
+    /// Merges a pull request. `method` is "merge", "squash", or "rebase".
+    /// Fails with the API's reason when rules block the merge (required
+    /// reviews, failing checks, disallowed method, ...).
+    pub fn merge_pull_request(
+        &self,
+        slug: &RepoSlug,
+        number: u64,
+        method: &str,
+    ) -> Result<String> {
         let path = format!("/repos/{}/{}/pulls/{number}/merge", slug.owner, slug.repo);
         let resp = agent()
             .put(&format!("{API_BASE}{path}"))
             .set("Authorization", &format!("Bearer {}", self.token))
             .set("Accept", "application/vnd.github+json")
-            .send_json(serde_json::json!({}));
+            .send_json(serde_json::json!({ "merge_method": method }));
         let value = read_json(resp)?;
         Ok(value
             .get("message")

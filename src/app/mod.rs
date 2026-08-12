@@ -921,7 +921,19 @@ impl App {
                             self.toast(m, false);
                         }
                     }
-                    Err(e) => self.toast(e, true),
+                    Err(e) => {
+                        // Conflicts from stash apply / checkout land here:
+                        // open the resolver instead of only toasting.
+                        if e.to_lowercase().contains("conflict") {
+                            self.toast(
+                                "Conflicts detected. Opening the resolver…",
+                                true,
+                            );
+                            self.load_conflicts();
+                        } else {
+                            self.toast(e, true);
+                        }
+                    }
                 }
                 if refresh {
                     self.refresh();

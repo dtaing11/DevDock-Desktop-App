@@ -23,6 +23,17 @@ macOS/Windows since egui is cross-platform).
 
 ## Install
 
+### Prebuilt packages
+
+Grab the latest from [Releases](https://github.com/dtaing11/DevDock-Desktop-App/releases):
+
+- **Linux**: `devdock_*.deb` (`sudo dpkg -i devdock_*.deb`) or the `.tar.gz` binary
+- **macOS**: `DevDock-macOS.zip`, unzip and drag `DevDock.app` to Applications
+
+Releases are built automatically when a version tag (`v*`) is pushed.
+
+### From source
+
 Prerequisites: `git` on PATH, Rust toolchain, and on Linux the usual GUI deps:
 
 ```sh
@@ -34,7 +45,11 @@ cargo build --release
 ./target/release/devdock
 ```
 
-Optional: `make install` installs the binary plus a `.desktop` entry.
+Optional targets:
+
+- `make install`: binary + `.desktop` entry + icon (Linux)
+- `make app`: builds `dist/DevDock.app` (macOS bundle)
+- `make deb`: builds a Debian package (needs `cargo install cargo-deb`)
 
 ## Ollama setup
 

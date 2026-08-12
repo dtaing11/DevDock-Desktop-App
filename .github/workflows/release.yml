@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux (.deb + binary)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GUI build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libgtk-3-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build .deb
+        run: |
+          cargo install cargo-deb --locked
+          cargo deb
+      - name: Package binary
+        run: |
+          tar czf devdock-linux-x86_64.tar.gz -C target/release devdock
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/debian/*.deb
+            devdock-linux-x86_64.tar.gz
+
+  macos:
+    name: macOS (.app)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build app bundle
+        run: make app
+      - name: Zip bundle
+        run: cd dist && zip -ry DevDock-macOS.zip DevDock.app
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/DevDock-macOS.zip

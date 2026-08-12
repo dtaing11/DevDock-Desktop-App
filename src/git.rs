@@ -168,6 +168,11 @@ pub struct Commit {
     pub subject: String,
     pub body: String,
     pub parents: Vec<String>,
+    /// Branch/tag names pointing at this commit (from %D), e.g.
+    /// ["HEAD -> main", "origin/main", "tag: v1.0"]. Empty unless the
+    /// log was fetched with decorations (log_all).
+    #[serde(default)]
+    pub refs: Vec<String>,
 }
 
 /// A conflicted file with all three stages plus the current working copy,
@@ -446,8 +451,9 @@ impl Repo {
     pub fn log_all(&self, limit: u32) -> Result<Vec<Commit>> {
         const FIELD: char = '\u{1f}';
         const RECORD: char = '\u{1e}';
-        let format =
-            format!("--format=%H{FIELD}%h{FIELD}%an{FIELD}%ae{FIELD}%aI{FIELD}%s{FIELD}%b{FIELD}%P{RECORD}");
+        let format = format!(
+            "--format=%H{FIELD}%h{FIELD}%an{FIELD}%ae{FIELD}%aI{FIELD}%s{FIELD}%b{FIELD}%P{FIELD}%D{RECORD}"
+        );
         let max_count = format!("--max-count={limit}");
         let args =
             vec!["log", max_count.as_str(), format.as_str(), "--all", "--topo-order"];
@@ -1140,7 +1146,13 @@ fn build_partial_patch(hunk: &Hunk, selected: &[usize]) -> Option<String> {
 
 fn parse_commit(record: &str, field_sep: char) -> Option<Commit> {
     let parts: Vec<&str> = record.split(field_sep).collect();
-    let [sha, short_sha, author, email, date, subject, body, parents] = parts.as_slice() else {
+    // 8 fields (plain log) or 9 (decorated log with %D refs).
+    let (core, refs_raw): (&[&str], &str) = match parts.as_slice() {
+        p @ [_, _, _, _, _, _, _, _] => (p, ""),
+        [p @ .., refs] if p.len() == 8 => (p, refs),
+        _ => return None,
+    };
+    let [sha, short_sha, author, email, date, subject, body, parents] = core else {
         return None;
     };
     Some(Commit {
@@ -1152,6 +1164,12 @@ fn parse_commit(record: &str, field_sep: char) -> Option<Commit> {
         subject: subject.to_string(),
         body: body.trim().to_string(),
         parents: parents.split_whitespace().map(String::from).collect(),
+        refs: refs_raw
+            .split(", ")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
     })
 }
 

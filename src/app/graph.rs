@@ -182,6 +182,7 @@ pub fn draw_panel(app: &mut App, ctx: &egui::Context) {
 
                 // --- nodes + labels ---
                 let hover = ui.ctx().pointer_hover_pos();
+                let mut hovered_popup: Option<(Pos2, usize)> = None;
                 for (i, node) in app.graph.iter().enumerate() {
                     let p = pos_of(i, node.lane);
                     let color = LANE_COLORS[node.lane % LANE_COLORS.len()];
@@ -210,23 +211,126 @@ pub fn draw_panel(app: &mut App, ctx: &egui::Context) {
                         theme::FG_DIM,
                     );
 
-                    // Hover ring + tooltip-ish highlight row.
+                    // Ref badges (branch/tag chips) next to decorated commits.
+                    if !node.commit.refs.is_empty() {
+                        let mut chip_x = origin.x
+                            + MARGIN_X
+                            + (max_lane as f32 + 1.0) * LANE_W
+                            + 12.0
+                            + 320.0;
+                        for name in node.commit.refs.iter().take(3) {
+                            let is_head = name.starts_with("HEAD");
+                            let chip_color = if is_head { theme::EMBER } else { theme::TEAL };
+                            let galley = painter.layout_no_wrap(
+                                name.clone(),
+                                egui::FontId::proportional(10.0),
+                                chip_color,
+                            );
+                            let pad = Vec2::new(8.0, 3.0);
+                            let chip = Rect::from_min_size(
+                                Pos2::new(chip_x, p.y - galley.size().y / 2.0 - pad.y),
+                                galley.size() + pad * 2.0,
+                            );
+                            painter.rect_filled(chip, 999.0, chip_color.linear_multiply(0.12));
+                            painter.rect_stroke(
+                                chip,
+                                999.0,
+                                Stroke::new(1.0_f32, chip_color.linear_multiply(0.6)),
+                                egui::StrokeKind::Outside,
+                            );
+                            painter.galley(chip.min + pad, galley, chip_color);
+                            chip_x = chip.max.x + 6.0;
+                        }
+                    }
+
+                    // Hover: bright highlight + branch-name popup.
                     if let Some(h) = hover {
-                        let row = Rect::from_min_size(
-                            Pos2::new(rect.min.x, p.y - ROW_H / 2.0),
-                            Vec2::new(rect.width(), ROW_H),
-                        );
-                        if row.contains(h) {
+                        if h.distance(p) <= NODE_R + 8.0 {
+                            // Emphasized rings around the hovered node.
                             painter.circle_stroke(
                                 p,
                                 NODE_R + 4.0,
-                                Stroke::new(1.0_f32, Color32::WHITE.linear_multiply(0.6)),
+                                Stroke::new(2.0_f32, Color32::WHITE),
                             );
+                            painter.circle_filled(
+                                p,
+                                NODE_R + 10.0,
+                                color.linear_multiply(0.18),
+                            );
+                            hovered_popup = Some((p, i));
                         }
+                    }
+                }
+                // --- hover popup: branches containing / pointing at the node ---
+                if let Some((p, i)) = hovered_popup {
+                    let node = &app.graph[i];
+                    let mut lines: Vec<(String, Color32)> = Vec::new();
+                    lines.push((
+                        format!(
+                            "{}  {}",
+                            node.commit.short_sha,
+                            truncate_str(&node.commit.subject, 46)
+                        ),
+                        theme::FG,
+                    ));
+                    if node.commit.refs.is_empty() {
+                        lines.push(("no branch points here".into(), theme::FG_DIM));
+                    } else {
+                        for name in node.commit.refs.iter().take(6) {
+                            let color = if name.starts_with("HEAD") {
+                                theme::EMBER
+                            } else if name.starts_with("tag:") {
+                                theme::WARN
+                            } else {
+                                theme::TEAL
+                            };
+                            lines.push((name.clone(), color));
+                        }
+                    }
+
+                    let font = egui::FontId::proportional(11.5);
+                    let galleys: Vec<_> = lines
+                        .iter()
+                        .map(|(t, c)| painter.layout_no_wrap(t.clone(), font.clone(), *c))
+                        .collect();
+                    let width = galleys
+                        .iter()
+                        .map(|g| g.size().x)
+                        .fold(0.0_f32, f32::max)
+                        + 24.0;
+                    let height =
+                        galleys.iter().map(|g| g.size().y + 4.0).sum::<f32>() + 16.0;
+                    let mut popup_pos = p + Vec2::new(14.0, -height / 2.0);
+                    // Keep the popup inside the drawn rect horizontally.
+                    if popup_pos.x + width > rect.max.x {
+                        popup_pos.x = p.x - width - 14.0;
+                    }
+                    let popup = Rect::from_min_size(popup_pos, Vec2::new(width, height));
+                    painter.rect_filled(popup, 8.0, theme::PANEL);
+                    painter.rect_stroke(
+                        popup,
+                        8.0,
+                        Stroke::new(1.0_f32, Color32::WHITE.linear_multiply(0.35)),
+                        egui::StrokeKind::Outside,
+                    );
+                    let mut y = popup.min.y + 8.0;
+                    for galley in galleys {
+                        let size = galley.size();
+                        painter.galley(Pos2::new(popup.min.x + 12.0, y), galley, theme::FG);
+                        y += size.y + 4.0;
                     }
                 }
             });
         });
+}
+
+/// Truncates a string to `n` chars with an ellipsis.
+fn truncate_str(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        s.chars().take(n - 1).collect::<String>() + "…"
+    }
 }
 
 /// Cubic-bezier edge between two commit points (smooth S-curve when the
@@ -274,6 +378,7 @@ mod tests {
             subject: format!("c {sha}"),
             body: String::new(),
             parents: parents.iter().map(|s| s.to_string()).collect(),
+            refs: Vec::new(),
         }
     }
 

@@ -811,7 +811,7 @@ fn open_pr_dialog(app: &mut App) {
     app.pr.loading = true;
     app.dialog = Dialog::PullRequests;
 
-    let repo = app.repo.clone().unwrap();
+    let Some(repo) = app.repo.clone() else { return };
     app.worker.spawn(move || {
         let result = (|| -> Result<Vec<crate::github::PullRequest>, String> {
             let client = crate::github::Client::from_store().ok_or("Not signed in")?;
@@ -1130,8 +1130,9 @@ pub fn load_file_diff(app: &mut App) {
         Msg::Diff { title: path, text }
     });
     if !staged {
-        let repo = app.repo.clone().unwrap();
-        let path = app.selected_file.clone().unwrap();
+        let (Some(repo), Some(path)) = (app.repo.clone(), app.selected_file.clone()) else {
+            return;
+        };
         app.worker.spawn(move || {
             let hunks = repo.hunks(&path).unwrap_or_default();
             Msg::Hunks { file: path, hunks }

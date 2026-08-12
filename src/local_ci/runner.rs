@@ -158,8 +158,11 @@ impl Runner for DockerRunner {
         cmd.args(["run", "--rm", "-v"])
             .arg(format!("{}:/work", request.repo_root.display()))
             .args(["-w", "/work"]);
+        // Pass env var NAMES only in argv; docker reads the values from
+        // this process's environment, keeping secrets out of `ps` output.
         for (key, value) in request.env {
-            cmd.arg("-e").arg(format!("{key}={value}"));
+            cmd.arg("-e").arg(key);
+            cmd.env(key, value);
         }
         cmd.arg(image).args(["sh", "-c", request.script]);
         let out = cmd.output().map_err(|e| format!("failed to start docker: {e}"))?;

@@ -779,11 +779,18 @@ impl Repo {
                 use base64::Engine as _;
                 let basic = base64::engine::general_purpose::STANDARD
                     .encode(format!("x-access-token:{token}"));
-                let header =
-                    format!("http.https://github.com/.extraheader=AUTHORIZATION: basic {basic}");
-                let mut full: Vec<&str> = vec!["-c", &header];
-                full.extend(args);
-                self.git(&full)
+                // GIT_CONFIG_* env vars (git >= 2.31) keep the credential out
+                // of the process argument list, where any local process
+                // could read it via `ps`.
+                let value = format!("AUTHORIZATION: basic {basic}");
+                self.git_env(
+                    args,
+                    &[
+                        ("GIT_CONFIG_COUNT", "1"),
+                        ("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader"),
+                        ("GIT_CONFIG_VALUE_0", value.as_str()),
+                    ],
+                )
             }
             _ => self.git(args),
         }

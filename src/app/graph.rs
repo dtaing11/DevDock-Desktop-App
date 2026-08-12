@@ -194,30 +194,27 @@ pub fn draw_panel(app: &mut App, ctx: &egui::Context) {
                     painter.circle_stroke(p, NODE_R, Stroke::new(2.0_f32, color));
                     painter.circle_filled(p, 2.0, color);
 
-                    // Subject text to the right of the lanes.
+                    // Subject text to the right of the lanes (truncated so
+                    // it cannot collide with the ref chips).
                     let text_x = origin.x + MARGIN_X + (max_lane as f32 + 1.0) * LANE_W + 12.0;
-                    painter.text(
-                        Pos2::new(text_x, p.y),
+                    let subject_rect = painter.text(
+                        Pos2::new(text_x, p.y - 6.0),
                         egui::Align2::LEFT_CENTER,
-                        &node.commit.subject,
+                        truncate_str(&node.commit.subject, 52),
                         egui::FontId::proportional(12.5),
                         theme::FG,
                     );
                     painter.text(
-                        Pos2::new(text_x, p.y + 13.0),
+                        Pos2::new(text_x, p.y + 8.0),
                         egui::Align2::LEFT_CENTER,
                         format!("{} · {}", node.commit.short_sha, node.commit.author),
                         egui::FontId::proportional(10.0),
                         theme::FG_DIM,
                     );
 
-                    // Ref badges (branch/tag chips) next to decorated commits.
+                    // Ref badges (branch/tag chips) after the subject text.
                     if !node.commit.refs.is_empty() {
-                        let mut chip_x = origin.x
-                            + MARGIN_X
-                            + (max_lane as f32 + 1.0) * LANE_W
-                            + 12.0
-                            + 320.0;
+                        let mut chip_x = subject_rect.max.x + 10.0;
                         for name in node.commit.refs.iter().take(3) {
                             let is_head = name.starts_with("HEAD");
                             let chip_color = if is_head { theme::EMBER } else { theme::TEAL };
@@ -228,15 +225,20 @@ pub fn draw_panel(app: &mut App, ctx: &egui::Context) {
                             );
                             let pad = Vec2::new(8.0, 3.0);
                             let chip = Rect::from_min_size(
-                                Pos2::new(chip_x, p.y - galley.size().y / 2.0 - pad.y),
+                                Pos2::new(chip_x, p.y - 6.0 - galley.size().y / 2.0 - pad.y),
                                 galley.size() + pad * 2.0,
                             );
-                            painter.rect_filled(chip, 999.0, chip_color.linear_multiply(0.12));
+                            let radius = (chip.height() / 2.0).min(120.0) as u8;
+                            painter.rect_filled(
+                                chip,
+                                radius,
+                                chip_color.linear_multiply(0.12),
+                            );
                             painter.rect_stroke(
                                 chip,
-                                999.0,
+                                radius,
                                 Stroke::new(1.0_f32, chip_color.linear_multiply(0.6)),
-                                egui::StrokeKind::Outside,
+                                egui::StrokeKind::Inside,
                             );
                             painter.galley(chip.min + pad, galley, chip_color);
                             chip_x = chip.max.x + 6.0;
@@ -306,12 +308,12 @@ pub fn draw_panel(app: &mut App, ctx: &egui::Context) {
                         popup_pos.x = p.x - width - 14.0;
                     }
                     let popup = Rect::from_min_size(popup_pos, Vec2::new(width, height));
-                    painter.rect_filled(popup, 8.0, theme::PANEL);
+                    painter.rect_filled(popup, 8, theme::PANEL);
                     painter.rect_stroke(
                         popup,
-                        8.0,
+                        8,
                         Stroke::new(1.0_f32, Color32::WHITE.linear_multiply(0.35)),
-                        egui::StrokeKind::Outside,
+                        egui::StrokeKind::Inside,
                     );
                     let mut y = popup.min.y + 8.0;
                     for galley in galleys {

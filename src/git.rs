@@ -1013,20 +1013,35 @@ impl Repo {
 // ---------------------------------------------------------------------------
 
 fn run_git(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String> {
-    let mut cmd = Command::new("git");
-    cmd.args(args).current_dir(dir).env("GIT_TERMINAL_PROMPT", "0");
-    for (key, value) in env {
-        cmd.env(key, value);
-    }
-    let out = cmd.output()?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    } else {
+    // Retry transient index.lock contention: the app's background status
+    // refresh can race user-initiated writes (rapid stacked commits).
+    const ATTEMPTS: u32 = 4;
+    for attempt in 0..ATTEMPTS {
+        let mut cmd = Command::new("git");
+        cmd.args(args)
+            .current_dir(dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            // Reads (status/diff) must not take the index lock
+            // opportunistically; writes take their required locks anyway.
+            .env("GIT_OPTIONAL_LOCKS", "0");
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        let out = cmd.output()?;
+        if out.status.success() {
+            return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+        }
         let stderr = String::from_utf8_lossy(&out.stderr);
         let stdout = String::from_utf8_lossy(&out.stdout);
         let message = if stderr.trim().is_empty() { stdout } else { stderr };
-        Err(GitError::Command(message.trim().to_string()))
+        let transient = message.contains("index.lock") && attempt + 1 < ATTEMPTS;
+        if transient {
+            std::thread::sleep(std::time::Duration::from_millis(120 * (attempt as u64 + 1)));
+            continue;
+        }
+        return Err(GitError::Command(message.trim().to_string()));
     }
+    unreachable!("loop returns on success or final failure")
 }
 
 fn parse_porcelain(out: &str) -> Vec<FileEntry> {

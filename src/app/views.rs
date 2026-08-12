@@ -73,6 +73,19 @@ pub fn toolbar(app: &mut App, ctx: &egui::Context) {
                 // 3. Context-aware sync action
                 sync_segment(app, ui);
 
+                // Graph toggle
+                let graph_btn = if app.graph_open { "Graph ✦" } else { "Graph" };
+                if ui
+                    .selectable_label(app.graph_open, graph_btn)
+                    .on_hover_text("Animated commit graph of all branches")
+                    .clicked()
+                {
+                    app.graph_open = !app.graph_open;
+                    if app.graph_open {
+                        app.load_graph();
+                    }
+                }
+
                 // Right side
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Settings").on_hover_text("Settings").clicked() {

@@ -10,6 +10,7 @@
 //! back through [`worker::Msg`], keeping the UI responsive.
 
 pub mod dialogs;
+pub mod graph;
 pub mod shortcuts;
 pub mod theme;
 pub mod views;
@@ -444,6 +445,10 @@ pub struct App {
     // history details
     pub commit_file_list: Vec<crate::git::CommitFileChange>,
 
+    // commit graph (all branches), shown when graph_open
+    pub graph: Vec<graph::GraphNode>,
+    pub graph_open: bool,
+
     // stash / tags / github repos
     pub stashes: Vec<crate::git::StashEntry>,
     pub tags: Vec<String>,
@@ -512,6 +517,8 @@ impl App {
             show_staged: false,
             blame: None,
             commit_file_list: Vec::new(),
+            graph: Vec::new(),
+            graph_open: false,
             stashes: Vec::new(),
             tags: Vec::new(),
             gh_repos: Vec::new(),
@@ -875,6 +882,9 @@ impl App {
                     // CI state and history belong to the previous repo.
                     self.local_ci = Default::default();
                     self.load_local_ci();
+                    // Graph belongs to the previous repo too.
+                    self.graph.clear();
+                    self.graph_open = false;
                     self.refresh();
                 }
                 Err(e) => self.toast(e.to_string(), true),
@@ -901,6 +911,10 @@ impl App {
                     self.unchecked.clear();
                     // Reload CI config from the new branch's worktree state.
                     self.load_local_ci();
+                    // Graph shows all branches but HEAD markers move.
+                    if self.graph_open {
+                        self.load_graph();
+                    }
                 }
                 self.status = Some(status);
             }
@@ -1057,6 +1071,7 @@ impl App {
             Msg::GhMainChecks { branch, summary } => {
                 self.main_checks = Some((branch, summary));
             }
+            Msg::Graph(nodes) => self.graph = nodes,
             Msg::MergePrompt { source, target, protected } => {
                 self.busy = false;
                 self.confirm(ConfirmAction::MergeInto { source, target, protected });
@@ -1408,6 +1423,15 @@ impl App {
         });
     }
 
+    /// Loads the all-branches commit log and lays out the graph.
+    pub fn load_graph(&mut self) {
+        let Some(repo) = self.repo.clone() else { return };
+        self.worker.spawn(move || {
+            let commits = repo.log_all(300).unwrap_or_default();
+            Msg::Graph(graph::layout(&commits))
+        });
+    }
+
     /// Reloads the stash list.
     pub fn load_stashes(&mut self) {
         let Some(repo) = self.repo.clone() else { return };
@@ -1527,7 +1551,11 @@ impl eframe::App for App {
 
         views::toolbar(self, ctx);
         views::sidebar(self, ctx);
-        views::diff_panel(self, ctx);
+        if self.graph_open {
+            graph::draw_panel(self, ctx);
+        } else {
+            views::diff_panel(self, ctx);
+        }
         dialogs::show(self, ctx);
         views::toasts(self, ctx);
     }

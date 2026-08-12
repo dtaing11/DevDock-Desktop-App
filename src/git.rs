@@ -442,6 +442,25 @@ impl Repo {
         Ok(self.git(&["rev-parse", "HEAD"])?.trim().to_string())
     }
 
+    /// Commit history across all branches, newest first (for the graph).
+    pub fn log_all(&self, limit: u32) -> Result<Vec<Commit>> {
+        const FIELD: char = '\u{1f}';
+        const RECORD: char = '\u{1e}';
+        let format =
+            format!("--format=%H{FIELD}%h{FIELD}%an{FIELD}%ae{FIELD}%aI{FIELD}%s{FIELD}%b{FIELD}%P{RECORD}");
+        let max_count = format!("--max-count={limit}");
+        let args =
+            vec!["log", max_count.as_str(), format.as_str(), "--all", "--topo-order"];
+        let Ok(out) = self.git(&args) else {
+            return Ok(Vec::new());
+        };
+        Ok(out
+            .split(RECORD)
+            .filter(|r| !r.trim().is_empty())
+            .filter_map(|record| parse_commit(record.trim_start_matches('\n'), FIELD))
+            .collect())
+    }
+
     /// Commit history, newest first.
     pub fn log(&self, limit: u32, branch: Option<&str>) -> Result<Vec<Commit>> {
         // Unit/record separators cannot appear in commit metadata.

@@ -1182,6 +1182,35 @@ fn confirm_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
 
     modal(ctx, action.title(), open, |ui| {
         ui.set_min_width(360.0);
+
+        // Merge gets a visual source -> target card so direction is obvious.
+        if let crate::app::ConfirmAction::MergeInto { source, target, protected } = &action {
+            egui::Frame::new()
+                .fill(theme::PANEL2)
+                .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+                .corner_radius(theme::RADIUS_MD as f32)
+                .inner_margin(egui::Margin::symmetric(14, 10))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        branch_chip(ui, source, theme::TEAL);
+                        ui.label(
+                            RichText::new("  merges into  ").color(theme::FG_DIM).small(),
+                        );
+                        branch_chip(
+                            ui,
+                            target,
+                            if *protected { theme::DANGER } else { theme::EMBER },
+                        );
+                        if *protected {
+                            ui.label(
+                                RichText::new(" protected").color(theme::DANGER).small(),
+                            );
+                        }
+                    });
+                });
+            ui.add_space(4.0);
+        }
+
         ui.label(action.body());
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -1205,4 +1234,16 @@ fn confirm_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                 .small(),
         );
     });
+}
+
+/// Small pill showing a branch name, colored by role.
+fn branch_chip(ui: &mut egui::Ui, name: &str, color: egui::Color32) {
+    egui::Frame::new()
+        .fill(color.linear_multiply(0.15))
+        .stroke(egui::Stroke::new(1.0_f32, color))
+        .corner_radius(999.0)
+        .inner_margin(egui::Margin::symmetric(10, 3))
+        .show(ui, |ui| {
+            ui.label(RichText::new(name).color(color).strong().monospace());
+        });
 }

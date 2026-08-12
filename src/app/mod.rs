@@ -181,6 +181,9 @@ pub enum ConfirmAction {
     RevertCommit { sha: String, subject: String },
     /// Discard every uncommitted change in the working tree.
     DiscardAll(usize),
+    /// Merge the current branch into `target`. `protected` reflects GitHub
+    /// branch rules on the target.
+    MergeInto { source: String, target: String, protected: bool },
 }
 
 impl ConfirmAction {
@@ -195,6 +198,7 @@ impl ConfirmAction {
             Self::UndoCommit(_) => "Undo commit?",
             Self::RevertCommit { .. } => "Revert commit?",
             Self::DiscardAll(_) => "Discard all changes?",
+            Self::MergeInto { .. } => "Confirm merge",
         }
     }
 
@@ -228,6 +232,15 @@ impl ConfirmAction {
                 "A new commit will be created that undoes \"{subject}\". \
                  History is preserved; this is safe for pushed commits."
             ),
+            Self::MergeInto { protected, .. } => {
+                if *protected {
+                    "The target is protected on GitHub: the merged result may be \
+                     rejected on push. Prefer a pull request."
+                        .into()
+                } else {
+                    "You will end up on the target branch; push to publish.".into()
+                }
+            }
             Self::DiscardAll(count) => format!(
                 "All {count} changed file(s) will be permanently reset.\n\
                  Tracked files return to the last commit; untracked files are deleted.\n\
@@ -247,6 +260,9 @@ impl ConfirmAction {
             Self::UndoCommit(_) => "Undo commit",
             Self::RevertCommit { .. } => "Revert commit",
             Self::DiscardAll(_) => "Discard everything",
+            Self::MergeInto { protected, .. } => {
+                if *protected { "Merge anyway (may not push)" } else { "Merge" }
+            }
         }
     }
 }
@@ -1032,6 +1048,10 @@ impl App {
             Msg::GhMainChecks { branch, summary } => {
                 self.main_checks = Some((branch, summary));
             }
+            Msg::MergePrompt { source, target, protected } => {
+                self.busy = false;
+                self.confirm(ConfirmAction::MergeInto { source, target, protected });
+            }
             Msg::GhPrChecks { number, summary } => {
                 self.pr.checks.insert(number, summary);
             }
@@ -1212,7 +1232,13 @@ impl App {
             } else {
                 repo.push(set_upstream, auth).map(|_| "Pushed.".to_string()).map_err(|e| {
                     let msg = e.to_string();
-                    if msg.contains("rejected") || msg.contains("non-fast-forward") {
+                    if msg.contains("protected branch") || msg.contains("GH006") {
+                        crate::git::GitError::Command(format!(
+                            "{msg}\n\nGitHub rejected the push: this branch is protected \
+                             by repository rules. Open a pull request instead \
+                             (Pull Request button in the toolbar)."
+                        ))
+                    } else if msg.contains("rejected") || msg.contains("non-fast-forward") {
                         crate::git::GitError::Command(format!(
                             "{msg}\n\nHint: after amend/rebase use Force push \
                              (right-click the sync button)."
@@ -1229,6 +1255,25 @@ impl App {
                 })
             };
             Msg::Done { message: strerr(result), refresh: true }
+        });
+    }
+
+    /// Starts a "merge current branch into target" flow: checks GitHub
+    /// branch protection first, then opens a confirmation dialog that
+    /// warns when repository rules restrict the target.
+    pub fn request_merge_into(&mut self, target: &str) {
+        let Some(repo) = self.repo.clone() else { return };
+        let source = self.status.as_ref().map(|s| s.branch.clone()).unwrap_or_default();
+        let target = target.to_string();
+        self.busy = true;
+        self.worker.spawn(move || {
+            let protected = (|| -> Option<bool> {
+                let client = github::Client::from_store()?;
+                let slug = views::origin_slug(&repo)?;
+                client.branch_protected(&slug, &target).ok()
+            })()
+            .unwrap_or(false); // offline/signed out: no warning, plain confirm
+            Msg::MergePrompt { source, target, protected }
         });
     }
 
@@ -1293,6 +1338,10 @@ impl App {
             }
             ConfirmAction::RevertCommit { sha, .. } => {
                 self.worker.spawn(move || Msg::MergeOutcome(repo.revert_commit(&sha)));
+            }
+            ConfirmAction::MergeInto { target, .. } => {
+                self.busy = true;
+                self.worker.spawn(move || Msg::MergeOutcome(repo.merge_into(&target)));
             }
             ConfirmAction::DiscardAll(_) => {
                 views::clear_diff_view(self);

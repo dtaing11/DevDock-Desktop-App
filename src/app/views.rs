@@ -533,9 +533,22 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
             if stashes.is_empty() {
                 ui.label(RichText::new("No stashes").color(theme::FG_DIM));
             }
+            let current_branch =
+                app.status.as_ref().map(|s| s.branch.clone()).unwrap_or_default();
             for stash in &stashes {
                 ui.horizontal(|ui| {
-                    ui.label(truncate(&stash.message, 26)).on_hover_text(&stash.message);
+                    let here = stash.branch.as_deref() == Some(current_branch.as_str());
+                    let label = if here {
+                        RichText::new(truncate(&stash.message, 26))
+                    } else {
+                        RichText::new(format!(
+                            "{} ({})",
+                            truncate(&stash.message, 20),
+                            stash.branch.as_deref().unwrap_or("?")
+                        ))
+                        .color(theme::FG_DIM)
+                    };
+                    ui.label(label).on_hover_text(&stash.message);
                     if ui.small_button("Apply").clicked() {
                         if let Some(repo) = app.repo.clone() {
                             let idx = stash.index;

@@ -214,6 +214,9 @@ pub struct Remote {
 pub struct StashEntry {
     pub index: u32,
     pub message: String,
+    /// Branch the stash was created on, parsed from git's
+    /// "WIP on <branch>:" / "On <branch>:" subject prefix.
+    pub branch: Option<String>,
 }
 
 /// One hunk of a unified diff, self-contained enough to apply as a patch.
@@ -809,7 +812,11 @@ impl Repo {
             .filter_map(|line| {
                 let (rev, message) = line.split_once('\u{1f}')?;
                 let index = rev.strip_prefix("stash@{")?.strip_suffix('}')?.parse().ok()?;
-                Some(StashEntry { index, message: message.to_string() })
+                Some(StashEntry {
+                    index,
+                    branch: parse_stash_branch(message),
+                    message: message.to_string(),
+                })
             })
             .collect())
     }
@@ -1159,6 +1166,17 @@ fn build_partial_patch(hunk: &Hunk, selected: &[usize]) -> Option<String> {
     Some(format!("{}{}\n{}\n", hunk.file_header, header, body_lines.join("\n")))
 }
 
+/// Extracts the branch name from a stash subject, which git formats as
+/// "WIP on <branch>: <sha> <msg>" or "On <branch>: <msg>".
+fn parse_stash_branch(subject: &str) -> Option<String> {
+    let rest = subject
+        .strip_prefix("WIP on ")
+        .or_else(|| subject.strip_prefix("On "))?;
+    let (branch, _) = rest.split_once(':')?;
+    let branch = branch.trim();
+    (!branch.is_empty()).then(|| branch.to_string())
+}
+
 fn parse_commit(record: &str, field_sep: char) -> Option<Commit> {
     let parts: Vec<&str> = record.split(field_sep).collect();
     // 8 fields (plain log) or 9 (decorated log with %D refs).
@@ -1225,6 +1243,16 @@ mod tests {
         assert!(b.current);
         assert_eq!(b.sha, "abc123");
         assert_eq!(b.subject, "initial");
+    }
+
+    #[test]
+    fn stash_branch_parses_wip_and_on_forms() {
+        assert_eq!(
+            parse_stash_branch("WIP on feature/x: abc123 msg"),
+            Some("feature/x".into())
+        );
+        assert_eq!(parse_stash_branch("On main: my note"), Some("main".into()));
+        assert_eq!(parse_stash_branch("random text"), None);
     }
 
     #[test]

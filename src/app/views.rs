@@ -203,7 +203,7 @@ fn repo_menu(app: &mut App, ui: &mut egui::Ui) {
                         .clicked()
                     {
                         app.open_repo(path);
-                        ui.close_menu();
+                        ui.close();
                     }
                 } else {
                     // Missing on disk: offer repair or removal.
@@ -219,7 +219,7 @@ fn repo_menu(app: &mut App, ui: &mut egui::Ui) {
                             remove = Some(path.clone());
                             app.open_repo(&folder.display().to_string());
                         }
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.small_button("Remove").clicked() {
                         remove = Some(path.clone());
@@ -239,7 +239,7 @@ fn repo_menu(app: &mut App, ui: &mut egui::Ui) {
         ui.separator();
         if ui.button("Add repository…").clicked() {
             app.dialog = Dialog::RepoPicker;
-            ui.close_menu();
+            ui.close();
         }
     })
     .response
@@ -321,7 +321,7 @@ fn checks_badge(app: &mut App, ui: &mut egui::Ui) {
                 if !run.html_url.is_empty() {
                     let _ = open::that(&run.html_url);
                 }
-                ui.close_menu();
+                ui.close();
             }
         }
         ui.separator();
@@ -334,7 +334,7 @@ fn checks_badge(app: &mut App, ui: &mut egui::Ui) {
                     ));
                 }
             }
-            ui.close_menu();
+            ui.close();
         }
     });
 }
@@ -368,7 +368,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
                         refresh: true,
                     });
                 }
-                ui.close_menu();
+                ui.close();
             }
         });
         ui.separator();
@@ -412,7 +412,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
                 let marker = if branch.current { "» " } else { "    " };
                 if ui.button(format!("{marker}{}", branch.name)).clicked() {
                     checkout(app, &branch.name);
-                    ui.close_menu();
+                    ui.close();
                 }
             }
 
@@ -454,7 +454,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
                     let local =
                         branch.name.split_once('/').map(|(_, l)| l).unwrap_or(&branch.name);
                     checkout(app, local);
-                    ui.close_menu();
+                    ui.close();
                 }
             }
         });
@@ -476,7 +476,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
             for branch in locals_only {
                 if ui.button(&branch.name).clicked() {
                     app.request_merge_into(&branch.name);
-                    ui.close_menu();
+                    ui.close();
                 }
             }
         });
@@ -494,7 +494,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
                         app.busy = true;
                         app.worker.spawn(move || Msg::MergeOutcome(repo.merge(&name)));
                     }
-                    ui.close_menu();
+                    ui.close();
                 }
             }
         });
@@ -507,13 +507,13 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
                         app.busy = true;
                         app.worker.spawn(move || Msg::MergeOutcome(repo.rebase(&name)));
                     }
-                    ui.close_menu();
+                    ui.close();
                 }
             }
         });
         if ui.button("Create Pull Request…").clicked() {
             open_pr_dialog(app);
-            ui.close_menu();
+            ui.close();
         }
 
         // Stash
@@ -525,7 +525,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
                     refresh: true,
                 });
             }
-            ui.close_menu();
+            ui.close();
         }
         let stashes = app.stashes.clone();
         ui.menu_button(format!("Stashes ({})", stashes.len()), |ui| {
@@ -559,11 +559,11 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
                                 refresh: true,
                             });
                         }
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.small_button("Drop").clicked() {
                         app.confirm(crate::app::ConfirmAction::DropStash(stash.index));
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
             }
@@ -577,7 +577,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
         {
             let subject = app.log.first().map(|c| c.subject.clone()).unwrap_or_default();
             app.confirm(crate::app::ConfirmAction::UndoCommit(subject));
-            ui.close_menu();
+            ui.close();
         }
 
         // Tags
@@ -600,7 +600,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
                             refresh: true,
                         });
                     }
-                    ui.close_menu();
+                    ui.close();
                 }
             });
             let tags = app.tags.clone();
@@ -619,7 +619,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
                                 refresh: false,
                             });
                         }
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
             }
@@ -637,7 +637,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
             for name in &manageable {
                 if ui.button(name).clicked() {
                     app.confirm(crate::app::ConfirmAction::DeleteBranch(name.clone()));
-                    ui.close_menu();
+                    ui.close();
                 }
             }
         });
@@ -659,7 +659,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
                         refresh: true,
                     });
                 }
-                ui.close_menu();
+                ui.close();
             }
         });
     });
@@ -726,15 +726,15 @@ fn sync_segment(app: &mut App, ui: &mut egui::Ui) {
     response.context_menu(|ui| {
         if ui.button("Fetch").clicked() {
             run_sync(app, "fetch");
-            ui.close_menu();
+            ui.close();
         }
         if ui.button("Pull").clicked() {
             run_sync(app, "pull");
-            ui.close_menu();
+            ui.close();
         }
         if ui.button("Push").clicked() {
             run_sync(app, "push");
-            ui.close_menu();
+            ui.close();
         }
         if ui
             .button("Force push (with lease)")
@@ -742,7 +742,7 @@ fn sync_segment(app: &mut App, ui: &mut egui::Ui) {
             .clicked()
         {
             run_sync(app, "force-push");
-            ui.close_menu();
+            ui.close();
         }
     });
     if response.clicked() {
@@ -1517,7 +1517,7 @@ fn history_tab(app: &mut App, ui: &mut egui::Ui) {
                         sha: commit.sha.clone(),
                         subject: commit.subject.clone(),
                     });
-                    ui.close_menu();
+                    ui.close();
                 }
             });
             if response.clicked() {

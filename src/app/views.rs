@@ -106,6 +106,61 @@ pub fn toolbar(app: &mut App, ctx: &egui::Context) {
                 });
             });
             state_banner(app, ui);
+            stash_banner(app, ui);
+        });
+}
+
+/// Subtle banner shown while stashes exist, so stashed work is never
+/// forgotten (and later reapplied onto conflicting changes by surprise).
+fn stash_banner(app: &mut App, ui: &mut egui::Ui) {
+    let count = app.stashes.len();
+    if count == 0 {
+        return;
+    }
+    ui.add_space(6.0);
+    egui::Frame::new()
+        .fill(theme::TEAL.linear_multiply(0.10))
+        .stroke(egui::Stroke::new(1.0_f32, theme::TEAL.linear_multiply(0.5)))
+        .corner_radius(theme::RADIUS_MD as f32)
+        .inner_margin(egui::Margin::symmetric(12, 6))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let newest = app
+                    .stashes
+                    .first()
+                    .map(|s| truncate(&s.message, 40))
+                    .unwrap_or_default();
+                let text = if count == 1 {
+                    format!("1 stash: {newest}")
+                } else {
+                    format!("{count} stashes, newest: {newest}")
+                };
+                ui.label(RichText::new(text).color(theme::TEAL).small());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("Apply newest")
+                        .on_hover_text(
+                            "Restores the most recent stash into the working tree.                              Conflicts open the resolver.",
+                        )
+                        .clicked()
+                    {
+                        if let Some(repo) = app.repo.clone() {
+                            app.worker.spawn(move || Msg::Done {
+                                message: strerr(
+                                    repo.stash_pop(0)
+                                        .map(|_| "Stash applied.".to_string()),
+                                ),
+                                refresh: true,
+                            });
+                        }
+                    }
+                    ui.label(
+                        RichText::new("more in the branch menu · ")
+                            .color(theme::FG_DIM)
+                            .small(),
+                    );
+                });
+            });
         });
 }
 

@@ -364,6 +364,17 @@ impl Client {
         Ok(summary)
     }
 
+    /// Whether a branch is protected by repository rules on GitHub.
+    ///
+    /// Uses the branch endpoint's `protected` flag, which reflects both
+    /// classic branch protection and repository rulesets that restrict
+    /// direct pushes.
+    pub fn branch_protected(&self, slug: &RepoSlug, branch: &str) -> Result<bool> {
+        let path = format!("/repos/{}/{}/branches/{branch}", slug.owner, slug.repo);
+        let value = self.get(&path)?;
+        Ok(value.get("protected").and_then(|p| p.as_bool()).unwrap_or(false))
+    }
+
     /// Repositories the user can access, most recently pushed first.
     pub fn my_repos(&self) -> Result<Vec<RemoteRepo>> {
         let value =

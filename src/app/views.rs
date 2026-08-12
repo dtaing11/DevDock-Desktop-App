@@ -407,11 +407,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
                 others.iter().filter(|b| !b.name.contains('/')).collect();
             for branch in locals_only {
                 if ui.button(&branch.name).clicked() {
-                    if let Some(repo) = app.repo.clone() {
-                        let name = branch.name.clone();
-                        app.busy = true;
-                        app.worker.spawn(move || Msg::MergeOutcome(repo.merge_into(&name)));
-                    }
+                    app.request_merge_into(&branch.name);
                     ui.close_menu();
                 }
             }

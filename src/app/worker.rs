@@ -42,6 +42,8 @@ pub enum Msg {
     GhBranchChecks { branch: String, summary: ChecksSummary },
     /// CI checks for the default branch (main/master).
     GhMainChecks { branch: String, summary: ChecksSummary },
+    /// Result of the pre-merge inspection: open the confirm dialog.
+    MergePrompt { source: String, target: String, protected: bool },
     /// CI checks for one PR head SHA.
     GhPrChecks { number: u64, summary: ChecksSummary },
 

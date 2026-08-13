@@ -59,6 +59,12 @@ Optional targets:
 3. Click **✨ AI message** in the commit box. The model reads the staged diff and
    fills in the summary and description.
 
+## CLI
+
+The same binary is a full CLI: `devdock status`, `log`, `branches`,
+`stash`, `commit --ai`, `push` (CI-gated), `pr --ai` (opens a pull
+request), `ci`, and `hook`. See [docs/cli.md](docs/cli.md).
+
 ## Local CI (checks before a PR)
 
 Define per-repo checks in `.git-manage-ci.toml` and run them from the

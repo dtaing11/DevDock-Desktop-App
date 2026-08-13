@@ -9,7 +9,7 @@
 use super::theme;
 use super::App;
 use crate::git::Commit;
-use egui::{Color32, Pos2, Rect, RichText, ScrollArea, Stroke, Vec2};
+use egui::{Color32, Pos2, RichText, ScrollArea, Stroke, Vec2};
 use std::collections::HashMap;
 
 /// Lane colors cycled across branches.
@@ -120,7 +120,7 @@ pub fn draw_side_panel(app: &mut App, ctx: &egui::Context) {
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
-                                if ui.small_button("↻").on_hover_text("Reload").clicked() {
+                                if ui.small_button("Reload").clicked() {
                                     app.load_graph();
                                 }
                             },
@@ -217,61 +217,53 @@ pub fn draw_side_panel(app: &mut App, ctx: &egui::Context) {
                     }
                 }
 
-                // --- hover popup: sha, subject, branches ---
+                // --- hover popup: rendered as an egui tooltip-layer Area
+                // so it floats above every panel and is never clipped by
+                // this narrow side panel.
                 if let Some((p, i)) = hovered_popup {
                     let node = &app.graph[i];
-                    let mut lines: Vec<(String, Color32)> = vec![(
-                        format!(
-                            "{}  {}",
-                            node.commit.short_sha,
-                            truncate_str(&node.commit.subject, 46)
-                        ),
-                        theme::FG,
-                    )];
-                    lines.push((
-                        format!("{} · {}", node.commit.author,
-                            node.commit.date.get(..10).unwrap_or("")),
-                        theme::FG_DIM,
-                    ));
-                    for name in node.commit.refs.iter().take(6) {
-                        let color = if name.starts_with("HEAD") {
-                            theme::EMBER
-                        } else if name.starts_with("tag:") {
-                            theme::WARN
-                        } else {
-                            theme::TEAL
-                        };
-                        lines.push((name.clone(), color));
-                    }
-
-                    let font = egui::FontId::proportional(11.5);
-                    let galleys: Vec<_> = lines
-                        .iter()
-                        .map(|(t, c)| painter.layout_no_wrap(t.clone(), font.clone(), *c))
-                        .collect();
-                    let width =
-                        galleys.iter().map(|g| g.size().x).fold(0.0_f32, f32::max) + 24.0;
-                    let height =
-                        galleys.iter().map(|g| g.size().y + 4.0).sum::<f32>() + 16.0;
-                    let mut popup_pos = p + Vec2::new(14.0, -height / 2.0);
-                    // Popup opens leftward when it would leave the panel.
-                    if popup_pos.x + width > rect.max.x {
-                        popup_pos.x = p.x - width - 14.0;
-                    }
-                    let popup = Rect::from_min_size(popup_pos, Vec2::new(width, height));
-                    painter.rect_filled(popup, 8, theme::PANEL);
-                    painter.rect_stroke(
-                        popup,
-                        8,
-                        Stroke::new(1.0_f32, Color32::WHITE.linear_multiply(0.35)),
-                        egui::StrokeKind::Inside,
+                    let refs = node.commit.refs.clone();
+                    let short = node.commit.short_sha.clone();
+                    let subject = truncate_str(&node.commit.subject, 46);
+                    let meta = format!(
+                        "{} · {}",
+                        node.commit.author,
+                        node.commit.date.get(..10).unwrap_or("")
                     );
-                    let mut y = popup.min.y + 8.0;
-                    for galley in galleys {
-                        let size = galley.size();
-                        painter.galley(Pos2::new(popup.min.x + 12.0, y), galley, theme::FG);
-                        y += size.y + 4.0;
-                    }
+                    egui::Area::new(egui::Id::new("graph-hover-popup"))
+                        .order(egui::Order::Tooltip)
+                        .fixed_pos(p + Vec2::new(-260.0, -10.0))
+                        .show(ui.ctx(), |ui| {
+                            egui::Frame::new()
+                                .fill(theme::PANEL)
+                                .stroke(egui::Stroke::new(
+                                    1.0_f32,
+                                    Color32::WHITE.linear_multiply(0.35),
+                                ))
+                                .corner_radius(8.0)
+                                .inner_margin(egui::Margin::symmetric(12, 8))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new(format!("{short}  {subject}"))
+                                            .small(),
+                                    );
+                                    ui.label(
+                                        RichText::new(meta).color(theme::FG_DIM).small(),
+                                    );
+                                    for name in refs.iter().take(6) {
+                                        let color = if name.starts_with("HEAD") {
+                                            theme::EMBER
+                                        } else if name.starts_with("tag:") {
+                                            theme::WARN
+                                        } else {
+                                            theme::TEAL
+                                        };
+                                        ui.label(
+                                            RichText::new(name).color(color).small(),
+                                        );
+                                    }
+                                });
+                        });
                 }
             });
         });

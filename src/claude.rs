@@ -13,14 +13,15 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Default model when none is chosen, Anthropic's fast/cheap tier.
-pub const DEFAULT_MODEL: &str = "claude-3-5-haiku-latest";
+/// Haiku also consumes the least subscription quota under OAuth.
+pub const DEFAULT_MODEL: &str = "claude-haiku-4-5-20251001";
 
 /// Static fallback list, used only when the models API is unreachable.
 pub const FALLBACK_MODELS: &[&str] =
-    &["claude-3-5-haiku-latest", "claude-sonnet-4-5", "claude-opus-4-1"];
+    &["claude-haiku-4-5-20251001", "claude-sonnet-4-5-20250929", "claude-opus-4-5-20251101"];
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
-const MAX_DIFF_CHARS: usize = 24_000;
+const MAX_DIFF_CHARS: usize = 12_000;
 const SYSTEM_PROMPT: &str = "You are an expert software engineer writing git commit messages. \
 Given a diff, produce a concise conventional-commit style summary line (max 72 chars, imperative mood, \
 e.g. 'feat: add user login') and a short description body explaining what changed and why. \
@@ -357,15 +358,37 @@ impl Client {
         let value: serde_json::Value = match resp {
             Ok(r) => r.into_json().map_err(|e| ClaudeError(e.to_string()))?,
             Err(ureq::Error::Status(code, r)) => {
+                let retry_after: Option<u64> =
+                    r.header("retry-after").and_then(|v| v.parse().ok());
                 let body: serde_json::Value = r.into_json().unwrap_or_default();
                 let detail = body
                     .pointer("/error/message")
                     .and_then(|m| m.as_str())
                     .unwrap_or("request failed");
                 let hint = match code {
-                    401 => " (sign in again in Settings)",
-                    429 => " (rate limited, try again shortly)",
-                    _ => "",
+                    401 => " (sign in again in Settings)".to_string(),
+                    429 => {
+                        let retry = retry_after
+                            .map(|secs| {
+                                if secs >= 60 {
+                                    format!("{} min", secs.div_ceil(60))
+                                } else {
+                                    format!("{secs}s")
+                                }
+                            });
+                        match retry {
+                            Some(t) => format!(
+                                " (rate limited; retry in ~{t}. OAuth shares your \
+                                 claude.ai subscription quota; Haiku uses far less \
+                                 of it than Sonnet/Opus)"
+                            ),
+                            None => " (rate limited. OAuth shares your claude.ai \
+                                     subscription quota; Haiku uses far less of it \
+                                     than Sonnet/Opus)"
+                                .to_string(),
+                        }
+                    }
+                    _ => String::new(),
                 };
                 return Err(ClaudeError(format!("Claude API {code}: {detail}{hint}")));
             }

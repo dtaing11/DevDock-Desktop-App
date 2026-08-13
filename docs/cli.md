@@ -19,6 +19,7 @@ devdock <command>    # run headlessly
   - [pr](#pr)
   - [resolve](#resolve)
   - [ci](#ci)
+  - [ci init](#ci-init)
   - [hook](#hook)
 - [The CI gate](#the-ci-gate)
 - [Auth and configuration](#auth-and-configuration)
@@ -183,6 +184,33 @@ devdock ci: tests ... FAIL (2.4s)
 
 See [local-ci.md](local-ci.md) for job configuration (Docker
 environments, secrets, `[on_push]`).
+
+### ci init
+
+Creates `.git-manage-ci.toml`. Plain `ci init` writes the commented
+starter template. `ci init --ai` scans the repository (file listing plus
+manifests like Cargo.toml, package.json, go.mod, Makefile) and asks the
+configured AI model to draft jobs tailored to the project.
+
+```
+$ devdock ci init --ai
+scanning the repository…
+asking the AI to draft the config…
+
+── AI proposed .git-manage-ci.toml ──
+  [[job]]
+  name = "tests"
+  commands = ["cargo test"]
+  ...
+── end ──
+nothing is written until you accept
+[a]ccept [e]dit in $EDITOR [q]uit ? a
+saved .git-manage-ci.toml
+```
+
+The draft is validated as TOML before you ever see it, and again after
+`[e]dit`. Nothing is written until you accept; quitting discards it.
+An existing config is only overwritten after the same confirmation.
 
 ### hook
 

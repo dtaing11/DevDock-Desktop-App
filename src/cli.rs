@@ -14,7 +14,7 @@ pub fn run(args: &[String]) -> Option<ExitCode> {
     let cmd = args.first().map(String::as_str)?;
     let rest = &args[1..];
     let code = match cmd {
-        "ci" => cmd_ci(),
+        "ci" => cmd_ci(rest),
         "status" => cmd_status(),
         "log" => cmd_log(rest),
         "branches" => cmd_branches(),
@@ -66,6 +66,8 @@ fn print_help() {
         ("pr --ai", "AI-generated PR title and body"),
         ("resolve", "interactive conflict resolver with AI proposals"),
         ("ci", "run all local CI jobs (.git-manage-ci.toml)"),
+        ("ci init", "write a starter .git-manage-ci.toml"),
+        ("ci init --ai", "AI drafts the CI config; review before saving"),
         ("hook install|remove|status", "git pre-push hook running devdock ci"),
         ("help", "this text"),
     ];
@@ -95,7 +97,15 @@ fn repo_root() -> Result<PathBuf, ExitCode> {
 // Commands
 // ---------------------------------------------------------------------------
 
-fn cmd_ci() -> ExitCode {
+fn cmd_ci(rest: &[String]) -> ExitCode {
+    match rest.first().map(String::as_str) {
+        Some("init") => return cmd_ci_init(rest.get(1).map(String::as_str) == Some("--ai")),
+        Some(other) if other != "--ai" => {
+            eprintln!("devdock ci: unknown subcommand \"{other}\" (try: ci, ci init, ci init --ai)");
+            return ExitCode::from(2);
+        }
+        _ => {}
+    }
     let Ok(root) = repo_root() else { return ExitCode::FAILURE };
     match crate::local_ci::run_all_cli(&root) {
         Ok(true) => ExitCode::SUCCESS,
@@ -106,6 +116,183 @@ fn cmd_ci() -> ExitCode {
         Err(e) => {
             eprintln!("devdock ci: {e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// Creates `.git-manage-ci.toml`: template, or AI-drafted from a repo
+/// scan with mandatory review. The AI draft is printed in full, validated,
+/// and only written after explicit confirmation.
+fn cmd_ci_init(ai: bool) -> ExitCode {
+    use std::io::{BufRead, Write};
+    let root = match repo_root() {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+    let config_path = root.join(crate::local_ci::CONFIG_FILE);
+    let exists = config_path.exists();
+
+    if !ai {
+        if exists {
+            eprintln!(
+                "devdock: {} already exists (delete it first, or use `ci init --ai`)",
+                crate::local_ci::CONFIG_FILE
+            );
+            return ExitCode::FAILURE;
+        }
+        return match crate::local_ci::write_template(&root) {
+            Ok(()) => {
+                println!("{} {}", style::green("created"), crate::local_ci::CONFIG_FILE);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("devdock: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    // AI draft.
+    let config = crate::app::Config::load();
+    let (provider, model) = match &config.commit_ai {
+        Some(sel) => (sel.provider.clone(), sel.model.clone()),
+        None => {
+            let provider = config.ai_provider.clone().unwrap_or_else(|| "ollama".into());
+            let model = if provider == "claude" {
+                config.claude_model.clone().unwrap_or_default()
+            } else {
+                config.ollama_model.clone().unwrap_or_default()
+            };
+            (provider, model)
+        }
+    };
+    println!("{}", style::dim("scanning the repository…"));
+    let scan = crate::local_ci::repo_scan(&root);
+    println!("{}", style::dim("asking the AI to draft the config…"));
+    let draft = if provider == "claude" {
+        match crate::claude::Client::from_store(model)
+            .ok_or_else(|| "Claude is not signed in (sign in from the GUI settings)".to_string())
+            .and_then(|c| c.generate_ci_config(&scan).map_err(|e| e.to_string()))
+        {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("devdock: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        if model.is_empty() {
+            eprintln!("devdock: no Ollama model configured (pick one in the GUI)");
+            return ExitCode::FAILURE;
+        }
+        let url = config.ollama_url.unwrap_or_else(|| crate::ollama::DEFAULT_URL.into());
+        match crate::ollama::Client::new(url).generate_ci_config(&model, &scan) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("devdock: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+
+    // Validate before showing, so the user reviews something loadable.
+    if let Err(e) = toml::from_str::<crate::local_ci::Config>(&draft) {
+        eprintln!("devdock: the AI produced invalid TOML ({e}); try again");
+        return ExitCode::FAILURE;
+    }
+
+    println!("\n{}", style::header(&format!("AI proposed {}", crate::local_ci::CONFIG_FILE)));
+    for line in draft.lines() {
+        println!("  {line}");
+    }
+    println!("{}", style::header("end"));
+    if exists {
+        println!(
+            "{}",
+            style::yellow(&format!(
+                "{} already exists and will be overwritten",
+                crate::local_ci::CONFIG_FILE
+            ))
+        );
+    }
+    println!("{}", style::dim("nothing is written until you accept"));
+
+    let stdin = std::io::stdin();
+    loop {
+        print!(
+            "{} {} {} ? ",
+            style::green("[a]ccept"),
+            style::teal("[e]dit in $EDITOR"),
+            style::red("[q]uit")
+        );
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line).is_err() {
+            return ExitCode::FAILURE;
+        }
+        match line.trim().to_lowercase().as_str() {
+            "a" | "y" | "yes" => {
+                return match std::fs::write(&config_path, &draft) {
+                    Ok(()) => {
+                        println!("{} {}", style::green("saved"), crate::local_ci::CONFIG_FILE);
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("devdock: {e}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
+            "e" => {
+                // Write to a temp file, open $EDITOR, re-validate, then confirm.
+                let tmp = std::env::temp_dir().join("devdock-ci-draft.toml");
+                if let Err(e) = std::fs::write(&tmp, &draft) {
+                    eprintln!("devdock: {e}");
+                    return ExitCode::FAILURE;
+                }
+                let editor =
+                    std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
+                let status = std::process::Command::new(&editor).arg(&tmp).status();
+                if !status.map(|s| s.success()).unwrap_or(false) {
+                    eprintln!("devdock: editor exited abnormally; keeping the draft");
+                    continue;
+                }
+                let edited = match std::fs::read_to_string(&tmp) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("devdock: {e}");
+                        continue;
+                    }
+                };
+                match toml::from_str::<crate::local_ci::Config>(&edited) {
+                    Ok(parsed) => {
+                        return match std::fs::write(&config_path, &edited) {
+                            Ok(()) => {
+                                println!(
+                                    "{} {} ({} job(s))",
+                                    style::green("saved"),
+                                    crate::local_ci::CONFIG_FILE,
+                                    parsed.jobs.len()
+                                );
+                                ExitCode::SUCCESS
+                            }
+                            Err(e) => {
+                                eprintln!("devdock: {e}");
+                                ExitCode::FAILURE
+                            }
+                        };
+                    }
+                    Err(e) => {
+                        eprintln!("devdock: edited file is invalid TOML ({e}); not saved");
+                        continue;
+                    }
+                }
+            }
+            "q" | "n" | "no" => {
+                println!("devdock: discarded, nothing written");
+                return ExitCode::SUCCESS;
+            }
+            other => println!("devdock: \"{other}\"? a / e / q"),
         }
     }
 }

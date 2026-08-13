@@ -616,6 +616,22 @@ impl Repo {
         OpOutcome::from(self.git(&["merge", "--no-edit", branch]))
     }
 
+    /// Starts resolving a PR's conflicts locally: checks out the PR's head
+    /// branch and merges the base branch into it. The resulting conflicts
+    /// are then fixable in the conflict resolver; pushing the merge
+    /// resolves the PR's conflict state on GitHub.
+    pub fn start_pr_conflict_fix(&self, head: &str, base: &str) -> OpOutcome {
+        if let Err(e) = self.fetch(None) {
+            return OpOutcome { ok: false, conflict: false, message: e.to_string() };
+        }
+        if let Err(e) = self.checkout(head) {
+            return OpOutcome { ok: false, conflict: false, message: e.to_string() };
+        }
+        // Merge the up-to-date remote base so the fix matches GitHub's view.
+        let base_ref = format!("origin/{base}");
+        self.merge(&base_ref)
+    }
+
     /// Merges the current branch into `target`: checks out `target`, then
     /// merges the previous branch into it. On success you end up on
     /// `target` with the merge applied (push it to publish).

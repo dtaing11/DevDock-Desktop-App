@@ -48,6 +48,8 @@ pub enum Msg {
     Graph(Vec<crate::app::graph::GraphNode>),
     /// CI checks for one PR head SHA.
     GhPrChecks { number: u64, summary: ChecksSummary },
+    /// Mergeable state for one PR (None = GitHub still computing).
+    GhPrMergeable { number: u64, mergeable: Option<bool> },
 
     OllamaModels(Result<Vec<Model>, String>),
     /// AI-generated text for the commit box or the PR form.

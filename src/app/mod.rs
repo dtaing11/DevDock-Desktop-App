@@ -319,6 +319,8 @@ pub struct PrState {
     pub open_prs: Vec<github::PullRequest>,
     /// CI check summaries keyed by PR number.
     pub checks: std::collections::HashMap<u64, github::ChecksSummary>,
+    /// Mergeable state keyed by PR number (false = has conflicts).
+    pub mergeable: std::collections::HashMap<u64, Option<bool>>,
     pub loading: bool,
     pub creating: bool,
 }
@@ -1058,18 +1060,36 @@ impl App {
                 self.pr.loading = false;
                 match result {
                     Ok(prs) => {
-                        // Kick off a checks lookup per PR.
+                        // Kick off checks + mergeable lookups per PR.
                         if let Some(repo) = self.repo.clone() {
                             for pr in &prs {
                                 let sha = pr.head_sha.clone();
                                 let number = pr.number;
+                                {
+                                    let repo = repo.clone();
+                                    self.worker.spawn(move || {
+                                        let summary = github::Client::from_store()
+                                            .zip(views::origin_slug(&repo))
+                                            .and_then(|(c, slug)| c.checks(&slug, &sha).ok());
+                                        match summary {
+                                            Some(summary) => {
+                                                Msg::GhPrChecks { number, summary }
+                                            }
+                                            None => Msg::Noop,
+                                        }
+                                    });
+                                }
                                 let repo = repo.clone();
                                 self.worker.spawn(move || {
-                                    let summary = github::Client::from_store()
+                                    let mergeable = github::Client::from_store()
                                         .zip(views::origin_slug(&repo))
-                                        .and_then(|(c, slug)| c.checks(&slug, &sha).ok());
-                                    match summary {
-                                        Some(summary) => Msg::GhPrChecks { number, summary },
+                                        .and_then(|(c, slug)| {
+                                            c.pr_mergeable(&slug, number).ok()
+                                        });
+                                    match mergeable {
+                                        Some(mergeable) => {
+                                            Msg::GhPrMergeable { number, mergeable }
+                                        }
                                         None => Msg::Noop,
                                     }
                                 });
@@ -1108,6 +1128,9 @@ impl App {
             }
             Msg::GhPrChecks { number, summary } => {
                 self.pr.checks.insert(number, summary);
+            }
+            Msg::GhPrMergeable { number, mergeable } => {
+                self.pr.mergeable.insert(number, mergeable);
             }
 
             Msg::CiJobDone { index, result } => {
@@ -1309,6 +1332,18 @@ impl App {
                 })
             };
             Msg::Done { message: strerr(result), refresh: true }
+        });
+    }
+
+    /// Starts fixing a PR's merge conflicts locally: checks out the head
+    /// branch, merges origin/<base>, and opens the conflict resolver.
+    pub fn fix_pr_conflicts(&mut self, head: String, base: String) {
+        let Some(repo) = self.repo.clone() else { return };
+        self.dialog = Dialog::None;
+        self.busy = true;
+        self.toast(format!("Preparing conflict fix: {head} <- {base}…"), false);
+        self.worker.spawn(move || {
+            Msg::MergeOutcome(repo.start_pr_conflict_fix(&head, &base))
         });
     }
 

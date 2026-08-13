@@ -401,6 +401,32 @@ fn pull_requests(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                             }
                         }
                     });
+                    match app.pr.mergeable.get(&pr.number) {
+                        Some(Some(false)) => {
+                            ui.label(
+                                RichText::new("[conflicts]").color(theme::DANGER).small(),
+                            )
+                            .on_hover_text("This PR cannot be merged until conflicts are resolved");
+                            if ui
+                                .small_button("Fix conflicts")
+                                .on_hover_text(format!(
+                                    "Checks out {}, merges origin/{} into it, and opens \
+                                     the conflict resolver. Push afterwards to update \
+                                     the PR.",
+                                    pr.head, pr.base
+                                ))
+                                .clicked()
+                            {
+                                app.fix_pr_conflicts(pr.head.clone(), pr.base.clone());
+                            }
+                        }
+                        Some(Some(true)) => {
+                            ui.label(
+                                RichText::new("[mergeable]").color(theme::ADD).small(),
+                            );
+                        }
+                        _ => {}
+                    }
                     if let Some(checks) = app.pr.checks.get(&pr.number) {
                         use crate::github::CheckState;
                         let (label, color) = match checks.state {

@@ -361,6 +361,15 @@ impl Client {
         Ok(summary)
     }
 
+    /// Whether a PR is mergeable per GitHub: `Some(false)` means merge
+    /// conflicts with the base branch. `None` while GitHub is still
+    /// computing the merge (the endpoint is eventually consistent).
+    pub fn pr_mergeable(&self, slug: &RepoSlug, number: u64) -> Result<Option<bool>> {
+        let path = format!("/repos/{}/{}/pulls/{number}", slug.owner, slug.repo);
+        let value = self.get(&path)?;
+        Ok(value.get("mergeable").and_then(|m| m.as_bool()))
+    }
+
     /// Merges a pull request. `method` is "merge", "squash", or "rebase".
     /// Fails with the API's reason when rules block the merge (required
     /// reviews, failing checks, disallowed method, ...).

@@ -931,6 +931,18 @@ fn repo_prompt_settings(app: &mut App, ui: &mut egui::Ui) {
         &mut changed,
         &mut error,
     );
+    prompt_slot(
+        ui,
+        PromptSlot {
+            label: "Conflict resolution",
+            hint: "e.g. Prefer our naming conventions; never drop test cases.",
+            text: &mut prompts.conflict,
+            file: &mut prompts.conflict_file,
+        },
+        &repo_root,
+        &mut changed,
+        &mut error,
+    );
 
     if changed {
         app.config.save();

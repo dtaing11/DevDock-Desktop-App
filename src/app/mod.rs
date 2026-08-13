@@ -95,6 +95,12 @@ pub struct RepoPrompts {
     /// Optional Markdown file whose contents are appended for PRs.
     #[serde(default)]
     pub pull_request_file: Option<String>,
+    /// Appended to the system prompt for AI conflict resolution.
+    #[serde(default)]
+    pub conflict: String,
+    /// Optional Markdown file whose contents are appended for conflicts.
+    #[serde(default)]
+    pub conflict_file: Option<String>,
 }
 
 /// A provider/model pair chosen for one AI task.
@@ -841,6 +847,27 @@ impl App {
         (!parts.is_empty()).then(|| parts.join("\n\n"))
     }
 
+    /// Custom AI instructions for conflict resolution in the current repo:
+    /// inline text plus a linked Markdown file, when configured.
+    fn conflict_prompt(&self) -> Option<String> {
+        let repo = self.repo.as_ref()?;
+        let prompts = self.config.repo_prompts.get(&repo.path().display().to_string())?;
+        let mut parts: Vec<String> = Vec::new();
+        let inline = prompts.conflict.trim();
+        if !inline.is_empty() {
+            parts.push(inline.to_string());
+        }
+        if let Some(path) = &prompts.conflict_file {
+            match std::fs::read_to_string(path) {
+                Ok(contents) if !contents.trim().is_empty() => {
+                    parts.push(contents.trim().to_string());
+                }
+                _ => {}
+            }
+        }
+        (!parts.is_empty()).then(|| parts.join("\n\n"))
+    }
+
     /// Shared AI generation path for the commit box and the PR form. Each
     /// target has its own provider/model selection and optional per-repo
     /// custom instructions.
@@ -1378,16 +1405,20 @@ impl App {
         let base = file.base.clone().unwrap_or_default();
         let ours = file.ours.clone().unwrap_or_default();
         let theirs = file.theirs.clone().unwrap_or_default();
+        let custom = self.conflict_prompt();
         self.conflicts.ai_busy = Some(path.clone());
         let ollama_url = self.effective_ollama_url();
         self.worker.spawn(move || {
+            let custom = custom.as_deref();
             let result = if sel.provider == "claude" {
                 claude::Client::from_store(sel.model)
                     .ok_or("Claude is not signed in. Open Settings.".to_string())
-                    .and_then(|c| strerr(c.resolve_conflict(&path, &base, &ours, &theirs)))
+                    .and_then(|c| {
+                        strerr(c.resolve_conflict(&path, &base, &ours, &theirs, custom))
+                    })
             } else {
                 strerr(ollama::Client::new(ollama_url).resolve_conflict(
-                    &sel.model, &path, &base, &ours, &theirs,
+                    &sel.model, &path, &base, &ours, &theirs, custom,
                 ))
             };
             Msg::AiMergeProposal { path, result }

@@ -22,12 +22,6 @@ pub const FALLBACK_MODELS: &[&str] =
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const MAX_DIFF_CHARS: usize = 12_000;
-const MERGE_SYSTEM_PROMPT: &str = "You are an expert software engineer resolving a git \
-merge conflict. You are given the common ancestor (BASE), the current branch's version \
-(OURS), and the incoming version (THEIRS) of one file. Produce the correctly merged file: \
-keep the intent of BOTH sides' changes wherever they do not contradict, and integrate them \
-coherently where they touch the same lines. Output ONLY the complete merged file content, \
-with no conflict markers, no explanation, and no markdown code fences.";
 const SYSTEM_PROMPT: &str = "You are an expert software engineer writing git commit messages. \
 Given a diff, produce a concise conventional-commit style summary line (max 72 chars, imperative mood, \
 e.g. 'feat: add user login') and a short description body explaining what changed and why. \
@@ -330,12 +324,14 @@ impl Client {
         base: &str,
         ours: &str,
         theirs: &str,
+        extra_instructions: Option<&str>,
     ) -> Result<String> {
         // Claude's smaller budget: the merge output must reproduce the whole
         // file, so cap input well below the commit-diff budget logic.
         let prompt = crate::ollama::merge_prompt(path, base, ours, theirs, 24_000)
             .map_err(ClaudeError)?;
-        let text = self.request_with_system(MERGE_SYSTEM_PROMPT, &prompt, 8192)?;
+        let system = crate::ollama::merge_system_prompt(extra_instructions);
+        let text = self.request_with_system(&system, &prompt, 8192)?;
         Ok(crate::ollama::extract_merged_content(&text))
     }
 

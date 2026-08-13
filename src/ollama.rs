@@ -135,13 +135,15 @@ impl Client {
         base: &str,
         ours: &str,
         theirs: &str,
+        extra_instructions: Option<&str>,
     ) -> Result<String> {
         let prompt = merge_prompt(path, base, ours, theirs, MAX_MERGE_INPUT_CHARS)
             .map_err(OllamaError)?;
+        let system = merge_system_prompt(extra_instructions);
         let payload = serde_json::json!({
             "model": model,
             "prompt": prompt,
-            "system": MERGE_SYSTEM_PROMPT,
+            "system": system,
             "stream": false,
             "options": {"temperature": 0.0}
         });
@@ -158,6 +160,16 @@ impl Client {
             .and_then(|r| r.as_str())
             .ok_or_else(|| OllamaError("Ollama returned no response text".into()))?;
         Ok(extract_merged_content(text))
+    }
+}
+
+/// The merge system prompt, with the user's custom instructions appended
+/// when configured. The built-in prompt always applies; custom text extends
+/// it rather than replacing it, so output-format rules stay intact.
+pub fn merge_system_prompt(extra_instructions: Option<&str>) -> String {
+    match extra_instructions.filter(|s| !s.trim().is_empty()) {
+        Some(extra) => format!("{MERGE_SYSTEM_PROMPT}\n\nAdditional instructions:\n{extra}"),
+        None => MERGE_SYSTEM_PROMPT.to_string(),
     }
 }
 
@@ -325,6 +337,14 @@ mod merge_tests {
         let big = "x".repeat(600);
         let err = merge_prompt("a.rs", &big, &big, &big, 1000).unwrap_err();
         assert!(err.contains("too large"), "{err}");
+    }
+
+    #[test]
+    fn custom_instructions_extend_merge_prompt() {
+        let s = merge_system_prompt(Some("Prefer tabs."));
+        assert!(s.contains("resolving a git merge") && s.ends_with("Prefer tabs."));
+        // Blank custom text leaves the built-in prompt untouched.
+        assert_eq!(merge_system_prompt(Some("  ")), merge_system_prompt(None));
     }
 
     #[test]

@@ -1579,10 +1579,9 @@ impl eframe::App for App {
         views::toolbar(self, ctx);
         views::sidebar(self, ctx);
         if self.graph_open {
-            graph::draw_panel(self, ctx);
-        } else {
-            views::diff_panel(self, ctx);
+            graph::draw_side_panel(self, ctx);
         }
+        views::diff_panel(self, ctx);
         dialogs::show(self, ctx);
         views::toasts(self, ctx);
     }

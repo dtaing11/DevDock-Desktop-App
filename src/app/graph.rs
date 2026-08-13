@@ -97,50 +97,56 @@ pub fn layout(commits: &[Commit]) -> Vec<GraphNode> {
         .collect()
 }
 
-/// Renders the animated graph panel in the central area.
-pub fn draw_panel(app: &mut App, ctx: &egui::Context) {
-    egui::CentralPanel::default()
+/// Renders the animated graph as a right side panel; the main diff view
+/// keeps working next to it. Pure graph: no text column, details on hover.
+pub fn draw_side_panel(app: &mut App, ctx: &egui::Context) {
+    egui::SidePanel::right("graph-panel")
+        .default_width(220.0)
+        .min_width(140.0)
+        .max_width(420.0)
+        .resizable(true)
         .frame(egui::Frame::new().fill(theme::BG).inner_margin(0.0))
         .show(ctx, |ui| {
             egui::Frame::new()
                 .fill(theme::PANEL2)
-                .inner_margin(egui::Margin::symmetric(12, 8))
+                .inner_margin(egui::Margin::symmetric(10, 6))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("Commit graph").strong());
                         ui.label(
-                            RichText::new(format!("{} commits, all branches", app.graph.len()))
+                            RichText::new(format!("Graph · {}", app.graph.len()))
                                 .color(theme::FG_DIM)
                                 .small(),
                         );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if super::views::panel_button(ui, "Reload", true).clicked() {
-                                app.load_graph();
-                            }
-                        });
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui.small_button("↻").on_hover_text("Reload").clicked() {
+                                    app.load_graph();
+                                }
+                            },
+                        );
                     });
                 });
 
             if app.graph.is_empty() {
                 ui.centered_and_justified(|ui| {
-                    ui.label(RichText::new("No commits to draw yet.").color(theme::FG_DIM));
+                    ui.label(RichText::new("no commits").color(theme::FG_DIM).small());
                 });
                 return;
             }
 
-            // Animation clock: repaint while this panel is visible.
             let time = ui.input(|i| i.time) as f32;
             ctx.request_repaint();
 
             let max_lane = app.graph.iter().map(|n| n.lane).max().unwrap_or(0);
-            let content_w =
-                (MARGIN_X * 2.0 + (max_lane as f32 + 1.0) * LANE_W + 420.0).max(ui.available_width());
+            let content_w = (MARGIN_X * 2.0 + (max_lane as f32 + 1.0) * LANE_W)
+                .max(ui.available_width());
             let content_h = MARGIN_Y * 2.0 + app.graph.len() as f32 * ROW_H;
 
             ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
                 let (rect, _) = ui.allocate_exact_size(
                     Vec2::new(content_w, content_h),
-                    egui::Sense::click(),
+                    egui::Sense::hover(),
                 );
                 let painter = ui.painter_at(rect);
                 let origin = rect.min;
@@ -152,7 +158,7 @@ pub fn draw_panel(app: &mut App, ctx: &egui::Context) {
                     )
                 };
 
-                // --- edges (curves) ---
+                // --- edges ---
                 for (i, node) in app.graph.iter().enumerate() {
                     let from = pos_of(i, node.lane);
                     for (pi, plane) in &node.parent_edges {
@@ -163,131 +169,79 @@ pub fn draw_panel(app: &mut App, ctx: &egui::Context) {
                     }
                 }
 
-                // --- light pulses along edges (the sci-fi bit) ---
+                // --- light pulses ---
                 for (i, node) in app.graph.iter().enumerate() {
                     let from = pos_of(i, node.lane);
                     for (pi, plane) in &node.parent_edges {
                         let to = pos_of(*pi, *plane);
-                        // Per-edge phase so pulses don't march in lockstep.
                         let phase = ((i * 31 + pi * 17) % 97) as f32 / 97.0;
                         let t = (time * 0.35 + phase) % 1.0;
                         let p = edge_point(from, to, t);
                         let color = LANE_COLORS[node.lane % LANE_COLORS.len()];
-                        // Layered glow: bright core, two soft halos.
                         painter.circle_filled(p, 1.8, Color32::WHITE);
                         painter.circle_filled(p, 3.6, color.linear_multiply(0.55));
                         painter.circle_filled(p, 7.0, color.linear_multiply(0.15));
                     }
                 }
 
-                // --- nodes + labels ---
+                // --- nodes ---
                 let hover = ui.ctx().pointer_hover_pos();
                 let mut hovered_popup: Option<(Pos2, usize)> = None;
                 for (i, node) in app.graph.iter().enumerate() {
                     let p = pos_of(i, node.lane);
                     let color = LANE_COLORS[node.lane % LANE_COLORS.len()];
-                    // Breathing halo, offset per node.
-                    let breathe =
-                        0.5 + 0.5 * (time * 2.0 + i as f32 * 0.7).sin();
+                    let breathe = 0.5 + 0.5 * (time * 2.0 + i as f32 * 0.7).sin();
                     painter.circle_filled(p, NODE_R + 5.0 * breathe, color.linear_multiply(0.10));
                     painter.circle_filled(p, NODE_R, theme::BG);
                     painter.circle_stroke(p, NODE_R, Stroke::new(2.0_f32, color));
                     painter.circle_filled(p, 2.0, color);
 
-                    // Subject text to the right of the lanes (truncated so
-                    // it cannot collide with the ref chips).
-                    let text_x = origin.x + MARGIN_X + (max_lane as f32 + 1.0) * LANE_W + 12.0;
-                    let subject_rect = painter.text(
-                        Pos2::new(text_x, p.y - 6.0),
-                        egui::Align2::LEFT_CENTER,
-                        truncate_str(&node.commit.subject, 52),
-                        egui::FontId::proportional(12.5),
-                        theme::FG,
-                    );
-                    painter.text(
-                        Pos2::new(text_x, p.y + 8.0),
-                        egui::Align2::LEFT_CENTER,
-                        format!("{} · {}", node.commit.short_sha, node.commit.author),
-                        egui::FontId::proportional(10.0),
-                        theme::FG_DIM,
-                    );
-
-                    // Ref badges (branch/tag chips) after the subject text.
-                    if !node.commit.refs.is_empty() {
-                        let mut chip_x = subject_rect.max.x + 10.0;
-                        for name in node.commit.refs.iter().take(3) {
-                            let is_head = name.starts_with("HEAD");
-                            let chip_color = if is_head { theme::EMBER } else { theme::TEAL };
-                            let galley = painter.layout_no_wrap(
-                                name.clone(),
-                                egui::FontId::proportional(10.0),
-                                chip_color,
-                            );
-                            let pad = Vec2::new(8.0, 3.0);
-                            let chip = Rect::from_min_size(
-                                Pos2::new(chip_x, p.y - 6.0 - galley.size().y / 2.0 - pad.y),
-                                galley.size() + pad * 2.0,
-                            );
-                            let radius = (chip.height() / 2.0).min(120.0) as u8;
-                            painter.rect_filled(
-                                chip,
-                                radius,
-                                chip_color.linear_multiply(0.12),
-                            );
-                            painter.rect_stroke(
-                                chip,
-                                radius,
-                                Stroke::new(1.0_f32, chip_color.linear_multiply(0.6)),
-                                egui::StrokeKind::Inside,
-                            );
-                            painter.galley(chip.min + pad, galley, chip_color);
-                            chip_x = chip.max.x + 6.0;
-                        }
+                    // Small HEAD marker dot ring for decorated commits.
+                    if node.commit.refs.iter().any(|r| r.starts_with("HEAD")) {
+                        painter.circle_stroke(
+                            p,
+                            NODE_R + 3.0,
+                            Stroke::new(1.0_f32, theme::EMBER),
+                        );
                     }
 
-                    // Hover: bright highlight + branch-name popup.
                     if let Some(h) = hover {
                         if h.distance(p) <= NODE_R + 8.0 {
-                            // Emphasized rings around the hovered node.
                             painter.circle_stroke(
                                 p,
                                 NODE_R + 4.0,
                                 Stroke::new(2.0_f32, Color32::WHITE),
                             );
-                            painter.circle_filled(
-                                p,
-                                NODE_R + 10.0,
-                                color.linear_multiply(0.18),
-                            );
                             hovered_popup = Some((p, i));
                         }
                     }
                 }
-                // --- hover popup: branches containing / pointing at the node ---
+
+                // --- hover popup: sha, subject, branches ---
                 if let Some((p, i)) = hovered_popup {
                     let node = &app.graph[i];
-                    let mut lines: Vec<(String, Color32)> = Vec::new();
-                    lines.push((
+                    let mut lines: Vec<(String, Color32)> = vec![(
                         format!(
                             "{}  {}",
                             node.commit.short_sha,
                             truncate_str(&node.commit.subject, 46)
                         ),
                         theme::FG,
+                    )];
+                    lines.push((
+                        format!("{} · {}", node.commit.author,
+                            node.commit.date.get(..10).unwrap_or("")),
+                        theme::FG_DIM,
                     ));
-                    if node.commit.refs.is_empty() {
-                        lines.push(("no branch points here".into(), theme::FG_DIM));
-                    } else {
-                        for name in node.commit.refs.iter().take(6) {
-                            let color = if name.starts_with("HEAD") {
-                                theme::EMBER
-                            } else if name.starts_with("tag:") {
-                                theme::WARN
-                            } else {
-                                theme::TEAL
-                            };
-                            lines.push((name.clone(), color));
-                        }
+                    for name in node.commit.refs.iter().take(6) {
+                        let color = if name.starts_with("HEAD") {
+                            theme::EMBER
+                        } else if name.starts_with("tag:") {
+                            theme::WARN
+                        } else {
+                            theme::TEAL
+                        };
+                        lines.push((name.clone(), color));
                     }
 
                     let font = egui::FontId::proportional(11.5);
@@ -295,15 +249,12 @@ pub fn draw_panel(app: &mut App, ctx: &egui::Context) {
                         .iter()
                         .map(|(t, c)| painter.layout_no_wrap(t.clone(), font.clone(), *c))
                         .collect();
-                    let width = galleys
-                        .iter()
-                        .map(|g| g.size().x)
-                        .fold(0.0_f32, f32::max)
-                        + 24.0;
+                    let width =
+                        galleys.iter().map(|g| g.size().x).fold(0.0_f32, f32::max) + 24.0;
                     let height =
                         galleys.iter().map(|g| g.size().y + 4.0).sum::<f32>() + 16.0;
                     let mut popup_pos = p + Vec2::new(14.0, -height / 2.0);
-                    // Keep the popup inside the drawn rect horizontally.
+                    // Popup opens leftward when it would leave the panel.
                     if popup_pos.x + width > rect.max.x {
                         popup_pos.x = p.x - width - 14.0;
                     }

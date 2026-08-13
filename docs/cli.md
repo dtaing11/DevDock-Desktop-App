@@ -80,12 +80,28 @@ Stages **everything** and commits.
 
 ```
 devdock commit -m "fix: handle empty input"
-devdock commit --ai        # AI-generated message
+devdock commit --ai        # AI-generated, with interactive review
 ```
 
-`--ai` uses the same provider/model you selected in the GUI (the picker
-next to the AI button): a local Ollama model or Claude. Sign-in/config
-happens in the GUI; the CLI reuses it.
+`--ai` generates a message and shows it for review before committing:
+
+```
+$ devdock commit --ai
+--- generated commit message ---
+fix: debounce search input to avoid redundant queries
+
+- Adds a 300ms debounce to the search box
+--- end ---
+[a]ccept / [r]egenerate / [e]dit manually / [q]uit? 
+```
+
+- **a** (or Enter): commit with the shown message
+- **r**: ask the model for a new suggestion
+- **e**: type your own title, then body lines (finish with a `.` line)
+- **q**: abort without committing
+
+The model is whatever you selected in the GUI (Ollama or Claude);
+sign-in/config happens there and the CLI reuses it.
 
 ### push
 
@@ -106,9 +122,12 @@ default branch (`main`/`master`).
 
 ```
 devdock pr -t "Add search" -b "Implements fuzzy search over titles"
-devdock pr --ai            # AI-generated title and body from the diff
+devdock pr --ai            # AI-generated, same review flow as commit --ai
 devdock pr -t "Fix" --no-verify
 ```
+
+`--ai` shows the generated title/description with the same
+accept / regenerate / edit / quit prompt before anything is pushed.
 
 ```
 $ devdock pr --ai

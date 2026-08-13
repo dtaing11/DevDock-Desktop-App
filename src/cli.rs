@@ -296,13 +296,10 @@ fn cmd_commit(rest: &[String]) -> ExitCode {
     }
 
     let message = if rest.first().map(String::as_str) == Some("--ai") {
-        match ai_message(&repo) {
-            Ok(suggestion) => {
-                println!("AI message: {}", suggestion.summary);
-                (suggestion.summary, suggestion.description)
-            }
-            Err(e) => {
-                eprintln!("devdock: {e}");
+        match review_ai_text(&repo, "commit message") {
+            Some(msg) => msg,
+            None => {
+                println!("devdock: commit aborted");
                 return ExitCode::FAILURE;
             }
         }
@@ -325,6 +322,73 @@ fn cmd_commit(rest: &[String]) -> ExitCode {
         Err(e) => {
             eprintln!("devdock: {e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// Interactive review for AI-generated text: accept, regenerate, edit
+/// manually, or abort. Returns None when the user aborts.
+///
+/// `label` names what is being generated ("commit message" / "PR").
+fn review_ai_text(
+    repo: &Repo,
+    label: &str,
+) -> Option<(String, String)> {
+    use std::io::{BufRead, Write};
+    let stdin = std::io::stdin();
+    let mut suggestion = match ai_message(repo) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("devdock: {e}");
+            return None;
+        }
+    };
+    loop {
+        println!("\n--- generated {label} ---");
+        println!("{}", suggestion.summary);
+        if !suggestion.description.trim().is_empty() {
+            println!("\n{}", suggestion.description);
+        }
+        println!("--- end ---");
+        print!("[a]ccept / [r]egenerate / [e]dit manually / [q]uit? ");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line).is_err() {
+            return None;
+        }
+        match line.trim().to_lowercase().as_str() {
+            "a" | "" | "y" | "yes" => {
+                return Some((suggestion.summary, suggestion.description));
+            }
+            "r" => match ai_message(repo) {
+                Ok(s) => suggestion = s,
+                Err(e) => eprintln!("devdock: regenerate failed: {e}"),
+            },
+            "e" => {
+                print!("title/summary: ");
+                let _ = std::io::stdout().flush();
+                let mut title = String::new();
+                if stdin.lock().read_line(&mut title).is_err() {
+                    return None;
+                }
+                let title = title.trim().to_string();
+                if title.is_empty() {
+                    eprintln!("devdock: empty title, keeping previous");
+                    continue;
+                }
+                println!("body/description (end with a single '.' line, empty for none):");
+                let mut body_lines: Vec<String> = Vec::new();
+                for input in stdin.lock().lines() {
+                    let Ok(input) = input else { break };
+                    if input.trim() == "." || input.trim().is_empty() && body_lines.is_empty() {
+                        break;
+                    }
+                    body_lines.push(input);
+                }
+                return Some((title, body_lines.join("\n")));
+            }
+            "q" | "n" | "no" => return None,
+            other => println!("devdock: \"{other}\"? a / r / e / q"),
         }
     }
 }
@@ -460,10 +524,10 @@ fn cmd_pr(rest: &[String]) -> ExitCode {
 
     // 2. Resolve title/body.
     let (title, body) = if rest.iter().any(|a| a == "--ai") {
-        match ai_message(&repo) {
-            Ok(s) => (s.summary, s.description),
-            Err(e) => {
-                eprintln!("devdock: {e}");
+        match review_ai_text(&repo, "PR title and description") {
+            Some(text) => text,
+            None => {
+                println!("devdock: PR aborted");
                 return ExitCode::FAILURE;
             }
         }

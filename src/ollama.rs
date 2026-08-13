@@ -125,6 +125,102 @@ impl Client {
             .ok_or_else(|| OllamaError("Ollama returned no response text".into()))?;
         Ok(parse_suggestion(text))
     }
+
+    /// Asks the model to merge a conflicted file from its three stages.
+    /// Returns the full merged file content.
+    pub fn resolve_conflict(
+        &self,
+        model: &str,
+        path: &str,
+        base: &str,
+        ours: &str,
+        theirs: &str,
+    ) -> Result<String> {
+        let prompt = merge_prompt(path, base, ours, theirs, MAX_MERGE_INPUT_CHARS)
+            .map_err(OllamaError)?;
+        let payload = serde_json::json!({
+            "model": model,
+            "prompt": prompt,
+            "system": MERGE_SYSTEM_PROMPT,
+            "stream": false,
+            "options": {"temperature": 0.0}
+        });
+        let resp = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(300))
+            .build()
+            .post(&format!("{}/api/generate", self.base_url))
+            .send_json(payload)
+            .map_err(|e| OllamaError(format!("Ollama request failed: {e}")))?;
+        let value: serde_json::Value =
+            resp.into_json().map_err(|e| OllamaError(format!("Bad response from Ollama: {e}")))?;
+        let text = value
+            .get("response")
+            .and_then(|r| r.as_str())
+            .ok_or_else(|| OllamaError("Ollama returned no response text".into()))?;
+        Ok(extract_merged_content(text))
+    }
+}
+
+const MERGE_SYSTEM_PROMPT: &str = "You are an expert software engineer resolving a git merge \
+conflict. You are given the common ancestor (BASE), the current branch's version (OURS), and \
+the incoming version (THEIRS) of one file. Produce the correctly merged file: keep the intent \
+of BOTH sides' changes wherever they do not contradict, and integrate them coherently where \
+they touch the same lines. Output ONLY the complete merged file content, with no conflict \
+markers, no explanation, and no markdown code fences.";
+
+/// Total input budget for AI conflict resolution, across all three versions.
+/// Larger files must be resolved by hand; a truncated merge would corrupt
+/// the file.
+pub const MAX_MERGE_INPUT_CHARS: usize = 48_000;
+
+/// Builds the user prompt for AI conflict resolution from the three stages.
+/// Errs when the combined content exceeds [`MAX_MERGE_INPUT_CHARS`], because
+/// truncating merge input would produce a corrupt file.
+pub fn merge_prompt(
+    path: &str,
+    base: &str,
+    ours: &str,
+    theirs: &str,
+    limit: usize,
+) -> std::result::Result<String, String> {
+    let total = base.len() + ours.len() + theirs.len();
+    if total > limit {
+        return Err(format!(
+            "{path} is too large for AI resolution ({total} chars, limit {limit}). \
+             Resolve it manually."
+        ));
+    }
+    Ok(format!(
+        "Resolve the merge conflict in `{path}`.\n\n\
+         BASE (common ancestor):\n```\n{base}\n```\n\n\
+         OURS (current branch):\n```\n{ours}\n```\n\n\
+         THEIRS (incoming):\n```\n{theirs}\n```\n\n\
+         Output the complete merged file content only."
+    ))
+}
+
+/// Cleans model output into plain file content: trims a single wrapping
+/// markdown code fence if present, preserving everything inside verbatim.
+pub fn extract_merged_content(text: &str) -> String {
+    let trimmed = text.trim();
+    let Some(rest) = trimmed.strip_prefix("```") else {
+        return ensure_trailing_newline(trimmed);
+    };
+    // Drop the info string (e.g. ```rust) on the fence line.
+    let body = match rest.split_once('\n') {
+        Some((_info, body)) => body,
+        None => rest,
+    };
+    let body = body.strip_suffix("```").unwrap_or(body).trim_end_matches('\n');
+    ensure_trailing_newline(body)
+}
+
+fn ensure_trailing_newline(s: &str) -> String {
+    if s.is_empty() || s.ends_with('\n') {
+        s.to_string()
+    } else {
+        format!("{s}\n")
+    }
 }
 
 /// Truncates to at most `max` bytes on a char boundary, marking the cut.
@@ -210,5 +306,32 @@ mod tests {
         let t = truncate_utf8(&s, 51);
         assert!(t.contains("[diff truncated]"));
         assert!(t.starts_with('é'));
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    #[test]
+    fn merge_prompt_includes_all_three_versions() {
+        let p = merge_prompt("a.rs", "b", "o", "t", 1000).unwrap();
+        assert!(p.contains("BASE") && p.contains("OURS") && p.contains("THEIRS"));
+        assert!(p.contains("a.rs"));
+    }
+
+    #[test]
+    fn merge_prompt_rejects_oversized_input() {
+        let big = "x".repeat(600);
+        let err = merge_prompt("a.rs", &big, &big, &big, 1000).unwrap_err();
+        assert!(err.contains("too large"), "{err}");
+    }
+
+    #[test]
+    fn extract_strips_code_fence() {
+        assert_eq!(extract_merged_content("```rust\nfn main() {}\n```"), "fn main() {}\n");
+        assert_eq!(extract_merged_content("plain text"), "plain text\n");
+        // Inner fences survive when there is no wrapping fence pair.
+        assert_eq!(extract_merged_content("a\nb\n"), "a\nb\n");
     }
 }

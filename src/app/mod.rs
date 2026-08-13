@@ -332,6 +332,17 @@ pub struct ConflictState {
     pub selected: Option<usize>,
     pub editor: String,
     pub resolved: Vec<String>,
+    /// Path currently being resolved by AI, shown as a busy indicator.
+    pub ai_busy: Option<String>,
+    /// AI proposal awaiting user review: nothing is written to the working
+    /// tree until the user explicitly accepts (or edits then saves) it.
+    pub ai_proposal: Option<AiMergeProposal>,
+}
+
+/// An AI-suggested merge for one file, pending user confirmation.
+pub struct AiMergeProposal {
+    pub path: String,
+    pub content: String,
 }
 
 /// Local CI run state shown in the PR dialog.
@@ -1199,6 +1210,22 @@ impl App {
                 self.ollama_models = models;
             }
             Msg::OllamaModels(Err(_)) => self.ollama_models.clear(),
+            Msg::AiMergeProposal { path, result } => {
+                self.conflicts.ai_busy = None;
+                match result {
+                    Ok(content) => {
+                        // Proposal only: shown for review, never auto-applied.
+                        self.conflicts.editor = content.clone();
+                        self.conflicts.ai_proposal =
+                            Some(AiMergeProposal { path: path.clone(), content });
+                        self.toast(
+                            format!("AI proposed a merge for {path}. Review before accepting."),
+                            false,
+                        );
+                    }
+                    Err(e) => self.toast(e, true),
+                }
+            }
             Msg::AiSuggestion { target, result } => {
                 self.ai_busy = false;
                 match (target, result) {
@@ -1332,6 +1359,38 @@ impl App {
                 })
             };
             Msg::Done { message: strerr(result), refresh: true }
+        });
+    }
+
+    /// Asks the selected AI to propose a merge for one conflicted file.
+    /// The result is only a proposal: it is loaded into the review editor
+    /// and must be explicitly confirmed by the user before anything is
+    /// written to the working tree or index.
+    pub fn ai_resolve_conflict(&mut self, path: String) {
+        let Some(file) = self.conflicts.files.iter().find(|f| f.path == path).cloned()
+        else {
+            return;
+        };
+        let Some(sel) = self.ai_selection(worker::AiTarget::Commit) else {
+            self.toast("No AI model selected. Pick one next to the AI button.", true);
+            return;
+        };
+        let base = file.base.clone().unwrap_or_default();
+        let ours = file.ours.clone().unwrap_or_default();
+        let theirs = file.theirs.clone().unwrap_or_default();
+        self.conflicts.ai_busy = Some(path.clone());
+        let ollama_url = self.effective_ollama_url();
+        self.worker.spawn(move || {
+            let result = if sel.provider == "claude" {
+                claude::Client::from_store(sel.model)
+                    .ok_or("Claude is not signed in. Open Settings.".to_string())
+                    .and_then(|c| strerr(c.resolve_conflict(&path, &base, &ours, &theirs)))
+            } else {
+                strerr(ollama::Client::new(ollama_url).resolve_conflict(
+                    &sel.model, &path, &base, &ours, &theirs,
+                ))
+            };
+            Msg::AiMergeProposal { path, result }
         });
     }
 

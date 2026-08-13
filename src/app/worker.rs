@@ -54,6 +54,9 @@ pub enum Msg {
     OllamaModels(Result<Vec<Model>, String>),
     /// AI-generated text for the commit box or the PR form.
     AiSuggestion { target: AiTarget, result: Result<CommitSuggestion, String> },
+    /// AI-proposed merged content for one conflicted file. Never applied
+    /// automatically: the user must review and confirm in the resolver.
+    AiMergeProposal { path: String, result: Result<String, String> },
 
     /// Background task finished with nothing to report.
     Noop,

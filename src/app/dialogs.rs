@@ -496,6 +496,7 @@ fn conflict_resolver(app: &mut App, ctx: &egui::Context, open: &mut bool) {
             });
             if ui.selectable_label(app.conflicts.selected == Some(*i), text).clicked() {
                 app.conflicts.selected = Some(*i);
+                app.conflicts.ai_proposal = None;
                 app.conflicts.editor = app.conflicts.files[*i]
                     .working
                     .clone()
@@ -521,7 +522,64 @@ fn conflict_resolver(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                     let content = app.conflicts.editor.clone();
                     resolve(app, &path, Resolution::Manual(content));
                 }
+                let ai_busy_here =
+                    app.conflicts.ai_busy.as_deref() == Some(path.as_str());
+                if ai_busy_here {
+                    ui.add(egui::Spinner::new().size(14.0));
+                    ui.label(RichText::new("AI is merging…").italics().weak());
+                } else if ui
+                    .button("Resolve with AI")
+                    .on_hover_text(
+                        "Asks the selected AI model to merge base, ours, and \
+                         theirs. The result is only a proposal: you review it \
+                         below and nothing is applied until you accept it.",
+                    )
+                    .clicked()
+                {
+                    app.ai_resolve_conflict(path.clone());
+                }
             });
+
+            // Pending AI proposal: requires explicit user confirmation.
+            let proposal_here = app
+                .conflicts
+                .ai_proposal
+                .as_ref()
+                .is_some_and(|p| p.path == path);
+            if proposal_here {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "AI PROPOSAL. Review the merged result below and edit it \
+                         if needed. Nothing is applied until you accept.",
+                    )
+                    .color(theme::WARN)
+                    .small(),
+                );
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(egui::Button::new("Accept AI merge").fill(theme::EMBER))
+                        .on_hover_text(
+                            "Writes the reviewed content (including your edits) \
+                             to the file and marks it resolved",
+                        )
+                        .clicked()
+                    {
+                        // Apply what is in the editor, so user edits to the
+                        // proposal are what actually lands.
+                        let content = app.conflicts.editor.clone();
+                        app.conflicts.ai_proposal = None;
+                        resolve(app, &path, Resolution::Manual(content));
+                    }
+                    if ui.button("Discard proposal").clicked() {
+                        app.conflicts.ai_proposal = None;
+                        app.conflicts.editor = app.conflicts.files[i]
+                            .working
+                            .clone()
+                            .unwrap_or_default();
+                    }
+                });
+            }
 
             // Side-by-side: ours | theirs (read-only context above the editor).
             ui.columns(2, |cols| {
@@ -545,11 +603,12 @@ fn conflict_resolver(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                 );
             });
 
-            ui.label(
-                RichText::new("MERGED RESULT (edit freely, then Save manual edit)")
-                    .color(theme::EMBER)
-                    .small(),
-            );
+            let editor_label = if proposal_here {
+                "AI PROPOSED MERGE (edit freely, then Accept AI merge)"
+            } else {
+                "MERGED RESULT (edit freely, then Save manual edit)"
+            };
+            ui.label(RichText::new(editor_label).color(theme::EMBER).small());
             ScrollArea::vertical().max_height(200.0).id_salt("merged").show(ui, |ui| {
                 ui.add(
                     egui::TextEdit::multiline(&mut app.conflicts.editor)

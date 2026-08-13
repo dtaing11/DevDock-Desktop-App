@@ -10,6 +10,7 @@
 //! back through [`worker::Msg`], keeping the UI responsive.
 
 pub mod dialogs;
+pub mod graph;
 pub mod shortcuts;
 pub mod theme;
 pub mod views;
@@ -444,6 +445,10 @@ pub struct App {
     // history details
     pub commit_file_list: Vec<crate::git::CommitFileChange>,
 
+    // commit graph (all branches), shown when graph_open
+    pub graph: Vec<graph::GraphNode>,
+    pub graph_open: bool,
+
     // stash / tags / github repos
     pub stashes: Vec<crate::git::StashEntry>,
     pub tags: Vec<String>,
@@ -512,6 +517,8 @@ impl App {
             show_staged: false,
             blame: None,
             commit_file_list: Vec::new(),
+            graph: Vec::new(),
+            graph_open: false,
             stashes: Vec::new(),
             tags: Vec::new(),
             gh_repos: Vec::new(),
@@ -548,10 +555,31 @@ impl App {
         } else {
             self.dialog = Dialog::RepoPicker;
         }
-        // Quietly check GitHub sign-in and Ollama models.
+        // Quietly check GitHub sign-in and Ollama models. Retry the
+        // profile fetch: a transient network failure at startup must not
+        // make a valid token look signed-out.
         self.worker.spawn(|| {
-            let user = github::Client::from_store().and_then(|c| c.user().ok());
-            Msg::GhUser(user)
+            let Some(client) = github::Client::from_store() else {
+                return Msg::GhUser(None); // genuinely signed out
+            };
+            for attempt in 0..3 {
+                match client.user() {
+                    Ok(user) => return Msg::GhUser(Some(user)),
+                    Err(_) if attempt < 2 => {
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            500 * (attempt + 1),
+                        ));
+                    }
+                    Err(_) => break,
+                }
+            }
+            // Token exists but GitHub is unreachable: stay signed in with
+            // a placeholder profile instead of flip-flopping to Sign in.
+            Msg::GhUser(Some(github::User {
+                login: "(offline)".into(),
+                name: None,
+                avatar_url: String::new(),
+            }))
         });
         let url = self.ollama_url_input.clone();
         self.worker.spawn(move || Msg::OllamaModels(strerr(ollama::Client::new(url).models())));
@@ -848,7 +876,9 @@ impl App {
 
     /// GitHub token for authenticated push/pull/fetch, when signed in.
     pub fn gh_token(&self) -> Option<String> {
-        self.gh.user.as_ref().and_then(|_| github::TokenStore::load())
+        // The stored token is the source of truth; gh.user is only the
+        // fetched profile and can lag behind (offline start, rate limit).
+        github::TokenStore::load()
     }
 
     // -- message pump -------------------------------------------------------
@@ -875,6 +905,9 @@ impl App {
                     // CI state and history belong to the previous repo.
                     self.local_ci = Default::default();
                     self.load_local_ci();
+                    // Graph belongs to the previous repo too.
+                    self.graph.clear();
+                    self.graph_open = false;
                     self.refresh();
                 }
                 Err(e) => self.toast(e.to_string(), true),
@@ -901,6 +934,10 @@ impl App {
                     self.unchecked.clear();
                     // Reload CI config from the new branch's worktree state.
                     self.load_local_ci();
+                    // Graph shows all branches but HEAD markers move.
+                    if self.graph_open {
+                        self.load_graph();
+                    }
                 }
                 self.status = Some(status);
             }
@@ -1009,7 +1046,11 @@ impl App {
                 self.gh.polling = false;
                 self.toast(e, true);
             }
-            Msg::GhUser(user) => self.gh.user = user,
+            Msg::GhUser(user) => {
+                if user.is_some() || github::TokenStore::load().is_none() {
+                    self.gh.user = user;
+                }
+            }
             Msg::GhPrs(result) => {
                 self.pr.loading = false;
                 match result {
@@ -1057,6 +1098,7 @@ impl App {
             Msg::GhMainChecks { branch, summary } => {
                 self.main_checks = Some((branch, summary));
             }
+            Msg::Graph(nodes) => self.graph = nodes,
             Msg::MergePrompt { source, target, protected } => {
                 self.busy = false;
                 self.confirm(ConfirmAction::MergeInto { source, target, protected });
@@ -1408,6 +1450,15 @@ impl App {
         });
     }
 
+    /// Loads the all-branches commit log and lays out the graph.
+    pub fn load_graph(&mut self) {
+        let Some(repo) = self.repo.clone() else { return };
+        self.worker.spawn(move || {
+            let commits = repo.log_all(300).unwrap_or_default();
+            Msg::Graph(graph::layout(&commits))
+        });
+    }
+
     /// Reloads the stash list.
     pub fn load_stashes(&mut self) {
         let Some(repo) = self.repo.clone() else { return };
@@ -1493,7 +1544,7 @@ impl App {
                     }
                     Msg::GhSignedIn(strerr(github::Client::new(token).user()))
                 }
-                Ok(None) => Msg::GhUser(None), // still pending; UI re-arms polling
+                Ok(None) => Msg::Noop, // still pending; UI re-arms polling
                 Err(e) => Msg::GhSignedIn(Err(e.to_string())),
             }
         });
@@ -1527,6 +1578,9 @@ impl eframe::App for App {
 
         views::toolbar(self, ctx);
         views::sidebar(self, ctx);
+        if self.graph_open {
+            graph::draw_side_panel(self, ctx);
+        }
         views::diff_panel(self, ctx);
         dialogs::show(self, ctx);
         views::toasts(self, ctx);

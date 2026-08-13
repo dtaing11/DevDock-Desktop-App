@@ -12,6 +12,8 @@
 
 pub mod app;
 pub mod claude;
+pub mod cli;
+pub mod cli_style;
 pub mod git;
 pub mod github;
 pub mod local_ci;

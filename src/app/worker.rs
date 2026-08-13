@@ -44,6 +44,8 @@ pub enum Msg {
     GhMainChecks { branch: String, summary: ChecksSummary },
     /// Result of the pre-merge inspection: open the confirm dialog.
     MergePrompt { source: String, target: String, protected: bool },
+    /// Laid-out commit graph nodes (all branches).
+    Graph(Vec<crate::app::graph::GraphNode>),
     /// CI checks for one PR head SHA.
     GhPrChecks { number: u64, summary: ChecksSummary },
 

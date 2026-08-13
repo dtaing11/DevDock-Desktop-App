@@ -397,7 +397,7 @@ fn pull_requests(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                                         Msg::Done { message: result, refresh: true }
                                     });
                                 }
-                                ui.close_menu();
+                                ui.close();
                             }
                         }
                     });

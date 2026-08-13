@@ -73,6 +73,19 @@ pub fn toolbar(app: &mut App, ctx: &egui::Context) {
                 // 3. Context-aware sync action
                 sync_segment(app, ui);
 
+                // Graph toggle
+                let graph_btn = if app.graph_open { "Graph ✦" } else { "Graph" };
+                if ui
+                    .selectable_label(app.graph_open, graph_btn)
+                    .on_hover_text("Animated commit graph of all branches")
+                    .clicked()
+                {
+                    app.graph_open = !app.graph_open;
+                    if app.graph_open {
+                        app.load_graph();
+                    }
+                }
+
                 // Right side
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Settings").on_hover_text("Settings").clicked() {
@@ -93,6 +106,61 @@ pub fn toolbar(app: &mut App, ctx: &egui::Context) {
                 });
             });
             state_banner(app, ui);
+            stash_banner(app, ui);
+        });
+}
+
+/// Subtle banner shown while stashes exist, so stashed work is never
+/// forgotten (and later reapplied onto conflicting changes by surprise).
+fn stash_banner(app: &mut App, ui: &mut egui::Ui) {
+    let count = app.stashes.len();
+    if count == 0 {
+        return;
+    }
+    ui.add_space(6.0);
+    egui::Frame::new()
+        .fill(theme::TEAL.linear_multiply(0.10))
+        .stroke(egui::Stroke::new(1.0_f32, theme::TEAL.linear_multiply(0.5)))
+        .corner_radius(theme::RADIUS_MD as f32)
+        .inner_margin(egui::Margin::symmetric(12, 6))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let newest = app
+                    .stashes
+                    .first()
+                    .map(|s| truncate(&s.message, 40))
+                    .unwrap_or_default();
+                let text = if count == 1 {
+                    format!("1 stash: {newest}")
+                } else {
+                    format!("{count} stashes, newest: {newest}")
+                };
+                ui.label(RichText::new(text).color(theme::TEAL).small());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("Apply newest")
+                        .on_hover_text(
+                            "Restores the most recent stash into the working tree.                              Conflicts open the resolver.",
+                        )
+                        .clicked()
+                    {
+                        if let Some(repo) = app.repo.clone() {
+                            app.worker.spawn(move || Msg::Done {
+                                message: strerr(
+                                    repo.stash_pop(0)
+                                        .map(|_| "Stash applied.".to_string()),
+                                ),
+                                refresh: true,
+                            });
+                        }
+                    }
+                    ui.label(
+                        RichText::new("more in the branch menu · ")
+                            .color(theme::FG_DIM)
+                            .small(),
+                    );
+                });
+            });
         });
 }
 
@@ -135,7 +203,7 @@ fn repo_menu(app: &mut App, ui: &mut egui::Ui) {
                         .clicked()
                     {
                         app.open_repo(path);
-                        ui.close_menu();
+                        ui.close();
                     }
                 } else {
                     // Missing on disk: offer repair or removal.
@@ -151,7 +219,7 @@ fn repo_menu(app: &mut App, ui: &mut egui::Ui) {
                             remove = Some(path.clone());
                             app.open_repo(&folder.display().to_string());
                         }
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.small_button("Remove").clicked() {
                         remove = Some(path.clone());
@@ -171,7 +239,7 @@ fn repo_menu(app: &mut App, ui: &mut egui::Ui) {
         ui.separator();
         if ui.button("Add repository…").clicked() {
             app.dialog = Dialog::RepoPicker;
-            ui.close_menu();
+            ui.close();
         }
     })
     .response
@@ -253,7 +321,7 @@ fn checks_badge(app: &mut App, ui: &mut egui::Ui) {
                 if !run.html_url.is_empty() {
                     let _ = open::that(&run.html_url);
                 }
-                ui.close_menu();
+                ui.close();
             }
         }
         ui.separator();
@@ -266,7 +334,7 @@ fn checks_badge(app: &mut App, ui: &mut egui::Ui) {
                     ));
                 }
             }
-            ui.close_menu();
+            ui.close();
         }
     });
 }
@@ -300,7 +368,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
                         refresh: true,
                     });
                 }
-                ui.close_menu();
+                ui.close();
             }
         });
         ui.separator();
@@ -344,7 +412,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
                 let marker = if branch.current { "» " } else { "    " };
                 if ui.button(format!("{marker}{}", branch.name)).clicked() {
                     checkout(app, &branch.name);
-                    ui.close_menu();
+                    ui.close();
                 }
             }
 
@@ -386,7 +454,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
                     let local =
                         branch.name.split_once('/').map(|(_, l)| l).unwrap_or(&branch.name);
                     checkout(app, local);
-                    ui.close_menu();
+                    ui.close();
                 }
             }
         });
@@ -408,7 +476,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
             for branch in locals_only {
                 if ui.button(&branch.name).clicked() {
                     app.request_merge_into(&branch.name);
-                    ui.close_menu();
+                    ui.close();
                 }
             }
         });
@@ -426,7 +494,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
                         app.busy = true;
                         app.worker.spawn(move || Msg::MergeOutcome(repo.merge(&name)));
                     }
-                    ui.close_menu();
+                    ui.close();
                 }
             }
         });
@@ -439,13 +507,13 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
                         app.busy = true;
                         app.worker.spawn(move || Msg::MergeOutcome(repo.rebase(&name)));
                     }
-                    ui.close_menu();
+                    ui.close();
                 }
             }
         });
         if ui.button("Create Pull Request…").clicked() {
             open_pr_dialog(app);
-            ui.close_menu();
+            ui.close();
         }
 
         // Stash
@@ -457,7 +525,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
                     refresh: true,
                 });
             }
-            ui.close_menu();
+            ui.close();
         }
         let stashes = app.stashes.clone();
         ui.menu_button(format!("Stashes ({})", stashes.len()), |ui| {
@@ -465,9 +533,22 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
             if stashes.is_empty() {
                 ui.label(RichText::new("No stashes").color(theme::FG_DIM));
             }
+            let current_branch =
+                app.status.as_ref().map(|s| s.branch.clone()).unwrap_or_default();
             for stash in &stashes {
                 ui.horizontal(|ui| {
-                    ui.label(truncate(&stash.message, 26)).on_hover_text(&stash.message);
+                    let here = stash.branch.as_deref() == Some(current_branch.as_str());
+                    let label = if here {
+                        RichText::new(truncate(&stash.message, 26))
+                    } else {
+                        RichText::new(format!(
+                            "{} ({})",
+                            truncate(&stash.message, 20),
+                            stash.branch.as_deref().unwrap_or("?")
+                        ))
+                        .color(theme::FG_DIM)
+                    };
+                    ui.label(label).on_hover_text(&stash.message);
                     if ui.small_button("Apply").clicked() {
                         if let Some(repo) = app.repo.clone() {
                             let idx = stash.index;
@@ -478,11 +559,11 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
                                 refresh: true,
                             });
                         }
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.small_button("Drop").clicked() {
                         app.confirm(crate::app::ConfirmAction::DropStash(stash.index));
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
             }
@@ -496,7 +577,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
         {
             let subject = app.log.first().map(|c| c.subject.clone()).unwrap_or_default();
             app.confirm(crate::app::ConfirmAction::UndoCommit(subject));
-            ui.close_menu();
+            ui.close();
         }
 
         // Tags
@@ -519,7 +600,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
                             refresh: true,
                         });
                     }
-                    ui.close_menu();
+                    ui.close();
                 }
             });
             let tags = app.tags.clone();
@@ -538,7 +619,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
                                 refresh: false,
                             });
                         }
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
             }
@@ -556,7 +637,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
             for name in &manageable {
                 if ui.button(name).clicked() {
                     app.confirm(crate::app::ConfirmAction::DeleteBranch(name.clone()));
-                    ui.close_menu();
+                    ui.close();
                 }
             }
         });
@@ -578,7 +659,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
                         refresh: true,
                     });
                 }
-                ui.close_menu();
+                ui.close();
             }
         });
     });
@@ -645,15 +726,15 @@ fn sync_segment(app: &mut App, ui: &mut egui::Ui) {
     response.context_menu(|ui| {
         if ui.button("Fetch").clicked() {
             run_sync(app, "fetch");
-            ui.close_menu();
+            ui.close();
         }
         if ui.button("Pull").clicked() {
             run_sync(app, "pull");
-            ui.close_menu();
+            ui.close();
         }
         if ui.button("Push").clicked() {
             run_sync(app, "push");
-            ui.close_menu();
+            ui.close();
         }
         if ui
             .button("Force push (with lease)")
@@ -661,7 +742,7 @@ fn sync_segment(app: &mut App, ui: &mut egui::Ui) {
             .clicked()
         {
             run_sync(app, "force-push");
-            ui.close_menu();
+            ui.close();
         }
     });
     if response.clicked() {
@@ -730,7 +811,7 @@ fn open_pr_dialog(app: &mut App) {
     app.pr.loading = true;
     app.dialog = Dialog::PullRequests;
 
-    let repo = app.repo.clone().unwrap();
+    let Some(repo) = app.repo.clone() else { return };
     app.worker.spawn(move || {
         let result = (|| -> Result<Vec<crate::github::PullRequest>, String> {
             let client = crate::github::Client::from_store().ok_or("Not signed in")?;
@@ -1049,8 +1130,9 @@ pub fn load_file_diff(app: &mut App) {
         Msg::Diff { title: path, text }
     });
     if !staged {
-        let repo = app.repo.clone().unwrap();
-        let path = app.selected_file.clone().unwrap();
+        let (Some(repo), Some(path)) = (app.repo.clone(), app.selected_file.clone()) else {
+            return;
+        };
         app.worker.spawn(move || {
             let hunks = repo.hunks(&path).unwrap_or_default();
             Msg::Hunks { file: path, hunks }
@@ -1435,7 +1517,7 @@ fn history_tab(app: &mut App, ui: &mut egui::Ui) {
                         sha: commit.sha.clone(),
                         subject: commit.subject.clone(),
                     });
-                    ui.close_menu();
+                    ui.close();
                 }
             });
             if response.clicked() {

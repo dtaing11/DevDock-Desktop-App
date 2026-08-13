@@ -168,6 +168,11 @@ pub struct Commit {
     pub subject: String,
     pub body: String,
     pub parents: Vec<String>,
+    /// Branch/tag names pointing at this commit (from %D), e.g.
+    /// ["HEAD -> main", "origin/main", "tag: v1.0"]. Empty unless the
+    /// log was fetched with decorations (log_all).
+    #[serde(default)]
+    pub refs: Vec<String>,
 }
 
 /// A conflicted file with all three stages plus the current working copy,
@@ -209,6 +214,9 @@ pub struct Remote {
 pub struct StashEntry {
     pub index: u32,
     pub message: String,
+    /// Branch the stash was created on, parsed from git's
+    /// "WIP on <branch>:" / "On <branch>:" subject prefix.
+    pub branch: Option<String>,
 }
 
 /// One hunk of a unified diff, self-contained enough to apply as a patch.
@@ -440,6 +448,26 @@ impl Repo {
         }
         self.git(&args)?;
         Ok(self.git(&["rev-parse", "HEAD"])?.trim().to_string())
+    }
+
+    /// Commit history across all branches, newest first (for the graph).
+    pub fn log_all(&self, limit: u32) -> Result<Vec<Commit>> {
+        const FIELD: char = '\u{1f}';
+        const RECORD: char = '\u{1e}';
+        let format = format!(
+            "--format=%H{FIELD}%h{FIELD}%an{FIELD}%ae{FIELD}%aI{FIELD}%s{FIELD}%b{FIELD}%P{FIELD}%D{RECORD}"
+        );
+        let max_count = format!("--max-count={limit}");
+        let args =
+            vec!["log", max_count.as_str(), format.as_str(), "--all", "--topo-order"];
+        let Ok(out) = self.git(&args) else {
+            return Ok(Vec::new());
+        };
+        Ok(out
+            .split(RECORD)
+            .filter(|r| !r.trim().is_empty())
+            .filter_map(|record| parse_commit(record.trim_start_matches('\n'), FIELD))
+            .collect())
     }
 
     /// Commit history, newest first.
@@ -751,11 +779,18 @@ impl Repo {
                 use base64::Engine as _;
                 let basic = base64::engine::general_purpose::STANDARD
                     .encode(format!("x-access-token:{token}"));
-                let header =
-                    format!("http.https://github.com/.extraheader=AUTHORIZATION: basic {basic}");
-                let mut full: Vec<&str> = vec!["-c", &header];
-                full.extend(args);
-                self.git(&full)
+                // GIT_CONFIG_* env vars (git >= 2.31) keep the credential out
+                // of the process argument list, where any local process
+                // could read it via `ps`.
+                let value = format!("AUTHORIZATION: basic {basic}");
+                self.git_env(
+                    args,
+                    &[
+                        ("GIT_CONFIG_COUNT", "1"),
+                        ("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader"),
+                        ("GIT_CONFIG_VALUE_0", value.as_str()),
+                    ],
+                )
             }
             _ => self.git(args),
         }
@@ -784,7 +819,11 @@ impl Repo {
             .filter_map(|line| {
                 let (rev, message) = line.split_once('\u{1f}')?;
                 let index = rev.strip_prefix("stash@{")?.strip_suffix('}')?.parse().ok()?;
-                Some(StashEntry { index, message: message.to_string() })
+                Some(StashEntry {
+                    index,
+                    branch: parse_stash_branch(message),
+                    message: message.to_string(),
+                })
             })
             .collect())
     }
@@ -988,20 +1027,35 @@ impl Repo {
 // ---------------------------------------------------------------------------
 
 fn run_git(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String> {
-    let mut cmd = Command::new("git");
-    cmd.args(args).current_dir(dir).env("GIT_TERMINAL_PROMPT", "0");
-    for (key, value) in env {
-        cmd.env(key, value);
-    }
-    let out = cmd.output()?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    } else {
+    // Retry transient index.lock contention: the app's background status
+    // refresh can race user-initiated writes (rapid stacked commits).
+    const ATTEMPTS: u32 = 4;
+    for attempt in 0..ATTEMPTS {
+        let mut cmd = Command::new("git");
+        cmd.args(args)
+            .current_dir(dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            // Reads (status/diff) must not take the index lock
+            // opportunistically; writes take their required locks anyway.
+            .env("GIT_OPTIONAL_LOCKS", "0");
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        let out = cmd.output()?;
+        if out.status.success() {
+            return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+        }
         let stderr = String::from_utf8_lossy(&out.stderr);
         let stdout = String::from_utf8_lossy(&out.stdout);
         let message = if stderr.trim().is_empty() { stdout } else { stderr };
-        Err(GitError::Command(message.trim().to_string()))
+        let transient = message.contains("index.lock") && attempt + 1 < ATTEMPTS;
+        if transient {
+            std::thread::sleep(std::time::Duration::from_millis(120 * (attempt as u64 + 1)));
+            continue;
+        }
+        return Err(GitError::Command(message.trim().to_string()));
     }
+    unreachable!("loop returns on success or final failure")
 }
 
 fn parse_porcelain(out: &str) -> Vec<FileEntry> {
@@ -1119,9 +1173,26 @@ fn build_partial_patch(hunk: &Hunk, selected: &[usize]) -> Option<String> {
     Some(format!("{}{}\n{}\n", hunk.file_header, header, body_lines.join("\n")))
 }
 
+/// Extracts the branch name from a stash subject, which git formats as
+/// "WIP on <branch>: <sha> <msg>" or "On <branch>: <msg>".
+fn parse_stash_branch(subject: &str) -> Option<String> {
+    let rest = subject
+        .strip_prefix("WIP on ")
+        .or_else(|| subject.strip_prefix("On "))?;
+    let (branch, _) = rest.split_once(':')?;
+    let branch = branch.trim();
+    (!branch.is_empty()).then(|| branch.to_string())
+}
+
 fn parse_commit(record: &str, field_sep: char) -> Option<Commit> {
     let parts: Vec<&str> = record.split(field_sep).collect();
-    let [sha, short_sha, author, email, date, subject, body, parents] = parts.as_slice() else {
+    // 8 fields (plain log) or 9 (decorated log with %D refs).
+    let (core, refs_raw): (&[&str], &str) = match parts.as_slice() {
+        p @ [_, _, _, _, _, _, _, _] => (p, ""),
+        [p @ .., refs] if p.len() == 8 => (p, refs),
+        _ => return None,
+    };
+    let [sha, short_sha, author, email, date, subject, body, parents] = core else {
         return None;
     };
     Some(Commit {
@@ -1133,6 +1204,12 @@ fn parse_commit(record: &str, field_sep: char) -> Option<Commit> {
         subject: subject.to_string(),
         body: body.trim().to_string(),
         parents: parents.split_whitespace().map(String::from).collect(),
+        refs: refs_raw
+            .split(", ")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
     })
 }
 
@@ -1173,6 +1250,16 @@ mod tests {
         assert!(b.current);
         assert_eq!(b.sha, "abc123");
         assert_eq!(b.subject, "initial");
+    }
+
+    #[test]
+    fn stash_branch_parses_wip_and_on_forms() {
+        assert_eq!(
+            parse_stash_branch("WIP on feature/x: abc123 msg"),
+            Some("feature/x".into())
+        );
+        assert_eq!(parse_stash_branch("On main: my note"), Some("main".into()));
+        assert_eq!(parse_stash_branch("random text"), None);
     }
 
     #[test]

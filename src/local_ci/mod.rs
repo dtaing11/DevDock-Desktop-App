@@ -297,10 +297,18 @@ pub fn run_all_cli(repo_root: &Path) -> Result<bool> {
         let _ = std::io::stdout().flush();
         let result = run_job(repo_root, job);
         if result.ok {
-            println!("PASS ({:.1}s)", result.duration_secs);
+            println!(
+                "{} {}",
+                crate::cli_style::status(true),
+                crate::cli_style::dim(&format!("({:.1}s)", result.duration_secs))
+            );
         } else {
             all_ok = false;
-            println!("FAIL ({:.1}s)", result.duration_secs);
+            println!(
+                "{} {}",
+                crate::cli_style::status(false),
+                crate::cli_style::dim(&format!("({:.1}s)", result.duration_secs))
+            );
             for line in result.output.lines() {
                 println!("    {line}");
             }

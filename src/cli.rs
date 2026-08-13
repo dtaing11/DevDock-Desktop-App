@@ -3,6 +3,7 @@
 //! Running `devdock` with no arguments launches the GUI; any subcommand
 //! runs headlessly. See `devdock help` or docs/cli.md.
 
+use crate::cli_style as style;
 use crate::git::Repo;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -40,36 +41,36 @@ pub fn run(args: &[String]) -> Option<ExitCode> {
 }
 
 fn print_help() {
+    let title = style::bold(&style::ember("devdock"));
     println!(
-        "devdock — native git client with local CI and AI commit messages
-
-USAGE:
-    devdock              launch the GUI
-    devdock <command>    run a command headlessly
-
-COMMANDS:
-    status               working-tree summary (branch, ahead/behind, files)
-    log [N]              last N commits (default 10)
-    branches             local and remote branches, current marked
-    stash list           stashes with their origin branch
-    stash save [MSG]     stash all changes (incl. untracked)
-    stash pop [INDEX]    apply and drop a stash (default newest)
-    commit -m MSG        stage everything and commit
-    commit --ai          AI-generated message (uses the app's configured model)
-    push                 push current branch, gated by local CI when configured
-    push --force         force push (--force-with-lease)
-    push --no-verify     skip the local CI gate
-    pr -t TITLE [-b BODY]   push branch and open a pull request into the
-                         default branch (main/master), gated by local CI
-    pr --ai              AI-generated PR title and body
-    ci                   run all local CI jobs (.git-manage-ci.toml)
-    hook install         install the git pre-push hook running `devdock ci`
-    hook remove          remove the pre-push hook
-    hook status          show whether the hook is installed
-    help                 this text
-
-Docs: docs/cli.md · Local CI: docs/local-ci.md"
+        "\n{title} — native git client with local CI and AI commit messages\n"
     );
+    println!("{}", style::header("usage"));
+    println!("  devdock              {}", style::dim("launch the GUI"));
+    println!("  devdock <command>    {}\n", style::dim("run a command headlessly"));
+    println!("{}", style::header("commands"));
+    let rows: &[(&str, &str)] = &[
+        ("status", "working-tree summary (branch, ahead/behind, files)"),
+        ("log [N]", "last N commits (default 10)"),
+        ("branches", "local and remote branches, current marked"),
+        ("stash list", "stashes with their origin branch"),
+        ("stash save [MSG]", "stash all changes (incl. untracked)"),
+        ("stash pop [INDEX]", "apply and drop a stash (default newest)"),
+        ("commit -m MSG", "stage everything and commit"),
+        ("commit --ai", "AI message with accept/regenerate/edit review"),
+        ("push", "push current branch, gated by local CI"),
+        ("push --force", "force push (--force-with-lease)"),
+        ("push --no-verify", "skip the local CI gate"),
+        ("pr -t TITLE [-b BODY]", "CI gate, push, open PR into main"),
+        ("pr --ai", "AI-generated PR title and body"),
+        ("ci", "run all local CI jobs (.git-manage-ci.toml)"),
+        ("hook install|remove|status", "git pre-push hook running devdock ci"),
+        ("help", "this text"),
+    ];
+    for (cmd, desc) in rows {
+        println!("  {:<28} {}", style::teal(cmd), style::dim(desc));
+    }
+    println!("\n{} docs/cli.md · docs/local-ci.md\n", style::dim("docs:"));
 }
 
 /// Opens the repository containing the current directory.
@@ -121,21 +122,32 @@ fn cmd_status() -> ExitCode {
             } else {
                 format!("ahead {}, behind {}", status.ahead, status.behind)
             };
-            println!("branch: {} ({sync})", status.branch);
+            println!(
+                "{} {} {}",
+                style::dim("on"),
+                style::bold(&style::ember(&status.branch)),
+                style::dim(&format!("({sync})"))
+            );
             if status.files.is_empty() {
-                println!("clean working tree");
+                println!("{}", style::green("clean working tree"));
             } else {
                 for file in &status.files {
                     let mark = if file.conflicted {
-                        "!"
+                        style::red("!")
                     } else if file.staged {
-                        "+"
+                        style::green("+")
                     } else {
-                        "*"
+                        style::yellow("*")
                     };
                     println!("  {mark} {}", file.path);
                 }
-                println!("{} changed file(s)  (+ staged, * unstaged, ! conflict)", status.files.len());
+                println!(
+                    "{}",
+                    style::dim(&format!(
+                        "{} changed file(s)   + staged  * unstaged  ! conflict",
+                        status.files.len()
+                    ))
+                );
             }
             ExitCode::SUCCESS
         }
@@ -156,11 +168,14 @@ fn cmd_log(rest: &[String]) -> ExitCode {
         Ok(commits) => {
             for c in commits {
                 println!(
-                    "{}  {}  {} · {}",
-                    c.short_sha,
+                    "{}  {}  {}",
+                    style::teal(&c.short_sha),
                     c.subject,
-                    c.author,
-                    c.date.get(..10).unwrap_or(&c.date)
+                    style::dim(&format!(
+                        "{} · {}",
+                        c.author,
+                        c.date.get(..10).unwrap_or(&c.date)
+                    ))
                 );
             }
             ExitCode::SUCCESS
@@ -180,11 +195,14 @@ fn cmd_branches() -> ExitCode {
     match repo.branches() {
         Ok(list) => {
             for b in &list.local {
-                let marker = if b.current { "*" } else { " " };
-                println!("{marker} {}", b.name);
+                if b.current {
+                    println!("{} {}", style::ember("»"), style::bold(&style::ember(&b.name)));
+                } else {
+                    println!("  {}", b.name);
+                }
             }
             for b in &list.remote {
-                println!("  {} (remote)", b.name);
+                println!("  {}", style::dim(&format!("{} (remote)", b.name)));
             }
             ExitCode::SUCCESS
         }
@@ -209,7 +227,12 @@ fn cmd_stash(rest: &[String]) -> ExitCode {
             Ok(stashes) => {
                 for s in stashes {
                     let branch = s.branch.as_deref().unwrap_or("?");
-                    println!("  [{}] ({branch}) {}", s.index, s.message);
+                    println!(
+                        "  {} {} {}",
+                        style::teal(&format!("[{}]", s.index)),
+                        style::ember(&format!("({branch})")),
+                        s.message
+                    );
                 }
                 ExitCode::SUCCESS
             }
@@ -222,7 +245,7 @@ fn cmd_stash(rest: &[String]) -> ExitCode {
             let message = rest.get(1..).map(|r| r.join(" ")).unwrap_or_default();
             match repo.stash_save(&message) {
                 Ok(()) => {
-                    println!("stashed");
+                    println!("{}", style::green("stashed"));
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
@@ -235,7 +258,7 @@ fn cmd_stash(rest: &[String]) -> ExitCode {
             let index: u32 = rest.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
             match repo.stash_pop(index) {
                 Ok(()) => {
-                    println!("stash applied");
+                    println!("{}", style::green("stash applied"));
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
@@ -275,7 +298,7 @@ fn cmd_push(rest: &[String]) -> ExitCode {
     };
     match result {
         Ok(_) => {
-            println!("pushed");
+            println!("{}", style::green("pushed"));
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -316,7 +339,7 @@ fn cmd_commit(rest: &[String]) -> ExitCode {
 
     match repo.commit(&message.0, &message.1, false) {
         Ok(sha) => {
-            println!("committed {}", &sha[..7]);
+            println!("{} {}", style::green("committed"), style::teal(&sha[..7]));
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -344,13 +367,19 @@ fn review_ai_text(
         }
     };
     loop {
-        println!("\n--- generated {label} ---");
-        println!("{}", suggestion.summary);
+        println!("\n{}", style::header(&format!("generated {label}")));
+        println!("{}", style::bold(&suggestion.summary));
         if !suggestion.description.trim().is_empty() {
             println!("\n{}", suggestion.description);
         }
-        println!("--- end ---");
-        print!("[a]ccept / [r]egenerate / [e]dit manually / [q]uit? ");
+        println!("{}", style::header("end"));
+        print!(
+            "{} {} {} {} ? ",
+            style::green("[a]ccept"),
+            style::teal("[r]egenerate"),
+            style::yellow("[e]dit"),
+            style::red("[q]uit")
+        );
         let _ = std::io::stdout().flush();
         let mut line = String::new();
         if stdin.lock().read_line(&mut line).is_err() {
@@ -435,7 +464,7 @@ fn cmd_hook(rest: &[String]) -> ExitCode {
     match rest.first().map(String::as_str) {
         Some("install") => match crate::local_ci::install_pre_push_hook(&root) {
             Ok(()) => {
-                println!("pre-push hook installed");
+                println!("{}", style::green("pre-push hook installed"));
                 ExitCode::SUCCESS
             }
             Err(e) => {
@@ -463,9 +492,9 @@ fn cmd_hook(rest: &[String]) -> ExitCode {
         }
         Some("status") | None => {
             if crate::local_ci::hook_installed(&root) {
-                println!("pre-push hook: installed");
+                println!("pre-push hook: {}", style::green("installed"));
             } else {
-                println!("pre-push hook: not installed");
+                println!("pre-push hook: {}", style::dim("not installed"));
             }
             ExitCode::SUCCESS
         }
@@ -594,7 +623,7 @@ fn cmd_pr(rest: &[String]) -> ExitCode {
     }
     match client.create_pull_request(&slug, &title, &body, &head, &base) {
         Ok(pr) => {
-            println!("PR #{} created: {}", pr.number, pr.html_url);
+            println!("{} {}", style::green(&format!("PR #{} created:", pr.number)), style::teal(&pr.html_url));
             ExitCode::SUCCESS
         }
         Err(e) => {

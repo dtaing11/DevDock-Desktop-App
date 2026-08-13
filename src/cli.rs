@@ -23,6 +23,7 @@ pub fn run(args: &[String]) -> Option<ExitCode> {
         "commit" => cmd_commit(rest),
         "pr" => cmd_pr(rest),
         "hook" => cmd_hook(rest),
+        "resolve" => cmd_resolve(),
         "help" | "--help" | "-h" => {
             print_help();
             ExitCode::SUCCESS
@@ -63,6 +64,7 @@ fn print_help() {
         ("push --no-verify", "skip the local CI gate"),
         ("pr -t TITLE [-b BODY]", "CI gate, push, open PR into main"),
         ("pr --ai", "AI-generated PR title and body"),
+        ("resolve", "interactive conflict resolver with AI proposals"),
         ("ci", "run all local CI jobs (.git-manage-ci.toml)"),
         ("hook install|remove|status", "git pre-push hook running devdock ci"),
         ("help", "this text"),
@@ -457,6 +459,242 @@ fn ai_message(repo: &Repo) -> Result<crate::ollama::CommitSuggestion, String> {
             .commit_message(&model, &diff, None)
             .map_err(|e| e.to_string())
     }
+}
+
+/// Interactive merge-conflict resolver. For each conflicted file the user
+/// picks ours/theirs, or asks the AI for a proposed merge. AI output is
+/// never applied silently: it is printed in full and must be explicitly
+/// accepted (or regenerated/skipped) before anything is written.
+fn cmd_resolve() -> ExitCode {
+    use std::io::{BufRead, Write};
+    let repo = match repo() {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+    let state = repo.state().unwrap_or(crate::git::RepoState::Clean);
+    let conflicts = match repo.conflicts() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("devdock: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if conflicts.is_empty() {
+        println!("devdock: no conflicted files");
+        return ExitCode::SUCCESS;
+    }
+    println!(
+        "{} {} conflicted file(s)",
+        style::header("resolve"),
+        style::bold(&conflicts.len().to_string())
+    );
+
+    let stdin = std::io::stdin();
+    let mut resolved = 0usize;
+    for file in &conflicts {
+        let path = &file.path;
+        println!("
+{} {}", style::yellow("[conflict]"), style::bold(path));
+        loop {
+            print!(
+                "{} {} {} {} {} ? ",
+                style::green("[a]i merge"),
+                style::teal("[o]urs"),
+                style::teal("[t]heirs"),
+                style::dim("[s]kip"),
+                style::red("[q]uit")
+            );
+            let _ = std::io::stdout().flush();
+            let mut line = String::new();
+            if stdin.lock().read_line(&mut line).is_err() {
+                return ExitCode::FAILURE;
+            }
+            match line.trim().to_lowercase().as_str() {
+                "a" | "" => {
+                    match ai_merge(&repo, file) {
+                        Ok(merged) => {
+                            if review_ai_merge(&repo, path, &merged, &stdin) {
+                                resolved += 1;
+                                break;
+                            }
+                            // Declined: fall through to re-prompt for this file.
+                        }
+                        Err(e) => eprintln!("devdock: {e}"),
+                    }
+                }
+                "o" => match repo.resolve(path, &crate::git::Resolution::Ours) {
+                    Ok(()) => {
+                        println!("{} kept ours: {path}", style::green("resolved"));
+                        resolved += 1;
+                        break;
+                    }
+                    Err(e) => eprintln!("devdock: {e}"),
+                },
+                "t" => match repo.resolve(path, &crate::git::Resolution::Theirs) {
+                    Ok(()) => {
+                        println!("{} kept theirs: {path}", style::green("resolved"));
+                        resolved += 1;
+                        break;
+                    }
+                    Err(e) => eprintln!("devdock: {e}"),
+                },
+                "s" => {
+                    println!("{} skipped {path}", style::dim("·"));
+                    break;
+                }
+                "q" => {
+                    println!("devdock: stopping; {resolved} file(s) resolved so far");
+                    return ExitCode::SUCCESS;
+                }
+                other => println!("devdock: \"{other}\"? a / o / t / s / q"),
+            }
+        }
+    }
+
+    if resolved == conflicts.len() {
+        let verb = match state {
+            crate::git::RepoState::Rebasing => "rebase",
+            _ => "merge",
+        };
+        print!(
+            "\nall conflicts resolved. continue the {verb} now? {} {} ? ",
+            style::green("[y]es"),
+            style::dim("[n]o")
+        );
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line).is_ok()
+            && matches!(line.trim().to_lowercase().as_str(), "y" | "yes" | "")
+        {
+            let outcome = match state {
+                crate::git::RepoState::Rebasing => repo.rebase_continue(),
+                _ => repo.merge_continue(),
+            };
+            if outcome.ok {
+                println!("{} {verb} completed", style::green("done"));
+            } else {
+                eprintln!("devdock: {}", outcome.message);
+                return ExitCode::FAILURE;
+            }
+        } else {
+            println!("devdock: staged resolutions kept; run `git {verb} --continue` when ready");
+        }
+    } else {
+        println!(
+            "\ndevdock: {resolved}/{} resolved; run `devdock resolve` again for the rest",
+            conflicts.len()
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+/// Prints an AI-proposed merge and asks for explicit confirmation.
+/// Returns true when the user accepted and the file was written+staged.
+fn review_ai_merge(
+    repo: &Repo,
+    path: &str,
+    merged: &str,
+    stdin: &std::io::Stdin,
+) -> bool {
+    use std::io::{BufRead, Write};
+    println!("\n{}", style::header(&format!("AI proposed merge for {path}")));
+    for line in merged.lines() {
+        println!("  {line}");
+    }
+    println!("{}", style::header("end"));
+    println!(
+        "{}",
+        style::dim("nothing is applied until you accept")
+    );
+    loop {
+        print!(
+            "{} {} ? ",
+            style::green("[a]ccept"),
+            style::red("[d]ecline")
+        );
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line).is_err() {
+            return false;
+        }
+        match line.trim().to_lowercase().as_str() {
+            "a" | "y" | "yes" => {
+                match repo.resolve(path, &crate::git::Resolution::Manual(merged.to_string())) {
+                    Ok(()) => {
+                        println!("{} {path}", style::green("resolved"));
+                        return true;
+                    }
+                    Err(e) => {
+                        eprintln!("devdock: {e}");
+                        return false;
+                    }
+                }
+            }
+            "d" | "n" | "no" | "q" => return false,
+            other => println!("devdock: \"{other}\"? a / d"),
+        }
+    }
+}
+
+/// Asks the configured AI (commit-task selection) to merge one conflicted
+/// file, honoring the repo's custom conflict-resolution instructions.
+fn ai_merge(repo: &Repo, file: &crate::git::ConflictFile) -> Result<String, String> {
+    let config = crate::app::Config::load();
+    let (provider, model) = match &config.commit_ai {
+        Some(sel) => (sel.provider.clone(), sel.model.clone()),
+        None => {
+            let provider = config.ai_provider.clone().unwrap_or_else(|| "ollama".into());
+            let model = if provider == "claude" {
+                config.claude_model.clone().unwrap_or_default()
+            } else {
+                config.ollama_model.clone().unwrap_or_default()
+            };
+            (provider, model)
+        }
+    };
+    let custom = conflict_instructions(&config, repo);
+    let base = file.base.clone().unwrap_or_default();
+    let ours = file.ours.clone().unwrap_or_default();
+    let theirs = file.theirs.clone().unwrap_or_default();
+
+    println!("{}", style::dim("asking the AI to merge…"));
+    if provider == "claude" {
+        let client = crate::claude::Client::from_store(model)
+            .ok_or("Claude is not signed in (sign in from the GUI settings)")?;
+        client
+            .resolve_conflict(&file.path, &base, &ours, &theirs, custom.as_deref())
+            .map_err(|e| e.to_string())
+    } else {
+        if model.is_empty() {
+            return Err("no Ollama model configured (pick one in the GUI)".into());
+        }
+        let url = config.ollama_url.unwrap_or_else(|| crate::ollama::DEFAULT_URL.into());
+        crate::ollama::Client::new(url)
+            .resolve_conflict(&model, &file.path, &base, &ours, &theirs, custom.as_deref())
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// The repo's custom conflict-resolution prompt: inline text plus linked
+/// Markdown file, mirroring the GUI's AI Prompts dialog.
+fn conflict_instructions(
+    config: &crate::app::Config,
+    repo: &Repo,
+) -> Option<String> {
+    let prompts = config.repo_prompts.get(&repo.path().display().to_string())?;
+    let mut parts: Vec<String> = Vec::new();
+    let inline = prompts.conflict.trim();
+    if !inline.is_empty() {
+        parts.push(inline.to_string());
+    }
+    if let Some(path) = &prompts.conflict_file {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            if !contents.trim().is_empty() {
+                parts.push(contents.trim().to_string());
+            }
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
 fn cmd_hook(rest: &[String]) -> ExitCode {

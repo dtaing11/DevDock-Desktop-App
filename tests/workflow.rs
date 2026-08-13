@@ -539,3 +539,20 @@ fn pr_conflict_fix_flow() {
     repo.push(false, None).unwrap();
     assert_eq!(read(&repo, "f.txt"), "merged result\n");
 }
+
+#[test]
+fn patch_line_numbering() {
+    use git_manage::github::parse_patch_lines;
+    let patch = "@@ -1,3 +1,4 @@\n context\n-removed\n+added one\n+added two\n context2";
+    let lines = parse_patch_lines(patch);
+    assert_eq!(lines[0].old_line, None); // hunk header
+    assert_eq!(lines[1].old_line, Some(1)); // context
+    assert_eq!(lines[1].new_line, Some(1));
+    assert_eq!(lines[2].old_line, Some(2)); // removed: old side only
+    assert_eq!(lines[2].new_line, None);
+    assert_eq!(lines[3].new_line, Some(2)); // added: new side only
+    assert_eq!(lines[3].old_line, None);
+    assert_eq!(lines[4].new_line, Some(3));
+    assert_eq!(lines[5].old_line, Some(3)); // trailing context advances both
+    assert_eq!(lines[5].new_line, Some(4));
+}

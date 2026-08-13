@@ -171,6 +171,95 @@ pub struct PullRequest {
     pub user: String,
 }
 
+/// One changed file in a pull request.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PrFile {
+    pub path: String,
+    /// added / modified / removed / renamed.
+    pub status: String,
+    pub additions: u64,
+    pub deletions: u64,
+    /// Unified diff hunks; None for binary or oversized files.
+    pub patch: Option<String>,
+}
+
+/// A submitted review on a pull request.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PrReview {
+    pub user: String,
+    /// APPROVED / CHANGES_REQUESTED / COMMENTED / DISMISSED.
+    pub state: String,
+    pub body: String,
+}
+
+/// An inline review comment pending submission, anchored to a diff line.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ReviewComment {
+    pub path: String,
+    /// File line number on the given side of the diff.
+    pub line: u64,
+    /// "RIGHT" (new file) or "LEFT" (old file).
+    pub side: String,
+    pub body: String,
+}
+
+/// One line of a unified-diff patch with computed file line numbers,
+/// ready to anchor review comments.
+#[derive(Debug, Clone)]
+pub struct PatchLine {
+    pub text: String,
+    /// Line number in the old file (LEFT side); None for added lines.
+    pub old_line: Option<u64>,
+    /// Line number in the new file (RIGHT side); None for removed lines.
+    pub new_line: Option<u64>,
+}
+
+/// Walks a unified-diff patch computing old/new line numbers per line.
+/// Hunk headers get no numbers.
+pub fn parse_patch_lines(patch: &str) -> Vec<PatchLine> {
+    let mut out = Vec::new();
+    let mut old_ln: u64 = 0;
+    let mut new_ln: u64 = 0;
+    for line in patch.lines() {
+        if line.starts_with("@@") {
+            // "@@ -a[,b] +c[,d] @@": old starts at a, new starts at c.
+            let start = |marker: char| -> u64 {
+                line.split_whitespace()
+                    .find_map(|tok| tok.strip_prefix(marker))
+                    .and_then(|tok| tok.split(',').next())
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0)
+            };
+            old_ln = start('-');
+            new_ln = start('+');
+            out.push(PatchLine { text: line.to_string(), old_line: None, new_line: None });
+        } else if let Some(_rest) = line.strip_prefix('+') {
+            out.push(PatchLine {
+                text: line.to_string(),
+                old_line: None,
+                new_line: Some(new_ln),
+            });
+            new_ln += 1;
+        } else if let Some(_rest) = line.strip_prefix('-') {
+            out.push(PatchLine {
+                text: line.to_string(),
+                old_line: Some(old_ln),
+                new_line: None,
+            });
+            old_ln += 1;
+        } else {
+            out.push(PatchLine {
+                text: line.to_string(),
+                old_line: Some(old_ln),
+                new_line: Some(new_ln),
+            });
+            old_ln += 1;
+            new_ln += 1;
+        }
+    }
+    out
+}
+
 /// Aggregated CI (GitHub Actions / checks) state for one commit.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckState {
@@ -359,6 +448,99 @@ impl Client {
             CheckState::Passing
         };
         Ok(summary)
+    }
+
+    /// Lists the changed files of a pull request, including unified-diff
+    /// patches for text files.
+    pub fn pr_files(&self, slug: &RepoSlug, number: u64) -> Result<Vec<PrFile>> {
+        let path = format!(
+            "/repos/{}/{}/pulls/{number}/files?per_page=100",
+            slug.owner, slug.repo
+        );
+        let value = self.get(&path)?;
+        Ok(value
+            .as_array()
+            .map(|files| {
+                files
+                    .iter()
+                    .filter_map(|f| {
+                        Some(PrFile {
+                            path: f.get("filename")?.as_str()?.to_string(),
+                            status: f.get("status")?.as_str()?.to_string(),
+                            additions: f.get("additions")?.as_u64()?,
+                            deletions: f.get("deletions")?.as_u64()?,
+                            patch: f
+                                .get("patch")
+                                .and_then(|p| p.as_str())
+                                .map(str::to_string),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Lists submitted reviews on a pull request (newest last).
+    pub fn pr_reviews(&self, slug: &RepoSlug, number: u64) -> Result<Vec<PrReview>> {
+        let path = format!(
+            "/repos/{}/{}/pulls/{number}/reviews?per_page=50",
+            slug.owner, slug.repo
+        );
+        let value = self.get(&path)?;
+        Ok(value
+            .as_array()
+            .map(|reviews| {
+                reviews
+                    .iter()
+                    .filter_map(|r| {
+                        let state = r.get("state")?.as_str()?.to_string();
+                        // PENDING reviews are drafts private to their author.
+                        (state != "PENDING").then(|| PrReview {
+                            user: r
+                                .pointer("/user/login")
+                                .and_then(|u| u.as_str())
+                                .unwrap_or("?")
+                                .to_string(),
+                            state,
+                            body: r
+                                .get("body")
+                                .and_then(|b| b.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Submits a review: `event` is APPROVE, REQUEST_CHANGES, or COMMENT.
+    /// `comments` are inline file comments anchored to diff lines.
+    pub fn submit_review(
+        &self,
+        slug: &RepoSlug,
+        number: u64,
+        event: &str,
+        body: &str,
+        comments: &[ReviewComment],
+    ) -> Result<()> {
+        let path = format!("/repos/{}/{}/pulls/{number}/reviews", slug.owner, slug.repo);
+        let comments: Vec<serde_json::Value> = comments
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "path": c.path,
+                    "line": c.line,
+                    "side": c.side,
+                    "body": c.body,
+                })
+            })
+            .collect();
+        let mut payload = serde_json::json!({ "event": event, "body": body });
+        if !comments.is_empty() {
+            payload["comments"] = serde_json::Value::Array(comments);
+        }
+        self.post(&path, payload).map(drop)
     }
 
     /// Whether a PR is mergeable per GitHub: `Some(false)` means merge

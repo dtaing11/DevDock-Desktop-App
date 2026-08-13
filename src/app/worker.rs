@@ -50,6 +50,12 @@ pub enum Msg {
     GhPrChecks { number: u64, summary: ChecksSummary },
     /// Mergeable state for one PR (None = GitHub still computing).
     GhPrMergeable { number: u64, mergeable: Option<bool> },
+    /// Changed files + submitted reviews for the PR being reviewed.
+    GhPrReviewData {
+        number: u64,
+        files: Vec<crate::github::PrFile>,
+        reviews: Vec<crate::github::PrReview>,
+    },
 
     OllamaModels(Result<Vec<Model>, String>),
     /// AI-generated text for the commit box or the PR form.

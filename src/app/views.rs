@@ -1857,7 +1857,7 @@ fn ignore_selected(app: &mut App) {
     }
 }
 
-fn diff_line_style(line: &str) -> (Color32, Option<Color32>) {
+pub fn diff_line_style(line: &str) -> (Color32, Option<Color32>) {
     if line.starts_with("+++") || line.starts_with("---") {
         (theme::FG_DIM, None)
     } else if line.starts_with('+') {

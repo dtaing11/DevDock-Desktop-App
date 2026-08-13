@@ -164,6 +164,8 @@ pub enum Dialog {
     SwitchBranch(String),
     /// Review an AI-drafted local CI config before writing it to disk.
     CiConfigReview,
+    /// Full PR review: diffs, inline comments, approve/request changes.
+    PrReview,
     /// Confirmation gate for a destructive action.
     Confirm(ConfirmAction),
 }
@@ -329,6 +331,8 @@ pub struct PrState {
     pub checks: std::collections::HashMap<u64, github::ChecksSummary>,
     /// Mergeable state keyed by PR number (false = has conflicts).
     pub mergeable: std::collections::HashMap<u64, Option<bool>>,
+    /// In-app review session state.
+    pub review: PrReviewState,
     pub loading: bool,
     pub creating: bool,
 }
@@ -351,6 +355,27 @@ pub struct ConflictState {
 pub struct AiMergeProposal {
     pub path: String,
     pub content: String,
+}
+
+/// State for reviewing one pull request inside the app.
+#[derive(Default)]
+pub struct PrReviewState {
+    /// PR being reviewed; None when the dialog is closed.
+    pub pr: Option<github::PullRequest>,
+    pub loading: bool,
+    pub files: Vec<github::PrFile>,
+    /// Reviews already submitted on this PR.
+    pub reviews: Vec<github::PrReview>,
+    /// Which file's diff is expanded.
+    pub selected: Option<usize>,
+    /// Pending inline comments (not yet submitted).
+    pub pending: Vec<github::ReviewComment>,
+    /// Overall review body text.
+    pub body: String,
+    /// Draft text for a new inline comment: (file index, line, side).
+    pub comment_target: Option<(usize, u64, String)>,
+    pub comment_draft: String,
+    pub submitting: bool,
 }
 
 /// Local CI run state shown in the PR dialog.
@@ -1002,6 +1027,7 @@ impl App {
                 self.diff_text = text;
             }
             Msg::Done { message, refresh } => {
+                self.pr.review.submitting = false;
                 self.busy = false;
                 match message {
                     Ok(m) => {
@@ -1177,6 +1203,13 @@ impl App {
             }
             Msg::GhPrMergeable { number, mergeable } => {
                 self.pr.mergeable.insert(number, mergeable);
+            }
+            Msg::GhPrReviewData { number, files, reviews } => {
+                if self.pr.review.pr.as_ref().map(|p| p.number) == Some(number) {
+                    self.pr.review.loading = false;
+                    self.pr.review.files = files;
+                    self.pr.review.reviews = reviews;
+                }
             }
 
             Msg::CiJobDone { index, result } => {
@@ -1405,6 +1438,58 @@ impl App {
                 })
             };
             Msg::Done { message: strerr(result), refresh: true }
+        });
+    }
+
+    /// Opens the in-app review screen for a PR and loads its files and
+    /// existing reviews in the background.
+    pub fn open_pr_review(&mut self, pr: github::PullRequest) {
+        let number = pr.number;
+        self.pr.review = PrReviewState {
+            pr: Some(pr),
+            loading: true,
+            ..Default::default()
+        };
+        self.dialog = Dialog::PrReview;
+        let Some(repo) = self.repo.clone() else { return };
+        self.worker.spawn(move || {
+            let data = github::Client::from_store()
+                .zip(views::origin_slug(&repo))
+                .map(|(client, slug)| {
+                    let files = client.pr_files(&slug, number).unwrap_or_default();
+                    let reviews = client.pr_reviews(&slug, number).unwrap_or_default();
+                    (files, reviews)
+                });
+            match data {
+                Some((files, reviews)) => Msg::GhPrReviewData { number, files, reviews },
+                None => Msg::Done {
+                    message: Err("Not signed in to GitHub".into()),
+                    refresh: false,
+                },
+            }
+        });
+    }
+
+    /// Submits the current review with the given event
+    /// (APPROVE / REQUEST_CHANGES / COMMENT) including pending inline
+    /// comments. Called from the review dialog's confirm popup.
+    pub fn submit_pr_review(&mut self, event: String) {
+        let Some(pr) = self.pr.review.pr.clone() else { return };
+        let Some(repo) = self.repo.clone() else { return };
+        let body = self.pr.review.body.clone();
+        let comments = self.pr.review.pending.clone();
+        self.pr.review.submitting = true;
+        let number = pr.number;
+        self.worker.spawn(move || {
+            let result = (|| -> Result<String, String> {
+                let client = github::Client::from_store().ok_or("Not signed in")?;
+                let slug = views::origin_slug(&repo).ok_or("No github.com remote")?;
+                client
+                    .submit_review(&slug, number, &event, &body, &comments)
+                    .map_err(|e| e.to_string())?;
+                Ok(format!("Review submitted on #{number}"))
+            })();
+            Msg::Done { message: result, refresh: true }
         });
     }
 

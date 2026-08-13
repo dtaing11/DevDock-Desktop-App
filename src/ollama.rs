@@ -126,6 +126,34 @@ impl Client {
         Ok(parse_suggestion(text))
     }
 
+    /// Asks the model to draft a `.git-manage-ci.toml` from a repo scan.
+    /// Returns raw TOML text (a proposal for the user to review).
+    pub fn generate_ci_config(&self, model: &str, repo_scan: &str) -> Result<String> {
+        let prompt = format!(
+            "Write .git-manage-ci.toml for this repository:\n\n{repo_scan}"
+        );
+        let payload = serde_json::json!({
+            "model": model,
+            "prompt": prompt,
+            "system": crate::local_ci::AI_CONFIG_SYSTEM_PROMPT,
+            "stream": false,
+            "options": {"temperature": 0.1}
+        });
+        let resp = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(300))
+            .build()
+            .post(&format!("{}/api/generate", self.base_url))
+            .send_json(payload)
+            .map_err(|e| OllamaError(format!("Ollama request failed: {e}")))?;
+        let value: serde_json::Value =
+            resp.into_json().map_err(|e| OllamaError(format!("Bad response from Ollama: {e}")))?;
+        let text = value
+            .get("response")
+            .and_then(|r| r.as_str())
+            .ok_or_else(|| OllamaError("Ollama returned no response text".into()))?;
+        Ok(extract_merged_content(text))
+    }
+
     /// Asks the model to merge a conflicted file from its three stages.
     /// Returns the full merged file content.
     pub fn resolve_conflict(

@@ -162,6 +162,8 @@ pub enum Dialog {
     /// Uncommitted changes exist; ask how to handle them before switching
     /// to the branch named inside.
     SwitchBranch(String),
+    /// Review an AI-drafted local CI config before writing it to disk.
+    CiConfigReview,
     /// Confirmation gate for a destructive action.
     Confirm(ConfirmAction),
 }
@@ -492,6 +494,10 @@ pub struct App {
     pub pr: PrState,
     pub local_ci: LocalCiState,
     pub conflicts: ConflictState,
+    /// AI CI-config generation: busy flag and the editable proposal text
+    /// shown in the review dialog. Nothing is written until confirmed.
+    pub ci_ai_busy: bool,
+    pub ci_ai_proposal: String,
     pub ollama_url_input: String,
     pub ollama_models: Vec<ollama::Model>,
 
@@ -532,6 +538,8 @@ impl App {
             commit_description: String::new(),
             amend: false,
             ai_busy: false,
+            ci_ai_busy: false,
+            ci_ai_proposal: String::new(),
             diff_title: String::new(),
             diff_text: String::new(),
             hunks: Vec::new(),
@@ -1237,6 +1245,17 @@ impl App {
                 self.ollama_models = models;
             }
             Msg::OllamaModels(Err(_)) => self.ollama_models.clear(),
+            Msg::AiCiConfig { result } => {
+                self.ci_ai_busy = false;
+                match result {
+                    Ok(toml_text) => {
+                        // Proposal only: opens for review, never auto-written.
+                        self.ci_ai_proposal = toml_text;
+                        self.dialog = Dialog::CiConfigReview;
+                    }
+                    Err(e) => self.toast(e, true),
+                }
+            }
             Msg::AiMergeProposal { path, result } => {
                 self.conflicts.ai_busy = None;
                 match result {
@@ -1386,6 +1405,30 @@ impl App {
                 })
             };
             Msg::Done { message: strerr(result), refresh: true }
+        });
+    }
+
+    /// Asks the selected AI to draft a `.git-manage-ci.toml` for this repo
+    /// from a scan of its files and manifests. The result opens in a review
+    /// dialog; nothing is written until the user confirms.
+    pub fn generate_ci_config(&mut self) {
+        let Some(repo) = self.repo.clone() else { return };
+        let Some(sel) = self.ai_selection(worker::AiTarget::Commit) else {
+            self.toast("No AI model selected. Pick one next to the AI button.", true);
+            return;
+        };
+        self.ci_ai_busy = true;
+        let ollama_url = self.effective_ollama_url();
+        self.worker.spawn(move || {
+            let scan = crate::local_ci::repo_scan(repo.path());
+            let result = if sel.provider == "claude" {
+                claude::Client::from_store(sel.model)
+                    .ok_or("Claude is not signed in. Open Settings.".to_string())
+                    .and_then(|c| strerr(c.generate_ci_config(&scan)))
+            } else {
+                strerr(ollama::Client::new(ollama_url).generate_ci_config(&sel.model, &scan))
+            };
+            Msg::AiCiConfig { result }
         });
     }
 

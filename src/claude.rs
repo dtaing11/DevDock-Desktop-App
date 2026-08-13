@@ -335,6 +335,21 @@ impl Client {
         Ok(crate::ollama::extract_merged_content(&text))
     }
 
+    /// Asks Claude to draft a `.git-manage-ci.toml` from a repo scan.
+    /// Returns raw TOML text (a proposal for the user to review).
+    pub fn generate_ci_config(&self, repo_scan: &str) -> Result<String> {
+        let prompt = format!(
+            "Write .git-manage-ci.toml for this repository:\n\n{}",
+            truncate_utf8(repo_scan, MAX_DIFF_CHARS)
+        );
+        let text = self.request_with_system(
+            crate::local_ci::AI_CONFIG_SYSTEM_PROMPT,
+            &prompt,
+            2048,
+        )?;
+        Ok(crate::ollama::extract_merged_content(&text))
+    }
+
     fn request(&self, prompt: &str, max_tokens: u32) -> Result<String> {
         self.request_with_system(SYSTEM_PROMPT, prompt, max_tokens)
     }

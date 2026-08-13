@@ -166,6 +166,93 @@ commands = ["echo hello from local CI"]
     std::fs::write(repo_root.join(CONFIG_FILE), template).map_err(|e| CiError(e.to_string()))
 }
 
+/// The system prompt for AI config generation, distilled from
+/// docs/local-ci.md so the model writes valid `.git-manage-ci.toml`.
+pub const AI_CONFIG_SYSTEM_PROMPT: &str = r#"You are an expert build engineer writing a local CI config file named .git-manage-ci.toml for the DevDock git client. Output ONLY valid TOML, no markdown fences, no explanation.
+
+Format specification:
+- Each [[job]] block is one check. Jobs run in parallel. Fields:
+  - name (string, required): shown in the UI.
+  - commands (array of strings, required): shell commands run in order inside the repo root; the job stops at the first failing command.
+  - image (string, optional): a Docker image; when set, commands run inside that container with the repo mounted at /work. Omit to run directly on the host machine.
+  - env (inline table, optional): extra environment variables, e.g. env = { RUST_BACKTRACE = "1" }.
+  - secrets (array of strings, optional): names of secrets whose values come from the untracked .git-manage-ci.secrets file.
+- An optional [on_push] section controls push integration:
+  [on_push]
+  run = true               # run all jobs automatically before every push
+  block_on_failure = true  # failing jobs cancel the push
+
+Guidelines:
+- Infer jobs from the project's actual stack (the user message lists the repo files and manifests). Typical jobs: lint/format check, tests, build.
+- Prefer fast, deterministic commands that exist in the project (e.g. use the project's own scripts when present).
+- Only suggest a Docker image when the project clearly benefits (e.g. pinned toolchain); otherwise run on the host.
+- Do not invent commands for tools the project does not use.
+- Include [on_push] with run = true and block_on_failure = true unless the project seems experimental.
+- Add short `#` comments explaining non-obvious choices."#;
+
+/// Collects a compact description of the repository for the AI: top-level
+/// file listing plus the contents of common build/manifest files. Bounded
+/// so it fits in a prompt.
+pub fn repo_scan(repo_root: &Path) -> String {
+    const MANIFESTS: &[&str] = &[
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "setup.py",
+        "requirements.txt",
+        "go.mod",
+        "Makefile",
+        "justfile",
+        "CMakeLists.txt",
+        "build.gradle",
+        "pom.xml",
+        "Gemfile",
+        "mix.exs",
+        "composer.json",
+        "Dockerfile",
+        "docker-compose.yml",
+        ".github/workflows/ci.yml",
+    ];
+    let mut out = String::from("Top-level files:\n");
+    if let Ok(entries) = std::fs::read_dir(repo_root) {
+        let mut names: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| {
+                let mut n = e.file_name().to_string_lossy().to_string();
+                if e.path().is_dir() {
+                    n.push('/');
+                }
+                n
+            })
+            .filter(|n| n != ".git/")
+            .collect();
+        names.sort();
+        for n in names.iter().take(60) {
+            out.push_str("  ");
+            out.push_str(n);
+            out.push('\n');
+        }
+    }
+    for name in MANIFESTS {
+        let path = repo_root.join(name);
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let mut snippet: String = text.chars().take(2_000).collect();
+            if snippet.len() < text.len() {
+                snippet.push_str("
+[truncated]");
+            }
+            out.push_str(&format!("
+--- {name} ---
+{snippet}
+"));
+        }
+        if out.len() > 14_000 {
+            break;
+        }
+    }
+    out
+}
+
 /// Whether the Docker CLI is available on this machine.
 pub fn docker_available() -> bool {
     DockerRunner.available().is_ok()
@@ -490,5 +577,35 @@ env = { FOO = "bar" }
     fn missing_config_is_none() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(load_config(tmp.path()).unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod ai_config_tests {
+    use super::*;
+
+    #[test]
+    fn repo_scan_lists_files_and_manifest_contents() {
+        let tmp = std::env::temp_dir().join(format!("devdock-scan-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+        std::fs::write(tmp.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        let scan = repo_scan(&tmp);
+        assert!(scan.contains("Cargo.toml"), "{scan}");
+        assert!(scan.contains("name = \"demo\""), "{scan}");
+        assert!(scan.contains("src/"), "{scan}");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn ai_prompt_documents_the_format() {
+        // The system prompt must teach the exact schema the parser accepts.
+        for needle in ["[[job]]", "commands", "image", "secrets", "[on_push]", "block_on_failure"] {
+            assert!(AI_CONFIG_SYSTEM_PROMPT.contains(needle), "missing {needle}");
+        }
+        // And what the model writes must parse: check the documented example shape.
+        let sample = "[[job]]\nname = \"tests\"\ncommands = [\"cargo test\"]\n\n[on_push]\nrun = true\nblock_on_failure = true\n";
+        let config: Config = toml::from_str(sample).unwrap();
+        assert_eq!(config.jobs.len(), 1);
+        assert!(config.on_push.run && config.on_push.block_on_failure);
     }
 }

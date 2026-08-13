@@ -19,6 +19,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         Dialog::GitHub => github_dialog(app, ctx, &mut open),
         Dialog::PullRequests => pull_requests(app, ctx, &mut open),
         Dialog::Conflicts => conflict_resolver(app, ctx, &mut open),
+        Dialog::CiConfigReview => ci_config_review(app, ctx, &mut open),
         Dialog::Settings => settings(app, ctx, &mut open),
         Dialog::AddRemote => add_remote(app, ctx, &mut open),
         Dialog::SwitchBranch(_) => switch_branch(app, ctx, &mut open),
@@ -635,6 +636,112 @@ fn conflict_resolver(app: &mut App, ctx: &egui::Context, open: &mut bool) {
     });
 }
 
+/// Review dialog for an AI-drafted `.git-manage-ci.toml`. The TOML is
+/// fully editable, validated live, and only written to the repository
+/// when the user explicitly confirms. Cancel discards everything.
+fn ci_config_review(app: &mut App, ctx: &egui::Context, open: &mut bool) {
+    modal(ctx, "Review AI-generated CI config", open, |ui| {
+        ui.set_min_width(640.0);
+        ui.label(
+            RichText::new(
+                "AI PROPOSAL. Review and edit the config below. Nothing is \
+                 written to your repository until you click Save.",
+            )
+            .color(theme::WARN)
+            .small(),
+        );
+        ui.add_space(4.0);
+
+        ScrollArea::vertical().max_height(360.0).id_salt("ci_ai_toml").show(ui, |ui| {
+            ui.add(
+                egui::TextEdit::multiline(&mut app.ci_ai_proposal)
+                    .code_editor()
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(18),
+            );
+        });
+
+        // Live validation so the user cannot save a broken file.
+        let parsed: Result<crate::local_ci::Config, _> =
+            toml::from_str(&app.ci_ai_proposal);
+        match &parsed {
+            Ok(config) => {
+                let jobs = config.jobs.len();
+                let on_push = if config.on_push.run {
+                    if config.on_push.block_on_failure {
+                        ", runs on push (blocking)"
+                    } else {
+                        ", runs on push (warn only)"
+                    }
+                } else {
+                    ""
+                };
+                ui.label(
+                    RichText::new(format!("Valid: {jobs} job(s){on_push}"))
+                        .color(theme::ADD)
+                        .small(),
+                );
+            }
+            Err(e) => {
+                ui.label(
+                    RichText::new(format!("Invalid TOML: {e}"))
+                        .color(theme::DANGER)
+                        .small(),
+                );
+            }
+        }
+
+        let exists = app
+            .repo
+            .as_ref()
+            .map(|r| r.path().join(crate::local_ci::CONFIG_FILE).exists())
+            .unwrap_or(false);
+        if exists {
+            ui.label(
+                RichText::new(format!(
+                    "{} already exists and will be overwritten.",
+                    crate::local_ci::CONFIG_FILE
+                ))
+                .color(theme::WARN)
+                .small(),
+            );
+        }
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            let save_label = if exists {
+                format!("Save (overwrite {})", crate::local_ci::CONFIG_FILE)
+            } else {
+                format!("Save {}", crate::local_ci::CONFIG_FILE)
+            };
+            if ui
+                .add_enabled(parsed.is_ok(), egui::Button::new(save_label).fill(theme::EMBER))
+                .clicked()
+            {
+                if let Some(repo) = app.repo.as_ref() {
+                    let path = repo.path().join(crate::local_ci::CONFIG_FILE);
+                    match std::fs::write(&path, &app.ci_ai_proposal) {
+                        Ok(()) => {
+                            app.toast(
+                                format!("{} saved.", crate::local_ci::CONFIG_FILE),
+                                false,
+                            );
+                            app.ci_ai_proposal.clear();
+                            app.load_local_ci();
+                            app.dialog = Dialog::PullRequests;
+                        }
+                        Err(e) => app.toast(e.to_string(), true),
+                    }
+                }
+            }
+            if ui.button("Cancel (discard proposal)").clicked() {
+                app.ci_ai_proposal.clear();
+                app.dialog = Dialog::PullRequests;
+            }
+        });
+    });
+}
+
 fn resolve(app: &mut App, path: &str, resolution: Resolution) {
     let Some(repo) = app.repo.clone() else { return };
     match repo.resolve(path, &resolution) {
@@ -984,6 +1091,20 @@ fn local_ci_panel(app: &mut App, ui: &mut egui::Ui) {
                         Err(e) => app.toast(e.to_string(), true),
                     }
                 }
+            }
+            if app.ci_ai_busy {
+                ui.add(egui::Spinner::new().size(14.0));
+                ui.label(RichText::new("AI is drafting…").italics().weak());
+            } else if ui
+                .small_button("Generate with AI")
+                .on_hover_text(
+                    "Scans the repo (manifests, scripts) and asks the selected \
+                     AI model to draft jobs for this project. You review and \
+                     edit the file before anything is written.",
+                )
+                .clicked()
+            {
+                app.generate_ci_config();
             }
         } else {
             let running = app.local_ci.running;

@@ -57,6 +57,9 @@ pub enum Msg {
     /// AI-proposed merged content for one conflicted file. Never applied
     /// automatically: the user must review and confirm in the resolver.
     AiMergeProposal { path: String, result: Result<String, String> },
+    /// AI-drafted local CI config (TOML). Never written automatically:
+    /// the user reviews and confirms in a dialog first.
+    AiCiConfig { result: Result<String, String> },
 
     /// Background task finished with nothing to report.
     Noop,

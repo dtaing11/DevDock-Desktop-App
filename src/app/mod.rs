@@ -33,6 +33,9 @@ pub fn run() -> eframe::Result<()> {
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([900.0, 600.0])
             .with_title("DevDock")
+            // Must match the desktop file name (devdock.desktop) so Linux
+            // shells associate the window with the right name and icon.
+            .with_app_id("devdock")
             .with_icon(load_icon()),
         ..Default::default()
     };

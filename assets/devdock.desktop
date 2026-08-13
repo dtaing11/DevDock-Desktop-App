@@ -2,7 +2,8 @@
 Name=DevDock
 Comment=Native git client with GitHub and AI integration
 Exec=devdock
-Icon=git-manage
+StartupWMClass=devdock
+Icon=devdock
 Terminal=false
 Type=Application
 Categories=Development;RevisionControl;

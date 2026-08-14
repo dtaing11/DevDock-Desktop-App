@@ -12,6 +12,7 @@
 pub mod dialogs;
 pub mod graph;
 pub mod shortcuts;
+pub mod syntax;
 pub mod theme;
 pub mod views;
 pub mod worker;

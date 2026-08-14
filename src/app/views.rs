@@ -1637,6 +1637,14 @@ pub fn diff_panel(app: &mut App, ctx: &egui::Context) {
             }
 
             // Plain diff: virtualized so huge diffs stay responsive.
+            // Code lines get language-aware syntax colors on top of the
+            // add/remove tinting.
+            let lang = app
+                .selected_file
+                .as_deref()
+                .map(crate::app::syntax::Lang::from_path)
+                .unwrap_or(crate::app::syntax::Lang::Plain);
+            let font = egui::TextStyle::Monospace.resolve(ui.style());
             let lines: Vec<&str> = app.diff_text.lines().collect();
             let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
             ScrollArea::both().auto_shrink([false, false]).show_rows(
@@ -1646,15 +1654,21 @@ pub fn diff_panel(app: &mut App, ctx: &egui::Context) {
                 |ui, range| {
                     for line in &lines[range] {
                         let (color, bg) = diff_line_style(line);
-                        let text = RichText::new(*line).monospace().color(color);
+                        let job = crate::app::syntax::diff_line_job(
+                            lang,
+                            line,
+                            color,
+                            font.clone(),
+                            true,
+                        );
                         match bg {
                             Some(bg) => {
                                 egui::Frame::new().fill(bg).show(ui, |ui| {
-                                    ui.label(text);
+                                    ui.label(job);
                                 });
                             }
                             None => {
-                                ui.label(text);
+                                ui.label(job);
                             }
                         }
                     }
@@ -1666,6 +1680,12 @@ pub fn diff_panel(app: &mut App, ctx: &egui::Context) {
 /// Diff view with per-line checkboxes on changed lines for line staging.
 fn interactive_diff(app: &mut App, ui: &mut egui::Ui) {
     let hunks = app.hunks.clone();
+    let lang = app
+        .selected_file
+        .as_deref()
+        .map(crate::app::syntax::Lang::from_path)
+        .unwrap_or(crate::app::syntax::Lang::Plain);
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
     ScrollArea::both().auto_shrink([false, false]).id_salt("interactive-diff").show(
         ui,
         |ui| {
@@ -1691,15 +1711,21 @@ fn interactive_diff(app: &mut App, ui: &mut egui::Ui) {
                         } else {
                             ui.add_space(26.0);
                         }
-                        let text = RichText::new(line).monospace().color(color);
+                        let job = crate::app::syntax::diff_line_job(
+                            lang,
+                            line,
+                            color,
+                            font.clone(),
+                            true,
+                        );
                         match bg {
                             Some(bg) => {
                                 egui::Frame::new().fill(bg).show(ui, |ui| {
-                                    ui.label(text);
+                                    ui.label(job);
                                 });
                             }
                             None => {
-                                ui.label(text);
+                                ui.label(job);
                             }
                         }
                     });

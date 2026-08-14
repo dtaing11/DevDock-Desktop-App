@@ -591,22 +591,37 @@ fn conflict_resolver(app: &mut App, ctx: &egui::Context, open: &mut bool) {
             }
 
             // Side-by-side: ours | theirs (read-only context above the editor).
+            let lang = crate::app::syntax::Lang::from_path(&path);
             ui.columns(2, |cols| {
                 cols[0].label(RichText::new("OURS (current branch)").color(theme::TEAL).small());
+                let font = egui::TextStyle::Small.resolve(cols[0].style());
                 ScrollArea::vertical().max_height(140.0).id_salt("ours").show(
                     &mut cols[0],
                     |ui| {
                         for line in ours.lines() {
-                            ui.label(RichText::new(line).monospace().small());
+                            ui.label(crate::app::syntax::diff_line_job(
+                                lang,
+                                line,
+                                theme::FG,
+                                font.clone(),
+                                true,
+                            ));
                         }
                     },
                 );
                 cols[1].label(RichText::new("THEIRS (incoming)").color(theme::WARN).small());
+                let font = egui::TextStyle::Small.resolve(cols[1].style());
                 ScrollArea::vertical().max_height(140.0).id_salt("theirs").show(
                     &mut cols[1],
                     |ui| {
                         for line in theirs.lines() {
-                            ui.label(RichText::new(line).monospace().small());
+                            ui.label(crate::app::syntax::diff_line_job(
+                                lang,
+                                line,
+                                theme::FG,
+                                font.clone(),
+                                true,
+                            ));
                         }
                     },
                 );
@@ -752,6 +767,8 @@ fn pr_review(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                     continue;
                 };
 
+                let lang = crate::app::syntax::Lang::from_path(&path);
+                let font = egui::TextStyle::Monospace.resolve(ui.style());
                 egui::Frame::default()
                     .fill(theme::BG)
                     .inner_margin(6.0)
@@ -772,14 +789,19 @@ fn pr_review(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                                     .map(|n| format!("{n:>4}"))
                                     .unwrap_or_else(|| "    ".into());
                                 ui.label(RichText::new(num).monospace().weak().small());
-                                let label = match bg {
-                                    Some(bg) => {
-                                        RichText::new(&pl.text).monospace().color(color)
-                                            .background_color(bg)
+                                let mut job = crate::app::syntax::diff_line_job(
+                                    lang,
+                                    &pl.text,
+                                    color,
+                                    font.clone(),
+                                    true,
+                                );
+                                if let Some(bg) = bg {
+                                    for section in &mut job.sections {
+                                        section.format.background = bg;
                                     }
-                                    None => RichText::new(&pl.text).monospace().color(color),
-                                };
-                                let resp = ui.label(label);
+                                }
+                                let resp = ui.label(job);
                                 if let Some((line, side)) = anchor.clone() {
                                     let has_pending = app.pr.review.pending.iter().any(|c| {
                                         c.path == path && c.line == line && c.side == side

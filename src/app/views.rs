@@ -684,7 +684,38 @@ fn checkout(app: &mut App, name: &str) {
 /// One context-aware sync segment, like GitHub Desktop's third header button:
 /// Publish when there is no upstream, Pull when behind, Push when ahead,
 /// otherwise Fetch. Publishing without any remote asks for a remote URL.
+/// Non-interactive toolbar segment with a circular spinner, shown while
+/// a sync operation runs so the click visibly "took".
+fn segment_spinner(ui: &mut egui::Ui, caption: &str, value: &str) {
+    egui::Frame::new()
+        .fill(theme::PANEL2)
+        .stroke(egui::Stroke::new(1.0_f32, theme::TEAL))
+        .corner_radius(theme::RADIUS_MD as f32)
+        .show(ui, |ui| {
+            ui.set_min_size(egui::vec2(SEGMENT_W, theme::SEGMENT_H));
+            ui.horizontal_centered(|ui| {
+                ui.add_space(12.0);
+                ui.add(egui::Spinner::new().size(16.0).color(theme::TEAL));
+                ui.add_space(6.0);
+                ui.label(segment_text(caption, value));
+            });
+        });
+}
+
 fn sync_segment(app: &mut App, ui: &mut egui::Ui) {
+    // A sync operation in flight: replace the button with a spinner so
+    // the click is obviously being worked on (and cannot double-fire).
+    if let Some(op) = app.sync_op {
+        let (caption, value) = match op {
+            "fetch" => ("REMOTE", "Fetching…"),
+            "pull" => ("PULL", "Pulling…"),
+            "force-push" => ("PUSH", "Force-pushing…"),
+            _ => ("PUSH", "Pushing…"),
+        };
+        segment_spinner(ui, caption, value);
+        return;
+    }
+
     let (ahead, behind, has_upstream, has_remote) = app
         .status
         .as_ref()
@@ -695,7 +726,7 @@ fn sync_segment(app: &mut App, ui: &mut egui::Ui) {
 
     // A CI-gated push in flight: reflect it on the button.
     if app.local_ci.pending_push.is_some() {
-        let _ = segment(
+        segment_spinner(
             ui,
             "PUSH",
             &format!(
@@ -703,9 +734,7 @@ fn sync_segment(app: &mut App, ui: &mut egui::Ui) {
                 app.local_ci.finished(),
                 app.local_ci.jobs.len()
             ),
-            SEGMENT_W,
-        )
-        .on_hover_text("Running local checks before push. See the Checks tab.");
+        );
         return;
     }
 
@@ -781,6 +810,7 @@ fn run_sync(app: &mut App, action: &'static str) {
 
     let token = app.gh_token();
     app.busy = true;
+    app.sync_op = Some(action);
     app.worker.spawn(move || {
         let auth = token.as_deref();
         let result = match action {

@@ -549,6 +549,9 @@ pub struct App {
     // feedback
     pub toast: Option<Toast>,
     pub busy: bool,
+    /// Sync operation in flight ("fetch"/"pull"/"push"/"force-push"),
+    /// shown as a spinner on the toolbar sync button.
+    pub sync_op: Option<&'static str>,
     /// Action currently being rebound in Settings, if any.
     pub rebinding: Option<shortcuts::Action>,
 }
@@ -615,6 +618,7 @@ impl App {
             ollama_models: Vec::new(),
             toast: None,
             busy: false,
+            sync_op: None,
             rebinding: None,
         };
         app.startup();
@@ -1074,6 +1078,7 @@ impl App {
             Msg::Done { message, refresh } => {
                 self.pr.review.submitting = false;
                 self.busy = false;
+                self.sync_op = None;
                 match message {
                     Ok(m) => {
                         if !m.is_empty() {
@@ -1453,6 +1458,7 @@ impl App {
         let token = self.gh_token();
         let force = action == "force-push";
         self.busy = true;
+        self.sync_op = Some(if force { "force-push" } else { "push" });
         self.worker.spawn(move || {
             let auth = token.as_deref();
             let result = if force {

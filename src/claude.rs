@@ -92,6 +92,14 @@ impl CredentialStore {
 // OAuth (PKCE, manual code paste like Claude Code)
 // ---------------------------------------------------------------------------
 
+/// Internal classification for retry decisions.
+enum RequestError {
+    /// Worth retrying after a wait (429 rate limits, 5xx).
+    Transient { wait_hint: Option<u64>, error: ClaudeError },
+    /// Retrying will not help (auth errors, bad requests).
+    Fatal(ClaudeError),
+}
+
 /// An in-progress OAuth sign-in: open `url`, then exchange the pasted code.
 #[derive(Clone)]
 pub struct OAuthFlow {
@@ -354,12 +362,50 @@ impl Client {
         self.request_with_system(SYSTEM_PROMPT, prompt, max_tokens)
     }
 
+    /// Sends one request with automatic retry on transient failures.
+    ///
+    /// Anthropic 429s are usually short-window limits (requests/tokens per
+    /// minute), not the subscription's weekly quota, so a brief wait
+    /// normally clears them. We honor the server's `retry-after` (capped)
+    /// and retry up to [`MAX_RETRIES`] times before surfacing the error.
+    /// 5xx/overloaded responses get the same treatment.
     fn request_with_system(
         &self,
         system: &str,
         prompt: &str,
         max_tokens: u32,
     ) -> Result<String> {
+        /// Retries after a 429/5xx. With waits capped at 30s this bounds
+        /// added latency to about a minute worst case.
+        const MAX_RETRIES: u32 = 3;
+        const MAX_WAIT_SECS: u64 = 30;
+
+        let mut attempt = 0;
+        loop {
+            match self.request_once(system, prompt, max_tokens) {
+                Err(RequestError::Transient { wait_hint, error }) => {
+                    attempt += 1;
+                    if attempt > MAX_RETRIES {
+                        return Err(error);
+                    }
+                    // Server hint capped, else exponential: 2s, 6s, 18s.
+                    let wait = wait_hint
+                        .unwrap_or(2 * 3u64.pow(attempt - 1))
+                        .min(MAX_WAIT_SECS);
+                    std::thread::sleep(Duration::from_secs(wait));
+                }
+                Err(RequestError::Fatal(e)) => return Err(e),
+                Ok(text) => return Ok(text),
+            }
+        }
+    }
+
+    fn request_once(
+        &self,
+        system: &str,
+        prompt: &str,
+        max_tokens: u32,
+    ) -> std::result::Result<String, RequestError> {
         #[derive(Deserialize)]
         struct Content {
             text: Option<String>,
@@ -390,7 +436,9 @@ impl Client {
         let resp = req.send_json(payload);
 
         let value: serde_json::Value = match resp {
-            Ok(r) => r.into_json().map_err(|e| ClaudeError(e.to_string()))?,
+            Ok(r) => r
+                .into_json()
+                .map_err(|e| RequestError::Fatal(ClaudeError(e.to_string())))?,
             Err(ureq::Error::Status(code, r)) => {
                 let retry_after: Option<u64> =
                     r.header("retry-after").and_then(|v| v.parse().ok());
@@ -399,43 +447,40 @@ impl Client {
                     .pointer("/error/message")
                     .and_then(|m| m.as_str())
                     .unwrap_or("request failed");
+                // 429 and 5xx are transient: retried automatically with
+                // backoff before this error ever reaches the user.
+                if code == 429 || code >= 500 {
+                    let error = ClaudeError(format!(
+                        "Claude API {code}: {detail} (retried {} times with \
+                         backoff; still limited. This is the per-minute \
+                         request/token window, not your weekly quota; wait a \
+                         minute and try again)",
+                        3
+                    ));
+                    return Err(RequestError::Transient { wait_hint: retry_after, error });
+                }
                 let hint = match code {
-                    401 => " (sign in again in Settings)".to_string(),
-                    429 => {
-                        let retry = retry_after
-                            .map(|secs| {
-                                if secs >= 60 {
-                                    format!("{} min", secs.div_ceil(60))
-                                } else {
-                                    format!("{secs}s")
-                                }
-                            });
-                        match retry {
-                            Some(t) => format!(
-                                " (rate limited; retry in ~{t}. OAuth shares your \
-                                 claude.ai subscription quota; Haiku uses far less \
-                                 of it than Sonnet/Opus)"
-                            ),
-                            None => " (rate limited. OAuth shares your claude.ai \
-                                     subscription quota; Haiku uses far less of it \
-                                     than Sonnet/Opus)"
-                                .to_string(),
-                        }
-                    }
-                    _ => String::new(),
+                    401 => " (sign in again in Settings)",
+                    _ => "",
                 };
-                return Err(ClaudeError(format!("Claude API {code}: {detail}{hint}")));
+                return Err(RequestError::Fatal(ClaudeError(format!(
+                    "Claude API {code}: {detail}{hint}"
+                ))));
             }
-            Err(e) => return Err(ClaudeError(format!("Cannot reach Claude: {e}"))),
+            Err(e) => {
+                return Err(RequestError::Fatal(ClaudeError(format!(
+                    "Cannot reach Claude: {e}"
+                ))))
+            }
         };
-        let parsed: Response =
-            serde_json::from_value(value).map_err(|e| ClaudeError(format!("Bad response: {e}")))?;
+        let parsed: Response = serde_json::from_value(value)
+            .map_err(|e| RequestError::Fatal(ClaudeError(format!("Bad response: {e}"))))?;
         parsed
             .content
             .into_iter()
             .filter_map(|c| c.text)
             .next()
-            .ok_or_else(|| ClaudeError("Claude returned no text".into()))
+            .ok_or_else(|| RequestError::Fatal(ClaudeError("Claude returned no text".into())))
     }
 }
 

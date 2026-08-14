@@ -362,33 +362,46 @@ impl Client {
         self.request_with_system(SYSTEM_PROMPT, prompt, max_tokens)
     }
 
-    /// Sends one request with automatic retry on transient failures.
+    /// Sends one request with automatic retry on transient failures and
+    /// automatic model fallback on persistent rate limits.
     ///
-    /// Anthropic 429s are usually short-window limits (requests/tokens per
-    /// minute), not the subscription's weekly quota, so a brief wait
-    /// normally clears them. We honor the server's `retry-after` (capped)
-    /// and retry up to [`MAX_RETRIES`] times before surfacing the error.
-    /// 5xx/overloaded responses get the same treatment.
+    /// Claude subscriptions cap Opus/Sonnet usage separately from (and far
+    /// lower than) Haiku. When the selected model keeps returning 429, we
+    /// silently fall back to the newest Haiku so generation still succeeds
+    /// on subscription auth, instead of failing until the weekly window
+    /// resets. Transient 429/5xx also get bounded backoff retries.
     fn request_with_system(
         &self,
         system: &str,
         prompt: &str,
         max_tokens: u32,
     ) -> Result<String> {
-        /// Retries after a 429/5xx. With waits capped at 30s this bounds
-        /// added latency to about a minute worst case.
-        const MAX_RETRIES: u32 = 3;
-        const MAX_WAIT_SECS: u64 = 30;
+        /// Backoff retries. Waits are short because model fallback (not
+        /// waiting) is the real fix for persistent subscription limits.
+        const MAX_RETRIES: u32 = 2;
+        const MAX_WAIT_SECS: u64 = 15;
 
+        let mut model = self.model.clone();
+        let mut fell_back = false;
         let mut attempt = 0;
         loop {
-            match self.request_once(system, prompt, max_tokens) {
+            match self.request_once(&model, system, prompt, max_tokens) {
                 Err(RequestError::Transient { wait_hint, error }) => {
+                    // First 429 on a non-Haiku model: switch to Haiku
+                    // immediately. Opus/Sonnet caps are weekly, so backoff
+                    // cannot clear them, but Haiku's cap is far higher.
+                    if !fell_back && !model.contains("haiku") {
+                        if let Some(haiku) = self.newest_haiku() {
+                            model = haiku;
+                            fell_back = true;
+                            attempt = 0;
+                            continue;
+                        }
+                    }
                     attempt += 1;
                     if attempt > MAX_RETRIES {
                         return Err(error);
                     }
-                    // Server hint capped, else exponential: 2s, 6s, 18s.
                     let wait = wait_hint
                         .unwrap_or(2 * 3u64.pow(attempt - 1))
                         .min(MAX_WAIT_SECS);
@@ -400,8 +413,15 @@ impl Client {
         }
     }
 
+    /// Newest Haiku model id available to this account, for rate-limit
+    /// fallback. Uses the live model list so ids never go stale.
+    fn newest_haiku(&self) -> Option<String> {
+        self.models().into_iter().find(|m| m.contains("haiku"))
+    }
+
     fn request_once(
         &self,
+        model: &str,
         system: &str,
         prompt: &str,
         max_tokens: u32,
@@ -416,7 +436,7 @@ impl Client {
         }
 
         let payload = serde_json::json!({
-            "model": self.model,
+            "model": model,
             "max_tokens": max_tokens,
             "system": system,
             "messages": [{"role": "user", "content": prompt}],
@@ -451,11 +471,10 @@ impl Client {
                 // backoff before this error ever reaches the user.
                 if code == 429 || code >= 500 {
                     let error = ClaudeError(format!(
-                        "Claude API {code}: {detail} (retried {} times with \
-                         backoff; still limited. This is the per-minute \
-                         request/token window, not your weekly quota; wait a \
-                         minute and try again)",
-                        3
+                        "Claude API {code} on {model}: {detail} (auto-retried \
+                         and tried falling back to Haiku. Subscriptions cap \
+                         Opus/Sonnet separately; pick Haiku in the model \
+                         picker or wait for the window to reset)"
                     ));
                     return Err(RequestError::Transient { wait_hint: retry_after, error });
                 }

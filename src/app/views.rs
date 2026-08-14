@@ -1638,24 +1638,28 @@ pub fn diff_panel(app: &mut App, ctx: &egui::Context) {
 
             // Plain diff: virtualized so huge diffs stay responsive.
             // Code lines get language-aware syntax colors on top of the
-            // add/remove tinting.
-            let lang = app
+            // add/remove tinting. Multi-file diffs (history mode shows a
+            // whole commit) switch language per file by following the
+            // diff headers, so each file is highlighted correctly.
+            let base_lang = app
                 .selected_file
                 .as_deref()
                 .map(crate::app::syntax::Lang::from_path)
                 .unwrap_or(crate::app::syntax::Lang::Plain);
             let font = egui::TextStyle::Monospace.resolve(ui.style());
             let lines: Vec<&str> = app.diff_text.lines().collect();
+            let line_langs = crate::app::syntax::langs_per_line(&lines, base_lang);
             let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
             ScrollArea::both().auto_shrink([false, false]).show_rows(
                 ui,
                 row_height,
                 lines.len(),
                 |ui, range| {
-                    for line in &lines[range] {
+                    for i in range {
+                        let line = lines[i];
                         let (color, bg) = diff_line_style(line);
                         let job = crate::app::syntax::diff_line_job(
-                            lang,
+                            line_langs[i],
                             line,
                             color,
                             font.clone(),

@@ -361,6 +361,26 @@ fn highlight_css(line: &str, default_color: Color32) -> Vec<Span> {
     spans
 }
 
+/// Computes the language for each line of a (possibly multi-file) diff
+/// by following `+++ b/<path>` headers. `base` applies until the first
+/// header, which covers single-file diffs loaded for a selected file.
+pub fn langs_per_line(lines: &[&str], base: Lang) -> Vec<Lang> {
+    let mut langs = Vec::with_capacity(lines.len());
+    let mut current = base;
+    for line in lines {
+        if let Some(path) = line.strip_prefix("+++ b/") {
+            current = Lang::from_path(path.trim());
+        } else if let Some(rest) = line.strip_prefix("diff --git a/") {
+            // Covers files whose +++ header is /dev/null (deletions).
+            if let Some(path) = rest.split(" b/").nth(1) {
+                current = Lang::from_path(path.trim());
+            }
+        }
+        langs.push(current);
+    }
+    langs
+}
+
 /// Builds an egui [`LayoutJob`] for one diff line: the +/- marker keeps
 /// the diff color, the rest of the line gets syntax colors.
 pub fn diff_line_job(
@@ -460,6 +480,21 @@ mod tests {
     fn function_calls_get_gold() {
         let spans = highlight_line(Lang::Go, "fmt.Println(x)", FG);
         assert_eq!(colors_of(&spans, "Println"), Some(palette::FUNCTION));
+    }
+
+    #[test]
+    fn multi_file_diffs_switch_language_per_file() {
+        let lines = vec![
+            "diff --git a/src/main.rs b/src/main.rs",
+            "+++ b/src/main.rs",
+            "+fn main() {}",
+            "diff --git a/web/app.js b/web/app.js",
+            "+++ b/web/app.js",
+            "+const x = 1;",
+        ];
+        let langs = langs_per_line(&lines, Lang::Plain);
+        assert_eq!(langs[2], Lang::Rust);
+        assert_eq!(langs[5], Lang::JavaScript);
     }
 
     #[test]

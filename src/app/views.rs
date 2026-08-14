@@ -38,10 +38,21 @@ fn segment_menu<R>(
     value: &str,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<Option<R>> {
+    use egui::containers::menu::{MenuButton, MenuConfig};
     ui.scope(|ui| {
         ui.spacing_mut().interact_size = egui::vec2(SEGMENT_W, theme::SEGMENT_H);
         ui.spacing_mut().button_padding = egui::vec2(12.0, 6.0);
-        ui.menu_button(segment_text(caption, value), add_contents)
+        // CloseOnClickOutside keeps the menu open when interacting with
+        // text inputs inside it (filter/search boxes, name fields).
+        // Item buttons still close explicitly via ui.close(). Submenus
+        // inherit this behavior through the menu config tag.
+        let (response, inner) = MenuButton::new(segment_text(caption, value))
+            .config(
+                MenuConfig::new()
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+            )
+            .ui(ui, add_contents);
+        egui::InnerResponse::new(inner.map(|ir| ir.inner), response)
     })
     .inner
 }

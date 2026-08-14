@@ -196,6 +196,9 @@ pub enum ConfirmAction {
     /// Merge the current branch into `target`. `protected` reflects GitHub
     /// branch rules on the target.
     MergeInto { source: String, target: String, protected: bool },
+    /// Regenerate AI text over existing user-visible text (commit message
+    /// or PR title/description).
+    OverwriteAiText(worker::AiTarget),
 }
 
 impl ConfirmAction {
@@ -211,6 +214,10 @@ impl ConfirmAction {
             Self::RevertCommit { .. } => "Revert commit?",
             Self::DiscardAll(_) => "Discard all changes?",
             Self::MergeInto { .. } => "Confirm merge",
+            Self::OverwriteAiText(worker::AiTarget::Commit) => "Overwrite commit message?",
+            Self::OverwriteAiText(worker::AiTarget::PullRequest) => {
+                "Overwrite PR title and description?"
+            }
         }
     }
 
@@ -258,6 +265,17 @@ impl ConfirmAction {
                  Tracked files return to the last commit; untracked files are deleted.\n\
                  Consider stashing instead if you might want them back."
             ),
+            Self::OverwriteAiText(worker::AiTarget::Commit) => {
+                "The commit box already has text. Generating replaces it with \
+                 the AI's suggestion, and anything you typed is lost."
+                    .into()
+            }
+            Self::OverwriteAiText(worker::AiTarget::PullRequest) => {
+                "The PR form already has a title or description. Generating \
+                 replaces both with the AI's suggestion, and anything you \
+                 typed is lost."
+                    .into()
+            }
         }
     }
 
@@ -275,6 +293,7 @@ impl ConfirmAction {
             Self::MergeInto { protected, .. } => {
                 if *protected { "Merge anyway (may not push)" } else { "Merge" }
             }
+            Self::OverwriteAiText(_) => "Overwrite and generate",
         }
     }
 }
@@ -841,6 +860,31 @@ impl App {
             worker::AiTarget::PullRequest => self.config.pr_ai = Some(sel),
         }
         self.config.save();
+    }
+
+    /// Entry point for the commit-box AI button: asks for confirmation
+    /// first when the box already has text the generation would replace.
+    pub fn request_ai_message(&mut self) {
+        if !self.commit_summary.trim().is_empty()
+            || !self.commit_description.trim().is_empty()
+        {
+            self.dialog =
+                Dialog::Confirm(ConfirmAction::OverwriteAiText(worker::AiTarget::Commit));
+            return;
+        }
+        self.generate_ai_message();
+    }
+
+    /// Entry point for the PR-form AI button: asks for confirmation first
+    /// when the form already has a title or description.
+    pub fn request_pr_text(&mut self) {
+        if !self.pr.title.trim().is_empty() || !self.pr.body.trim().is_empty() {
+            self.dialog = Dialog::Confirm(ConfirmAction::OverwriteAiText(
+                worker::AiTarget::PullRequest,
+            ));
+            return;
+        }
+        self.generate_pr_text();
     }
 
     /// Generates a commit message into the commit box using the selected
@@ -1593,8 +1637,19 @@ impl App {
     /// Executes a confirmed destructive action.
     pub fn execute_confirmed(&mut self, action: ConfirmAction) {
         self.dialog = Dialog::None;
+        // Overwrite-AI-text needs no repo mutation, handle before repo gate.
+        if let ConfirmAction::OverwriteAiText(target) = &action {
+            match target {
+                worker::AiTarget::Commit => self.generate_ai_message(),
+                worker::AiTarget::PullRequest => self.generate_pr_text(),
+            }
+            return;
+        }
         let Some(repo) = self.repo.clone() else { return };
+        #[allow(clippy::match_same_arms)]
         match action {
+            // Handled above; kept for exhaustiveness.
+            ConfirmAction::OverwriteAiText(_) => {}
             ConfirmAction::DiscardFile(path) => {
                 if self.selected_file.as_deref() == Some(path.as_str()) {
                     views::clear_diff_view(self);

@@ -1258,8 +1258,8 @@ pub fn ai_controls(
             .clicked()
         {
             match target {
-                crate::app::worker::AiTarget::Commit => app.generate_ai_message(),
-                crate::app::worker::AiTarget::PullRequest => app.generate_pr_text(),
+                crate::app::worker::AiTarget::Commit => app.request_ai_message(),
+                crate::app::worker::AiTarget::PullRequest => app.request_pr_text(),
             }
         }
         ai_model_picker(app, ui, target);

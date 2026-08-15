@@ -38,10 +38,21 @@ fn segment_menu<R>(
     value: &str,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<Option<R>> {
+    use egui::containers::menu::{MenuButton, MenuConfig};
     ui.scope(|ui| {
         ui.spacing_mut().interact_size = egui::vec2(SEGMENT_W, theme::SEGMENT_H);
         ui.spacing_mut().button_padding = egui::vec2(12.0, 6.0);
-        ui.menu_button(segment_text(caption, value), add_contents)
+        // CloseOnClickOutside keeps the menu open when interacting with
+        // text inputs inside it (filter/search boxes, name fields).
+        // Item buttons still close explicitly via ui.close(). Submenus
+        // inherit this behavior through the menu config tag.
+        let (response, inner) = MenuButton::new(segment_text(caption, value))
+            .config(
+                MenuConfig::new()
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+            )
+            .ui(ui, add_contents);
+        egui::InnerResponse::new(inner.map(|ir| ir.inner), response)
     })
     .inner
 }
@@ -673,7 +684,38 @@ fn checkout(app: &mut App, name: &str) {
 /// One context-aware sync segment, like GitHub Desktop's third header button:
 /// Publish when there is no upstream, Pull when behind, Push when ahead,
 /// otherwise Fetch. Publishing without any remote asks for a remote URL.
+/// Non-interactive toolbar segment with a circular spinner, shown while
+/// a sync operation runs so the click visibly "took".
+fn segment_spinner(ui: &mut egui::Ui, caption: &str, value: &str) {
+    egui::Frame::new()
+        .fill(theme::PANEL2)
+        .stroke(egui::Stroke::new(1.0_f32, theme::TEAL))
+        .corner_radius(theme::RADIUS_MD as f32)
+        .show(ui, |ui| {
+            ui.set_min_size(egui::vec2(SEGMENT_W, theme::SEGMENT_H));
+            ui.horizontal_centered(|ui| {
+                ui.add_space(12.0);
+                ui.add(egui::Spinner::new().size(16.0).color(theme::TEAL));
+                ui.add_space(6.0);
+                ui.label(segment_text(caption, value));
+            });
+        });
+}
+
 fn sync_segment(app: &mut App, ui: &mut egui::Ui) {
+    // A sync operation in flight: replace the button with a spinner so
+    // the click is obviously being worked on (and cannot double-fire).
+    if let Some(op) = app.sync_op {
+        let (caption, value) = match op {
+            "fetch" => ("REMOTE", "Fetching…"),
+            "pull" => ("PULL", "Pulling…"),
+            "force-push" => ("PUSH", "Force-pushing…"),
+            _ => ("PUSH", "Pushing…"),
+        };
+        segment_spinner(ui, caption, value);
+        return;
+    }
+
     let (ahead, behind, has_upstream, has_remote) = app
         .status
         .as_ref()
@@ -684,7 +726,7 @@ fn sync_segment(app: &mut App, ui: &mut egui::Ui) {
 
     // A CI-gated push in flight: reflect it on the button.
     if app.local_ci.pending_push.is_some() {
-        let _ = segment(
+        segment_spinner(
             ui,
             "PUSH",
             &format!(
@@ -692,9 +734,7 @@ fn sync_segment(app: &mut App, ui: &mut egui::Ui) {
                 app.local_ci.finished(),
                 app.local_ci.jobs.len()
             ),
-            SEGMENT_W,
-        )
-        .on_hover_text("Running local checks before push. See the Checks tab.");
+        );
         return;
     }
 
@@ -770,6 +810,7 @@ fn run_sync(app: &mut App, action: &'static str) {
 
     let token = app.gh_token();
     app.busy = true;
+    app.sync_op = Some(action);
     app.worker.spawn(move || {
         let auth = token.as_deref();
         let result = match action {
@@ -1247,8 +1288,8 @@ pub fn ai_controls(
             .clicked()
         {
             match target {
-                crate::app::worker::AiTarget::Commit => app.generate_ai_message(),
-                crate::app::worker::AiTarget::PullRequest => app.generate_pr_text(),
+                crate::app::worker::AiTarget::Commit => app.request_ai_message(),
+                crate::app::worker::AiTarget::PullRequest => app.request_pr_text(),
             }
         }
         ai_model_picker(app, ui, target);
@@ -1626,24 +1667,42 @@ pub fn diff_panel(app: &mut App, ctx: &egui::Context) {
             }
 
             // Plain diff: virtualized so huge diffs stay responsive.
+            // Code lines get language-aware syntax colors on top of the
+            // add/remove tinting. Multi-file diffs (history mode shows a
+            // whole commit) switch language per file by following the
+            // diff headers, so each file is highlighted correctly.
+            let base_lang = app
+                .selected_file
+                .as_deref()
+                .map(crate::app::syntax::Lang::from_path)
+                .unwrap_or(crate::app::syntax::Lang::Plain);
+            let font = egui::TextStyle::Monospace.resolve(ui.style());
             let lines: Vec<&str> = app.diff_text.lines().collect();
+            let line_langs = crate::app::syntax::langs_per_line(&lines, base_lang);
             let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
             ScrollArea::both().auto_shrink([false, false]).show_rows(
                 ui,
                 row_height,
                 lines.len(),
                 |ui, range| {
-                    for line in &lines[range] {
+                    for i in range {
+                        let line = lines[i];
                         let (color, bg) = diff_line_style(line);
-                        let text = RichText::new(*line).monospace().color(color);
+                        let job = crate::app::syntax::diff_line_job(
+                            line_langs[i],
+                            line,
+                            color,
+                            font.clone(),
+                            true,
+                        );
                         match bg {
                             Some(bg) => {
                                 egui::Frame::new().fill(bg).show(ui, |ui| {
-                                    ui.label(text);
+                                    ui.label(job);
                                 });
                             }
                             None => {
-                                ui.label(text);
+                                ui.label(job);
                             }
                         }
                     }
@@ -1655,6 +1714,12 @@ pub fn diff_panel(app: &mut App, ctx: &egui::Context) {
 /// Diff view with per-line checkboxes on changed lines for line staging.
 fn interactive_diff(app: &mut App, ui: &mut egui::Ui) {
     let hunks = app.hunks.clone();
+    let lang = app
+        .selected_file
+        .as_deref()
+        .map(crate::app::syntax::Lang::from_path)
+        .unwrap_or(crate::app::syntax::Lang::Plain);
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
     ScrollArea::both().auto_shrink([false, false]).id_salt("interactive-diff").show(
         ui,
         |ui| {
@@ -1680,15 +1745,21 @@ fn interactive_diff(app: &mut App, ui: &mut egui::Ui) {
                         } else {
                             ui.add_space(26.0);
                         }
-                        let text = RichText::new(line).monospace().color(color);
+                        let job = crate::app::syntax::diff_line_job(
+                            lang,
+                            line,
+                            color,
+                            font.clone(),
+                            true,
+                        );
                         match bg {
                             Some(bg) => {
                                 egui::Frame::new().fill(bg).show(ui, |ui| {
-                                    ui.label(text);
+                                    ui.label(job);
                                 });
                             }
                             None => {
-                                ui.label(text);
+                                ui.label(job);
                             }
                         }
                     });
@@ -1857,7 +1928,7 @@ fn ignore_selected(app: &mut App) {
     }
 }
 
-fn diff_line_style(line: &str) -> (Color32, Option<Color32>) {
+pub fn diff_line_style(line: &str) -> (Color32, Option<Color32>) {
     if line.starts_with("+++") || line.starts_with("---") {
         (theme::FG_DIM, None)
     } else if line.starts_with('+') {

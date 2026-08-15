@@ -108,9 +108,12 @@ pub fn apply(ctx: &egui::Context) {
     visuals.widgets.hovered.bg_fill = PANEL2;
     visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, TEAL);
     visuals.widgets.hovered.corner_radius = CornerRadius::same(RADIUS_MD);
-    visuals.widgets.active.bg_fill = BORDER;
-    visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, EMBER);
+    // Pressed state: clearly different from hover so clicks visibly land.
+    visuals.widgets.active.bg_fill = EMBER_DEEP.linear_multiply(0.45);
+    visuals.widgets.active.weak_bg_fill = EMBER_DEEP.linear_multiply(0.45);
+    visuals.widgets.active.bg_stroke = Stroke::new(2.0_f32, EMBER);
     visuals.widgets.active.corner_radius = CornerRadius::same(RADIUS_MD);
+    visuals.widgets.active.expansion = -1.0; // slight press-down effect
     visuals.widgets.open.bg_fill = PANEL2;
 
     visuals.selection.bg_fill = EMBER_DEEP.linear_multiply(0.35);

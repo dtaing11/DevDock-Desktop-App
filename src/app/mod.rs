@@ -12,6 +12,7 @@
 pub mod dialogs;
 pub mod graph;
 pub mod shortcuts;
+pub mod syntax;
 pub mod theme;
 pub mod views;
 pub mod worker;
@@ -33,6 +34,9 @@ pub fn run() -> eframe::Result<()> {
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([900.0, 600.0])
             .with_title("DevDock")
+            // Must match the desktop file name (devdock.desktop) so Linux
+            // shells associate the window with the right name and icon.
+            .with_app_id("devdock")
             .with_icon(load_icon()),
         ..Default::default()
     };
@@ -92,6 +96,12 @@ pub struct RepoPrompts {
     /// Optional Markdown file whose contents are appended for PRs.
     #[serde(default)]
     pub pull_request_file: Option<String>,
+    /// Appended to the system prompt for AI conflict resolution.
+    #[serde(default)]
+    pub conflict: String,
+    /// Optional Markdown file whose contents are appended for conflicts.
+    #[serde(default)]
+    pub conflict_file: Option<String>,
 }
 
 /// A provider/model pair chosen for one AI task.
@@ -153,6 +163,10 @@ pub enum Dialog {
     /// Uncommitted changes exist; ask how to handle them before switching
     /// to the branch named inside.
     SwitchBranch(String),
+    /// Review an AI-drafted local CI config before writing it to disk.
+    CiConfigReview,
+    /// Full PR review: diffs, inline comments, approve/request changes.
+    PrReview,
     /// Confirmation gate for a destructive action.
     Confirm(ConfirmAction),
 }
@@ -182,6 +196,9 @@ pub enum ConfirmAction {
     /// Merge the current branch into `target`. `protected` reflects GitHub
     /// branch rules on the target.
     MergeInto { source: String, target: String, protected: bool },
+    /// Regenerate AI text over existing user-visible text (commit message
+    /// or PR title/description).
+    OverwriteAiText(worker::AiTarget),
 }
 
 impl ConfirmAction {
@@ -197,6 +214,10 @@ impl ConfirmAction {
             Self::RevertCommit { .. } => "Revert commit?",
             Self::DiscardAll(_) => "Discard all changes?",
             Self::MergeInto { .. } => "Confirm merge",
+            Self::OverwriteAiText(worker::AiTarget::Commit) => "Overwrite commit message?",
+            Self::OverwriteAiText(worker::AiTarget::PullRequest) => {
+                "Overwrite PR title and description?"
+            }
         }
     }
 
@@ -244,6 +265,17 @@ impl ConfirmAction {
                  Tracked files return to the last commit; untracked files are deleted.\n\
                  Consider stashing instead if you might want them back."
             ),
+            Self::OverwriteAiText(worker::AiTarget::Commit) => {
+                "The commit box already has text. Generating replaces it with \
+                 the AI's suggestion, and anything you typed is lost."
+                    .into()
+            }
+            Self::OverwriteAiText(worker::AiTarget::PullRequest) => {
+                "The PR form already has a title or description. Generating \
+                 replaces both with the AI's suggestion, and anything you \
+                 typed is lost."
+                    .into()
+            }
         }
     }
 
@@ -261,6 +293,7 @@ impl ConfirmAction {
             Self::MergeInto { protected, .. } => {
                 if *protected { "Merge anyway (may not push)" } else { "Merge" }
             }
+            Self::OverwriteAiText(_) => "Overwrite and generate",
         }
     }
 }
@@ -316,6 +349,10 @@ pub struct PrState {
     pub open_prs: Vec<github::PullRequest>,
     /// CI check summaries keyed by PR number.
     pub checks: std::collections::HashMap<u64, github::ChecksSummary>,
+    /// Mergeable state keyed by PR number (false = has conflicts).
+    pub mergeable: std::collections::HashMap<u64, Option<bool>>,
+    /// In-app review session state.
+    pub review: PrReviewState,
     pub loading: bool,
     pub creating: bool,
 }
@@ -327,6 +364,38 @@ pub struct ConflictState {
     pub selected: Option<usize>,
     pub editor: String,
     pub resolved: Vec<String>,
+    /// Path currently being resolved by AI, shown as a busy indicator.
+    pub ai_busy: Option<String>,
+    /// AI proposal awaiting user review: nothing is written to the working
+    /// tree until the user explicitly accepts (or edits then saves) it.
+    pub ai_proposal: Option<AiMergeProposal>,
+}
+
+/// An AI-suggested merge for one file, pending user confirmation.
+pub struct AiMergeProposal {
+    pub path: String,
+    pub content: String,
+}
+
+/// State for reviewing one pull request inside the app.
+#[derive(Default)]
+pub struct PrReviewState {
+    /// PR being reviewed; None when the dialog is closed.
+    pub pr: Option<github::PullRequest>,
+    pub loading: bool,
+    pub files: Vec<github::PrFile>,
+    /// Reviews already submitted on this PR.
+    pub reviews: Vec<github::PrReview>,
+    /// Which file's diff is expanded.
+    pub selected: Option<usize>,
+    /// Pending inline comments (not yet submitted).
+    pub pending: Vec<github::ReviewComment>,
+    /// Overall review body text.
+    pub body: String,
+    /// Draft text for a new inline comment: (file index, line, side).
+    pub comment_target: Option<(usize, u64, String)>,
+    pub comment_draft: String,
+    pub submitting: bool,
 }
 
 /// Local CI run state shown in the PR dialog.
@@ -470,12 +539,19 @@ pub struct App {
     pub pr: PrState,
     pub local_ci: LocalCiState,
     pub conflicts: ConflictState,
+    /// AI CI-config generation: busy flag and the editable proposal text
+    /// shown in the review dialog. Nothing is written until confirmed.
+    pub ci_ai_busy: bool,
+    pub ci_ai_proposal: String,
     pub ollama_url_input: String,
     pub ollama_models: Vec<ollama::Model>,
 
     // feedback
     pub toast: Option<Toast>,
     pub busy: bool,
+    /// Sync operation in flight ("fetch"/"pull"/"push"/"force-push"),
+    /// shown as a spinner on the toolbar sync button.
+    pub sync_op: Option<&'static str>,
     /// Action currently being rebound in Settings, if any.
     pub rebinding: Option<shortcuts::Action>,
 }
@@ -510,6 +586,8 @@ impl App {
             commit_description: String::new(),
             amend: false,
             ai_busy: false,
+            ci_ai_busy: false,
+            ci_ai_proposal: String::new(),
             diff_title: String::new(),
             diff_text: String::new(),
             hunks: Vec::new(),
@@ -540,6 +618,7 @@ impl App {
             ollama_models: Vec::new(),
             toast: None,
             busy: false,
+            sync_op: None,
             rebinding: None,
         };
         app.startup();
@@ -787,6 +866,31 @@ impl App {
         self.config.save();
     }
 
+    /// Entry point for the commit-box AI button: asks for confirmation
+    /// first when the box already has text the generation would replace.
+    pub fn request_ai_message(&mut self) {
+        if !self.commit_summary.trim().is_empty()
+            || !self.commit_description.trim().is_empty()
+        {
+            self.dialog =
+                Dialog::Confirm(ConfirmAction::OverwriteAiText(worker::AiTarget::Commit));
+            return;
+        }
+        self.generate_ai_message();
+    }
+
+    /// Entry point for the PR-form AI button: asks for confirmation first
+    /// when the form already has a title or description.
+    pub fn request_pr_text(&mut self) {
+        if !self.pr.title.trim().is_empty() || !self.pr.body.trim().is_empty() {
+            self.dialog = Dialog::Confirm(ConfirmAction::OverwriteAiText(
+                worker::AiTarget::PullRequest,
+            ));
+            return;
+        }
+        self.generate_pr_text();
+    }
+
     /// Generates a commit message into the commit box using the selected
     /// provider/model. Stages the checked files first so the AI sees the
     /// intended diff.
@@ -820,6 +924,27 @@ impl App {
                     parts.push(contents.trim().to_string());
                 }
                 _ => {} // missing/unreadable file: fall back to inline text only
+            }
+        }
+        (!parts.is_empty()).then(|| parts.join("\n\n"))
+    }
+
+    /// Custom AI instructions for conflict resolution in the current repo:
+    /// inline text plus a linked Markdown file, when configured.
+    fn conflict_prompt(&self) -> Option<String> {
+        let repo = self.repo.as_ref()?;
+        let prompts = self.config.repo_prompts.get(&repo.path().display().to_string())?;
+        let mut parts: Vec<String> = Vec::new();
+        let inline = prompts.conflict.trim();
+        if !inline.is_empty() {
+            parts.push(inline.to_string());
+        }
+        if let Some(path) = &prompts.conflict_file {
+            match std::fs::read_to_string(path) {
+                Ok(contents) if !contents.trim().is_empty() => {
+                    parts.push(contents.trim().to_string());
+                }
+                _ => {}
             }
         }
         (!parts.is_empty()).then(|| parts.join("\n\n"))
@@ -951,7 +1076,9 @@ impl App {
                 self.diff_text = text;
             }
             Msg::Done { message, refresh } => {
+                self.pr.review.submitting = false;
                 self.busy = false;
+                self.sync_op = None;
                 match message {
                     Ok(m) => {
                         if !m.is_empty() {
@@ -1055,18 +1182,36 @@ impl App {
                 self.pr.loading = false;
                 match result {
                     Ok(prs) => {
-                        // Kick off a checks lookup per PR.
+                        // Kick off checks + mergeable lookups per PR.
                         if let Some(repo) = self.repo.clone() {
                             for pr in &prs {
                                 let sha = pr.head_sha.clone();
                                 let number = pr.number;
+                                {
+                                    let repo = repo.clone();
+                                    self.worker.spawn(move || {
+                                        let summary = github::Client::from_store()
+                                            .zip(views::origin_slug(&repo))
+                                            .and_then(|(c, slug)| c.checks(&slug, &sha).ok());
+                                        match summary {
+                                            Some(summary) => {
+                                                Msg::GhPrChecks { number, summary }
+                                            }
+                                            None => Msg::Noop,
+                                        }
+                                    });
+                                }
                                 let repo = repo.clone();
                                 self.worker.spawn(move || {
-                                    let summary = github::Client::from_store()
+                                    let mergeable = github::Client::from_store()
                                         .zip(views::origin_slug(&repo))
-                                        .and_then(|(c, slug)| c.checks(&slug, &sha).ok());
-                                    match summary {
-                                        Some(summary) => Msg::GhPrChecks { number, summary },
+                                        .and_then(|(c, slug)| {
+                                            c.pr_mergeable(&slug, number).ok()
+                                        });
+                                    match mergeable {
+                                        Some(mergeable) => {
+                                            Msg::GhPrMergeable { number, mergeable }
+                                        }
                                         None => Msg::Noop,
                                     }
                                 });
@@ -1105,6 +1250,16 @@ impl App {
             }
             Msg::GhPrChecks { number, summary } => {
                 self.pr.checks.insert(number, summary);
+            }
+            Msg::GhPrMergeable { number, mergeable } => {
+                self.pr.mergeable.insert(number, mergeable);
+            }
+            Msg::GhPrReviewData { number, files, reviews } => {
+                if self.pr.review.pr.as_ref().map(|p| p.number) == Some(number) {
+                    self.pr.review.loading = false;
+                    self.pr.review.files = files;
+                    self.pr.review.reviews = reviews;
+                }
             }
 
             Msg::CiJobDone { index, result } => {
@@ -1173,6 +1328,33 @@ impl App {
                 self.ollama_models = models;
             }
             Msg::OllamaModels(Err(_)) => self.ollama_models.clear(),
+            Msg::AiCiConfig { result } => {
+                self.ci_ai_busy = false;
+                match result {
+                    Ok(toml_text) => {
+                        // Proposal only: opens for review, never auto-written.
+                        self.ci_ai_proposal = toml_text;
+                        self.dialog = Dialog::CiConfigReview;
+                    }
+                    Err(e) => self.toast(e, true),
+                }
+            }
+            Msg::AiMergeProposal { path, result } => {
+                self.conflicts.ai_busy = None;
+                match result {
+                    Ok(content) => {
+                        // Proposal only: shown for review, never auto-applied.
+                        self.conflicts.editor = content.clone();
+                        self.conflicts.ai_proposal =
+                            Some(AiMergeProposal { path: path.clone(), content });
+                        self.toast(
+                            format!("AI proposed a merge for {path}. Review before accepting."),
+                            false,
+                        );
+                    }
+                    Err(e) => self.toast(e, true),
+                }
+            }
             Msg::AiSuggestion { target, result } => {
                 self.ai_busy = false;
                 match (target, result) {
@@ -1276,6 +1458,7 @@ impl App {
         let token = self.gh_token();
         let force = action == "force-push";
         self.busy = true;
+        self.sync_op = Some(if force { "force-push" } else { "push" });
         self.worker.spawn(move || {
             let auth = token.as_deref();
             let result = if force {
@@ -1309,6 +1492,130 @@ impl App {
         });
     }
 
+    /// Opens the in-app review screen for a PR and loads its files and
+    /// existing reviews in the background.
+    pub fn open_pr_review(&mut self, pr: github::PullRequest) {
+        let number = pr.number;
+        self.pr.review = PrReviewState {
+            pr: Some(pr),
+            loading: true,
+            ..Default::default()
+        };
+        self.dialog = Dialog::PrReview;
+        let Some(repo) = self.repo.clone() else { return };
+        self.worker.spawn(move || {
+            let data = github::Client::from_store()
+                .zip(views::origin_slug(&repo))
+                .map(|(client, slug)| {
+                    let files = client.pr_files(&slug, number).unwrap_or_default();
+                    let reviews = client.pr_reviews(&slug, number).unwrap_or_default();
+                    (files, reviews)
+                });
+            match data {
+                Some((files, reviews)) => Msg::GhPrReviewData { number, files, reviews },
+                None => Msg::Done {
+                    message: Err("Not signed in to GitHub".into()),
+                    refresh: false,
+                },
+            }
+        });
+    }
+
+    /// Submits the current review with the given event
+    /// (APPROVE / REQUEST_CHANGES / COMMENT) including pending inline
+    /// comments. Called from the review dialog's confirm popup.
+    pub fn submit_pr_review(&mut self, event: String) {
+        let Some(pr) = self.pr.review.pr.clone() else { return };
+        let Some(repo) = self.repo.clone() else { return };
+        let body = self.pr.review.body.clone();
+        let comments = self.pr.review.pending.clone();
+        self.pr.review.submitting = true;
+        let number = pr.number;
+        self.worker.spawn(move || {
+            let result = (|| -> Result<String, String> {
+                let client = github::Client::from_store().ok_or("Not signed in")?;
+                let slug = views::origin_slug(&repo).ok_or("No github.com remote")?;
+                client
+                    .submit_review(&slug, number, &event, &body, &comments)
+                    .map_err(|e| e.to_string())?;
+                Ok(format!("Review submitted on #{number}"))
+            })();
+            Msg::Done { message: result, refresh: true }
+        });
+    }
+
+    /// Asks the selected AI to draft a `.git-manage-ci.toml` for this repo
+    /// from a scan of its files and manifests. The result opens in a review
+    /// dialog; nothing is written until the user confirms.
+    pub fn generate_ci_config(&mut self) {
+        let Some(repo) = self.repo.clone() else { return };
+        let Some(sel) = self.ai_selection(worker::AiTarget::Commit) else {
+            self.toast("No AI model selected. Pick one next to the AI button.", true);
+            return;
+        };
+        self.ci_ai_busy = true;
+        let ollama_url = self.effective_ollama_url();
+        self.worker.spawn(move || {
+            let scan = crate::local_ci::repo_scan(repo.path());
+            let result = if sel.provider == "claude" {
+                claude::Client::from_store(sel.model)
+                    .ok_or("Claude is not signed in. Open Settings.".to_string())
+                    .and_then(|c| strerr(c.generate_ci_config(&scan)))
+            } else {
+                strerr(ollama::Client::new(ollama_url).generate_ci_config(&sel.model, &scan))
+            };
+            Msg::AiCiConfig { result }
+        });
+    }
+
+    /// Asks the selected AI to propose a merge for one conflicted file.
+    /// The result is only a proposal: it is loaded into the review editor
+    /// and must be explicitly confirmed by the user before anything is
+    /// written to the working tree or index.
+    pub fn ai_resolve_conflict(&mut self, path: String) {
+        let Some(file) = self.conflicts.files.iter().find(|f| f.path == path).cloned()
+        else {
+            return;
+        };
+        let Some(sel) = self.ai_selection(worker::AiTarget::Commit) else {
+            self.toast("No AI model selected. Pick one next to the AI button.", true);
+            return;
+        };
+        let base = file.base.clone().unwrap_or_default();
+        let ours = file.ours.clone().unwrap_or_default();
+        let theirs = file.theirs.clone().unwrap_or_default();
+        let custom = self.conflict_prompt();
+        self.conflicts.ai_busy = Some(path.clone());
+        let ollama_url = self.effective_ollama_url();
+        self.worker.spawn(move || {
+            let custom = custom.as_deref();
+            let result = if sel.provider == "claude" {
+                claude::Client::from_store(sel.model)
+                    .ok_or("Claude is not signed in. Open Settings.".to_string())
+                    .and_then(|c| {
+                        strerr(c.resolve_conflict(&path, &base, &ours, &theirs, custom))
+                    })
+            } else {
+                strerr(ollama::Client::new(ollama_url).resolve_conflict(
+                    &sel.model, &path, &base, &ours, &theirs, custom,
+                ))
+            };
+            Msg::AiMergeProposal { path, result }
+        });
+    }
+
+    /// Starts fixing a PR's merge conflicts locally: checks out the head
+    /// branch, merges origin/<base>, and opens the conflict resolver.
+    pub fn fix_pr_conflicts(&mut self, head: String, base: String) {
+        let Some(repo) = self.repo.clone() else { return };
+        self.dialog = Dialog::None;
+        self.busy = true;
+        self.toast(format!("Preparing conflict fix: {head} <- {base}…"), false);
+        self.worker.spawn(move || {
+            Msg::MergeOutcome(repo.start_pr_conflict_fix(&head, &base))
+        });
+    }
+
     /// Starts a "merge current branch into target" flow: checks GitHub
     /// branch protection first, then opens a confirmation dialog that
     /// warns when repository rules restrict the target.
@@ -1336,8 +1643,19 @@ impl App {
     /// Executes a confirmed destructive action.
     pub fn execute_confirmed(&mut self, action: ConfirmAction) {
         self.dialog = Dialog::None;
+        // Overwrite-AI-text needs no repo mutation, handle before repo gate.
+        if let ConfirmAction::OverwriteAiText(target) = &action {
+            match target {
+                worker::AiTarget::Commit => self.generate_ai_message(),
+                worker::AiTarget::PullRequest => self.generate_pr_text(),
+            }
+            return;
+        }
         let Some(repo) = self.repo.clone() else { return };
+        #[allow(clippy::match_same_arms)]
         match action {
+            // Handled above; kept for exhaustiveness.
+            ConfirmAction::OverwriteAiText(_) => {}
             ConfirmAction::DiscardFile(path) => {
                 if self.selected_file.as_deref() == Some(path.as_str()) {
                     views::clear_diff_view(self);

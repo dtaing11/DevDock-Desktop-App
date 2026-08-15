@@ -286,7 +286,7 @@ Things the orchestration layer guarantees to every runner:
 - `script` uses `&&` semantics; don't re-split commands.
 - Output is capped (64 KB) and timed by the caller; just return everything.
 
-Things expected **from** your runner:
+Things expected *hbhj*from** your runner:
 
 - `id()` is stable and lowercase; it's a public config API.
 - `available()` is cheap; it runs before every job.

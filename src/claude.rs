@@ -13,14 +13,15 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Default model when none is chosen, Anthropic's fast/cheap tier.
-pub const DEFAULT_MODEL: &str = "claude-3-5-haiku-latest";
+/// Haiku also consumes the least subscription quota under OAuth.
+pub const DEFAULT_MODEL: &str = "claude-haiku-4-5-20251001";
 
 /// Static fallback list, used only when the models API is unreachable.
 pub const FALLBACK_MODELS: &[&str] =
-    &["claude-3-5-haiku-latest", "claude-sonnet-4-5", "claude-opus-4-1"];
+    &["claude-haiku-4-5-20251001", "claude-sonnet-4-5-20250929", "claude-opus-4-5-20251101"];
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
-const MAX_DIFF_CHARS: usize = 24_000;
+const MAX_DIFF_CHARS: usize = 12_000;
 const SYSTEM_PROMPT: &str = "You are an expert software engineer writing git commit messages. \
 Given a diff, produce a concise conventional-commit style summary line (max 72 chars, imperative mood, \
 e.g. 'feat: add user login') and a short description body explaining what changed and why. \
@@ -90,6 +91,14 @@ impl CredentialStore {
 // ---------------------------------------------------------------------------
 // OAuth (PKCE, manual code paste like Claude Code)
 // ---------------------------------------------------------------------------
+
+/// Internal classification for retry decisions.
+enum RequestError {
+    /// Worth retrying after a wait (429 rate limits, 5xx).
+    Transient { wait_hint: Option<u64>, error: ClaudeError },
+    /// Retrying will not help (auth errors, bad requests).
+    Fatal(ClaudeError),
+}
 
 /// An in-progress OAuth sign-in: open `url`, then exchange the pasted code.
 #[derive(Clone)]
@@ -315,16 +324,108 @@ impl Client {
         Ok(crate::ollama::parse_suggestion_text(&text))
     }
 
+    /// Asks Claude to merge a conflicted file from its three stages.
+    /// Returns the full merged file content.
+    pub fn resolve_conflict(
+        &self,
+        path: &str,
+        base: &str,
+        ours: &str,
+        theirs: &str,
+        extra_instructions: Option<&str>,
+    ) -> Result<String> {
+        // Claude's smaller budget: the merge output must reproduce the whole
+        // file, so cap input well below the commit-diff budget logic.
+        let prompt = crate::ollama::merge_prompt(path, base, ours, theirs, 24_000)
+            .map_err(ClaudeError)?;
+        let system = crate::ollama::merge_system_prompt(extra_instructions);
+        let text = self.request_with_system(&system, &prompt, 8192)?;
+        Ok(crate::ollama::extract_merged_content(&text))
+    }
+
+    /// Asks Claude to draft a `.git-manage-ci.toml` from a repo scan.
+    /// Returns raw TOML text (a proposal for the user to review).
+    pub fn generate_ci_config(&self, repo_scan: &str) -> Result<String> {
+        let prompt = format!(
+            "Write .git-manage-ci.toml for this repository:\n\n{}",
+            truncate_utf8(repo_scan, MAX_DIFF_CHARS)
+        );
+        let text = self.request_with_system(
+            crate::local_ci::AI_CONFIG_SYSTEM_PROMPT,
+            &prompt,
+            2048,
+        )?;
+        Ok(crate::ollama::extract_merged_content(&text))
+    }
+
     fn request(&self, prompt: &str, max_tokens: u32) -> Result<String> {
         self.request_with_system(SYSTEM_PROMPT, prompt, max_tokens)
     }
 
+    /// Sends one request with automatic retry on transient failures and
+    /// automatic model fallback on persistent rate limits.
+    ///
+    /// Claude subscriptions cap Opus/Sonnet usage separately from (and far
+    /// lower than) Haiku. When the selected model keeps returning 429, we
+    /// silently fall back to the newest Haiku so generation still succeeds
+    /// on subscription auth, instead of failing until the weekly window
+    /// resets. Transient 429/5xx also get bounded backoff retries.
     fn request_with_system(
         &self,
         system: &str,
         prompt: &str,
         max_tokens: u32,
     ) -> Result<String> {
+        /// Backoff retries. Waits are short because model fallback (not
+        /// waiting) is the real fix for persistent subscription limits.
+        const MAX_RETRIES: u32 = 2;
+        const MAX_WAIT_SECS: u64 = 15;
+
+        let mut model = self.model.clone();
+        let mut fell_back = false;
+        let mut attempt = 0;
+        loop {
+            match self.request_once(&model, system, prompt, max_tokens) {
+                Err(RequestError::Transient { wait_hint, error }) => {
+                    // First 429 on a non-Haiku model: switch to Haiku
+                    // immediately. Opus/Sonnet caps are weekly, so backoff
+                    // cannot clear them, but Haiku's cap is far higher.
+                    if !fell_back && !model.contains("haiku") {
+                        if let Some(haiku) = self.newest_haiku() {
+                            model = haiku;
+                            fell_back = true;
+                            attempt = 0;
+                            continue;
+                        }
+                    }
+                    attempt += 1;
+                    if attempt > MAX_RETRIES {
+                        return Err(error);
+                    }
+                    let wait = wait_hint
+                        .unwrap_or(2 * 3u64.pow(attempt - 1))
+                        .min(MAX_WAIT_SECS);
+                    std::thread::sleep(Duration::from_secs(wait));
+                }
+                Err(RequestError::Fatal(e)) => return Err(e),
+                Ok(text) => return Ok(text),
+            }
+        }
+    }
+
+    /// Newest Haiku model id available to this account, for rate-limit
+    /// fallback. Uses the live model list so ids never go stale.
+    fn newest_haiku(&self) -> Option<String> {
+        self.models().into_iter().find(|m| m.contains("haiku"))
+    }
+
+    fn request_once(
+        &self,
+        model: &str,
+        system: &str,
+        prompt: &str,
+        max_tokens: u32,
+    ) -> std::result::Result<String, RequestError> {
         #[derive(Deserialize)]
         struct Content {
             text: Option<String>,
@@ -335,7 +436,7 @@ impl Client {
         }
 
         let payload = serde_json::json!({
-            "model": self.model,
+            "model": model,
             "max_tokens": max_tokens,
             "system": system,
             "messages": [{"role": "user", "content": prompt}],
@@ -355,30 +456,50 @@ impl Client {
         let resp = req.send_json(payload);
 
         let value: serde_json::Value = match resp {
-            Ok(r) => r.into_json().map_err(|e| ClaudeError(e.to_string()))?,
+            Ok(r) => r
+                .into_json()
+                .map_err(|e| RequestError::Fatal(ClaudeError(e.to_string())))?,
             Err(ureq::Error::Status(code, r)) => {
+                let retry_after: Option<u64> =
+                    r.header("retry-after").and_then(|v| v.parse().ok());
                 let body: serde_json::Value = r.into_json().unwrap_or_default();
                 let detail = body
                     .pointer("/error/message")
                     .and_then(|m| m.as_str())
                     .unwrap_or("request failed");
+                // 429 and 5xx are transient: retried automatically with
+                // backoff before this error ever reaches the user.
+                if code == 429 || code >= 500 {
+                    let error = ClaudeError(format!(
+                        "Claude API {code} on {model}: {detail} (auto-retried \
+                         and tried falling back to Haiku. Subscriptions cap \
+                         Opus/Sonnet separately; pick Haiku in the model \
+                         picker or wait for the window to reset)"
+                    ));
+                    return Err(RequestError::Transient { wait_hint: retry_after, error });
+                }
                 let hint = match code {
                     401 => " (sign in again in Settings)",
-                    429 => " (rate limited, try again shortly)",
                     _ => "",
                 };
-                return Err(ClaudeError(format!("Claude API {code}: {detail}{hint}")));
+                return Err(RequestError::Fatal(ClaudeError(format!(
+                    "Claude API {code}: {detail}{hint}"
+                ))));
             }
-            Err(e) => return Err(ClaudeError(format!("Cannot reach Claude: {e}"))),
+            Err(e) => {
+                return Err(RequestError::Fatal(ClaudeError(format!(
+                    "Cannot reach Claude: {e}"
+                ))))
+            }
         };
-        let parsed: Response =
-            serde_json::from_value(value).map_err(|e| ClaudeError(format!("Bad response: {e}")))?;
+        let parsed: Response = serde_json::from_value(value)
+            .map_err(|e| RequestError::Fatal(ClaudeError(format!("Bad response: {e}"))))?;
         parsed
             .content
             .into_iter()
             .filter_map(|c| c.text)
             .next()
-            .ok_or_else(|| ClaudeError("Claude returned no text".into()))
+            .ok_or_else(|| RequestError::Fatal(ClaudeError("Claude returned no text".into())))
     }
 }
 

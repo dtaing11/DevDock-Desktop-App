@@ -510,3 +510,49 @@ fn merge_into_lands_commits_on_target() {
     assert!(!outcome.ok);
     assert!(outcome.message.contains("same branch"));
 }
+
+#[test]
+fn pr_conflict_fix_flow() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "f.txt", "base\n", "base");
+    repo.push(true, None).unwrap();
+
+    // Feature branch diverges and conflicts with main.
+    repo.create_branch("feature", true).unwrap();
+    commit_file(&repo, "f.txt", "feature version\n", "feature edit");
+    repo.push(true, None).unwrap();
+    repo.checkout("main").unwrap();
+    commit_file(&repo, "f.txt", "main version\n", "main edit");
+    repo.push(false, None).unwrap();
+
+    // Simulate the app's "Fix conflicts" on the PR (head=feature, base=main).
+    let outcome = repo.start_pr_conflict_fix("feature", "main");
+    assert!(!outcome.ok && outcome.conflict, "expected conflict: {}", outcome.message);
+    assert_eq!(repo.current_branch(), "feature");
+    assert_eq!(repo.state().unwrap(), RepoState::Merging);
+
+    // Resolve and complete, exactly as the resolver UI does.
+    repo.resolve("f.txt", &Resolution::Manual("merged result\n".into())).unwrap();
+    assert!(repo.merge_continue().ok);
+    assert_eq!(repo.state().unwrap(), RepoState::Clean);
+    // Pushing the head branch would now clear the PR's conflict state.
+    repo.push(false, None).unwrap();
+    assert_eq!(read(&repo, "f.txt"), "merged result\n");
+}
+
+#[test]
+fn patch_line_numbering() {
+    use git_manage::github::parse_patch_lines;
+    let patch = "@@ -1,3 +1,4 @@\n context\n-removed\n+added one\n+added two\n context2";
+    let lines = parse_patch_lines(patch);
+    assert_eq!(lines[0].old_line, None); // hunk header
+    assert_eq!(lines[1].old_line, Some(1)); // context
+    assert_eq!(lines[1].new_line, Some(1));
+    assert_eq!(lines[2].old_line, Some(2)); // removed: old side only
+    assert_eq!(lines[2].new_line, None);
+    assert_eq!(lines[3].new_line, Some(2)); // added: new side only
+    assert_eq!(lines[3].old_line, None);
+    assert_eq!(lines[4].new_line, Some(3));
+    assert_eq!(lines[5].old_line, Some(3)); // trailing context advances both
+    assert_eq!(lines[5].new_line, Some(4));
+}

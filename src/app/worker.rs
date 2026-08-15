@@ -48,10 +48,24 @@ pub enum Msg {
     Graph(Vec<crate::app::graph::GraphNode>),
     /// CI checks for one PR head SHA.
     GhPrChecks { number: u64, summary: ChecksSummary },
+    /// Mergeable state for one PR (None = GitHub still computing).
+    GhPrMergeable { number: u64, mergeable: Option<bool> },
+    /// Changed files + submitted reviews for the PR being reviewed.
+    GhPrReviewData {
+        number: u64,
+        files: Vec<crate::github::PrFile>,
+        reviews: Vec<crate::github::PrReview>,
+    },
 
     OllamaModels(Result<Vec<Model>, String>),
     /// AI-generated text for the commit box or the PR form.
     AiSuggestion { target: AiTarget, result: Result<CommitSuggestion, String> },
+    /// AI-proposed merged content for one conflicted file. Never applied
+    /// automatically: the user must review and confirm in the resolver.
+    AiMergeProposal { path: String, result: Result<String, String> },
+    /// AI-drafted local CI config (TOML). Never written automatically:
+    /// the user reviews and confirms in a dialog first.
+    AiCiConfig { result: Result<String, String> },
 
     /// Background task finished with nothing to report.
     Noop,

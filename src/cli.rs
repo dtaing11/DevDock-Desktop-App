@@ -14,7 +14,7 @@ pub fn run(args: &[String]) -> Option<ExitCode> {
     let cmd = args.first().map(String::as_str)?;
     let rest = &args[1..];
     let code = match cmd {
-        "ci" => cmd_ci(),
+        "ci" => cmd_ci(rest),
         "status" => cmd_status(),
         "log" => cmd_log(rest),
         "branches" => cmd_branches(),
@@ -23,6 +23,7 @@ pub fn run(args: &[String]) -> Option<ExitCode> {
         "commit" => cmd_commit(rest),
         "pr" => cmd_pr(rest),
         "hook" => cmd_hook(rest),
+        "resolve" => cmd_resolve(),
         "help" | "--help" | "-h" => {
             print_help();
             ExitCode::SUCCESS
@@ -63,7 +64,10 @@ fn print_help() {
         ("push --no-verify", "skip the local CI gate"),
         ("pr -t TITLE [-b BODY]", "CI gate, push, open PR into main"),
         ("pr --ai", "AI-generated PR title and body"),
+        ("resolve", "interactive conflict resolver with AI proposals"),
         ("ci", "run all local CI jobs (.git-manage-ci.toml)"),
+        ("ci init", "write a starter .git-manage-ci.toml"),
+        ("ci init --ai", "AI drafts the CI config; review before saving"),
         ("hook install|remove|status", "git pre-push hook running devdock ci"),
         ("help", "this text"),
     ];
@@ -93,7 +97,15 @@ fn repo_root() -> Result<PathBuf, ExitCode> {
 // Commands
 // ---------------------------------------------------------------------------
 
-fn cmd_ci() -> ExitCode {
+fn cmd_ci(rest: &[String]) -> ExitCode {
+    match rest.first().map(String::as_str) {
+        Some("init") => return cmd_ci_init(rest.get(1).map(String::as_str) == Some("--ai")),
+        Some(other) if other != "--ai" => {
+            eprintln!("devdock ci: unknown subcommand \"{other}\" (try: ci, ci init, ci init --ai)");
+            return ExitCode::from(2);
+        }
+        _ => {}
+    }
     let Ok(root) = repo_root() else { return ExitCode::FAILURE };
     match crate::local_ci::run_all_cli(&root) {
         Ok(true) => ExitCode::SUCCESS,
@@ -104,6 +116,183 @@ fn cmd_ci() -> ExitCode {
         Err(e) => {
             eprintln!("devdock ci: {e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// Creates `.git-manage-ci.toml`: template, or AI-drafted from a repo
+/// scan with mandatory review. The AI draft is printed in full, validated,
+/// and only written after explicit confirmation.
+fn cmd_ci_init(ai: bool) -> ExitCode {
+    use std::io::{BufRead, Write};
+    let root = match repo_root() {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+    let config_path = root.join(crate::local_ci::CONFIG_FILE);
+    let exists = config_path.exists();
+
+    if !ai {
+        if exists {
+            eprintln!(
+                "devdock: {} already exists (delete it first, or use `ci init --ai`)",
+                crate::local_ci::CONFIG_FILE
+            );
+            return ExitCode::FAILURE;
+        }
+        return match crate::local_ci::write_template(&root) {
+            Ok(()) => {
+                println!("{} {}", style::green("created"), crate::local_ci::CONFIG_FILE);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("devdock: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    // AI draft.
+    let config = crate::app::Config::load();
+    let (provider, model) = match &config.commit_ai {
+        Some(sel) => (sel.provider.clone(), sel.model.clone()),
+        None => {
+            let provider = config.ai_provider.clone().unwrap_or_else(|| "ollama".into());
+            let model = if provider == "claude" {
+                config.claude_model.clone().unwrap_or_default()
+            } else {
+                config.ollama_model.clone().unwrap_or_default()
+            };
+            (provider, model)
+        }
+    };
+    println!("{}", style::dim("scanning the repository…"));
+    let scan = crate::local_ci::repo_scan(&root);
+    println!("{}", style::dim("asking the AI to draft the config…"));
+    let draft = if provider == "claude" {
+        match crate::claude::Client::from_store(model)
+            .ok_or_else(|| "Claude is not signed in (sign in from the GUI settings)".to_string())
+            .and_then(|c| c.generate_ci_config(&scan).map_err(|e| e.to_string()))
+        {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("devdock: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        if model.is_empty() {
+            eprintln!("devdock: no Ollama model configured (pick one in the GUI)");
+            return ExitCode::FAILURE;
+        }
+        let url = config.ollama_url.unwrap_or_else(|| crate::ollama::DEFAULT_URL.into());
+        match crate::ollama::Client::new(url).generate_ci_config(&model, &scan) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("devdock: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+
+    // Validate before showing, so the user reviews something loadable.
+    if let Err(e) = toml::from_str::<crate::local_ci::Config>(&draft) {
+        eprintln!("devdock: the AI produced invalid TOML ({e}); try again");
+        return ExitCode::FAILURE;
+    }
+
+    println!("\n{}", style::header(&format!("AI proposed {}", crate::local_ci::CONFIG_FILE)));
+    for line in draft.lines() {
+        println!("  {line}");
+    }
+    println!("{}", style::header("end"));
+    if exists {
+        println!(
+            "{}",
+            style::yellow(&format!(
+                "{} already exists and will be overwritten",
+                crate::local_ci::CONFIG_FILE
+            ))
+        );
+    }
+    println!("{}", style::dim("nothing is written until you accept"));
+
+    let stdin = std::io::stdin();
+    loop {
+        print!(
+            "{} {} {} ? ",
+            style::green("[a]ccept"),
+            style::teal("[e]dit in $EDITOR"),
+            style::red("[q]uit")
+        );
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line).is_err() {
+            return ExitCode::FAILURE;
+        }
+        match line.trim().to_lowercase().as_str() {
+            "a" | "y" | "yes" => {
+                return match std::fs::write(&config_path, &draft) {
+                    Ok(()) => {
+                        println!("{} {}", style::green("saved"), crate::local_ci::CONFIG_FILE);
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("devdock: {e}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
+            "e" => {
+                // Write to a temp file, open $EDITOR, re-validate, then confirm.
+                let tmp = std::env::temp_dir().join("devdock-ci-draft.toml");
+                if let Err(e) = std::fs::write(&tmp, &draft) {
+                    eprintln!("devdock: {e}");
+                    return ExitCode::FAILURE;
+                }
+                let editor =
+                    std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
+                let status = std::process::Command::new(&editor).arg(&tmp).status();
+                if !status.map(|s| s.success()).unwrap_or(false) {
+                    eprintln!("devdock: editor exited abnormally; keeping the draft");
+                    continue;
+                }
+                let edited = match std::fs::read_to_string(&tmp) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("devdock: {e}");
+                        continue;
+                    }
+                };
+                match toml::from_str::<crate::local_ci::Config>(&edited) {
+                    Ok(parsed) => {
+                        return match std::fs::write(&config_path, &edited) {
+                            Ok(()) => {
+                                println!(
+                                    "{} {} ({} job(s))",
+                                    style::green("saved"),
+                                    crate::local_ci::CONFIG_FILE,
+                                    parsed.jobs.len()
+                                );
+                                ExitCode::SUCCESS
+                            }
+                            Err(e) => {
+                                eprintln!("devdock: {e}");
+                                ExitCode::FAILURE
+                            }
+                        };
+                    }
+                    Err(e) => {
+                        eprintln!("devdock: edited file is invalid TOML ({e}); not saved");
+                        continue;
+                    }
+                }
+            }
+            "q" | "n" | "no" => {
+                println!("devdock: discarded, nothing written");
+                return ExitCode::SUCCESS;
+            }
+            other => println!("devdock: \"{other}\"? a / e / q"),
         }
     }
 }
@@ -457,6 +646,242 @@ fn ai_message(repo: &Repo) -> Result<crate::ollama::CommitSuggestion, String> {
             .commit_message(&model, &diff, None)
             .map_err(|e| e.to_string())
     }
+}
+
+/// Interactive merge-conflict resolver. For each conflicted file the user
+/// picks ours/theirs, or asks the AI for a proposed merge. AI output is
+/// never applied silently: it is printed in full and must be explicitly
+/// accepted (or regenerated/skipped) before anything is written.
+fn cmd_resolve() -> ExitCode {
+    use std::io::{BufRead, Write};
+    let repo = match repo() {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+    let state = repo.state().unwrap_or(crate::git::RepoState::Clean);
+    let conflicts = match repo.conflicts() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("devdock: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if conflicts.is_empty() {
+        println!("devdock: no conflicted files");
+        return ExitCode::SUCCESS;
+    }
+    println!(
+        "{} {} conflicted file(s)",
+        style::header("resolve"),
+        style::bold(&conflicts.len().to_string())
+    );
+
+    let stdin = std::io::stdin();
+    let mut resolved = 0usize;
+    for file in &conflicts {
+        let path = &file.path;
+        println!("
+{} {}", style::yellow("[conflict]"), style::bold(path));
+        loop {
+            print!(
+                "{} {} {} {} {} ? ",
+                style::green("[a]i merge"),
+                style::teal("[o]urs"),
+                style::teal("[t]heirs"),
+                style::dim("[s]kip"),
+                style::red("[q]uit")
+            );
+            let _ = std::io::stdout().flush();
+            let mut line = String::new();
+            if stdin.lock().read_line(&mut line).is_err() {
+                return ExitCode::FAILURE;
+            }
+            match line.trim().to_lowercase().as_str() {
+                "a" | "" => {
+                    match ai_merge(&repo, file) {
+                        Ok(merged) => {
+                            if review_ai_merge(&repo, path, &merged, &stdin) {
+                                resolved += 1;
+                                break;
+                            }
+                            // Declined: fall through to re-prompt for this file.
+                        }
+                        Err(e) => eprintln!("devdock: {e}"),
+                    }
+                }
+                "o" => match repo.resolve(path, &crate::git::Resolution::Ours) {
+                    Ok(()) => {
+                        println!("{} kept ours: {path}", style::green("resolved"));
+                        resolved += 1;
+                        break;
+                    }
+                    Err(e) => eprintln!("devdock: {e}"),
+                },
+                "t" => match repo.resolve(path, &crate::git::Resolution::Theirs) {
+                    Ok(()) => {
+                        println!("{} kept theirs: {path}", style::green("resolved"));
+                        resolved += 1;
+                        break;
+                    }
+                    Err(e) => eprintln!("devdock: {e}"),
+                },
+                "s" => {
+                    println!("{} skipped {path}", style::dim("·"));
+                    break;
+                }
+                "q" => {
+                    println!("devdock: stopping; {resolved} file(s) resolved so far");
+                    return ExitCode::SUCCESS;
+                }
+                other => println!("devdock: \"{other}\"? a / o / t / s / q"),
+            }
+        }
+    }
+
+    if resolved == conflicts.len() {
+        let verb = match state {
+            crate::git::RepoState::Rebasing => "rebase",
+            _ => "merge",
+        };
+        print!(
+            "\nall conflicts resolved. continue the {verb} now? {} {} ? ",
+            style::green("[y]es"),
+            style::dim("[n]o")
+        );
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line).is_ok()
+            && matches!(line.trim().to_lowercase().as_str(), "y" | "yes" | "")
+        {
+            let outcome = match state {
+                crate::git::RepoState::Rebasing => repo.rebase_continue(),
+                _ => repo.merge_continue(),
+            };
+            if outcome.ok {
+                println!("{} {verb} completed", style::green("done"));
+            } else {
+                eprintln!("devdock: {}", outcome.message);
+                return ExitCode::FAILURE;
+            }
+        } else {
+            println!("devdock: staged resolutions kept; run `git {verb} --continue` when ready");
+        }
+    } else {
+        println!(
+            "\ndevdock: {resolved}/{} resolved; run `devdock resolve` again for the rest",
+            conflicts.len()
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+/// Prints an AI-proposed merge and asks for explicit confirmation.
+/// Returns true when the user accepted and the file was written+staged.
+fn review_ai_merge(
+    repo: &Repo,
+    path: &str,
+    merged: &str,
+    stdin: &std::io::Stdin,
+) -> bool {
+    use std::io::{BufRead, Write};
+    println!("\n{}", style::header(&format!("AI proposed merge for {path}")));
+    for line in merged.lines() {
+        println!("  {line}");
+    }
+    println!("{}", style::header("end"));
+    println!(
+        "{}",
+        style::dim("nothing is applied until you accept")
+    );
+    loop {
+        print!(
+            "{} {} ? ",
+            style::green("[a]ccept"),
+            style::red("[d]ecline")
+        );
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line).is_err() {
+            return false;
+        }
+        match line.trim().to_lowercase().as_str() {
+            "a" | "y" | "yes" => {
+                match repo.resolve(path, &crate::git::Resolution::Manual(merged.to_string())) {
+                    Ok(()) => {
+                        println!("{} {path}", style::green("resolved"));
+                        return true;
+                    }
+                    Err(e) => {
+                        eprintln!("devdock: {e}");
+                        return false;
+                    }
+                }
+            }
+            "d" | "n" | "no" | "q" => return false,
+            other => println!("devdock: \"{other}\"? a / d"),
+        }
+    }
+}
+
+/// Asks the configured AI (commit-task selection) to merge one conflicted
+/// file, honoring the repo's custom conflict-resolution instructions.
+fn ai_merge(repo: &Repo, file: &crate::git::ConflictFile) -> Result<String, String> {
+    let config = crate::app::Config::load();
+    let (provider, model) = match &config.commit_ai {
+        Some(sel) => (sel.provider.clone(), sel.model.clone()),
+        None => {
+            let provider = config.ai_provider.clone().unwrap_or_else(|| "ollama".into());
+            let model = if provider == "claude" {
+                config.claude_model.clone().unwrap_or_default()
+            } else {
+                config.ollama_model.clone().unwrap_or_default()
+            };
+            (provider, model)
+        }
+    };
+    let custom = conflict_instructions(&config, repo);
+    let base = file.base.clone().unwrap_or_default();
+    let ours = file.ours.clone().unwrap_or_default();
+    let theirs = file.theirs.clone().unwrap_or_default();
+
+    println!("{}", style::dim("asking the AI to merge…"));
+    if provider == "claude" {
+        let client = crate::claude::Client::from_store(model)
+            .ok_or("Claude is not signed in (sign in from the GUI settings)")?;
+        client
+            .resolve_conflict(&file.path, &base, &ours, &theirs, custom.as_deref())
+            .map_err(|e| e.to_string())
+    } else {
+        if model.is_empty() {
+            return Err("no Ollama model configured (pick one in the GUI)".into());
+        }
+        let url = config.ollama_url.unwrap_or_else(|| crate::ollama::DEFAULT_URL.into());
+        crate::ollama::Client::new(url)
+            .resolve_conflict(&model, &file.path, &base, &ours, &theirs, custom.as_deref())
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// The repo's custom conflict-resolution prompt: inline text plus linked
+/// Markdown file, mirroring the GUI's AI Prompts dialog.
+fn conflict_instructions(
+    config: &crate::app::Config,
+    repo: &Repo,
+) -> Option<String> {
+    let prompts = config.repo_prompts.get(&repo.path().display().to_string())?;
+    let mut parts: Vec<String> = Vec::new();
+    let inline = prompts.conflict.trim();
+    if !inline.is_empty() {
+        parts.push(inline.to_string());
+    }
+    if let Some(path) = &prompts.conflict_file {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            if !contents.trim().is_empty() {
+                parts.push(contents.trim().to_string());
+            }
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
 fn cmd_hook(rest: &[String]) -> ExitCode {

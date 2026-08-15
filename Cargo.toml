@@ -43,6 +43,6 @@ priority = "optional"
 extended-description = "Native GitHub-Desktop-style git client with GitHub sign-in, pull requests, conflict resolution, and AI commit messages (Ollama or Claude)."
 assets = [
     ["target/release/devdock", "usr/bin/", "755"],
-    ["assets/git-manage.desktop", "usr/share/applications/", "644"],
-    ["assets/icons/git-manage-256.png", "usr/share/icons/hicolor/256x256/apps/git-manage.png", "644"],
+    ["assets/devdock.desktop", "usr/share/applications/", "644"],
+    ["assets/icons/git-manage-256.png", "usr/share/icons/hicolor/256x256/apps/devdock.png", "644"],
 ]

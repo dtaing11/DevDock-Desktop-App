@@ -17,7 +17,9 @@ devdock <command>    # run headlessly
   - [commit](#commit)
   - [push](#push)
   - [pr](#pr)
+  - [resolve](#resolve)
   - [ci](#ci)
+  - [ci init](#ci-init)
   - [hook](#hook)
 - [The CI gate](#the-ci-gate)
 - [Auth and configuration](#auth-and-configuration)
@@ -140,6 +142,34 @@ PR #7 created: https://github.com/you/repo/pull/7
 Requires GitHub sign-in (done once in the GUI) and a github.com remote.
 Refuses to open a PR from `main` onto itself.
 
+### resolve
+
+Interactive merge-conflict resolver. Walks each conflicted file and lets
+you keep ours, keep theirs, or ask the configured AI model to propose a
+merge from the base/ours/theirs versions.
+
+```
+$ devdock resolve
+── resolve ─────────────────────────── 2 conflicted file(s)
+
+[conflict] src/lib.rs
+[a]i merge [o]urs [t]heirs [s]kip [q]uit ? a
+asking the AI to merge…
+
+── AI proposed merge for src/lib.rs ──
+  ...full merged file...
+── end ──
+nothing is applied until you accept
+[a]ccept [d]ecline ? a
+resolved src/lib.rs
+```
+
+AI proposals are never applied silently: the full merged content is
+printed and must be explicitly accepted, mirroring the GUI's
+review-then-accept flow. Custom per-repo conflict instructions from the
+AI Prompts dialog apply here too. When every file is resolved, the
+command offers to run the merge/rebase continue step for you.
+
 ### ci
 
 Runs every job in `.git-manage-ci.toml` and prints per-job results.
@@ -154,6 +184,33 @@ devdock ci: tests ... FAIL (2.4s)
 
 See [local-ci.md](local-ci.md) for job configuration (Docker
 environments, secrets, `[on_push]`).
+
+### ci init
+
+Creates `.git-manage-ci.toml`. Plain `ci init` writes the commented
+starter template. `ci init --ai` scans the repository (file listing plus
+manifests like Cargo.toml, package.json, go.mod, Makefile) and asks the
+configured AI model to draft jobs tailored to the project.
+
+```
+$ devdock ci init --ai
+scanning the repository…
+asking the AI to draft the config…
+
+── AI proposed .git-manage-ci.toml ──
+  [[job]]
+  name = "tests"
+  commands = ["cargo test"]
+  ...
+── end ──
+nothing is written until you accept
+[a]ccept [e]dit in $EDITOR [q]uit ? a
+saved .git-manage-ci.toml
+```
+
+The draft is validated as TOML before you ever see it, and again after
+`[e]dit`. Nothing is written until you accept; quitting discards it.
+An existing config is only overwritten after the same confirmation.
 
 ### hook
 

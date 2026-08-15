@@ -19,6 +19,8 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         Dialog::GitHub => github_dialog(app, ctx, &mut open),
         Dialog::PullRequests => pull_requests(app, ctx, &mut open),
         Dialog::Conflicts => conflict_resolver(app, ctx, &mut open),
+        Dialog::CiConfigReview => ci_config_review(app, ctx, &mut open),
+        Dialog::PrReview => pr_review(app, ctx, &mut open),
         Dialog::Settings => settings(app, ctx, &mut open),
         Dialog::AddRemote => add_remote(app, ctx, &mut open),
         Dialog::SwitchBranch(_) => switch_branch(app, ctx, &mut open),
@@ -401,6 +403,39 @@ fn pull_requests(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                             }
                         }
                     });
+                    if ui
+                        .small_button("Review")
+                        .on_hover_text("Open the full diff, comment, and approve or request changes")
+                        .clicked()
+                    {
+                        app.open_pr_review(pr.clone());
+                    }
+                    match app.pr.mergeable.get(&pr.number) {
+                        Some(Some(false)) => {
+                            ui.label(
+                                RichText::new("[conflicts]").color(theme::DANGER).small(),
+                            )
+                            .on_hover_text("This PR cannot be merged until conflicts are resolved");
+                            if ui
+                                .small_button("Fix conflicts")
+                                .on_hover_text(format!(
+                                    "Checks out {}, merges origin/{} into it, and opens \
+                                     the conflict resolver. Push afterwards to update \
+                                     the PR.",
+                                    pr.head, pr.base
+                                ))
+                                .clicked()
+                            {
+                                app.fix_pr_conflicts(pr.head.clone(), pr.base.clone());
+                            }
+                        }
+                        Some(Some(true)) => {
+                            ui.label(
+                                RichText::new("[mergeable]").color(theme::ADD).small(),
+                            );
+                        }
+                        _ => {}
+                    }
                     if let Some(checks) = app.pr.checks.get(&pr.number) {
                         use crate::github::CheckState;
                         let (label, color) = match checks.state {
@@ -470,6 +505,7 @@ fn conflict_resolver(app: &mut App, ctx: &egui::Context, open: &mut bool) {
             });
             if ui.selectable_label(app.conflicts.selected == Some(*i), text).clicked() {
                 app.conflicts.selected = Some(*i);
+                app.conflicts.ai_proposal = None;
                 app.conflicts.editor = app.conflicts.files[*i]
                     .working
                     .clone()
@@ -495,35 +531,108 @@ fn conflict_resolver(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                     let content = app.conflicts.editor.clone();
                     resolve(app, &path, Resolution::Manual(content));
                 }
+                let ai_busy_here =
+                    app.conflicts.ai_busy.as_deref() == Some(path.as_str());
+                if ai_busy_here {
+                    ui.add(egui::Spinner::new().size(14.0));
+                    ui.label(RichText::new("AI is merging…").italics().weak());
+                } else if ui
+                    .button("Resolve with AI")
+                    .on_hover_text(
+                        "Asks the selected AI model to merge base, ours, and \
+                         theirs. The result is only a proposal: you review it \
+                         below and nothing is applied until you accept it.",
+                    )
+                    .clicked()
+                {
+                    app.ai_resolve_conflict(path.clone());
+                }
             });
 
+            // Pending AI proposal: requires explicit user confirmation.
+            let proposal_here = app
+                .conflicts
+                .ai_proposal
+                .as_ref()
+                .is_some_and(|p| p.path == path);
+            if proposal_here {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "AI PROPOSAL. Review the merged result below and edit it \
+                         if needed. Nothing is applied until you accept.",
+                    )
+                    .color(theme::WARN)
+                    .small(),
+                );
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(egui::Button::new("Accept AI merge").fill(theme::EMBER))
+                        .on_hover_text(
+                            "Writes the reviewed content (including your edits) \
+                             to the file and marks it resolved",
+                        )
+                        .clicked()
+                    {
+                        // Apply what is in the editor, so user edits to the
+                        // proposal are what actually lands.
+                        let content = app.conflicts.editor.clone();
+                        app.conflicts.ai_proposal = None;
+                        resolve(app, &path, Resolution::Manual(content));
+                    }
+                    if ui.button("Discard proposal").clicked() {
+                        app.conflicts.ai_proposal = None;
+                        app.conflicts.editor = app.conflicts.files[i]
+                            .working
+                            .clone()
+                            .unwrap_or_default();
+                    }
+                });
+            }
+
             // Side-by-side: ours | theirs (read-only context above the editor).
+            let lang = crate::app::syntax::Lang::from_path(&path);
             ui.columns(2, |cols| {
                 cols[0].label(RichText::new("OURS (current branch)").color(theme::TEAL).small());
+                let font = egui::TextStyle::Small.resolve(cols[0].style());
                 ScrollArea::vertical().max_height(140.0).id_salt("ours").show(
                     &mut cols[0],
                     |ui| {
                         for line in ours.lines() {
-                            ui.label(RichText::new(line).monospace().small());
+                            ui.label(crate::app::syntax::diff_line_job(
+                                lang,
+                                line,
+                                theme::FG,
+                                font.clone(),
+                                true,
+                            ));
                         }
                     },
                 );
                 cols[1].label(RichText::new("THEIRS (incoming)").color(theme::WARN).small());
+                let font = egui::TextStyle::Small.resolve(cols[1].style());
                 ScrollArea::vertical().max_height(140.0).id_salt("theirs").show(
                     &mut cols[1],
                     |ui| {
                         for line in theirs.lines() {
-                            ui.label(RichText::new(line).monospace().small());
+                            ui.label(crate::app::syntax::diff_line_job(
+                                lang,
+                                line,
+                                theme::FG,
+                                font.clone(),
+                                true,
+                            ));
                         }
                     },
                 );
             });
 
-            ui.label(
-                RichText::new("MERGED RESULT (edit freely, then Save manual edit)")
-                    .color(theme::EMBER)
-                    .small(),
-            );
+            let editor_label = if proposal_here {
+                "AI PROPOSED MERGE (edit freely, then Accept AI merge)"
+            } else {
+                "MERGED RESULT (edit freely, then Save manual edit)"
+            };
+            ui.label(RichText::new(editor_label).color(theme::EMBER).small());
             ScrollArea::vertical().max_height(200.0).id_salt("merged").show(ui, |ui| {
                 ui.add(
                     egui::TextEdit::multiline(&mut app.conflicts.editor)
@@ -545,6 +654,424 @@ fn conflict_resolver(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                 .clicked()
             {
                 finish_conflicts(app);
+            }
+        });
+    });
+}
+
+/// Full in-app pull-request review: changed files with diffs, inline
+/// comments on any diff line, past reviews, and an approve / request
+/// changes / comment verdict. Everything is drafted locally and only
+/// sent to GitHub when the user clicks Submit review.
+fn pr_review(app: &mut App, ctx: &egui::Context, open: &mut bool) {
+    use crate::github::parse_patch_lines;
+    let Some(pr) = app.pr.review.pr.clone() else {
+        app.dialog = Dialog::PullRequests;
+        return;
+    };
+    let title = format!("Review PR #{}: {}", pr.number, pr.title);
+    modal(ctx, &title, open, |ui| {
+        ui.set_min_width(760.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(&pr.head).color(theme::TEAL).monospace());
+            ui.label(RichText::new("into").weak());
+            ui.label(RichText::new(&pr.base).color(theme::TEAL).monospace());
+            ui.label(RichText::new(format!("by {}", pr.user)).weak());
+            if ui.small_button("Back to list").clicked() {
+                app.dialog = Dialog::PullRequests;
+            }
+        });
+
+        // Existing reviews summary.
+        if !app.pr.review.reviews.is_empty() {
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                for review in &app.pr.review.reviews {
+                    let (label, color) = match review.state.as_str() {
+                        "APPROVED" => ("approved", theme::ADD),
+                        "CHANGES_REQUESTED" => ("requested changes", theme::DANGER),
+                        "DISMISSED" => ("dismissed", theme::FG_DIM),
+                        _ => ("commented", theme::FG_DIM),
+                    };
+                    let chip = format!("{} {label}", review.user);
+                    let resp = ui.label(RichText::new(chip).color(color).small());
+                    if !review.body.trim().is_empty() {
+                        resp.on_hover_text(&review.body);
+                    }
+                }
+            });
+        }
+
+        if app.pr.review.loading {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(16.0));
+                ui.label(RichText::new("Loading changed files…").italics().weak());
+            });
+            return;
+        }
+
+        ui.separator();
+
+        // Changed files with expandable diffs.
+        let file_count = app.pr.review.files.len();
+        let total_add: u64 = app.pr.review.files.iter().map(|f| f.additions).sum();
+        let total_del: u64 = app.pr.review.files.iter().map(|f| f.deletions).sum();
+        ui.horizontal(|ui| {
+            ui.label(theme::overline(&format!("{file_count} CHANGED FILES")));
+            ui.label(RichText::new(format!("+{total_add}")).color(theme::ADD).small());
+            ui.label(RichText::new(format!("-{total_del}")).color(theme::DEL).small());
+            let pending = app.pr.review.pending.len();
+            if pending > 0 {
+                ui.label(
+                    RichText::new(format!("{pending} pending comment(s)"))
+                        .color(theme::WARN)
+                        .small(),
+                );
+            }
+        });
+
+        ScrollArea::vertical().max_height(340.0).id_salt("pr_review_files").show(ui, |ui| {
+            for fi in 0..file_count {
+                let (path, status, adds, dels, patch) = {
+                    let f = &app.pr.review.files[fi];
+                    (f.path.clone(), f.status.clone(), f.additions, f.deletions, f.patch.clone())
+                };
+                let selected = app.pr.review.selected == Some(fi);
+                let marker = match status.as_str() {
+                    "added" => RichText::new("[A]").color(theme::ADD),
+                    "removed" => RichText::new("[D]").color(theme::DEL),
+                    "renamed" => RichText::new("[R]").color(theme::TEAL),
+                    _ => RichText::new("[M]").color(theme::WARN),
+                };
+                ui.horizontal(|ui| {
+                    ui.label(marker.monospace().small());
+                    let text = RichText::new(&path).monospace();
+                    if ui.selectable_label(selected, text).clicked() {
+                        app.pr.review.selected = if selected { None } else { Some(fi) };
+                        app.pr.review.comment_target = None;
+                    }
+                    ui.label(RichText::new(format!("+{adds}")).color(theme::ADD).small());
+                    ui.label(RichText::new(format!("-{dels}")).color(theme::DEL).small());
+                });
+
+                if !selected {
+                    continue;
+                }
+                let Some(patch) = patch else {
+                    ui.label(
+                        RichText::new("No text diff (binary or too large). Review on GitHub.")
+                            .italics()
+                            .weak(),
+                    );
+                    continue;
+                };
+
+                let lang = crate::app::syntax::Lang::from_path(&path);
+                let font = egui::TextStyle::Monospace.resolve(ui.style());
+                egui::Frame::default()
+                    .fill(theme::BG)
+                    .inner_margin(6.0)
+                    .corner_radius(4.0)
+                    .show(ui, |ui| {
+                        for pl in parse_patch_lines(&patch) {
+                            let (color, bg) = super::views::diff_line_style(&pl.text);
+                            // Comments anchor to the new side when the line
+                            // exists there, otherwise to the old side.
+                            let anchor = pl
+                                .new_line
+                                .map(|n| (n, "RIGHT".to_string()))
+                                .or(pl.old_line.map(|n| (n, "LEFT".to_string())));
+                            ui.horizontal(|ui| {
+                                let num = pl
+                                    .new_line
+                                    .or(pl.old_line)
+                                    .map(|n| format!("{n:>4}"))
+                                    .unwrap_or_else(|| "    ".into());
+                                ui.label(RichText::new(num).monospace().weak().small());
+                                let mut job = crate::app::syntax::diff_line_job(
+                                    lang,
+                                    &pl.text,
+                                    color,
+                                    font.clone(),
+                                    true,
+                                );
+                                if let Some(bg) = bg {
+                                    for section in &mut job.sections {
+                                        section.format.background = bg;
+                                    }
+                                }
+                                let resp = ui.label(job);
+                                if let Some((line, side)) = anchor.clone() {
+                                    let has_pending = app.pr.review.pending.iter().any(|c| {
+                                        c.path == path && c.line == line && c.side == side
+                                    });
+                                    if has_pending {
+                                        ui.label(
+                                            RichText::new("[comment]")
+                                                .color(theme::WARN)
+                                                .small(),
+                                        );
+                                    }
+                                    if (resp.hovered() || has_pending)
+                                        && ui
+                                            .small_button("+")
+                                            .on_hover_text("Comment on this line")
+                                            .clicked()
+                                    {
+                                        app.pr.review.comment_target =
+                                            Some((fi, line, side));
+                                        app.pr.review.comment_draft.clear();
+                                    }
+                                }
+                            });
+
+                            // Inline comment editor under the target line.
+                            if let Some((tfi, tline, tside)) =
+                                app.pr.review.comment_target.clone()
+                            {
+                                let is_here = tfi == fi
+                                    && anchor.as_ref().map(|(l, s)| (*l, s.clone()))
+                                        == Some((tline, tside.clone()));
+                                if is_here {
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(40.0);
+                                        ui.add(
+                                            egui::TextEdit::multiline(
+                                                &mut app.pr.review.comment_draft,
+                                            )
+                                            .hint_text("Comment on this line…")
+                                            .desired_rows(2)
+                                            .desired_width(480.0),
+                                        );
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(40.0);
+                                        let can_add =
+                                            !app.pr.review.comment_draft.trim().is_empty();
+                                        if ui
+                                            .add_enabled(
+                                                can_add,
+                                                egui::Button::new("Add to review"),
+                                            )
+                                            .clicked()
+                                        {
+                                            app.pr.review.pending.push(
+                                                crate::github::ReviewComment {
+                                                    path: path.clone(),
+                                                    line: tline,
+                                                    side: tside.clone(),
+                                                    body: app
+                                                        .pr
+                                                        .review
+                                                        .comment_draft
+                                                        .trim()
+                                                        .to_string(),
+                                                },
+                                            );
+                                            app.pr.review.comment_target = None;
+                                        }
+                                        if ui.button("Cancel").clicked() {
+                                            app.pr.review.comment_target = None;
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                    });
+            }
+        });
+
+        // Pending comments list (removable before submitting).
+        if !app.pr.review.pending.is_empty() {
+            ui.separator();
+            ui.label(theme::overline("PENDING COMMENTS (not yet submitted)"));
+            let mut remove: Option<usize> = None;
+            for (i, c) in app.pr.review.pending.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("{}:{}", c.path, c.line))
+                            .monospace()
+                            .small()
+                            .color(theme::TEAL),
+                    );
+                    ui.label(RichText::new(&c.body).small());
+                    if ui.small_button("Remove").clicked() {
+                        remove = Some(i);
+                    }
+                });
+            }
+            if let Some(i) = remove {
+                app.pr.review.pending.remove(i);
+            }
+        }
+
+        ui.separator();
+        ui.label(theme::overline("YOUR REVIEW"));
+        ui.add(
+            egui::TextEdit::multiline(&mut app.pr.review.body)
+                .hint_text("Overall review summary (optional for approve/comment)…")
+                .desired_rows(3)
+                .desired_width(f32::INFINITY),
+        );
+
+        ui.horizontal(|ui| {
+            let submitting = app.pr.review.submitting;
+            if submitting {
+                ui.add(egui::Spinner::new().size(14.0));
+                ui.label(RichText::new("Submitting…").italics().weak());
+            } else {
+                let own_pr = app.gh.user.as_ref().map(|u| u.login == pr.user).unwrap_or(false);
+                let approve = ui
+                    .add_enabled(!own_pr, egui::Button::new("Approve").fill(theme::ADD.linear_multiply(0.35)))
+                    .on_hover_text(if own_pr {
+                        "GitHub does not allow approving your own pull request"
+                    } else {
+                        "Approve this pull request"
+                    });
+                if approve.clicked() {
+                    app.submit_pr_review("APPROVE".into());
+                }
+                let request = ui
+                    .add_enabled(
+                        !own_pr,
+                        egui::Button::new("Request changes")
+                            .fill(theme::DANGER.linear_multiply(0.35)),
+                    )
+                    .on_hover_text(if own_pr {
+                        "GitHub does not allow requesting changes on your own pull request"
+                    } else {
+                        "Block the PR until changes are made (summary required)"
+                    });
+                if request.clicked() {
+                    if app.pr.review.body.trim().is_empty() {
+                        app.toast(
+                            "Request changes needs a summary explaining what to change.",
+                            true,
+                        );
+                    } else {
+                        app.submit_pr_review("REQUEST_CHANGES".into());
+                    }
+                }
+                let can_comment = !app.pr.review.body.trim().is_empty()
+                    || !app.pr.review.pending.is_empty();
+                if ui
+                    .add_enabled(can_comment, egui::Button::new("Comment only"))
+                    .on_hover_text("Submit comments without an approval verdict")
+                    .clicked()
+                {
+                    app.submit_pr_review("COMMENT".into());
+                }
+            }
+        });
+    });
+    if app.dialog == Dialog::None && app.pr.review.pr.is_some() {
+        // Dialog was closed via the X: drop the review session.
+        app.pr.review = Default::default();
+    }
+}
+
+/// Review dialog for an AI-drafted `.git-manage-ci.toml`. The TOML is
+/// fully editable, validated live, and only written to the repository
+/// when the user explicitly confirms. Cancel discards everything.
+fn ci_config_review(app: &mut App, ctx: &egui::Context, open: &mut bool) {
+    modal(ctx, "Review AI-generated CI config", open, |ui| {
+        ui.set_min_width(640.0);
+        ui.label(
+            RichText::new(
+                "AI PROPOSAL. Review and edit the config below. Nothing is \
+                 written to your repository until you click Save.",
+            )
+            .color(theme::WARN)
+            .small(),
+        );
+        ui.add_space(4.0);
+
+        ScrollArea::vertical().max_height(360.0).id_salt("ci_ai_toml").show(ui, |ui| {
+            ui.add(
+                egui::TextEdit::multiline(&mut app.ci_ai_proposal)
+                    .code_editor()
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(18),
+            );
+        });
+
+        // Live validation so the user cannot save a broken file.
+        let parsed: Result<crate::local_ci::Config, _> =
+            toml::from_str(&app.ci_ai_proposal);
+        match &parsed {
+            Ok(config) => {
+                let jobs = config.jobs.len();
+                let on_push = if config.on_push.run {
+                    if config.on_push.block_on_failure {
+                        ", runs on push (blocking)"
+                    } else {
+                        ", runs on push (warn only)"
+                    }
+                } else {
+                    ""
+                };
+                ui.label(
+                    RichText::new(format!("Valid: {jobs} job(s){on_push}"))
+                        .color(theme::ADD)
+                        .small(),
+                );
+            }
+            Err(e) => {
+                ui.label(
+                    RichText::new(format!("Invalid TOML: {e}"))
+                        .color(theme::DANGER)
+                        .small(),
+                );
+            }
+        }
+
+        let exists = app
+            .repo
+            .as_ref()
+            .map(|r| r.path().join(crate::local_ci::CONFIG_FILE).exists())
+            .unwrap_or(false);
+        if exists {
+            ui.label(
+                RichText::new(format!(
+                    "{} already exists and will be overwritten.",
+                    crate::local_ci::CONFIG_FILE
+                ))
+                .color(theme::WARN)
+                .small(),
+            );
+        }
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            let save_label = if exists {
+                format!("Save (overwrite {})", crate::local_ci::CONFIG_FILE)
+            } else {
+                format!("Save {}", crate::local_ci::CONFIG_FILE)
+            };
+            if ui
+                .add_enabled(parsed.is_ok(), egui::Button::new(save_label).fill(theme::EMBER))
+                .clicked()
+            {
+                if let Some(repo) = app.repo.as_ref() {
+                    let path = repo.path().join(crate::local_ci::CONFIG_FILE);
+                    match std::fs::write(&path, &app.ci_ai_proposal) {
+                        Ok(()) => {
+                            app.toast(
+                                format!("{} saved.", crate::local_ci::CONFIG_FILE),
+                                false,
+                            );
+                            app.ci_ai_proposal.clear();
+                            app.load_local_ci();
+                            app.dialog = Dialog::PullRequests;
+                        }
+                        Err(e) => app.toast(e.to_string(), true),
+                    }
+                }
+            }
+            if ui.button("Cancel (discard proposal)").clicked() {
+                app.ci_ai_proposal.clear();
+                app.dialog = Dialog::PullRequests;
             }
         });
     });
@@ -846,6 +1373,18 @@ fn repo_prompt_settings(app: &mut App, ui: &mut egui::Ui) {
         &mut changed,
         &mut error,
     );
+    prompt_slot(
+        ui,
+        PromptSlot {
+            label: "Conflict resolution",
+            hint: "e.g. Prefer our naming conventions; never drop test cases.",
+            text: &mut prompts.conflict,
+            file: &mut prompts.conflict_file,
+        },
+        &repo_root,
+        &mut changed,
+        &mut error,
+    );
 
     if changed {
         app.config.save();
@@ -887,6 +1426,20 @@ fn local_ci_panel(app: &mut App, ui: &mut egui::Ui) {
                         Err(e) => app.toast(e.to_string(), true),
                     }
                 }
+            }
+            if app.ci_ai_busy {
+                ui.add(egui::Spinner::new().size(14.0));
+                ui.label(RichText::new("AI is drafting…").italics().weak());
+            } else if ui
+                .small_button("Generate with AI")
+                .on_hover_text(
+                    "Scans the repo (manifests, scripts) and asks the selected \
+                     AI model to draft jobs for this project. You review and \
+                     edit the file before anything is written.",
+                )
+                .clicked()
+            {
+                app.generate_ci_config();
             }
         } else {
             let running = app.local_ci.running;

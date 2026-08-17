@@ -381,38 +381,17 @@ const NOT_WORTH_INLINING: &[&str] = &[
 /// never inlined `pubspec.yaml`, so there was nothing to recognise.
 pub fn repo_scan(repo_root: &Path) -> String {
     let files = tracked_files(repo_root);
-    let mut out = String::new();
-
-    // 1. Extension census: the clearest single signal of what the code is,
-    //    and pure data — no per-language knowledge involved.
     let census = extension_census(&files);
-    if !census.is_empty() {
-        out.push_str("File types by count:\n");
-        for (ext, count) in census.iter().take(20) {
-            out.push_str(&format!("  {count:>5}  .{ext}\n"));
-        }
-        out.push('\n');
-    }
+    let source = source_extensions(&census, files.len());
 
-    // 2. Every tracked path, not just the top level, so nested packages,
-    //    platform directories, and test layout are all visible.
-    out.push_str(&format!("Tracked files ({} total):\n", files.len()));
-    for path in files.iter().take(400) {
-        out.push_str("  ");
-        out.push_str(path);
-        out.push('\n');
-    }
-    if files.len() > 400 {
-        out.push_str(&format!("  … and {} more\n", files.len() - 400));
-    }
-
-    // 3. Contents of the shallow config files, whatever they happen to be
-    //    called. Selected by shape (shallow, small, not generated) rather
-    //    than from a list of names, so an ecosystem nobody enumerated still
-    //    gets its manifest read.
-    for path in inlinable_files(&files) {
-        if out.len() > SCAN_BUDGET {
-            out.push_str("\n[scan truncated]\n");
+    // The config file contents are the highest-signal part of the scan, so
+    // they are built *first* and get the budget. Doing this after the file
+    // listing meant a large repo spent the whole budget on paths and never
+    // reached its manifest — which reproduced the original bug (a Flutter
+    // repo with 1868 files whose pubspec.yaml never made it into the prompt).
+    let mut manifests = String::new();
+    for path in inlinable_files(&files, &source) {
+        if manifests.len() > SCAN_BUDGET * 2 / 3 {
             break;
         }
         let Ok(text) = std::fs::read_to_string(repo_root.join(&path)) else { continue };
@@ -423,38 +402,103 @@ pub fn repo_scan(repo_root: &Path) -> String {
         if snippet.len() < text.len() {
             snippet.push_str("\n[truncated]");
         }
-        out.push_str(&format!("\n--- {path} ---\n{snippet}\n"));
+        manifests.push_str(&format!("\n--- {path} ---\n{snippet}\n"));
+    }
+
+    let mut out = String::new();
+
+    // 1. Extension census: the clearest single signal of what the code is,
+    //    and pure counting — no per-language knowledge involved.
+    if !census.is_empty() {
+        out.push_str("Code files by type:\n");
+        for (ext, count) in census.iter().take(20) {
+            out.push_str(&format!("  {count:>5}  .{ext}\n"));
+        }
+        out.push('\n');
+    }
+
+    // 2. Configuration contents.
+    out.push_str(&manifests);
+
+    // 3. The listing last, with whatever budget is left: it is context, and
+    //    the most truncatable part.
+    out.push_str(&format!("\nTracked files ({} total):\n", files.len()));
+    let room = SCAN_BUDGET.saturating_sub(out.len());
+    let mut shown = 0;
+    let mut used = 0;
+    for path in &files {
+        if used + path.len() + 3 > room {
+            break;
+        }
+        used += path.len() + 3;
+        shown += 1;
+        out.push_str("  ");
+        out.push_str(path);
+        out.push('\n');
+    }
+    if shown < files.len() {
+        out.push_str(&format!("  … and {} more\n", files.len() - shown));
     }
     out
 }
 
 /// Paths worth inlining, shallowest first: manifests, task runners, CI
 /// workflows, and the README all fall out of this without being named.
-fn inlinable_files(files: &[String]) -> Vec<String> {
+fn inlinable_files(files: &[String], source_exts: &[String]) -> Vec<String> {
     let depth = |p: &str| p.matches('/').count();
+    let is_source = |p: &str| {
+        p.rsplit_once('.').map(|(_, e)| source_exts.iter().any(|s| s == e)).unwrap_or(false)
+    };
+    let is_doc = |p: &str| {
+        let lower = p.to_ascii_lowercase();
+        lower.ends_with(".md") || lower.ends_with(".rst") || lower.ends_with(".txt")
+    };
     let mut candidates: Vec<&String> = files
         .iter()
         .filter(|p| {
-            // Depth 0-1 covers root manifests and things like
-            // .github/workflows/ci.yml or packages/api/pubspec.yaml.
+            // Depth 0-2 covers root manifests plus things like
+            // .github/workflows/ci.yml and packages/api/pubspec.yaml.
             depth(p) <= 2
                 && !NOT_WORTH_INLINING.iter().any(|s| p.ends_with(s))
-                // Source files are described by the census; their contents
-                // would crowd out the manifests.
-                && !is_probably_source(p)
+                // The project's own source is described by the census; its
+                // contents would crowd out the configuration.
+                && !is_source(p)
         })
         .collect();
-    candidates.sort_by_key(|p| (depth(p), p.len(), (*p).clone()));
-    candidates.into_iter().take(30).cloned().collect()
+    // Configuration before prose. A repo with several long markdown documents
+    // would otherwise spend the budget on them and push its actual manifest
+    // out — which is how a Flutter monorepo lost `frontend/pubspec.yaml` to
+    // its README. Docs are still useful context, so a couple are kept.
+    candidates.sort_by_key(|p| (is_doc(p), depth(p), p.len(), (*p).clone()));
+    let mut docs = 0;
+    candidates
+        .into_iter()
+        .filter(|p| {
+            if !is_doc(p) {
+                return true;
+            }
+            docs += 1;
+            docs <= 2
+        })
+        .take(30)
+        .cloned()
+        .collect()
 }
 
-/// Whether a path looks like program source rather than configuration. Uses
-/// the census's own logic in spirit: many files of one extension are source,
-/// and configuration is the handful of odd ones out. Kept crude on purpose —
-/// getting it wrong only changes which files are inlined first.
-fn is_probably_source(path: &str) -> bool {
-    const SOURCE_DIRS: &[&str] = &["src/", "lib/", "test/", "tests/", "spec/", "app/"];
-    SOURCE_DIRS.iter().any(|d| path.starts_with(d))
+/// Extensions that make up a large share of the repository — the project's
+/// own source. Derived from the census, so it needs no per-language table:
+/// whatever this project is mostly written in counts as source, whether that
+/// is `.dart`, `.zig`, or something nobody has heard of.
+///
+/// The share threshold is what keeps a README inlinable: `.md` at 1% of files
+/// is documentation, `.dart` at 75% is the codebase.
+fn source_extensions(census: &[(String, usize)], total: usize) -> Vec<String> {
+    let floor = (total / 10).max(5);
+    census
+        .iter()
+        .filter(|(_, count)| *count >= floor)
+        .map(|(ext, _)| ext.clone())
+        .collect()
 }
 
 /// Repository-relative paths of tracked and not-ignored files, via git so
@@ -480,13 +524,26 @@ fn tracked_files(repo_root: &Path) -> Vec<String> {
     names
 }
 
-/// Extension counts, most common first. Extensionless files are skipped.
+/// Binary and asset extensions excluded from the census. A Flutter app with
+/// 35 icons and 20 Dart files is a Dart project; counting the icons first
+/// buries the signal. This is about file encoding, not about ecosystems, so
+/// unlike a stack taxonomy it does not need per-framework upkeep.
+const ASSET_EXTS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "icns", "svg", "pdf", "ttf", "otf",
+    "woff", "woff2", "eot", "mp3", "mp4", "wav", "mov", "avi", "zip", "gz", "tar", "bz2",
+    "7z", "rar", "jar", "so", "dylib", "dll", "a", "o", "class", "pyc", "wasm", "bin",
+    "exe", "lock", "riv", "psd", "ai", "sketch", "keystore", "jks",
+];
+
+/// Extension counts of *code and configuration*, most common first.
+/// Extensionless files and assets are skipped.
 fn extension_census(files: &[String]) -> Vec<(String, usize)> {
     let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for path in files {
         let name = path.rsplit('/').next().unwrap_or(path);
         if let Some((_stem, ext)) = name.rsplit_once('.') {
-            if !ext.is_empty() && ext.len() <= 12 && !name.starts_with('.') {
+            let asset = ASSET_EXTS.iter().any(|a| a.eq_ignore_ascii_case(ext));
+            if !ext.is_empty() && ext.len() <= 12 && !name.starts_with('.') && !asset {
                 *counts.entry(ext).or_default() += 1;
             }
         }
@@ -877,23 +934,86 @@ mod ai_config_tests {
             "pubspec.yaml",       // Flutter — never named in this file
             "flake.nix",          // Nix — never named either
             "zig.build",
+            "README.md",          // documentation: useful context, inlined
             "Cargo.lock",         // generated: skipped
             "LICENSE",            // no signal: skipped
             "assets/logo.png",    // binary: skipped
-            "src/main.rs",        // source: described by the census instead
             ".github/workflows/ci.yml",
         ]
         .iter()
         .map(|s| s.to_string())
         .collect();
 
-        let picked = inlinable_files(&files);
-        for want in ["pubspec.yaml", "flake.nix", "zig.build", ".github/workflows/ci.yml"] {
+        let picked = inlinable_files(&files, &[]);
+        for want in
+            ["pubspec.yaml", "flake.nix", "zig.build", "README.md", ".github/workflows/ci.yml"]
+        {
             assert!(picked.iter().any(|p| p == want), "{want} should be inlined: {picked:?}");
         }
-        for skip in ["Cargo.lock", "LICENSE", "assets/logo.png", "src/main.rs"] {
+        for skip in ["Cargo.lock", "LICENSE", "assets/logo.png"] {
             assert!(!picked.iter().any(|p| p == skip), "{skip} should be skipped: {picked:?}");
         }
+    }
+
+    /// The project's own source is excluded from inlining, and which
+    /// extensions count as source comes from the census rather than a table —
+    /// so this works for a language nobody enumerated.
+    #[test]
+    fn dominant_extensions_are_treated_as_source() {
+        // 30 .dart files, one README: .dart is the codebase, .md is not.
+        let mut files: Vec<String> = (0..30).map(|i| format!("lib/f{i}.dart")).collect();
+        files.push("README.md".to_string());
+        files.push("pubspec.yaml".to_string());
+
+        let census = extension_census(&files);
+        let source = source_extensions(&census, files.len());
+        assert!(source.iter().any(|e| e == "dart"), "dart should be source: {source:?}");
+        assert!(!source.iter().any(|e| e == "md"), "a lone README is not source: {source:?}");
+
+        let picked = inlinable_files(&files, &source);
+        assert!(picked.iter().any(|p| p == "pubspec.yaml"));
+        assert!(picked.iter().any(|p| p == "README.md"));
+        assert!(!picked.iter().any(|p| p.ends_with(".dart")), "source leaked in: {picked:?}");
+    }
+
+    /// Assets must not outrank code in the census. A Flutter app with more
+    /// icons than Dart files is still a Dart project.
+    #[test]
+    fn census_ignores_assets() {
+        let mut files: Vec<String> = (0..40).map(|i| format!("assets/i{i}.png")).collect();
+        files.extend((0..8).map(|i| format!("lib/f{i}.dart")));
+        let census = extension_census(&files);
+        assert_eq!(census[0], ("dart".to_string(), 8), "assets buried the code: {census:?}");
+        assert!(!census.iter().any(|(e, _)| e == "png"));
+    }
+
+    /// Regression: in a large repository the file listing used to consume the
+    /// whole budget, so the manifest never reached the prompt — the same
+    /// failure as the original bug, just triggered by size instead of by a
+    /// missing name.
+    #[test]
+    fn a_large_repository_still_gets_its_manifest_inlined() {
+        let tmp = std::env::temp_dir().join(format!("devdock-big-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("lib")).unwrap();
+        std::fs::write(
+            tmp.join("pubspec.yaml"),
+            "name: big_app\ndependencies:\n  flutter:\n    sdk: flutter\n",
+        )
+        .unwrap();
+        // Enough paths that the listing alone would blow the budget.
+        for i in 0..3000 {
+            std::fs::write(tmp.join("lib").join(format!("a_very_long_file_name_{i}.dart")), "//")
+                .ok();
+        }
+
+        let scan = repo_scan(&tmp);
+        assert!(
+            scan.contains("--- pubspec.yaml ---"),
+            "the manifest must survive the budget in a big repo"
+        );
+        assert!(scan.contains("sdk: flutter"), "and its contents, not just its name");
+        assert!(scan.len() <= SCAN_BUDGET + FILE_SNIPPET, "scan is {} bytes", scan.len());
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]

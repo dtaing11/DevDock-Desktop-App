@@ -6,6 +6,7 @@ Docker containers for reproducible environments.
 
 - [Quick start](#quick-start)
 - [The config file](#the-config-file)
+- [Per-directory configs (monorepos)](#per-directory-configs-monorepos)
 - [Running checks](#running-checks)
 - [Gating pushes and pull requests](#gating-pushes-and-pull-requests)
 - [AI code review](#ai-code-review)
@@ -57,7 +58,9 @@ examples, so you can uncomment rather than type them from scratch.
 ## The config file
 
 `.git-manage-ci.toml` lives at the repository root and is meant to be
-**committed**, so your whole team shares the same checks.
+**committed**, so your whole team shares the same checks. In a monorepo you can
+also put one in each package — see
+[Per-directory configs](#per-directory-configs-monorepos).
 
 ```toml
 # Every [[job]] block is one check. Jobs run in parallel.
@@ -84,6 +87,67 @@ secrets = ["API_TOKEN"]             # optional: secret names (values elsewhere)
 | `image`    | no       | Docker image; when set, the job runs in a container                |
 | `env`      | no       | Plain environment variables (committed, never put secrets here)    |
 | `secrets`  | no       | Names of secrets to inject; values come from the secrets file      |
+
+## Per-directory configs (monorepos)
+
+A `.git-manage-ci.toml` in **any** directory contributes jobs, not just the one
+at the repository root. Every config found is loaded and its jobs combined:
+
+```
+my-repo/
+├── .git-manage-ci.toml          # repo-wide jobs + the gates
+├── packages/
+│   ├── api/
+│   │   └── .git-manage-ci.toml  # jobs for the api package
+│   └── web/
+│       └── .git-manage-ci.toml  # jobs for the web package
+└── tools/
+    └── .git-manage-ci.toml
+```
+
+Three rules make this work the way you would expect:
+
+**1. Jobs run in their own directory.** A job from
+`packages/api/.git-manage-ci.toml` runs with `packages/api` as its working
+directory, so plain commands are correct without any `cd`:
+
+```toml
+# packages/api/.git-manage-ci.toml
+[[job]]
+name = "tests"
+commands = ["cargo test"]     # runs in packages/api, not the repo root
+```
+
+For a container job, the **whole repository** is still mounted at `/work` and
+only the working directory changes (`-w /work/packages/api`), so a package can
+still reach a sibling by relative path.
+
+**2. Names are qualified by directory.** Two packages can both call a job
+`tests`; the checks list shows `packages/api: tests` and `packages/web: tests`
+so results are never ambiguous. Root-level jobs keep their bare name.
+
+**3. The gates live at the root only.** `[on_push]` and `[review]` apply to the
+whole repository — a push publishes all of it, so a per-package push gate has
+no coherent meaning. Those sections are read from the root config; if a nested
+config declares one, it is **ignored and reported** in a warning naming the
+directory. Put them in the root file.
+
+### What gets searched
+
+Discovery runs through git
+(`git ls-files --cached --others --exclude-standard`), which means:
+
+- **`.gitignore` is honoured.** A config under `target/`, `node_modules/`,
+  `vendor/`, or any ignored path is never picked up. No depth limits or
+  hard-coded directory names are involved.
+- **Uncommitted configs still count.** A config you just wrote is found before
+  you commit it.
+- A config that fails to parse is **skipped**, and the others still run — one
+  bad file in a large repo cannot take down the whole check run.
+- At most 25 config files are loaded.
+
+Reloading (**Reload config** in the Checks tab) re-scans, and reports how many
+files contributed when there is more than one.
 
 ## Running checks
 
@@ -678,6 +742,9 @@ tools. See [extending-local-ci.md](extending-local-ci.md).
 | `Missing secret(s): X` | Add `X = value` to `.git-manage-ci.secrets` or `export X=...` before launching the app |
 | Container job can't find your toolchain | The container only has what the image ships; pick a toolchain image (`rust:1.80`, `node:22`) or install inside `commands` |
 | Changes not picked up after editing the config | Click **Reload** in the LOCAL CHECKS section |
+| A nested config's jobs never appear | Its directory is probably gitignored — discovery goes through git, so ignored paths are skipped. Check with `git check-ignore -v <path>`. A config that fails to parse is also skipped |
+| `[on_push]/[review] in … were ignored` | Those gates are repository-wide; move them to the root `.git-manage-ci.toml`. Nested configs contribute jobs only |
+| A nested job cannot find its files | It runs with its own directory as the working directory, so paths are relative to the package, not the repo root |
 | Job output cut off | Output is capped at 64 KB per job to keep the UI responsive; run the command in a terminal for the full log |
 | `AI review is enabled but no model is available` | No provider is set up. Sign in to Claude in Settings, or install Ollama and pull a model — see [Before you start](#before-you-start-sign-in-to-a-model). The push still goes through |
 | `did not return a usable review` | The model could not hold the JSON format — usually a small local model. Use a larger one, set `provider = "claude"`, or switch to `output = "markdown"`, which has no format to parse |

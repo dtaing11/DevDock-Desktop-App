@@ -1019,3 +1019,140 @@ fn staging_errors_when_nothing_could_be_staged() {
     let err = repo.stage(&["dist/app.bin".into()]).unwrap_err().to_string();
     assert!(err.contains("Could not stage"), "unexpected error: {err}");
 }
+
+// ---------------------------------------------------------------------------
+// Nested CI configs (monorepo)
+// ---------------------------------------------------------------------------
+
+fn write_ci(repo: &Repo, dir: &str, body: &str) {
+    let target = if dir.is_empty() { repo.path().to_path_buf() } else { repo.path().join(dir) };
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join(git_manage::local_ci::CONFIG_FILE), body).unwrap();
+}
+
+/// Every config in the tree contributes jobs, and each job is tagged with the
+/// directory it came from.
+#[test]
+fn nested_configs_all_contribute_jobs() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "x\n", "init");
+
+    write_ci(&repo, "", "[[job]]\nname = \"root\"\ncommands = [\"true\"]\n");
+    write_ci(&repo, "packages/api", "[[job]]\nname = \"tests\"\ncommands = [\"true\"]\n");
+    write_ci(&repo, "packages/web", "[[job]]\nname = \"tests\"\ncommands = [\"true\"]\n");
+
+    let loaded = git_manage::local_ci::discover_configs(repo.path()).unwrap();
+    let names: Vec<String> = loaded.config.jobs.iter().map(|j| j.display_name()).collect();
+
+    assert_eq!(loaded.config.jobs.len(), 3, "got {names:?}");
+    // Root first, then nested in path order.
+    assert_eq!(names[0], "root");
+    // Same job name in two packages must not be ambiguous.
+    assert!(names.contains(&"packages/api: tests".to_string()), "{names:?}");
+    assert!(names.contains(&"packages/web: tests".to_string()), "{names:?}");
+    assert_eq!(loaded.sources.len(), 3);
+}
+
+/// A nested job's commands run in that directory, not the repo root — a
+/// package's `cargo test` has to run in the package.
+#[test]
+fn a_nested_job_runs_in_its_own_directory() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "x\n", "init");
+    write_ci(&repo, "packages/api", "[[job]]\nname = \"where\"\ncommands = [\"pwd\"]\n");
+
+    let loaded = git_manage::local_ci::discover_configs(repo.path()).unwrap();
+    let job = loaded.config.jobs.first().expect("expected the nested job");
+    assert_eq!(job.dir, "packages/api");
+
+    let result = git_manage::local_ci::run_job(repo.path(), job);
+    assert!(result.ok, "job failed: {}", result.output);
+    assert!(
+        result.output.trim_end().ends_with("packages/api"),
+        "ran in the wrong directory: {}",
+        result.output
+    );
+    assert_eq!(result.name, "packages/api: where");
+}
+
+/// Discovery goes through git, so gitignored paths are never searched — a
+/// config left in `target/` or `node_modules/` must not add jobs.
+#[test]
+fn ignored_directories_are_not_searched() {
+    let (_tmp, repo) = setup();
+    write_ci(&repo, "", "[[job]]\nname = \"root\"\ncommands = [\"true\"]\n");
+    commit_file(&repo, ".gitignore", "/target\n/node_modules\n", "chore: ignore");
+
+    write_ci(&repo, "target/leftover", "[[job]]\nname = \"stale\"\ncommands = [\"false\"]\n");
+    write_ci(&repo, "node_modules/pkg", "[[job]]\nname = \"vendored\"\ncommands = [\"false\"]\n");
+
+    let loaded = git_manage::local_ci::discover_configs(repo.path()).unwrap();
+    let names: Vec<String> = loaded.config.jobs.iter().map(|j| j.display_name()).collect();
+    assert_eq!(names, vec!["root"], "ignored paths leaked in: {names:?}");
+}
+
+/// An uncommitted config still counts — you should not have to commit before
+/// the checks you just wrote will run.
+#[test]
+fn an_uncommitted_nested_config_is_found() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "x\n", "init");
+    write_ci(&repo, "svc", "[[job]]\nname = \"fresh\"\ncommands = [\"true\"]\n");
+
+    let loaded = git_manage::local_ci::discover_configs(repo.path()).unwrap();
+    assert_eq!(
+        loaded.config.jobs.iter().map(|j| j.display_name()).collect::<Vec<_>>(),
+        vec!["svc: fresh"]
+    );
+}
+
+/// Gates are repository-wide: only the root config's are honoured, and a
+/// nested one is reported rather than silently dropped.
+#[test]
+fn gates_come_from_the_root_and_nested_ones_are_reported() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "x\n", "init");
+    write_ci(
+        &repo,
+        "",
+        "[on_push]\nrun = true\n\n[review]\nrun = true\nfail_on = \"medium\"\n",
+    );
+    write_ci(
+        &repo,
+        "svc",
+        "[[job]]\nname = \"t\"\ncommands = [\"true\"]\n\n[on_push]\nrun = false\n\n[review]\nrun = true\n",
+    );
+
+    let loaded = git_manage::local_ci::discover_configs(repo.path()).unwrap();
+    assert!(loaded.config.on_push.run, "root [on_push] must win");
+    assert_eq!(loaded.config.review.fail_on, git_manage::review::Severity::Medium);
+    assert_eq!(loaded.ignored_gates, vec!["svc".to_string()], "must report what it ignored");
+}
+
+/// A repo with no root config still runs the nested ones.
+#[test]
+fn nested_configs_work_without_a_root_config() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "x\n", "init");
+    write_ci(&repo, "svc", "[[job]]\nname = \"t\"\ncommands = [\"true\"]\n");
+
+    let loaded = git_manage::local_ci::discover_configs(repo.path()).unwrap();
+    assert_eq!(loaded.config.jobs.len(), 1);
+    assert!(!loaded.config.on_push.run, "no root config means default gates");
+}
+
+/// One unparseable nested config must not take down the rest.
+#[test]
+fn a_broken_nested_config_is_skipped() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "x\n", "init");
+    write_ci(&repo, "", "[[job]]\nname = \"root\"\ncommands = [\"true\"]\n");
+    write_ci(&repo, "good", "[[job]]\nname = \"ok\"\ncommands = [\"true\"]\n");
+    write_ci(&repo, "bad", "this is not = valid toml [[[\n");
+
+    let loaded = git_manage::local_ci::discover_configs(repo.path()).unwrap();
+    let names: Vec<String> = loaded.config.jobs.iter().map(|j| j.display_name()).collect();
+    assert!(names.contains(&"root".to_string()), "{names:?}");
+    assert!(names.contains(&"good: ok".to_string()), "{names:?}");
+    assert_eq!(names.len(), 2, "the broken config should be skipped: {names:?}");
+}

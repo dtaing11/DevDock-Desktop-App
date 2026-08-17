@@ -1646,7 +1646,7 @@ fn local_ci_panel(app: &mut App, ui: &mut egui::Ui) {
                 .unwrap_or_else(|| " (host)".into());
             let expanded = app.local_ci.expanded == Some(i);
             if ui
-                .selectable_label(expanded, format!("{}{env}", job.name))
+                .selectable_label(expanded, format!("{}{env}", job.display_name()))
                 .on_hover_text("Click to show/hide output")
                 .clicked()
             {

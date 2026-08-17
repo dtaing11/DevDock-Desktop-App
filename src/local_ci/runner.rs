@@ -62,14 +62,39 @@ use std::process::Command;
 
 /// Everything a runner needs to execute one job.
 pub struct ExecRequest<'a> {
-    /// Repository worktree root.
+    /// Repository worktree root. Stays the mount root for container runners so
+    /// cross-package paths keep working in a monorepo.
     pub repo_root: &'a Path,
+    /// Directory the commands run in, relative to [`Self::repo_root`]. Empty
+    /// for a root-level job; set when the job came from a nested config.
+    pub work_subdir: &'a str,
     /// The job's commands joined with `&&` (stop at first failure).
     pub script: &'a str,
     /// Environment variables (config `env` plus resolved secrets).
     pub env: &'a [(String, String)],
     /// Runner-specific target: Docker image, SSH host, etc.
     pub target: Option<&'a str>,
+}
+
+impl ExecRequest<'_> {
+    /// Absolute directory the commands should run in.
+    pub fn workdir(&self) -> std::path::PathBuf {
+        if self.work_subdir.is_empty() {
+            self.repo_root.to_path_buf()
+        } else {
+            self.repo_root.join(self.work_subdir)
+        }
+    }
+
+    /// Working directory inside a container, given the repo is mounted at
+    /// `mount`.
+    pub fn container_workdir(&self, mount: &str) -> String {
+        if self.work_subdir.is_empty() {
+            mount.to_string()
+        } else {
+            format!("{mount}/{}", self.work_subdir)
+        }
+    }
 }
 
 /// What a runner produced.
@@ -112,7 +137,7 @@ impl Runner for HostRunner {
 
     fn exec(&self, request: &ExecRequest<'_>) -> Result<ExecOutput, String> {
         let mut cmd = Command::new("sh");
-        cmd.args(["-c", request.script]).current_dir(request.repo_root);
+        cmd.args(["-c", request.script]).current_dir(request.workdir());
         for (key, value) in request.env {
             cmd.env(key, value);
         }
@@ -188,9 +213,13 @@ impl Runner for DockerRunner {
             .target
             .ok_or("docker runner needs an image (set `image = \"...\"` on the job)")?;
         let mut cmd = Command::new("docker");
+        // The whole repository is mounted, with the workdir pointing at the
+        // job's own directory, so a nested job can still reach sibling
+        // packages by relative path.
         cmd.args(["run", "--rm", "-v"])
             .arg(format!("{}:/work", request.repo_root.display()))
-            .args(["-w", "/work"]);
+            .arg("-w")
+            .arg(request.container_workdir("/work"));
         // Pass env var NAMES only in argv; docker reads the values from
         // this process's environment, keeping secrets out of `ps` output.
         for (key, value) in request.env {
@@ -324,6 +353,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let out = HostRunner
             .exec(&ExecRequest {
+                work_subdir: "",
                 repo_root: tmp.path(),
                 script: "echo from-host-runner",
                 env: &[],
@@ -340,6 +370,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let out = runner
             .exec(&ExecRequest {
+                work_subdir: "",
                 repo_root: tmp.path(),
                 script: "anything",
                 env: &[],

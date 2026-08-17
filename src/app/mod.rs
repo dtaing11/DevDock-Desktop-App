@@ -1512,13 +1512,40 @@ impl App {
         self.local_ci = Default::default();
         self.local_ci.history = history;
         let Some(repo) = self.repo.as_ref() else { return };
-        if let Ok(Some(config)) = crate::local_ci::load_config(repo.path()) {
-            self.local_ci.results = vec![None; config.jobs.len()];
-            self.local_ci.jobs = config.jobs;
-            self.local_ci.on_push = config.on_push;
-            // Keep the last outcome visible across a config reload; only the
-            // settings are re-read.
-            self.review.config = config.review;
+        // Picks up per-directory configs too, so a monorepo's packages each
+        // contribute their own jobs.
+        let Ok(loaded) = crate::local_ci::discover_configs(repo.path()) else { return };
+        let nested = loaded.sources.iter().filter(|d| !d.is_empty()).count();
+        let ignored = loaded.ignored_gates.clone();
+        self.local_ci.results = vec![None; loaded.config.jobs.len()];
+        self.local_ci.jobs = loaded.config.jobs;
+        self.local_ci.on_push = loaded.config.on_push;
+        // Keep the last outcome visible across a config reload; only the
+        // settings are re-read.
+        self.review.config = loaded.config.review;
+
+        if nested > 0 {
+            self.toast(
+                format!(
+                    "Loaded {} check(s) from {} config file(s).",
+                    self.local_ci.jobs.len(),
+                    nested + 1
+                ),
+                false,
+            );
+        }
+        // Ignoring part of someone's config silently would be worse than the
+        // limitation itself.
+        if !ignored.is_empty() {
+            self.toast(
+                format!(
+                    "[on_push]/[review] in {} apply to the whole repository and \
+                     were ignored — set them in the root {}.",
+                    ignored.join(", "),
+                    crate::local_ci::CONFIG_FILE
+                ),
+                true,
+            );
         }
     }
 

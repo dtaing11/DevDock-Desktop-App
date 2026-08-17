@@ -65,6 +65,14 @@ pub struct Job {
     /// Runner-specific target (e.g. SSH host). For Docker, `image` is used.
     #[serde(default)]
     pub runner_target: Option<String>,
+    /// Directory of the config file this job came from, relative to the
+    /// repository root; empty for the root config. The job's commands run
+    /// here, so a monorepo package's `cargo test` runs in that package.
+    ///
+    /// Filled in by [`discover_configs`], never read from the TOML — a config
+    /// does not get to claim it lives somewhere else.
+    #[serde(skip)]
+    pub dir: String,
 }
 
 impl Job {
@@ -81,6 +89,17 @@ impl Job {
     /// Effective runner target: `runner_target`, falling back to `image`.
     pub fn target(&self) -> Option<&str> {
         self.runner_target.as_deref().or(self.image.as_deref())
+    }
+
+    /// Name for the UI, qualified by directory when the job came from a
+    /// nested config. Two packages can both call a job "tests"; without the
+    /// prefix the results list would be ambiguous.
+    pub fn display_name(&self) -> String {
+        if self.dir.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{}: {}", self.dir, self.name)
+        }
     }
 }
 
@@ -139,6 +158,101 @@ pub fn load_config(repo_root: &Path) -> Result<Option<Config>> {
     let config: Config =
         toml::from_str(&text).map_err(|e| CiError(format!("Invalid {CONFIG_FILE}: {e}")))?;
     Ok(Some(config))
+}
+
+/// Cap on how many config files are loaded, so a pathological tree cannot
+/// spawn hundreds of jobs.
+pub const MAX_CONFIGS: usize = 25;
+
+/// Every config in the repository, merged: the root one plus any in
+/// subdirectories.
+#[derive(Debug, Clone, Default)]
+pub struct LoadedConfigs {
+    /// Jobs from every config, each tagged with its directory, plus the
+    /// **root** config's gate settings.
+    pub config: Config,
+    /// Directories that contributed jobs, in load order. `""` is the root.
+    pub sources: Vec<String>,
+    /// Directories whose `[on_push]` / `[review]` sections were ignored
+    /// because those gates are repository-wide. Surfaced to the user rather
+    /// than dropped silently.
+    pub ignored_gates: Vec<String>,
+}
+
+/// Finds every `.git-manage-ci.toml` in the repository and merges them.
+///
+/// Discovery goes through `git ls-files --cached --others --exclude-standard`,
+/// which means `.gitignore` is honoured for free: configs under `target/`,
+/// `node_modules/`, or any ignored path are never picked up, and a brand-new
+/// uncommitted config still is. Falls back to the root config alone when the
+/// path is not a git repository.
+///
+/// Jobs from a nested config run **in that config's directory**, so a
+/// monorepo package's `cargo test` runs in the package rather than the root.
+///
+/// `[on_push]` and `[review]` are taken from the root config only. A push
+/// publishes the whole repository, so a per-directory push gate has no
+/// coherent meaning; nested ones are reported in
+/// [`LoadedConfigs::ignored_gates`].
+pub fn discover_configs(repo_root: &Path) -> Result<LoadedConfigs> {
+    let mut loaded = LoadedConfigs::default();
+
+    // Root config first, so its gates win and its jobs list first.
+    if let Some(root) = load_config(repo_root)? {
+        loaded.config.on_push = root.on_push;
+        loaded.config.review = root.review;
+        loaded.sources.push(String::new());
+        loaded.config.jobs.extend(tag_jobs(root.jobs, ""));
+    }
+
+    for dir in nested_config_dirs(repo_root) {
+        if loaded.sources.len() >= MAX_CONFIGS {
+            break;
+        }
+        // A broken nested config must not take down the whole run; skip it
+        // and keep the configs that do parse.
+        let Ok(Some(nested)) = load_config(&repo_root.join(&dir)) else { continue };
+        if nested.on_push.run || nested.review.runs_at_all() {
+            loaded.ignored_gates.push(dir.clone());
+        }
+        if nested.jobs.is_empty() {
+            continue;
+        }
+        loaded.config.jobs.extend(tag_jobs(nested.jobs, &dir));
+        loaded.sources.push(dir);
+    }
+
+    Ok(loaded)
+}
+
+fn tag_jobs(jobs: Vec<Job>, dir: &str) -> Vec<Job> {
+    jobs.into_iter().map(|mut j| { j.dir = dir.to_string(); j }).collect()
+}
+
+/// Directories (relative, never empty) holding a non-root config file,
+/// sorted so the job order is stable between runs.
+fn nested_config_dirs(repo_root: &Path) -> Vec<String> {
+    let Ok(repo) = crate::git::Repo::open(repo_root) else { return Vec::new() };
+    // `--others --exclude-standard` adds untracked-but-not-ignored files, so a
+    // config added and not yet committed is still found.
+    let Ok(out) = repo.git(&["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
+    else {
+        return Vec::new();
+    };
+
+    let mut dirs: Vec<String> = out
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .filter_map(|path| {
+            let rest = path.strip_suffix(CONFIG_FILE)?;
+            // The root config is loaded separately.
+            let dir = rest.strip_suffix('/')?;
+            (!dir.is_empty()).then(|| dir.to_string())
+        })
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    dirs
 }
 
 /// Writes a starter config with commented examples.
@@ -354,7 +468,7 @@ pub fn run_job(repo_root: &Path, job: &Job) -> JobResult {
 pub fn run_job_with(registry: &RunnerRegistry, repo_root: &Path, job: &Job) -> JobResult {
     let started = Instant::now();
     let fail = |output: String| JobResult {
-        name: job.name.clone(),
+        name: job.display_name(),
         ok: false,
         output,
         duration_secs: started.elapsed().as_secs_f32(),
@@ -382,7 +496,13 @@ pub fn run_job_with(registry: &RunnerRegistry, repo_root: &Path, job: &Job) -> J
 
     // 3. Execute.
     let script = job.commands.join(" && ");
-    let request = ExecRequest { repo_root, script: &script, env: &env, target: job.target() };
+    let request = ExecRequest {
+        repo_root,
+        work_subdir: &job.dir,
+        script: &script,
+        env: &env,
+        target: job.target(),
+    };
     match runner.exec(&request) {
         Ok(out) => {
             let mut text = out.stdout;
@@ -399,7 +519,7 @@ pub fn run_job_with(registry: &RunnerRegistry, repo_root: &Path, job: &Job) -> J
                 text.push_str("\n[output truncated]");
             }
             JobResult {
-                name: job.name.clone(),
+                name: job.display_name(),
                 ok: out.success,
                 output: text.trim().to_string(),
                 duration_secs: started.elapsed().as_secs_f32(),
@@ -528,6 +648,7 @@ env = { FOO = "bar" }
             secrets: Vec::new(),
             runner: None,
             runner_target: None,
+            dir: String::new(),
         };
         let result = run_job(tmp.path(), &pass);
         assert!(result.ok);
@@ -541,6 +662,7 @@ env = { FOO = "bar" }
             secrets: Vec::new(),
             runner: None,
             runner_target: None,
+            dir: String::new(),
         };
         let result = run_job(tmp.path(), &fail);
         assert!(!result.ok);
@@ -562,6 +684,7 @@ env = { FOO = "bar" }
                 secrets: Vec::new(),
                 runner: None,
                 runner_target: None,
+            dir: String::new(),
             };
         let result = run_job(tmp.path(), &job);
         assert!(result.ok);
@@ -593,6 +716,7 @@ env = { FOO = "bar" }
             secrets: vec!["API_TOKEN".into()],
             runner: None,
             runner_target: None,
+            dir: String::new(),
         };
         let result = run_job(tmp.path(), &job);
         assert!(result.ok, "{}", result.output);
@@ -610,6 +734,7 @@ env = { FOO = "bar" }
             secrets: vec!["DEFINITELY_NOT_SET_ANYWHERE_XYZ".into()],
             runner: None,
             runner_target: None,
+            dir: String::new(),
         };
         let result = run_job(tmp.path(), &job);
         assert!(!result.ok);

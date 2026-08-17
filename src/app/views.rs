@@ -1559,7 +1559,7 @@ fn checks_tab(app: &mut App, ui: &mut egui::Ui) {
                     };
                 ui.label(RichText::new(status).color(color).small().monospace());
                 let expanded = app.local_ci.expanded == Some(i);
-                if ui.selectable_label(expanded, &job.name).clicked() {
+                if ui.selectable_label(expanded, job.display_name()).clicked() {
                     app.local_ci.expanded = if expanded { None } else { Some(i) };
                 }
             });

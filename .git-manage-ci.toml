@@ -16,3 +16,41 @@ commands = ["cargo test"]
 [[job]]
 name = "release build"
 commands = ["cargo build --release"]
+
+
+
+# AI review of the outgoing diff, after the jobs above pass. Advisory: it
+# reports findings with its reasoning and you can always proceed anyway.
+[review]
+run = true
+block_on_failure = true   # high-severity findings stop to ask first
+fail_on = "high"          # set to "medium" to be asked about those too
+provider = "claude"
+model = "claude-opus-5"
+instructions = """
+This is DevDock, a native egui git client that shells out to the git CLI. The
+failure modes that matter most here are the ones that quietly destroy or
+mislabel a user's work.
+
+- Every git invocation: state which of the index and the working tree the
+  command actually changes, and check that against what the surrounding
+  function claims to do. `git checkout -- <path>` copies the index over the
+  working tree and is a no-op on a staged change; `git checkout HEAD -- <path>`
+  rewrites both. Confusing the two silently does nothing.
+- Commands whose behaviour depends on git config the user may not have set
+  (`pull` without a reconciliation strategy, rename detection, autocrlf).
+  Prefer an explicit flag over relying on a default.
+- File states that are easy to miss: staged vs unstaged, staged additions,
+  staged deletions, renames (a rename is a delete plus an add, and the UI
+  lists only the new path), conflicted, untracked directories, and the root
+  commit having no parent.
+- Blocking work on the UI thread. Anything that shells out, hits the network,
+  or touches many files belongs on `self.worker`, not in a render path — a
+  blocked frame is a visible freeze.
+- Credentials: OAuth tokens, API keys, and GitHub PATs must not reach prompts,
+  logs, toasts, error strings, or the event history sent to a model.
+- `unwrap()` / `expect()` on anything derived from git output, a filesystem
+  path, or a network response, outside tests.
+- A new destructive or hard-to-reverse action that does not route through the
+  existing confirmation gate.
+"""

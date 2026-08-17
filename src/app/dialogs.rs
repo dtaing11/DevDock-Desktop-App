@@ -25,6 +25,15 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         Dialog::AddRemote => add_remote(app, ctx, &mut open),
         Dialog::SwitchBranch(_) => switch_branch(app, ctx, &mut open),
         Dialog::Confirm(_) => confirm_dialog(app, ctx, &mut open),
+        Dialog::ReviewGate => review_gate(app, ctx, &mut open),
+        Dialog::ChecksGate => checks_gate(app, ctx, &mut open),
+    }
+    // Dismissing a gate with the X is a deferred decision, not an approval:
+    // the modal closes but the held action stays available behind the
+    // explicit button in the Checks tab. Only "Cancel and fix" discards it.
+    if !open && matches!(app.dialog, Dialog::ReviewGate | Dialog::ChecksGate) {
+        app.toast("Still held — proceed or discard it from the Checks tab.", false);
+        app.tab = crate::app::Tab::Checks;
     }
     // The window's X button was clicked.
     if !open {
@@ -347,7 +356,9 @@ fn pull_requests(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                 .add_enabled(create_enabled, egui::Button::new("Create PR").fill(theme::EMBER))
                 .clicked()
             {
-                create_pr(app);
+                // Runs the AI reviewer first when `[review] run = true`;
+                // creates the PR straight away otherwise.
+                app.gate_with_review(crate::app::GatedAction::PullRequest);
             }
         });
 
@@ -457,7 +468,215 @@ fn pull_requests(app: &mut App, ctx: &egui::Context, open: &mut bool) {
     });
 }
 
-fn create_pr(app: &mut App) {
+// ---------------------------------------------------------------------------
+// AI review gate
+// ---------------------------------------------------------------------------
+
+/// Colour for a severity chip.
+fn severity_color(s: crate::review::Severity) -> egui::Color32 {
+    match s {
+        crate::review::Severity::High => theme::DANGER,
+        crate::review::Severity::Medium => theme::EMBER,
+        crate::review::Severity::Low => theme::FG_DIM,
+    }
+}
+
+/// Findings that blocked a push or pull request, the reviewer's reasoning,
+/// and the choice to fix them or proceed anyway.
+///
+/// The override is deliberately a plain button rather than a hidden setting:
+/// the reviewer is advisory, it can be wrong, and a gate with no way past it
+/// gets disabled wholesale the first time it misfires.
+fn review_gate(app: &mut App, ctx: &egui::Context, open: &mut bool) {
+    let Some(outcome) = app.review.outcome.clone() else {
+        app.dialog = Dialog::None;
+        return;
+    };
+    let fail_on = app.review.config.fail_on;
+    let blocking = outcome.blocking(fail_on).len();
+    let (high, medium, low) = outcome.tally();
+    let noun = app.review.pending.as_ref().map(|g| g.noun()).unwrap_or("action");
+    let override_label =
+        app.review.pending.as_ref().map(|g| g.override_label()).unwrap_or("Proceed anyway");
+
+    modal(ctx, "AI code review", open, |ui| {
+        ui.set_min_width(560.0);
+
+        // Markdown mode has no severities: the reviewer's own verdict line is
+        // what held the action, and the body is rendered as it was written.
+        if let Some(md) = outcome.markdown.clone() {
+            ui.label(RichText::new(format!("The reviewer asked to hold this {noun}.")));
+            ui.add_space(6.0);
+            ui.separator();
+            super::markdown::render(ui, &md);
+            ui.separator();
+            ui.add_space(6.0);
+            review_gate_buttons(app, ui, noun, override_label);
+            return;
+        }
+
+        ui.label(RichText::new(format!(
+            "{blocking} finding(s) at or above \"{}\" held this {noun}.",
+            fail_on.label()
+        )));
+        ui.label(
+            RichText::new(format!("{high} high · {medium} medium · {low} low"))
+                .color(theme::FG_DIM)
+                .small(),
+        );
+
+        if !outcome.summary.is_empty() {
+            ui.add_space(6.0);
+            ui.label(RichText::new(&outcome.summary).strong());
+        }
+
+        // The reviewer's own account of what it checked. This is what makes
+        // an informed override possible rather than a coin flip.
+        if !outcome.reasoning.is_empty() {
+            ui.add_space(6.0);
+            egui::CollapsingHeader::new("Reviewer's reasoning")
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.label(RichText::new(&outcome.reasoning).color(theme::FG_DIM));
+                });
+        }
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        for (i, finding) in outcome.findings.iter().enumerate() {
+            let where_ = match (finding.file.is_empty(), finding.line) {
+                (true, _) => String::new(),
+                (false, Some(line)) => format!("{}:{line}", finding.file),
+                (false, None) => finding.file.clone(),
+            };
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(finding.severity.label().to_uppercase())
+                        .color(severity_color(finding.severity))
+                        .small()
+                        .strong(),
+                );
+                if !where_.is_empty() {
+                    ui.label(RichText::new(where_).color(theme::FG_DIM).small().monospace());
+                }
+                ui.label(RichText::new(&finding.title).strong());
+            });
+            if !finding.detail.is_empty() {
+                let expanded = app.review.expanded == Some(i);
+                let toggle = if expanded { "Hide detail" } else { "Show detail" };
+                if ui.small_button(toggle).clicked() {
+                    app.review.expanded = if expanded { None } else { Some(i) };
+                }
+                if expanded {
+                    ui.label(RichText::new(&finding.detail).color(theme::FG_DIM));
+                }
+            }
+            ui.add_space(6.0);
+        }
+
+        ui.separator();
+        ui.add_space(6.0);
+        review_gate_buttons(app, ui, noun, override_label);
+    });
+}
+
+/// Failing local CI checks, with the option to proceed anyway.
+///
+/// Overriding here does **not** skip the AI reviewer: the two gates are
+/// independent, and clearing one is not consent to skip the other.
+fn checks_gate(app: &mut App, ctx: &egui::Context, open: &mut bool) {
+    let Some(held) = app.local_ci.blocked.clone() else {
+        app.dialog = Dialog::None;
+        return;
+    };
+    let failed: Vec<(String, String)> = app
+        .local_ci
+        .results
+        .iter()
+        .flatten()
+        .filter(|r| !r.ok)
+        .map(|r| (r.name.clone(), r.output.clone()))
+        .collect();
+    let noun = held.noun();
+
+    modal(ctx, "Checks failed", open, |ui| {
+        ui.set_min_width(560.0);
+        ui.label(RichText::new(format!(
+            "{} check(s) failed, holding this {noun}.",
+            failed.len()
+        )));
+        ui.add_space(8.0);
+
+        for (name, output) in &failed {
+            ui.label(RichText::new(name).color(theme::DANGER).strong());
+            // The tail is where the failure is; the head is usually setup.
+            let tail: Vec<&str> = output.lines().rev().take(8).collect();
+            for line in tail.into_iter().rev() {
+                ui.label(RichText::new(line).color(theme::FG_DIM).monospace().small());
+            }
+            ui.add_space(6.0);
+        }
+
+        ui.separator();
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let fix = egui::Button::new(RichText::new("Cancel and fix").strong())
+                .min_size(egui::vec2(0.0, theme::CONTROL_MD));
+            if ui.add(fix).clicked() {
+                app.local_ci.blocked = None;
+                app.dialog = Dialog::None;
+                app.toast(format!("{noun} cancelled."), false);
+            }
+            let label = held.override_label();
+            let proceed = egui::Button::new(RichText::new(label).color(theme::FG_DIM))
+                .min_size(egui::vec2(0.0, theme::CONTROL_MD));
+            if ui
+                .add(proceed)
+                .on_hover_text("The AI review still runs; this only overrides the checks.")
+                .clicked()
+            {
+                app.dialog = Dialog::None;
+                if let Some(held) = app.local_ci.blocked.take() {
+                    app.toast("Overriding failed checks.", true);
+                    // Still subject to the review gate — one override is not
+                    // consent to skip the other.
+                    app.gate_with_review(held);
+                }
+            }
+        });
+    });
+}
+
+/// The gate's two choices, shared by both output styles.
+fn review_gate_buttons(app: &mut App, ui: &mut egui::Ui, noun: &str, override_label: &str) {
+    ui.horizontal(|ui| {
+        // Fixing is the default action, so it reads first and is plain.
+        let fix = egui::Button::new(RichText::new("Cancel and fix").strong())
+            .min_size(egui::vec2(0.0, theme::CONTROL_MD));
+        if ui.add(fix).clicked() {
+            app.review.pending = None;
+            app.dialog = Dialog::None;
+            app.toast(format!("{noun} cancelled. Review kept in the Checks tab."), false);
+        }
+        let proceed = egui::Button::new(RichText::new(override_label).color(theme::FG_DIM))
+            .min_size(egui::vec2(0.0, theme::CONTROL_MD));
+        if ui
+            .add(proceed)
+            .on_hover_text("The reviewer is advisory. The review stays in the Checks tab.")
+            .clicked()
+        {
+            app.dialog = Dialog::None;
+            if let Some(gated) = app.review.pending.take() {
+                app.toast("Overriding the review.", false);
+                app.perform(gated);
+            }
+        }
+    });
+}
+
+pub(super) fn create_pr(app: &mut App) {
     let Some(repo) = app.repo.clone() else { return };
     let (title, body) = (app.pr.title.trim().to_string(), app.pr.body.trim().to_string());
     let (head, base) = (app.pr.head.clone(), app.pr.base.clone());
@@ -1497,7 +1716,7 @@ fn local_ci_panel(app: &mut App, ui: &mut egui::Ui) {
                 .unwrap_or_else(|| " (host)".into());
             let expanded = app.local_ci.expanded == Some(i);
             if ui
-                .selectable_label(expanded, format!("{}{env}", job.name))
+                .selectable_label(expanded, format!("{}{env}", job.display_name()))
                 .on_hover_text("Click to show/hide output")
                 .clicked()
             {

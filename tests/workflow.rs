@@ -335,6 +335,70 @@ fn discard_and_unstage() {
     assert!(!repo.status().unwrap().files[0].staged);
 }
 
+/// Regression: discarding must clear *staged* work, not just unstaged edits.
+/// `git checkout -- <path>` copies the index over the working tree, so
+/// against a staged change it rewrites the file with the very content being
+/// discarded: the edit survives in both places and the discard silently does
+/// nothing. Restoring from `HEAD` is what actually clears it.
+#[test]
+fn discard_clears_staged_changes() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "clean\n", "init");
+
+    write(&repo, "a.txt", "dirty\n");
+    repo.stage_all().unwrap();
+    assert!(repo.status().unwrap().files[0].staged, "setup should have staged the edit");
+
+    repo.discard(&["a.txt".into()]).unwrap();
+    assert_eq!(read(&repo, "a.txt"), "clean\n", "working tree kept the discarded edit");
+    assert!(repo.status().unwrap().files.is_empty(), "index kept the discarded edit");
+}
+
+/// A file staged but never committed has no state in `HEAD` to restore to,
+/// so discarding it removes it from the index and the working tree.
+#[test]
+fn discard_removes_staged_new_file() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "clean\n", "init");
+
+    write(&repo, "added.txt", "new\n");
+    repo.stage_all().unwrap();
+
+    repo.discard(&["added.txt".into()]).unwrap();
+    assert!(!repo.path().join("added.txt").exists(), "file left on disk");
+    assert!(repo.status().unwrap().files.is_empty(), "index still lists the addition");
+}
+
+#[test]
+fn discard_restores_staged_deletion() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "clean\n", "init");
+
+    repo.git(&["rm", "--quiet", "a.txt"]).unwrap();
+    repo.discard(&["a.txt".into()]).unwrap();
+
+    assert_eq!(read(&repo, "a.txt"), "clean\n", "deleted file not restored");
+    assert!(repo.status().unwrap().files.is_empty());
+}
+
+/// A rename is staged as a deletion of the original path plus an addition of
+/// the new one, and the UI lists it under the new path alone. Discarding it
+/// has to put the original back rather than just dropping the new name.
+#[test]
+fn discard_reverses_staged_rename() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "clean\n", "init");
+
+    repo.git(&["mv", "a.txt", "b.txt"]).unwrap();
+    let listed = repo.status().unwrap();
+    assert_eq!(listed.files[0].path, "b.txt", "rename should be listed under its new path");
+
+    repo.discard(&["b.txt".into()]).unwrap();
+    assert_eq!(read(&repo, "a.txt"), "clean\n", "original path not restored");
+    assert!(!repo.path().join("b.txt").exists(), "renamed path not removed");
+    assert!(repo.status().unwrap().files.is_empty());
+}
+
 #[test]
 fn diff_for_ai_prefers_staged_changes() {
     let (_tmp, repo) = setup();
@@ -706,4 +770,523 @@ fn patch_line_numbering() {
     assert_eq!(lines[4].new_line, Some(3));
     assert_eq!(lines[5].old_line, Some(3)); // trailing context advances both
     assert_eq!(lines[5].new_line, Some(4));
+}
+
+// ---------------------------------------------------------------------------
+// AI review gate
+// ---------------------------------------------------------------------------
+
+/// The reviewer must see the commits a push would publish, not the working
+/// tree: reviewing uncommitted edits would review code that isn't going out.
+#[test]
+fn review_diff_covers_outgoing_commits_not_working_tree() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "base\n", "init");
+    repo.push(true, None).unwrap();
+
+    commit_file(&repo, "a.txt", "published\n", "feat: committed work");
+    write(&repo, "a.txt", "uncommitted scratch\n");
+
+    let diff = repo.diff_for_review(None).unwrap();
+    assert!(diff.contains("+published"), "outgoing commit missing: {diff}");
+    assert!(
+        !diff.contains("uncommitted scratch"),
+        "working-tree edit must not be reviewed: {diff}"
+    );
+}
+
+/// With no upstream there is no `@{upstream}` to diff against, so the range
+/// is derived from the oldest commit no remote has.
+#[test]
+fn review_diff_works_without_an_upstream() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "base\n", "init");
+    repo.push(true, None).unwrap();
+
+    repo.create_branch("feature", true).unwrap();
+    commit_file(&repo, "b.txt", "feature work\n", "feat: b");
+
+    let diff = repo.diff_for_review(None).unwrap();
+    assert!(diff.contains("+feature work"), "unpushed commit missing: {diff}");
+}
+
+/// A pull request is reviewed against its target branch.
+#[test]
+fn review_diff_against_a_base_branch() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "base\n", "init");
+    repo.create_branch("feature", true).unwrap();
+    commit_file(&repo, "b.txt", "pr work\n", "feat: b");
+
+    let diff = repo.diff_for_review(Some("main")).unwrap();
+    assert!(diff.contains("+pr work"), "PR diff missing the change: {diff}");
+}
+
+/// A branch with nothing outgoing yields an empty diff rather than an error,
+/// so the gate reports "nothing to review" instead of failing.
+#[test]
+fn review_diff_is_empty_when_nothing_is_outgoing() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "base\n", "init");
+    repo.push(true, None).unwrap();
+
+    assert!(repo.diff_for_review(None).unwrap().trim().is_empty());
+}
+
+/// Review settings live beside the jobs in the same config file, and are
+/// off unless the repository opts in.
+#[test]
+fn review_config_parses_from_the_ci_file() {
+    use git_manage::review::Severity;
+
+    let (_tmp, repo) = setup();
+    fs::write(
+        repo.path().join(git_manage::local_ci::CONFIG_FILE),
+        r#"
+[[job]]
+name = "tests"
+commands = ["true"]
+
+[review]
+run = true
+fail_on = "medium"
+instructions = "Watch the UI thread."
+"#,
+    )
+    .unwrap();
+
+    let config = git_manage::local_ci::load_config(repo.path()).unwrap().unwrap();
+    assert_eq!(config.jobs.len(), 1);
+    assert!(config.review.run);
+    assert_eq!(config.review.fail_on, Severity::Medium);
+    assert_eq!(config.review.instructions.as_deref(), Some("Watch the UI thread."));
+    // Unset fields keep their defaults.
+    assert!(config.review.block_on_failure);
+    assert_eq!(config.review.max_diff_bytes, 24_000);
+}
+
+/// A config with no `[review]` section leaves the reviewer off, so adding
+/// the feature cannot change behaviour for existing repositories.
+#[test]
+fn review_is_off_when_the_config_omits_it() {
+    let (_tmp, repo) = setup();
+    fs::write(
+        repo.path().join(git_manage::local_ci::CONFIG_FILE),
+        "[[job]]\nname = \"tests\"\ncommands = [\"true\"]\n",
+    )
+    .unwrap();
+
+    let config = git_manage::local_ci::load_config(repo.path()).unwrap().unwrap();
+    assert!(!config.review.run, "review must be opt-in");
+}
+
+/// Keeps the guide honest: every `[review]`/`[on_push]` example in
+/// `docs/local-ci.md` must deserialize into the real config types. A
+/// documented field that no longer exists is a silent lie otherwise.
+#[test]
+fn documented_config_examples_match_the_real_schema() {
+    let doc = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/local-ci.md");
+    let text = fs::read_to_string(&doc).expect("docs/local-ci.md should exist");
+
+    // Pull out fenced ```toml blocks.
+    let mut blocks: Vec<String> = Vec::new();
+    let mut current: Option<String> = None;
+    for line in text.lines() {
+        match (&mut current, line.trim()) {
+            (None, "```toml") => current = Some(String::new()),
+            (Some(_), "```") => blocks.push(current.take().unwrap()),
+            (Some(buf), _) => {
+                buf.push_str(line);
+                buf.push('\n');
+            }
+            _ => {}
+        }
+    }
+    assert!(blocks.len() >= 10, "expected the guide's toml examples, found {}", blocks.len());
+
+    let mut checked = 0;
+    for block in &blocks {
+        if !block.contains("[review]") && !block.contains("[on_push]") {
+            continue;
+        }
+        // `deny_unknown_fields` is not set on the config types, so compare
+        // against a strict parse of the same text to catch stale field names.
+        let parsed: git_manage::local_ci::Config = toml::from_str(block)
+            .unwrap_or_else(|e| panic!("documented example does not parse:\n{block}\n{e}"));
+        let raw: toml::Table = toml::from_str(block).unwrap();
+        if let Some(toml::Value::Table(review)) = raw.get("review") {
+            let round_trip = toml::Value::try_from(&parsed.review).unwrap();
+            for key in review.keys() {
+                assert!(
+                    round_trip.get(key).is_some(),
+                    "docs document `[review] {key}`, which the ReviewConfig struct \
+                     does not have"
+                );
+            }
+            checked += 1;
+        }
+        if let Some(toml::Value::Table(on_push)) = raw.get("on_push") {
+            let round_trip = toml::Value::try_from(&parsed.on_push).unwrap();
+            for key in on_push.keys() {
+                assert!(
+                    round_trip.get(key).is_some(),
+                    "docs document `[on_push] {key}`, which the OnPush struct \
+                     does not have"
+                );
+            }
+            checked += 1;
+        }
+    }
+    assert!(checked >= 3, "expected several gate examples in the guide, checked {checked}");
+}
+
+/// Regression: a tracked file inside a gitignored directory must not be able
+/// to block staging everything else.
+///
+/// `git add` refuses any path under an ignored directory — even a tracked
+/// one — and fails the *whole* invocation, so batching every path into one
+/// `git add` meant a single such file broke every commit. (This is the state
+/// a repo lands in when a build directory is committed and `.gitignore` gains
+/// the directory afterwards.)
+#[test]
+fn staging_survives_a_tracked_file_in_an_ignored_directory() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "one\n", "init");
+
+    // Commit a build artifact, then start ignoring the directory.
+    fs::create_dir_all(repo.path().join("dist")).unwrap();
+    write(&repo, "dist/app.bin", "v1\n");
+    repo.git(&["add", "--force", "--", "dist/app.bin"]).unwrap();
+    repo.commit("chore: add build output", "", false).unwrap();
+    write(&repo, ".gitignore", "/dist\n");
+    commit_file(&repo, ".gitignore", "/dist\n", "chore: ignore dist");
+
+    // Now change both the ignored-but-tracked artifact and a normal file.
+    write(&repo, "dist/app.bin", "v2\n");
+    write(&repo, "a.txt", "two\n");
+
+    // Batching these into one `git add` fails outright; staging must cope.
+    let skipped = repo
+        .stage(&["a.txt".into(), "dist/app.bin".into()])
+        .expect("staging must not fail because of the ignored directory");
+    assert!(skipped.is_empty(), "tracked paths should be force-added, not skipped: {skipped:?}");
+
+    let status = repo.status().unwrap();
+    let staged: Vec<&str> =
+        status.files.iter().filter(|f| f.staged).map(|f| f.path.as_str()).collect();
+    assert!(staged.contains(&"a.txt"), "normal file was not staged: {staged:?}");
+    assert!(staged.contains(&"dist/app.bin"), "tracked artifact was not staged: {staged:?}");
+
+    // And the commit actually goes through.
+    repo.commit("chore: both", "", false).unwrap();
+    assert!(repo.status().unwrap().files.is_empty());
+}
+
+/// A path that is ignored *and* untracked is reported, not forced into the
+/// repository, and does not stop the rest from staging.
+#[test]
+fn staging_skips_but_reports_an_ignored_untracked_path() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, ".gitignore", "/dist\n", "chore: ignore dist");
+    commit_file(&repo, "a.txt", "one\n", "init");
+
+    fs::create_dir_all(repo.path().join("dist")).unwrap();
+    write(&repo, "dist/app.bin", "fresh\n");
+    write(&repo, "a.txt", "two\n");
+
+    let skipped = repo.stage(&["a.txt".into(), "dist/app.bin".into()]).unwrap();
+    assert_eq!(skipped, vec!["dist/app.bin".to_string()], "should report what it left out");
+
+    let status = repo.status().unwrap();
+    assert!(status.files.iter().any(|f| f.path == "a.txt" && f.staged));
+    // The ignored file must not have been sneaked in.
+    assert!(
+        !repo.git(&["ls-files", "--", "dist/app.bin"]).unwrap().contains("app.bin"),
+        "an ignored, untracked file must never be force-added"
+    );
+}
+
+/// When every requested path is unstageable that is a real error, not a
+/// silent no-op commit.
+#[test]
+fn staging_errors_when_nothing_could_be_staged() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, ".gitignore", "/dist\n", "chore: ignore dist");
+
+    fs::create_dir_all(repo.path().join("dist")).unwrap();
+    write(&repo, "dist/app.bin", "fresh\n");
+
+    let err = repo.stage(&["dist/app.bin".into()]).unwrap_err().to_string();
+    assert!(err.contains("Could not stage"), "unexpected error: {err}");
+}
+
+// ---------------------------------------------------------------------------
+// Nested CI configs (monorepo)
+// ---------------------------------------------------------------------------
+
+fn write_ci(repo: &Repo, dir: &str, body: &str) {
+    let target = if dir.is_empty() { repo.path().to_path_buf() } else { repo.path().join(dir) };
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join(git_manage::local_ci::CONFIG_FILE), body).unwrap();
+}
+
+/// Every config in the tree contributes jobs, and each job is tagged with the
+/// directory it came from.
+#[test]
+fn nested_configs_all_contribute_jobs() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "x\n", "init");
+
+    write_ci(&repo, "", "[[job]]\nname = \"root\"\ncommands = [\"true\"]\n");
+    write_ci(&repo, "packages/api", "[[job]]\nname = \"tests\"\ncommands = [\"true\"]\n");
+    write_ci(&repo, "packages/web", "[[job]]\nname = \"tests\"\ncommands = [\"true\"]\n");
+
+    let loaded = git_manage::local_ci::discover_configs(repo.path()).unwrap();
+    let names: Vec<String> = loaded.config.jobs.iter().map(|j| j.display_name()).collect();
+
+    assert_eq!(loaded.config.jobs.len(), 3, "got {names:?}");
+    // Root first, then nested in path order.
+    assert_eq!(names[0], "root");
+    // Same job name in two packages must not be ambiguous.
+    assert!(names.contains(&"packages/api: tests".to_string()), "{names:?}");
+    assert!(names.contains(&"packages/web: tests".to_string()), "{names:?}");
+    assert_eq!(loaded.sources.len(), 3);
+}
+
+/// A nested job's commands run in that directory, not the repo root — a
+/// package's `cargo test` has to run in the package.
+#[test]
+fn a_nested_job_runs_in_its_own_directory() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "x\n", "init");
+    write_ci(&repo, "packages/api", "[[job]]\nname = \"where\"\ncommands = [\"pwd\"]\n");
+
+    let loaded = git_manage::local_ci::discover_configs(repo.path()).unwrap();
+    let job = loaded.config.jobs.first().expect("expected the nested job");
+    assert_eq!(job.dir, "packages/api");
+
+    let result = git_manage::local_ci::run_job(repo.path(), job);
+    assert!(result.ok, "job failed: {}", result.output);
+    assert!(
+        result.output.trim_end().ends_with("packages/api"),
+        "ran in the wrong directory: {}",
+        result.output
+    );
+    assert_eq!(result.name, "packages/api: where");
+}
+
+/// Discovery goes through git, so gitignored paths are never searched — a
+/// config left in `target/` or `node_modules/` must not add jobs.
+#[test]
+fn ignored_directories_are_not_searched() {
+    let (_tmp, repo) = setup();
+    write_ci(&repo, "", "[[job]]\nname = \"root\"\ncommands = [\"true\"]\n");
+    commit_file(&repo, ".gitignore", "/target\n/node_modules\n", "chore: ignore");
+
+    write_ci(&repo, "target/leftover", "[[job]]\nname = \"stale\"\ncommands = [\"false\"]\n");
+    write_ci(&repo, "node_modules/pkg", "[[job]]\nname = \"vendored\"\ncommands = [\"false\"]\n");
+
+    let loaded = git_manage::local_ci::discover_configs(repo.path()).unwrap();
+    let names: Vec<String> = loaded.config.jobs.iter().map(|j| j.display_name()).collect();
+    assert_eq!(names, vec!["root"], "ignored paths leaked in: {names:?}");
+}
+
+/// An uncommitted config still counts — you should not have to commit before
+/// the checks you just wrote will run.
+#[test]
+fn an_uncommitted_nested_config_is_found() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "x\n", "init");
+    write_ci(&repo, "svc", "[[job]]\nname = \"fresh\"\ncommands = [\"true\"]\n");
+
+    let loaded = git_manage::local_ci::discover_configs(repo.path()).unwrap();
+    assert_eq!(
+        loaded.config.jobs.iter().map(|j| j.display_name()).collect::<Vec<_>>(),
+        vec!["svc: fresh"]
+    );
+}
+
+/// Gates are repository-wide: only the root config's are honoured, and a
+/// nested one is reported rather than silently dropped.
+#[test]
+fn gates_come_from_the_root_and_nested_ones_are_reported() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "x\n", "init");
+    write_ci(
+        &repo,
+        "",
+        "[on_push]\nrun = true\n\n[review]\nrun = true\nfail_on = \"medium\"\n",
+    );
+    write_ci(
+        &repo,
+        "svc",
+        "[[job]]\nname = \"t\"\ncommands = [\"true\"]\n\n[on_push]\nrun = false\n\n[review]\nrun = true\n",
+    );
+
+    let loaded = git_manage::local_ci::discover_configs(repo.path()).unwrap();
+    assert!(loaded.config.on_push.run, "root [on_push] must win");
+    assert_eq!(loaded.config.review.fail_on, git_manage::review::Severity::Medium);
+    assert_eq!(loaded.ignored_gates, vec!["svc".to_string()], "must report what it ignored");
+}
+
+/// A repo with no root config still runs the nested ones.
+#[test]
+fn nested_configs_work_without_a_root_config() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "x\n", "init");
+    write_ci(&repo, "svc", "[[job]]\nname = \"t\"\ncommands = [\"true\"]\n");
+
+    let loaded = git_manage::local_ci::discover_configs(repo.path()).unwrap();
+    assert_eq!(loaded.config.jobs.len(), 1);
+    assert!(!loaded.config.on_push.run, "no root config means default gates");
+}
+
+/// One unparseable nested config must not take down the rest.
+#[test]
+fn a_broken_nested_config_is_skipped() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "x\n", "init");
+    write_ci(&repo, "", "[[job]]\nname = \"root\"\ncommands = [\"true\"]\n");
+    write_ci(&repo, "good", "[[job]]\nname = \"ok\"\ncommands = [\"true\"]\n");
+    write_ci(&repo, "bad", "this is not = valid toml [[[\n");
+
+    let loaded = git_manage::local_ci::discover_configs(repo.path()).unwrap();
+    let names: Vec<String> = loaded.config.jobs.iter().map(|j| j.display_name()).collect();
+    assert!(names.contains(&"root".to_string()), "{names:?}");
+    assert!(names.contains(&"good: ok".to_string()), "{names:?}");
+    assert_eq!(names.len(), 2, "the broken config should be skipped: {names:?}");
+}
+
+/// Regression: `devdock ci` and the pre-push hook must run the same jobs as
+/// the app. Loading only the root config meant a monorepo's package checks
+/// were skipped on the CLI — so the hook that gates pushes reported success
+/// while the app showed failures.
+#[test]
+fn the_cli_runner_sees_nested_configs() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "x\n", "init");
+    write_ci(&repo, "", "[[job]]\nname = \"root\"\ncommands = [\"true\"]\n");
+    write_ci(&repo, "packages/api", "[[job]]\nname = \"t\"\ncommands = [\"false\"]\n");
+
+    // The nested job fails, so the whole run must fail.
+    let ok = git_manage::local_ci::run_all_cli(repo.path()).unwrap();
+    assert!(!ok, "a failing nested job must fail the CLI run");
+}
+
+/// With only a root config the CLI behaves exactly as before.
+#[test]
+fn the_cli_runner_still_handles_a_single_config() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "x\n", "init");
+    write_ci(&repo, "", "[[job]]\nname = \"root\"\ncommands = [\"true\"]\n");
+    assert!(git_manage::local_ci::run_all_cli(repo.path()).unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// Review instructions from a file
+// ---------------------------------------------------------------------------
+
+fn review_cfg(toml: &str) -> git_manage::review::ReviewConfig {
+    toml::from_str(toml).expect("config should parse")
+}
+
+#[test]
+fn instructions_can_come_from_a_file() {
+    let (_tmp, repo) = setup();
+    fs::create_dir_all(repo.path().join("docs")).unwrap();
+    fs::write(
+        repo.path().join("docs/review.md"),
+        "# House rules\n\nFlag any blocking call on the UI thread.\n",
+    )
+    .unwrap();
+
+    let cfg = review_cfg("instructions_file = \"docs/review.md\"\n");
+    let resolved = cfg.resolve_files(repo.path()).unwrap();
+    let text = resolved.instructions.expect("should have instructions");
+    assert!(text.contains("blocking call on the UI thread"), "{text}");
+    // The path is consumed, so providers never touch the filesystem.
+    assert!(resolved.instructions_file.is_none());
+}
+
+/// Inline text and a file combine, so a shared guidelines document can be
+/// topped up with a line specific to one repository.
+#[test]
+fn inline_instructions_and_a_file_combine() {
+    let (_tmp, repo) = setup();
+    fs::write(repo.path().join("rules.md"), "From the file.\n").unwrap();
+
+    let cfg = review_cfg("instructions = \"Inline note.\"\ninstructions_file = \"rules.md\"\n");
+    let text = cfg.resolve_files(repo.path()).unwrap().instructions.unwrap();
+    assert!(text.contains("Inline note."), "{text}");
+    assert!(text.contains("From the file."), "{text}");
+}
+
+/// A path that escapes the repository is refused. The config may have arrived
+/// with a cloned repo, and the contents are sent to an AI provider.
+#[test]
+fn an_instructions_path_cannot_escape_the_repository() {
+    let (tmp, repo) = setup();
+    fs::write(tmp.path().join("outside.md"), "secrets\n").unwrap();
+
+    for bad in ["../outside.md", "/etc/hosts"] {
+        let cfg = review_cfg(&format!("instructions_file = \"{bad}\"\n"));
+        let err = cfg
+            .resolve_files(repo.path())
+            .expect_err(&format!("{bad} should be refused"));
+        assert!(
+            err.contains("outside the repository") || err.contains("must be relative"),
+            "unexpected error for {bad}: {err}"
+        );
+    }
+}
+
+/// A missing file is an error, not a silent skip: reviewing without the rules
+/// you configured produces an authoritative-looking review that is not the
+/// one you asked for.
+#[test]
+fn a_missing_instructions_file_is_reported() {
+    let (_tmp, repo) = setup();
+    let cfg = review_cfg("instructions_file = \"docs/nope.md\"\n");
+    let err = cfg.resolve_files(repo.path()).unwrap_err();
+    assert!(err.contains("no such file"), "{err}");
+
+    // An empty one is equally useless and equally reported.
+    fs::write(repo.path().join("empty.md"), "   \n").unwrap();
+    let cfg = review_cfg("instructions_file = \"empty.md\"\n");
+    assert!(cfg.resolve_files(repo.path()).unwrap_err().contains("is empty"));
+}
+
+/// The house style for Markdown output can come from a file too.
+#[test]
+fn output_instructions_can_come_from_a_file() {
+    let (_tmp, repo) = setup();
+    fs::write(repo.path().join("style.md"), "## Verdict\n## Must fix\n").unwrap();
+
+    let cfg = review_cfg("output = \"markdown\"\noutput_instructions_file = \"style.md\"\n");
+    let resolved = cfg.resolve_files(repo.path()).unwrap();
+    assert!(resolved.output_instructions.unwrap().contains("## Must fix"));
+    assert!(resolved.output_instructions_file.is_none());
+}
+
+/// A very long guidance file is truncated rather than crowding out the diff.
+#[test]
+fn an_oversized_instructions_file_is_truncated() {
+    let (_tmp, repo) = setup();
+    let huge = "x".repeat(git_manage::review::MAX_INSTRUCTIONS_BYTES + 5_000);
+    fs::write(repo.path().join("big.md"), &huge).unwrap();
+
+    let cfg = review_cfg("instructions_file = \"big.md\"\n");
+    let text = cfg.resolve_files(repo.path()).unwrap().instructions.unwrap();
+    assert!(text.contains("[instructions truncated]"), "should mark the cut");
+    assert!(text.len() < huge.len(), "should be shorter than the source");
+}
+
+/// Nothing configured stays nothing — resolution is a no-op.
+#[test]
+fn no_instructions_configured_resolves_to_none() {
+    let (_tmp, repo) = setup();
+    let cfg = review_cfg("run = true\n");
+    let resolved = cfg.resolve_files(repo.path()).unwrap();
+    assert!(resolved.instructions.is_none());
+    assert!(resolved.output_instructions.is_none());
 }

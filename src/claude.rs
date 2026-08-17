@@ -358,6 +358,42 @@ impl Client {
         Ok(crate::ollama::extract_merged_content(&text))
     }
 
+    /// Reviews an outgoing diff in whichever output style `config` selects.
+    pub fn review(
+        &self,
+        diff: &str,
+        config: &crate::review::ReviewConfig,
+    ) -> Result<crate::review::ReviewOutcome> {
+        use crate::review::{self, OutputStyle};
+
+        let prompt =
+            review::user_prompt(diff, config.instructions.as_deref(), config.max_diff_bytes);
+
+        match config.output {
+            OutputStyle::Findings => {
+                let text = self.request_with_system(review::SYSTEM_PROMPT, &prompt, 8192)?;
+                if !review::parsed_cleanly(&text) {
+                    return Err(ClaudeError(format!(
+                        "The reviewer did not return a usable review: {}",
+                        review::excerpt(&text)
+                    )));
+                }
+                Ok(review::parse(&text))
+            }
+            OutputStyle::Markdown => {
+                let system = review::markdown_system_prompt(
+                    config.output_instructions.as_deref(),
+                    config.block_on_failure,
+                );
+                let text = self.request_with_system(&system, &prompt, 8192)?;
+                if text.trim().is_empty() {
+                    return Err(ClaudeError("The reviewer returned nothing.".into()));
+                }
+                Ok(review::parse_markdown(&text))
+            }
+        }
+    }
+
     fn request(&self, prompt: &str, max_tokens: u32) -> Result<String> {
         self.request_with_system(SYSTEM_PROMPT, prompt, max_tokens)
     }

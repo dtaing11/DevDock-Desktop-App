@@ -11,6 +11,7 @@
 
 pub mod dialogs;
 pub mod graph;
+pub mod markdown;
 pub mod shortcuts;
 pub mod syntax;
 pub mod theme;
@@ -169,6 +170,10 @@ pub enum Dialog {
     PrReview,
     /// Confirmation gate for a destructive action.
     Confirm(ConfirmAction),
+    /// AI review findings, with the option to act on them or proceed anyway.
+    ReviewGate,
+    /// Failing local CI checks, with the option to proceed anyway.
+    ChecksGate,
 }
 
 /// A destructive action awaiting user confirmation.
@@ -413,12 +418,59 @@ pub struct LocalCiState {
     /// A push waiting for the current CI run to finish:
     /// (action, set_upstream). Executed when all jobs pass.
     pub pending_push: Option<(String, bool)>,
+    /// An action held back because checks failed, kept so the user can look
+    /// at the failures and still choose to proceed. Dropped on cancel.
+    pub blocked: Option<GatedAction>,
     /// Completed runs, newest first, for the Checks tab.
     pub history: Vec<CiRun>,
     /// When the current run started.
     pub run_started: Option<Instant>,
     /// What triggered the current run.
     pub trigger: CiTrigger,
+}
+
+/// An action held back while the AI reviewer runs, and resumed if the user
+/// accepts the findings or overrides them.
+#[derive(Clone, PartialEq, Eq)]
+pub enum GatedAction {
+    Push { action: String, set_upstream: bool },
+    PullRequest,
+}
+
+impl GatedAction {
+    /// How the override button describes proceeding anyway.
+    pub fn override_label(&self) -> &'static str {
+        match self {
+            Self::Push { action, .. } if action == "force-push" => "Force-push anyway",
+            Self::Push { .. } => "Push anyway",
+            Self::PullRequest => "Create pull request anyway",
+        }
+    }
+
+    pub fn noun(&self) -> &'static str {
+        match self {
+            Self::Push { .. } => "push",
+            Self::PullRequest => "pull request",
+        }
+    }
+}
+
+/// AI code review state for the current repository.
+#[derive(Default)]
+pub struct ReviewState {
+    /// `[review]` settings, re-read from the config file with the CI jobs.
+    pub config: crate::review::ReviewConfig,
+    pub running: bool,
+    /// The most recent outcome, kept so the Checks tab can show it after the
+    /// gate dialog is dismissed.
+    pub outcome: Option<crate::review::ReviewOutcome>,
+    /// Why the last review could not be produced, if it failed. A failed
+    /// review never blocks: it is reported and the action proceeds.
+    pub error: Option<String>,
+    /// The action waiting on this review's verdict.
+    pub pending: Option<GatedAction>,
+    /// Which finding's detail is expanded in the list.
+    pub expanded: Option<usize>,
 }
 
 /// What started a CI run.
@@ -542,6 +594,7 @@ pub struct App {
     pub claude: ClaudeState,
     pub pr: PrState,
     pub local_ci: LocalCiState,
+    pub review: ReviewState,
     pub conflicts: ConflictState,
     /// AI CI-config generation: busy flag and the editable proposal text
     /// shown in the review dialog. Nothing is written until confirmed.
@@ -619,6 +672,7 @@ impl App {
             claude: Default::default(),
             pr: Default::default(),
             local_ci: Default::default(),
+            review: Default::default(),
             conflicts: Default::default(),
             ollama_models: Vec::new(),
             toast: None,
@@ -834,12 +888,24 @@ impl App {
         self.hunks_expanded = false;
         self.worker.spawn(move || {
             let result = (|| -> Result<String, crate::git::GitError> {
+                let mut skipped = Vec::new();
                 if !files.is_empty() {
                     repo.unstage_all().ok();
-                    repo.stage(&files)?;
+                    skipped = repo.stage(&files)?;
                 }
                 let sha = repo.commit(&summary, &description, amend)?;
-                Ok(format!("{} {}", if amend { "Amended" } else { "Committed" }, &sha[..7]))
+                let verb = if amend { "Amended" } else { "Committed" };
+                // Say so rather than letting a file drop out of the commit
+                // without a word.
+                if skipped.is_empty() {
+                    Ok(format!("{verb} {}", &sha[..7]))
+                } else {
+                    Ok(format!(
+                        "{verb} {} — left out {} (ignored by .gitignore and not tracked)",
+                        &sha[..7],
+                        skipped.join(", ")
+                    ))
+                }
             })();
             Msg::Done { message: strerr(result), refresh: true }
         });
@@ -1269,6 +1335,50 @@ impl App {
                 }
             }
 
+            Msg::ReviewDone(result) => {
+                self.review.running = false;
+                match result {
+                    Ok(outcome) => {
+                        // `should_block` covers both output styles: the
+                        // fail_on threshold for findings, the reviewer's
+                        // verdict line for custom Markdown.
+                        let blocks = outcome.should_block(&self.review.config);
+                        let (high, medium, low) = outcome.tally();
+                        let markdown = outcome.markdown.is_some();
+                        self.review.outcome = Some(outcome);
+                        // The gate dialog only makes sense when an action is
+                        // actually being held; a manual review just reports.
+                        if blocks && self.review.pending.is_some() {
+                            // Hold the action and put the findings and the
+                            // reviewer's reasoning in front of the user.
+                            self.dialog = Dialog::ReviewGate;
+                        } else {
+                            let note = if markdown {
+                                "Review ready — see the Checks tab.".to_string()
+                            } else if high + medium + low == 0 {
+                                "Review found nothing.".to_string()
+                            } else {
+                                format!(
+                                    "Review: {high} high, {medium} medium, {low} low. \
+                                     Not blocking; see the Checks tab."
+                                )
+                            };
+                            self.toast(note, false);
+                            if let Some(gated) = self.review.pending.take() {
+                                self.perform(gated);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Never block on our own failure — report and proceed.
+                        self.review.error = Some(e.clone());
+                        self.toast(format!("AI review did not run: {e}. Proceeding."), true);
+                        if let Some(gated) = self.review.pending.take() {
+                            self.perform(gated);
+                        }
+                    }
+                }
+            }
             Msg::CiJobDone { index, result } => {
                 if let Some(slot) = self.local_ci.results.get_mut(index) {
                     *slot = Some(result);
@@ -1299,20 +1409,24 @@ impl App {
                     // A push may be waiting on this run.
                     if let Some((action, set_upstream)) = self.local_ci.pending_push.take() {
                         if passed {
-                            self.toast("Checks passed. Pushing…", false);
-                            self.execute_push(&action, set_upstream);
+                            // Jobs cleared; the AI reviewer is the next gate.
+                            self.toast("Checks passed.", false);
+                            self.gate_with_review(GatedAction::Push { action, set_upstream });
                         } else if self.local_ci.on_push.block_on_failure {
-                            // Surface the failure prominently.
+                            // Hold the push and show what failed, rather than
+                            // discarding it. The checks are the developer's own
+                            // and can be wrong or irrelevant to this change, so
+                            // the gate offers a way through — the same bargain
+                            // the AI reviewer makes.
                             self.tab = Tab::Checks;
                             self.local_ci.expanded = self
                                 .local_ci
                                 .results
                                 .iter()
                                 .position(|r| r.as_ref().map(|x| !x.ok).unwrap_or(false));
-                            self.toast(
-                                "Push cancelled: checks failed. See the Checks tab.",
-                                true,
-                            );
+                            self.local_ci.blocked =
+                                Some(GatedAction::Push { action, set_upstream });
+                            self.dialog = Dialog::ChecksGate;
                         } else {
                             self.toast("Checks failed (non-blocking). Pushing anyway…", true);
                             self.execute_push(&action, set_upstream);
@@ -1406,10 +1520,40 @@ impl App {
         self.local_ci = Default::default();
         self.local_ci.history = history;
         let Some(repo) = self.repo.as_ref() else { return };
-        if let Ok(Some(config)) = crate::local_ci::load_config(repo.path()) {
-            self.local_ci.results = vec![None; config.jobs.len()];
-            self.local_ci.jobs = config.jobs;
-            self.local_ci.on_push = config.on_push;
+        // Picks up per-directory configs too, so a monorepo's packages each
+        // contribute their own jobs.
+        let Ok(loaded) = crate::local_ci::discover_configs(repo.path()) else { return };
+        let nested = loaded.sources.iter().filter(|d| !d.is_empty()).count();
+        let ignored = loaded.ignored_gates.clone();
+        self.local_ci.results = vec![None; loaded.config.jobs.len()];
+        self.local_ci.jobs = loaded.config.jobs;
+        self.local_ci.on_push = loaded.config.on_push;
+        // Keep the last outcome visible across a config reload; only the
+        // settings are re-read.
+        self.review.config = loaded.config.review;
+
+        if nested > 0 {
+            self.toast(
+                format!(
+                    "Loaded {} check(s) from {} config file(s).",
+                    self.local_ci.jobs.len(),
+                    nested + 1
+                ),
+                false,
+            );
+        }
+        // Ignoring part of someone's config silently would be worse than the
+        // limitation itself.
+        if !ignored.is_empty() {
+            self.toast(
+                format!(
+                    "[on_push]/[review] in {} apply to the whole repository and \
+                     were ignored — set them in the root {}.",
+                    ignored.join(", "),
+                    crate::local_ci::CONFIG_FILE
+                ),
+                true,
+            );
         }
     }
 
@@ -1456,7 +1600,122 @@ impl App {
             );
             return;
         }
-        self.execute_push(action, set_upstream);
+        // No job gate (or none configured): the reviewer is the only gate.
+        self.gate_with_review(GatedAction::Push {
+            action: action.to_string(),
+            set_upstream,
+        });
+    }
+
+    /// Runs `action` through the AI review gate when `[review] run = true`,
+    /// otherwise performs it immediately.
+    ///
+    /// A review that cannot run at all (no provider signed in, request
+    /// failed) reports the reason and lets the action through. A gate that
+    /// silently blocks work when its own dependency is missing is worse than
+    /// no gate: the first time it happens the feature gets switched off.
+    pub fn gate_with_review(&mut self, gated: GatedAction) {
+        self.start_review(Some(gated), false);
+    }
+
+    /// Shared body of the gated and manual review paths. `force` runs the
+    /// review even when `[review] run = false`; `gated` is the action to
+    /// resume afterwards, or `None` for a review that gates nothing.
+    fn start_review(&mut self, gated: Option<GatedAction>, force: bool) {
+        let Some(repo) = self.repo.clone() else { return };
+        // Each trigger is enabled independently, falling back to `run` when
+        // the repo only set the simple switch.
+        let enabled = match &gated {
+            Some(GatedAction::Push { .. }) => self.review.config.runs_on_push(),
+            Some(GatedAction::PullRequest) => self.review.config.runs_on_pull_request(),
+            // A manual review from the Checks tab is its own consent.
+            None => true,
+        };
+        if (!enabled && !force) || self.review.running {
+            if let Some(gated) = gated {
+                self.perform(gated);
+            }
+            return;
+        }
+        let Some((provider, model)) = self.review_provider() else {
+            self.toast(
+                "AI review is enabled but no model is available. Pick one in \
+                 Settings, or set provider/model under [review]. Proceeding.",
+                true,
+            );
+            if let Some(gated) = gated {
+                self.perform(gated);
+            }
+            return;
+        };
+
+        // A pull request is reviewed against its target branch; a push
+        // against whatever the branch would publish.
+        let base = match &gated {
+            Some(GatedAction::PullRequest) => Some(self.pr.base.clone()),
+            _ => None,
+        };
+        let cfg = self.review.config.clone();
+        let url = self.effective_ollama_url();
+
+        self.review.running = true;
+        self.review.error = None;
+        self.review.outcome = None;
+        self.review.expanded = None;
+        self.review.pending = gated;
+        self.toast("Reviewing the outgoing diff…", false);
+
+        self.worker.spawn(move || {
+            let result = (|| -> Result<crate::review::ReviewOutcome, String> {
+                // Read instructions files now rather than at config load, so
+                // editing the guidance takes effect on the next review without
+                // reloading the config.
+                let cfg = cfg.resolve_files(repo.path())?;
+                let diff = strerr(repo.diff_for_review(base.as_deref()))?;
+                if diff.trim().is_empty() {
+                    return Err("Nothing to review: no outgoing changes found.".into());
+                }
+                if provider == "claude" {
+                    let client = claude::Client::from_store(model)
+                        .ok_or("Claude is not signed in. Open Settings.")?;
+                    strerr(client.review(&diff, &cfg))
+                } else {
+                    strerr(ollama::Client::new(url).review(&model, &diff, &cfg))
+                }
+            })();
+            Msg::ReviewDone(result)
+        });
+    }
+
+    /// Reviews the outgoing diff without gating anything, for the Checks
+    /// tab's own button. Runs even when `[review] run = false`, since asking
+    /// for a review explicitly is its own consent.
+    pub fn review_now(&mut self) {
+        self.start_review(None, true);
+    }
+
+    /// Which provider and model the reviewer should use: the `[review]`
+    /// overrides when set, else whatever the app has selected for AI work.
+    fn review_provider(&self) -> Option<(String, String)> {
+        let cfg = &self.review.config;
+        if let (Some(provider), Some(model)) = (&cfg.provider, &cfg.model) {
+            return Some((provider.clone(), model.clone()));
+        }
+        let sel = self.ai_selection(worker::AiTarget::Commit)?;
+        Some((
+            cfg.provider.clone().unwrap_or(sel.provider),
+            cfg.model.clone().unwrap_or(sel.model),
+        ))
+    }
+
+    /// Carries out an action that has cleared (or been let through) the gate.
+    pub fn perform(&mut self, gated: GatedAction) {
+        match gated {
+            GatedAction::Push { action, set_upstream } => {
+                self.execute_push(&action, set_upstream)
+            }
+            GatedAction::PullRequest => dialogs::create_pr(self),
+        }
     }
 
     /// Runs the actual push/force-push on a worker thread.

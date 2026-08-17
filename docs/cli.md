@@ -187,20 +187,25 @@ environments, secrets, `[on_push]`).
 
 ### ci init
 
-Creates `.git-manage-ci.toml`. Plain `ci init` writes the commented
-starter template. `ci init --ai` scans the repository (file listing plus
-manifests like Cargo.toml, package.json, go.mod, Makefile) and asks the
-configured AI model to draft jobs tailored to the project.
+Creates `.git-manage-ci.toml`. Plain `ci init` writes the commented starter
+template. `ci init --ai` scans the repository and asks an AI model to draft
+jobs tailored to the project.
+
+```
+devdock ci init --ai [--provider claude|ollama] [--model NAME]
+```
 
 ```
 $ devdock ci init --ai
+using claude / claude-opus-5
 scanning the repository…
 asking the AI to draft the config…
 
 ── AI proposed .git-manage-ci.toml ──
+  # Stack: Flutter (Dart)
   [[job]]
-  name = "tests"
-  commands = ["cargo test"]
+  name = "analyze"
+  commands = ["flutter analyze"]
   ...
 ── end ──
 nothing is written until you accept
@@ -208,9 +213,31 @@ nothing is written until you accept
 saved .git-manage-ci.toml
 ```
 
-The draft is validated as TOML before you ever see it, and again after
-`[e]dit`. Nothing is written until you accept; quitting discards it.
-An existing config is only overwritten after the same confirmation.
+**Provider and model.** Both are optional and resolve in this order: the flag,
+then the selection configured in the app, then whatever is actually available
+on this machine — Claude if you are signed in, otherwise Ollama if it is
+running with a model pulled. So `--ai` works with no prior GUI setup as long as
+one provider is reachable. The line it prints tells you which it picked. If
+nothing is available it says so rather than failing obscurely.
+
+**What the scan sends.** Evidence, not conclusions:
+
+1. A count of files by extension — the clearest signal of what the code is.
+2. The full list of tracked files, not just the top directory, so nested
+   packages, platform folders, and test layout are visible.
+3. The contents of the project's shallow configuration files.
+
+Which files get inlined is decided by *shape* — shallow, small, not generated,
+not source — rather than from a list of known manifest names. That means a
+`pubspec.yaml`, `flake.nix`, or a manifest from an ecosystem nobody thought to
+enumerate is read just the same. Lock files, licences, and binaries are skipped
+as noise; `.gitignore` is honoured throughout, since the listing comes from git.
+
+The draft leads with a `# Stack: …` comment stating what the model concluded,
+so a misread is obvious before you accept. It is validated as TOML before you
+ever see it, and again after `[e]dit`. Nothing is written until you accept;
+quitting discards it. An existing config is only overwritten after the same
+confirmation.
 
 ### hook
 

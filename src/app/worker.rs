@@ -32,6 +32,9 @@ pub enum Msg {
     ClaudeModels(Vec<String>),
     /// One local CI job finished.
     CiJobDone { index: usize, result: crate::local_ci::JobResult },
+    /// The AI reviewer finished. `Err` means the review could not be
+    /// produced, which reports but never blocks the gated action.
+    ReviewDone(Result<crate::review::ReviewOutcome, String>),
 
     GhDeviceCode(Result<DeviceCode, String>),
     GhSignedIn(Result<User, String>),

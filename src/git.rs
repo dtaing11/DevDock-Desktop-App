@@ -36,6 +36,10 @@ pub enum GitError {
 /// Convenience alias used across this module.
 pub type Result<T> = std::result::Result<T, GitError>;
 
+/// Git's canonical empty-tree object, for diffing a root commit that has no
+/// parent to compare against.
+const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
 // ---------------------------------------------------------------------------
 // Data types
 // ---------------------------------------------------------------------------
@@ -399,9 +403,56 @@ impl Repo {
 
     // -- staging ------------------------------------------------------------
 
-    /// Stages the given paths.
-    pub fn stage(&self, files: &[String]) -> Result<()> {
-        self.run_on_files(&["add", "--"], files)
+    /// True when `path` is in the index (already tracked by this repository).
+    fn is_tracked(&self, path: &str) -> bool {
+        self.git(&["ls-files", "--error-unmatch", "--", path]).is_ok()
+    }
+
+    /// Stages the given paths, returning any that could not be staged.
+    ///
+    /// `git add` fails the *entire* invocation when one pathspec is refused,
+    /// so a single problem path would otherwise take down every commit. The
+    /// batch is tried first for speed, then retried per path to isolate the
+    /// failures.
+    ///
+    /// The refusal that motivates this: `git add` rejects any path inside a
+    /// directory matched by `.gitignore` — **even a tracked one** — and
+    /// reports the ignored ancestor rather than the path given. A build
+    /// directory that is both gitignored and (historically) committed hits
+    /// this on every commit. Forcing is correct for a path already in the
+    /// index: it stages a change to a file the repository already has, and
+    /// cannot introduce a new ignored one.
+    ///
+    /// Paths that are ignored *and* untracked are skipped and returned rather
+    /// than failing the call, so one of them cannot block committing
+    /// everything else.
+    pub fn stage(&self, files: &[String]) -> Result<Vec<String>> {
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.run_on_files(&["add", "--"], files).is_ok() {
+            return Ok(Vec::new());
+        }
+
+        let mut skipped = Vec::new();
+        for file in files {
+            if self.git(&["add", "--", file]).is_ok() {
+                continue;
+            }
+            if self.is_tracked(file) && self.git(&["add", "--force", "--", file]).is_ok() {
+                continue;
+            }
+            skipped.push(file.clone());
+        }
+        // Everything failing is a real error; some failing is a warning the
+        // caller reports while the rest of the commit proceeds.
+        if skipped.len() == files.len() {
+            return Err(GitError::Command(format!(
+                "Could not stage {}: ignored by .gitignore and not tracked.",
+                skipped.join(", ")
+            )));
+        }
+        Ok(skipped)
     }
 
     /// Unstages the given paths.
@@ -419,33 +470,98 @@ impl Repo {
         self.git(&["reset", "HEAD"]).map(drop)
     }
 
-    /// Discards changes: restores tracked files, deletes untracked ones.
+    /// Diff of the work that a push or pull request would publish.
+    ///
+    /// With `base` (a pull request's target branch) this is `base...HEAD`.
+    /// Without it, it is everything the current branch would push: against
+    /// the upstream when there is one, otherwise from just before the oldest
+    /// commit no remote has yet.
+    ///
+    /// This is deliberately not the working-tree diff — a push publishes
+    /// commits, so reviewing uncommitted edits would review the wrong code.
+    pub fn diff_for_review(&self, base: Option<&str>) -> Result<String> {
+        if let Some(base) = base.map(str::trim).filter(|b| !b.is_empty()) {
+            let range = format!("{base}...HEAD");
+            return self.git(&["diff", &range]);
+        }
+        if self.git(&["rev-parse", "--verify", "--quiet", "@{upstream}"]).is_ok() {
+            return self.git(&["diff", "@{upstream}...HEAD"]);
+        }
+        // No upstream: `rev-list` is newest-first, so the last entry is the
+        // oldest commit missing from every remote.
+        let unpushed = self.git(&["rev-list", "HEAD", "--not", "--remotes"])?;
+        let Some(oldest) = unpushed.split_whitespace().last() else {
+            return Ok(String::new());
+        };
+        let range = format!("{oldest}^..HEAD");
+        match self.git(&["diff", &range]) {
+            Ok(diff) => Ok(diff),
+            // The oldest commit is the root commit and has no parent, so
+            // there is nothing to diff against but the empty tree.
+            Err(_) => self.git(&["diff", EMPTY_TREE, "HEAD"]),
+        }
+    }
+
+    /// True when `path` exists in the `HEAD` commit.
+    fn in_head(&self, path: &str) -> bool {
+        self.git(&["ls-tree", "--name-only", "HEAD", "--", path])
+            .map(|out| !out.trim().is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Discards every change to `files`, returning each to its committed
+    /// state: staged and unstaged edits alike, plus untracked files.
+    ///
+    /// Restoring from `HEAD` rather than the index is what makes this cover
+    /// staged work. `git checkout -- <path>` copies the *index* over the
+    /// working tree, so against a staged change it rewrites the file with
+    /// the very content being discarded — the file keeps its edit and stays
+    /// staged, and the discard silently does nothing.
     pub fn discard(&self, files: &[String]) -> Result<()> {
         let status = self.status()?;
-        let untracked: HashSet<&str> = status
-            .files
-            .iter()
-            .filter(|f| {
-                f.index_status == Some(FileStatus::Untracked)
-                    || f.work_status == Some(FileStatus::Untracked)
-            })
-            .map(|f| f.path.as_str())
-            .collect();
 
-        let tracked: Vec<String> = files
-            .iter()
-            .filter(|f| !untracked.contains(f.as_str()))
-            .cloned()
-            .collect();
-        if !tracked.is_empty() {
-            self.run_on_files(&["checkout", "--"], &tracked)?;
+        // A rename is staged as a deletion of the original path plus an
+        // addition of the new one. Restoring only the path the UI lists
+        // would leave the original still deleted.
+        let mut targets: Vec<String> = Vec::new();
+        for path in files {
+            targets.push(path.clone());
+            let orig = status
+                .files
+                .iter()
+                .find(|f| &f.path == path)
+                .and_then(|f| f.orig_path.clone());
+            if let Some(orig) = orig {
+                targets.push(orig);
+            }
         }
-        for file in files.iter().filter(|f| untracked.contains(f.as_str())) {
-            let target = self.root.join(file);
-            if target.is_dir() {
-                std::fs::remove_dir_all(&target)?;
-            } else if target.exists() {
-                std::fs::remove_file(&target)?;
+        targets.sort();
+        targets.dedup();
+
+        // Paths in HEAD are restored from it. Everything else — untracked
+        // files and staged additions — has no committed state to return to,
+        // so it leaves the index and the working tree entirely.
+        let (restore, remove): (Vec<String>, Vec<String>) =
+            targets.into_iter().partition(|p| self.in_head(p));
+
+        if !restore.is_empty() {
+            self.run_on_files(&["checkout", "HEAD", "--"], &restore)?;
+        }
+        if !remove.is_empty() {
+            // Drops staged additions from the index. `--ignore-unmatch`
+            // keeps untracked paths, which were never in the index, from
+            // failing the whole call.
+            self.run_on_files(
+                &["rm", "--force", "--quiet", "--ignore-unmatch", "--"],
+                &remove,
+            )?;
+            for path in &remove {
+                let target = self.root.join(path);
+                if target.is_dir() {
+                    std::fs::remove_dir_all(&target)?;
+                } else if target.exists() {
+                    std::fs::remove_file(&target)?;
+                }
             }
         }
         Ok(())

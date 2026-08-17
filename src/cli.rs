@@ -68,6 +68,7 @@ fn print_help() {
         ("ci", "run all local CI jobs (.git-manage-ci.toml)"),
         ("ci init", "write a starter .git-manage-ci.toml"),
         ("ci init --ai", "AI drafts the CI config; review before saving"),
+        ("ci init --ai --provider P --model M", "pick the AI provider/model explicitly"),
         ("hook install|remove|status", "git pre-push hook running devdock ci"),
         ("help", "this text"),
     ];
@@ -99,7 +100,54 @@ fn repo_root() -> Result<PathBuf, ExitCode> {
 
 fn cmd_ci(rest: &[String]) -> ExitCode {
     match rest.first().map(String::as_str) {
-        Some("init") => return cmd_ci_init(rest.get(1).map(String::as_str) == Some("--ai")),
+        Some("init") => {
+            let flags = &rest[1..];
+            let ai = flags.iter().any(|a| a == "--ai");
+
+            // Reject unknown flags before parsing values, so a typo is not
+            // silently ignored. `--provider=x` has to be matched by prefix.
+            if let Some(unknown) = flags.iter().find(|a| {
+                a.starts_with("--")
+                    && !["--ai", "--provider", "--model"]
+                        .iter()
+                        .any(|k| *a == k || a.starts_with(&format!("{k}=")))
+            }) {
+                eprintln!(
+                    "devdock ci init: unknown flag \"{unknown}\" \
+                     (try: --ai [--provider claude|ollama] [--model NAME])"
+                );
+                return ExitCode::from(2);
+            }
+
+            let (provider, model) = match (
+                flag_value(flags, "--provider"),
+                flag_value(flags, "--model"),
+            ) {
+                (Ok(p), Ok(m)) => (p, m),
+                (Err(e), _) | (_, Err(e)) => {
+                    eprintln!("devdock ci init: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            // Provider names are lowercase everywhere else, but rejecting
+            // "Claude" over capitalisation helps nobody.
+            let provider = match provider.map(str::to_ascii_lowercase) {
+                Some(p) if !PROVIDERS.contains(&p.as_str()) => {
+                    eprintln!(
+                        "devdock ci init: unknown --provider \"{p}\" (expected {})",
+                        PROVIDERS.join(" or ")
+                    );
+                    return ExitCode::from(2);
+                }
+                other => other,
+            };
+            let provider = provider.as_deref();
+            if !ai && (provider.is_some() || model.is_some()) {
+                eprintln!("devdock ci init: --provider/--model only apply with --ai");
+                return ExitCode::from(2);
+            }
+            return cmd_ci_init(ai, provider, model);
+        }
         Some(other) if other != "--ai" => {
             eprintln!("devdock ci: unknown subcommand \"{other}\" (try: ci, ci init, ci init --ai)");
             return ExitCode::from(2);
@@ -120,10 +168,127 @@ fn cmd_ci(rest: &[String]) -> ExitCode {
     }
 }
 
-/// Creates `.git-manage-ci.toml`: template, or AI-drafted from a repo
-/// scan with mandatory review. The AI draft is printed in full, validated,
-/// and only written after explicit confirmation.
-fn cmd_ci_init(ai: bool) -> ExitCode {
+/// Value of `--name VALUE` or `--name=VALUE`.
+///
+/// Distinguishes *absent* from *present but unusable*. `--provider` with
+/// nothing after it, or `--provider=`, used to come back as "not given", so
+/// the resolver silently fell through to a different provider than the one
+/// asked for — the command appeared to work and used the wrong model. Those
+/// now report the mistake.
+fn flag_value<'a>(
+    args: &'a [String],
+    name: &str,
+) -> std::result::Result<Option<&'a str>, String> {
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if let Some(inline) = arg.strip_prefix(&format!("{name}=")) {
+            return non_empty(inline, name).map(Some);
+        }
+        if arg == name {
+            let next = it
+                .next()
+                .map(String::as_str)
+                // A following flag is the next option, not this one's value.
+                .filter(|v| !v.starts_with("--"))
+                .ok_or_else(|| format!("{name} needs a value"))?;
+            return non_empty(next, name).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+fn non_empty<'a>(value: &'a str, name: &str) -> std::result::Result<&'a str, String> {
+    if value.trim().is_empty() {
+        Err(format!("{name} needs a value"))
+    } else {
+        Ok(value.trim())
+    }
+}
+
+/// Providers the CLI accepts, checked when the flag is parsed rather than
+/// deep inside resolution, so a typo fails immediately and says what is valid.
+const PROVIDERS: &[&str] = &["claude", "ollama"];
+
+/// Picks the provider and model for an AI command.
+///
+/// Explicit flags win, then the app's configured selection, then whatever is
+/// actually available on this machine — so `ci init --ai` works without any
+/// prior setup in the GUI as long as one provider is reachable.
+fn resolve_ai(
+    flag_provider: Option<&str>,
+    flag_model: Option<&str>,
+    config: &crate::app::Config,
+) -> std::result::Result<(String, String), String> {
+    let configured = config.commit_ai.clone();
+    let provider = flag_provider
+        .map(str::to_string)
+        .or_else(|| configured.as_ref().map(|s| s.provider.clone()))
+        .or_else(|| config.ai_provider.clone())
+        .or_else(detect_provider)
+        .ok_or_else(|| {
+            "no AI provider available. Sign in to Claude in the app, or start \
+             Ollama and pull a model, or pass --provider"
+                .to_string()
+        })?;
+    if provider != "claude" && provider != "ollama" {
+        return Err(format!("unknown --provider \"{provider}\" (claude | ollama)"));
+    }
+
+    // A configured model only applies to the provider it was chosen for.
+    let configured_model = configured
+        .filter(|s| s.provider == provider)
+        .map(|s| s.model)
+        .or_else(|| {
+            if provider == "claude" {
+                config.claude_model.clone()
+            } else {
+                config.ollama_model.clone()
+            }
+        })
+        .filter(|m| !m.trim().is_empty());
+
+    let model = match flag_model.map(str::to_string).or(configured_model) {
+        Some(m) => m,
+        None if provider == "claude" => crate::claude::DEFAULT_MODEL.to_string(),
+        None => first_ollama_model(config).ok_or_else(|| {
+            "no Ollama model found. Run `ollama pull llama3.2`, or pass --model"
+                .to_string()
+        })?,
+    };
+
+    if provider == "claude" && crate::claude::Client::from_store(model.clone()).is_none() {
+        return Err(
+            "Claude is not signed in. Sign in from the app's Settings, or use \
+             --provider ollama"
+                .to_string(),
+        );
+    }
+    Ok((provider, model))
+}
+
+/// A provider that is actually usable right now, preferring Claude.
+fn detect_provider() -> Option<String> {
+    if crate::claude::Client::from_store(crate::claude::DEFAULT_MODEL).is_some() {
+        return Some("claude".into());
+    }
+    let url = crate::app::Config::load()
+        .ollama_url
+        .unwrap_or_else(|| crate::ollama::DEFAULT_URL.into());
+    let has_model =
+        crate::ollama::Client::new(url).models().map(|m| !m.is_empty()).unwrap_or(false);
+    has_model.then(|| "ollama".to_string())
+}
+
+fn first_ollama_model(config: &crate::app::Config) -> Option<String> {
+    let url =
+        config.ollama_url.clone().unwrap_or_else(|| crate::ollama::DEFAULT_URL.into());
+    crate::ollama::Client::new(url).models().ok()?.first().map(|m| m.name.clone())
+}
+
+/// Creates `.git-manage-ci.toml`: template, or AI-drafted from a repo scan
+/// with mandatory review. The AI draft is printed in full, validated, and only
+/// written after explicit confirmation.
+fn cmd_ci_init(ai: bool, want_provider: Option<&str>, want_model: Option<&str>) -> ExitCode {
     use std::io::{BufRead, Write};
     let root = match repo_root() {
         Ok(r) => r,
@@ -154,18 +319,14 @@ fn cmd_ci_init(ai: bool) -> ExitCode {
 
     // AI draft.
     let config = crate::app::Config::load();
-    let (provider, model) = match &config.commit_ai {
-        Some(sel) => (sel.provider.clone(), sel.model.clone()),
-        None => {
-            let provider = config.ai_provider.clone().unwrap_or_else(|| "ollama".into());
-            let model = if provider == "claude" {
-                config.claude_model.clone().unwrap_or_default()
-            } else {
-                config.ollama_model.clone().unwrap_or_default()
-            };
-            (provider, model)
+    let (provider, model) = match resolve_ai(want_provider, want_model, &config) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("devdock: {e}");
+            return ExitCode::FAILURE;
         }
     };
+    println!("{}", style::dim(&format!("using {provider} / {model}")));
     println!("{}", style::dim("scanning the repository…"));
     let scan = crate::local_ci::repo_scan(&root);
     println!("{}", style::dim("asking the AI to draft the config…"));
@@ -1055,5 +1216,65 @@ fn cmd_pr(rest: &[String]) -> ExitCode {
             eprintln!("devdock: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn flag_value_reads_both_spellings() {
+        let a = args(&["--ai", "--provider", "claude", "--model=opus"]);
+        assert_eq!(flag_value(&a, "--provider").unwrap(), Some("claude"));
+        assert_eq!(flag_value(&a, "--model").unwrap(), Some("opus"));
+        assert_eq!(flag_value(&a, "--missing").unwrap(), None);
+    }
+
+    /// Regression: a flag with no usable value used to come back as `None`,
+    /// which is indistinguishable from "not given" — so the resolver fell
+    /// through to a different provider than the one asked for and the command
+    /// quietly used the wrong model. These are mistakes, not absences.
+    #[test]
+    fn a_flag_without_a_value_is_an_error_not_an_absence() {
+        for bad in [
+            vec!["--provider"],              // nothing follows
+            vec!["--provider="],             // empty inline
+            vec!["--provider", ""],          // empty argument
+            vec!["--provider", "   "],       // whitespace only
+            vec!["--provider", "--model"],   // the next flag is not a value
+        ] {
+            let a = args(&bad);
+            assert!(
+                flag_value(&a, "--provider").is_err(),
+                "{bad:?} should be rejected, got {:?}",
+                flag_value(&a, "--provider")
+            );
+        }
+    }
+
+    /// A following flag must not be swallowed as this flag's value.
+    #[test]
+    fn a_following_flag_is_left_for_its_own_parse() {
+        let a = args(&["--provider", "--model", "opus"]);
+        assert!(flag_value(&a, "--provider").is_err());
+        assert_eq!(flag_value(&a, "--model").unwrap(), Some("opus"));
+    }
+
+    #[test]
+    fn values_are_trimmed() {
+        let a = args(&["--model", "  opus  "]);
+        assert_eq!(flag_value(&a, "--model").unwrap(), Some("opus"));
+    }
+
+    #[test]
+    fn provider_list_is_what_the_error_message_offers() {
+        assert!(PROVIDERS.contains(&"claude"));
+        assert!(PROVIDERS.contains(&"ollama"));
+        assert_eq!(PROVIDERS.len(), 2, "keep the help text in step");
     }
 }

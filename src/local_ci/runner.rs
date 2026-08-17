@@ -62,14 +62,39 @@ use std::process::Command;
 
 /// Everything a runner needs to execute one job.
 pub struct ExecRequest<'a> {
-    /// Repository worktree root.
+    /// Repository worktree root. Stays the mount root for container runners so
+    /// cross-package paths keep working in a monorepo.
     pub repo_root: &'a Path,
+    /// Directory the commands run in, relative to [`Self::repo_root`]. Empty
+    /// for a root-level job; set when the job came from a nested config.
+    pub work_subdir: &'a str,
     /// The job's commands joined with `&&` (stop at first failure).
     pub script: &'a str,
     /// Environment variables (config `env` plus resolved secrets).
     pub env: &'a [(String, String)],
     /// Runner-specific target: Docker image, SSH host, etc.
     pub target: Option<&'a str>,
+}
+
+impl ExecRequest<'_> {
+    /// Absolute directory the commands should run in.
+    pub fn workdir(&self) -> std::path::PathBuf {
+        if self.work_subdir.is_empty() {
+            self.repo_root.to_path_buf()
+        } else {
+            self.repo_root.join(self.work_subdir)
+        }
+    }
+
+    /// Working directory inside a container, given the repo is mounted at
+    /// `mount`.
+    pub fn container_workdir(&self, mount: &str) -> String {
+        if self.work_subdir.is_empty() {
+            mount.to_string()
+        } else {
+            format!("{mount}/{}", self.work_subdir)
+        }
+    }
 }
 
 /// What a runner produced.
@@ -112,7 +137,7 @@ impl Runner for HostRunner {
 
     fn exec(&self, request: &ExecRequest<'_>) -> Result<ExecOutput, String> {
         let mut cmd = Command::new("sh");
-        cmd.args(["-c", request.script]).current_dir(request.repo_root);
+        cmd.args(["-c", request.script]).current_dir(request.workdir());
         for (key, value) in request.env {
             cmd.env(key, value);
         }
@@ -132,22 +157,55 @@ impl Runner for HostRunner {
 /// Runs commands inside a Docker container (Linux), repo mounted at `/work`.
 pub struct DockerRunner;
 
+/// Outcome of running `docker info`, split so the two failures can be told
+/// apart (and tested) without Docker installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DockerProbe {
+    /// The binary launched. `success` is whether it reached the daemon.
+    Ran { success: bool },
+    /// The binary could not be launched at all.
+    NotLaunched,
+}
+
+/// Turns a probe into an availability verdict.
+///
+/// The daemon-down and not-installed cases have different fixes, so they get
+/// different messages instead of one "Docker is not available".
+fn classify_docker_probe(probe: DockerProbe) -> Result<(), String> {
+    match probe {
+        DockerProbe::Ran { success: true } => Ok(()),
+        DockerProbe::Ran { success: false } => Err(
+            "Docker is installed but its daemon is not running. Start Docker \
+             Desktop (macOS/Windows) or `sudo systemctl start docker` (Linux), \
+             then run the checks again. Jobs without `image` are unaffected."
+                .into(),
+        ),
+        DockerProbe::NotLaunched => Err(
+            "Docker is not installed, or `docker` is not on PATH. Install \
+             Docker Desktop (or colima/podman-docker), or drop `image` from \
+             the job to run it on this machine instead."
+                .into(),
+        ),
+    }
+}
+
 impl Runner for DockerRunner {
     fn id(&self) -> &'static str {
         "docker"
     }
 
+    /// Probes with `docker info`, which needs the daemon.
+    ///
+    /// `docker --version` is not a usable check: it only prints the client
+    /// version and succeeds with the daemon stopped, so the job would run and
+    /// fail on a raw "Cannot connect to the Docker daemon" from stderr instead
+    /// of this message. The two cases also have different fixes, so they get
+    /// different messages.
     fn available(&self) -> Result<(), String> {
-        let ok = Command::new("docker")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if ok {
-            Ok(())
-        } else {
-            Err("Docker is not available. Install Docker or use the host runner.".into())
-        }
+        classify_docker_probe(match Command::new("docker").arg("info").output() {
+            Ok(out) => DockerProbe::Ran { success: out.status.success() },
+            Err(_) => DockerProbe::NotLaunched,
+        })
     }
 
     fn exec(&self, request: &ExecRequest<'_>) -> Result<ExecOutput, String> {
@@ -155,9 +213,13 @@ impl Runner for DockerRunner {
             .target
             .ok_or("docker runner needs an image (set `image = \"...\"` on the job)")?;
         let mut cmd = Command::new("docker");
+        // The whole repository is mounted, with the workdir pointing at the
+        // job's own directory, so a nested job can still reach sibling
+        // packages by relative path.
         cmd.args(["run", "--rm", "-v"])
             .arg(format!("{}:/work", request.repo_root.display()))
-            .args(["-w", "/work"]);
+            .arg("-w")
+            .arg(request.container_workdir("/work"));
         // Pass env var NAMES only in argv; docker reads the values from
         // this process's environment, keeping secrets out of `ps` output.
         for (key, value) in request.env {
@@ -245,6 +307,26 @@ mod tests {
         }
     }
 
+
+    /// `docker --version` succeeds with the daemon stopped, so it cannot be
+    /// the availability probe: the job would run and fail on a raw "Cannot
+    /// connect to the Docker daemon" instead of a message that says what to do.
+    #[test]
+    fn docker_probe_tells_daemon_down_apart_from_not_installed() {
+        assert!(classify_docker_probe(DockerProbe::Ran { success: true }).is_ok());
+
+        let daemon_down =
+            classify_docker_probe(DockerProbe::Ran { success: false }).unwrap_err();
+        assert!(daemon_down.contains("daemon is not running"), "got: {daemon_down}");
+        assert!(daemon_down.contains("Start Docker"), "should say what to do: {daemon_down}");
+
+        let missing = classify_docker_probe(DockerProbe::NotLaunched).unwrap_err();
+        assert!(missing.contains("not installed"), "got: {missing}");
+
+        // The two must not be the same message — they have different fixes.
+        assert_ne!(daemon_down, missing);
+    }
+
     #[test]
     fn registry_finds_builtins_and_custom() {
         let mut registry = RunnerRegistry::with_builtins();
@@ -271,6 +353,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let out = HostRunner
             .exec(&ExecRequest {
+                work_subdir: "",
                 repo_root: tmp.path(),
                 script: "echo from-host-runner",
                 env: &[],
@@ -287,6 +370,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let out = runner
             .exec(&ExecRequest {
+                work_subdir: "",
                 repo_root: tmp.path(),
                 script: "anything",
                 env: &[],

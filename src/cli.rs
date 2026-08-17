@@ -68,6 +68,7 @@ fn print_help() {
         ("ci", "run all local CI jobs (.git-manage-ci.toml)"),
         ("ci init", "write a starter .git-manage-ci.toml"),
         ("ci init --ai", "AI drafts the CI config; review before saving"),
+        ("ci init --ai --provider P --model M", "pick the AI provider/model explicitly"),
         ("hook install|remove|status", "git pre-push hook running devdock ci"),
         ("help", "this text"),
     ];
@@ -99,7 +100,26 @@ fn repo_root() -> Result<PathBuf, ExitCode> {
 
 fn cmd_ci(rest: &[String]) -> ExitCode {
     match rest.first().map(String::as_str) {
-        Some("init") => return cmd_ci_init(rest.get(1).map(String::as_str) == Some("--ai")),
+        Some("init") => {
+            let flags = &rest[1..];
+            let ai = flags.iter().any(|a| a == "--ai");
+            let provider = flag_value(flags, "--provider");
+            let model = flag_value(flags, "--model");
+            if !ai && (provider.is_some() || model.is_some()) {
+                eprintln!("devdock ci init: --provider/--model only apply with --ai");
+                return ExitCode::from(2);
+            }
+            if let Some(unknown) = flags.iter().find(|a| {
+                a.starts_with("--") && !["--ai", "--provider", "--model"].contains(&a.as_str())
+            }) {
+                eprintln!(
+                    "devdock ci init: unknown flag \"{unknown}\" \
+                     (try: --ai [--provider claude|ollama] [--model NAME])"
+                );
+                return ExitCode::from(2);
+            }
+            return cmd_ci_init(ai, provider, model);
+        }
         Some(other) if other != "--ai" => {
             eprintln!("devdock ci: unknown subcommand \"{other}\" (try: ci, ci init, ci init --ai)");
             return ExitCode::from(2);
@@ -120,10 +140,100 @@ fn cmd_ci(rest: &[String]) -> ExitCode {
     }
 }
 
-/// Creates `.git-manage-ci.toml`: template, or AI-drafted from a repo
-/// scan with mandatory review. The AI draft is printed in full, validated,
-/// and only written after explicit confirmation.
-fn cmd_ci_init(ai: bool) -> ExitCode {
+/// Value of `--name VALUE` or `--name=VALUE`, if present.
+fn flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if let Some(inline) = arg.strip_prefix(&format!("{name}=")) {
+            return Some(inline);
+        }
+        if arg == name {
+            return it.next().map(String::as_str).filter(|v| !v.starts_with("--"));
+        }
+    }
+    None
+}
+
+/// Picks the provider and model for an AI command.
+///
+/// Explicit flags win, then the app's configured selection, then whatever is
+/// actually available on this machine — so `ci init --ai` works without any
+/// prior setup in the GUI as long as one provider is reachable.
+fn resolve_ai(
+    flag_provider: Option<&str>,
+    flag_model: Option<&str>,
+    config: &crate::app::Config,
+) -> std::result::Result<(String, String), String> {
+    let configured = config.commit_ai.clone();
+    let provider = flag_provider
+        .map(str::to_string)
+        .or_else(|| configured.as_ref().map(|s| s.provider.clone()))
+        .or_else(|| config.ai_provider.clone())
+        .or_else(detect_provider)
+        .ok_or_else(|| {
+            "no AI provider available. Sign in to Claude in the app, or start \
+             Ollama and pull a model, or pass --provider"
+                .to_string()
+        })?;
+    if provider != "claude" && provider != "ollama" {
+        return Err(format!("unknown --provider \"{provider}\" (claude | ollama)"));
+    }
+
+    // A configured model only applies to the provider it was chosen for.
+    let configured_model = configured
+        .filter(|s| s.provider == provider)
+        .map(|s| s.model)
+        .or_else(|| {
+            if provider == "claude" {
+                config.claude_model.clone()
+            } else {
+                config.ollama_model.clone()
+            }
+        })
+        .filter(|m| !m.trim().is_empty());
+
+    let model = match flag_model.map(str::to_string).or(configured_model) {
+        Some(m) => m,
+        None if provider == "claude" => crate::claude::DEFAULT_MODEL.to_string(),
+        None => first_ollama_model(config).ok_or_else(|| {
+            "no Ollama model found. Run `ollama pull llama3.2`, or pass --model"
+                .to_string()
+        })?,
+    };
+
+    if provider == "claude" && crate::claude::Client::from_store(model.clone()).is_none() {
+        return Err(
+            "Claude is not signed in. Sign in from the app's Settings, or use \
+             --provider ollama"
+                .to_string(),
+        );
+    }
+    Ok((provider, model))
+}
+
+/// A provider that is actually usable right now, preferring Claude.
+fn detect_provider() -> Option<String> {
+    if crate::claude::Client::from_store(crate::claude::DEFAULT_MODEL).is_some() {
+        return Some("claude".into());
+    }
+    let url = crate::app::Config::load()
+        .ollama_url
+        .unwrap_or_else(|| crate::ollama::DEFAULT_URL.into());
+    let has_model =
+        crate::ollama::Client::new(url).models().map(|m| !m.is_empty()).unwrap_or(false);
+    has_model.then(|| "ollama".to_string())
+}
+
+fn first_ollama_model(config: &crate::app::Config) -> Option<String> {
+    let url =
+        config.ollama_url.clone().unwrap_or_else(|| crate::ollama::DEFAULT_URL.into());
+    crate::ollama::Client::new(url).models().ok()?.first().map(|m| m.name.clone())
+}
+
+/// Creates `.git-manage-ci.toml`: template, or AI-drafted from a repo scan
+/// with mandatory review. The AI draft is printed in full, validated, and only
+/// written after explicit confirmation.
+fn cmd_ci_init(ai: bool, want_provider: Option<&str>, want_model: Option<&str>) -> ExitCode {
     use std::io::{BufRead, Write};
     let root = match repo_root() {
         Ok(r) => r,
@@ -154,18 +264,14 @@ fn cmd_ci_init(ai: bool) -> ExitCode {
 
     // AI draft.
     let config = crate::app::Config::load();
-    let (provider, model) = match &config.commit_ai {
-        Some(sel) => (sel.provider.clone(), sel.model.clone()),
-        None => {
-            let provider = config.ai_provider.clone().unwrap_or_else(|| "ollama".into());
-            let model = if provider == "claude" {
-                config.claude_model.clone().unwrap_or_default()
-            } else {
-                config.ollama_model.clone().unwrap_or_default()
-            };
-            (provider, model)
+    let (provider, model) = match resolve_ai(want_provider, want_model, &config) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("devdock: {e}");
+            return ExitCode::FAILURE;
         }
     };
+    println!("{}", style::dim(&format!("using {provider} / {model}")));
     println!("{}", style::dim("scanning the repository…"));
     let scan = crate::local_ci::repo_scan(&root);
     println!("{}", style::dim("asking the AI to draft the config…"));

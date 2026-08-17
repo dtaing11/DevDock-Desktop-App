@@ -339,8 +339,14 @@ Format specification:
   # output = "markdown"    # answer in the project's own format instead of
   # output_instructions = "..."   # findings; describe the shape you want
 
+Identify the project before writing anything. The user message gives you, in order: a count of files by extension, the full list of tracked files, and the contents of the project's configuration files. Work out from that evidence what the project is and which toolchain builds it. The extension counts tell you what the code is written in; the config file contents tell you how it is built and tested.
+
+Then write the config as a TOML comment on the first line stating what you concluded, e.g. `# Stack: Flutter (Dart)` — the developer reviews this before saving, so a wrong guess is visible immediately.
+
 Guidelines:
-- Infer jobs from the project's actual stack (the user message lists the repo files and manifests). Typical jobs: lint/format check, tests, build.
+- Every command must be justified by something in the scan. Do not propose a command for a toolchain you cannot see evidence of: a package manager with no manifest, a test runner not in the dependencies. If the evidence does not tell you what to run, emit a job with a `# TODO` comment naming what you would need instead of inventing a command.
+- Prefer commands the project already defines over ones you know generically: a Makefile or justfile target, a script in the manifest, or a step from a CI workflow included in the scan. Those are known to work in this repository.
+- Typical jobs: lint/format check, tests, build.
 - Prefer fast, deterministic commands that exist in the project (e.g. use the project's own scripts when present).
 - Only suggest a Docker image when the project clearly benefits (e.g. pinned toolchain); otherwise run on the host.
 - Do not invent commands for tools the project does not use.
@@ -351,65 +357,147 @@ Guidelines:
 /// Collects a compact description of the repository for the AI: top-level
 /// file listing plus the contents of common build/manifest files. Bounded
 /// so it fits in a prompt.
+/// Total scan budget, and the per-file cap when inlining contents.
+const SCAN_BUDGET: usize = 24_000;
+const FILE_SNIPPET: usize = 2_000;
+
+/// Names and suffixes never worth inlining: generated, huge, or no signal
+/// about how the project is built. Deliberately tiny — this is about token
+/// budget, not about knowing ecosystems.
+const NOT_WORTH_INLINING: &[&str] = &[
+    ".lock", "-lock.json", ".sum", ".min.js", ".map", ".svg", ".png", ".jpg", ".jpeg",
+    ".gif", ".ico", ".ttf", ".otf", ".woff", ".woff2", ".pdf", ".zip", ".gz", ".icns",
+    "LICENSE", "LICENCE", "COPYING", ".gitignore", ".gitattributes",
+];
+
+/// Collects a description of the repository for the AI: a file-type census,
+/// the full tracked listing, and the contents of the shallow config files.
+///
+/// Everything here is **evidence, not conclusions**. There is deliberately no
+/// table mapping marker files to stack names: such a list needs updating for
+/// every framework, is wrong for anything not in it, and replaces a judgement
+/// the model makes better. The original bug was not that the model could not
+/// recognise Flutter — it was that this scan showed only the top directory and
+/// never inlined `pubspec.yaml`, so there was nothing to recognise.
 pub fn repo_scan(repo_root: &Path) -> String {
-    const MANIFESTS: &[&str] = &[
-        "Cargo.toml",
-        "package.json",
-        "pyproject.toml",
-        "setup.py",
-        "requirements.txt",
-        "go.mod",
-        "Makefile",
-        "justfile",
-        "CMakeLists.txt",
-        "build.gradle",
-        "pom.xml",
-        "Gemfile",
-        "mix.exs",
-        "composer.json",
-        "Dockerfile",
-        "docker-compose.yml",
-        ".github/workflows/ci.yml",
-    ];
-    let mut out = String::from("Top-level files:\n");
-    if let Ok(entries) = std::fs::read_dir(repo_root) {
-        let mut names: Vec<String> = entries
-            .filter_map(|e| e.ok())
-            .map(|e| {
-                let mut n = e.file_name().to_string_lossy().to_string();
-                if e.path().is_dir() {
-                    n.push('/');
-                }
-                n
-            })
-            .filter(|n| n != ".git/")
-            .collect();
-        names.sort();
-        for n in names.iter().take(60) {
-            out.push_str("  ");
-            out.push_str(n);
-            out.push('\n');
+    let files = tracked_files(repo_root);
+    let mut out = String::new();
+
+    // 1. Extension census: the clearest single signal of what the code is,
+    //    and pure data — no per-language knowledge involved.
+    let census = extension_census(&files);
+    if !census.is_empty() {
+        out.push_str("File types by count:\n");
+        for (ext, count) in census.iter().take(20) {
+            out.push_str(&format!("  {count:>5}  .{ext}\n"));
         }
+        out.push('\n');
     }
-    for name in MANIFESTS {
-        let path = repo_root.join(name);
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            let mut snippet: String = text.chars().take(2_000).collect();
-            if snippet.len() < text.len() {
-                snippet.push_str("
-[truncated]");
-            }
-            out.push_str(&format!("
---- {name} ---
-{snippet}
-"));
-        }
-        if out.len() > 14_000 {
+
+    // 2. Every tracked path, not just the top level, so nested packages,
+    //    platform directories, and test layout are all visible.
+    out.push_str(&format!("Tracked files ({} total):\n", files.len()));
+    for path in files.iter().take(400) {
+        out.push_str("  ");
+        out.push_str(path);
+        out.push('\n');
+    }
+    if files.len() > 400 {
+        out.push_str(&format!("  … and {} more\n", files.len() - 400));
+    }
+
+    // 3. Contents of the shallow config files, whatever they happen to be
+    //    called. Selected by shape (shallow, small, not generated) rather
+    //    than from a list of names, so an ecosystem nobody enumerated still
+    //    gets its manifest read.
+    for path in inlinable_files(&files) {
+        if out.len() > SCAN_BUDGET {
+            out.push_str("\n[scan truncated]\n");
             break;
         }
+        let Ok(text) = std::fs::read_to_string(repo_root.join(&path)) else { continue };
+        if text.trim().is_empty() {
+            continue;
+        }
+        let mut snippet: String = text.chars().take(FILE_SNIPPET).collect();
+        if snippet.len() < text.len() {
+            snippet.push_str("\n[truncated]");
+        }
+        out.push_str(&format!("\n--- {path} ---\n{snippet}\n"));
     }
     out
 }
+
+/// Paths worth inlining, shallowest first: manifests, task runners, CI
+/// workflows, and the README all fall out of this without being named.
+fn inlinable_files(files: &[String]) -> Vec<String> {
+    let depth = |p: &str| p.matches('/').count();
+    let mut candidates: Vec<&String> = files
+        .iter()
+        .filter(|p| {
+            // Depth 0-1 covers root manifests and things like
+            // .github/workflows/ci.yml or packages/api/pubspec.yaml.
+            depth(p) <= 2
+                && !NOT_WORTH_INLINING.iter().any(|s| p.ends_with(s))
+                // Source files are described by the census; their contents
+                // would crowd out the manifests.
+                && !is_probably_source(p)
+        })
+        .collect();
+    candidates.sort_by_key(|p| (depth(p), p.len(), (*p).clone()));
+    candidates.into_iter().take(30).cloned().collect()
+}
+
+/// Whether a path looks like program source rather than configuration. Uses
+/// the census's own logic in spirit: many files of one extension are source,
+/// and configuration is the handful of odd ones out. Kept crude on purpose —
+/// getting it wrong only changes which files are inlined first.
+fn is_probably_source(path: &str) -> bool {
+    const SOURCE_DIRS: &[&str] = &["src/", "lib/", "test/", "tests/", "spec/", "app/"];
+    SOURCE_DIRS.iter().any(|d| path.starts_with(d))
+}
+
+/// Repository-relative paths of tracked and not-ignored files, via git so
+/// `.gitignore` is honoured. Falls back to a top-level listing outside a repo.
+fn tracked_files(repo_root: &Path) -> Vec<String> {
+    if let Ok(repo) = crate::git::Repo::open(repo_root) {
+        if let Ok(out) =
+            repo.git(&["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
+        {
+            let mut files: Vec<String> =
+                out.split('\0').filter(|p| !p.is_empty()).map(str::to_string).collect();
+            files.sort();
+            return files;
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(repo_root) else { return Vec::new() };
+    let mut names: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n != ".git")
+        .collect();
+    names.sort();
+    names
+}
+
+/// Extension counts, most common first. Extensionless files are skipped.
+fn extension_census(files: &[String]) -> Vec<(String, usize)> {
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for path in files {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        if let Some((_stem, ext)) = name.rsplit_once('.') {
+            if !ext.is_empty() && ext.len() <= 12 && !name.starts_with('.') {
+                *counts.entry(ext).or_default() += 1;
+            }
+        }
+    }
+    let mut census: Vec<(String, usize)> =
+        counts.into_iter().map(|(e, c)| (e.to_string(), c)).collect();
+    // Count descending, then name, so the order is stable.
+    census.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    census
+}
+
 
 /// Whether the Docker CLI is available on this machine.
 pub fn docker_available() -> bool {
@@ -759,10 +847,53 @@ mod ai_config_tests {
         std::fs::create_dir_all(tmp.join("src")).unwrap();
         std::fs::write(tmp.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
         let scan = repo_scan(&tmp);
+        // Outside a git repo the listing falls back to the top level, but the
+        // manifest contents must still be inlined.
         assert!(scan.contains("Cargo.toml"), "{scan}");
         assert!(scan.contains("name = \"demo\""), "{scan}");
-        assert!(scan.contains("src/"), "{scan}");
+        assert!(scan.contains("Tracked files"), "{scan}");
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The census is what settles "what kind of project is this", and it is
+    /// pure counting — no per-language table involved.
+    #[test]
+    fn census_counts_extensions_most_common_first() {
+        let files: Vec<String> = ["lib/a.dart", "lib/b.dart", "lib/c.dart", "pubspec.yaml", "x.md"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let census = extension_census(&files);
+        assert_eq!(census[0], ("dart".to_string(), 3), "got {census:?}");
+        assert!(census.contains(&("yaml".to_string(), 1)));
+    }
+
+    /// Shallow config files get inlined whatever they are called, so an
+    /// ecosystem nobody enumerated still has its manifest read. This is the
+    /// property that replaced a hard-coded manifest list.
+    #[test]
+    fn inlining_is_selected_by_shape_not_by_name() {
+        let files: Vec<String> = [
+            "pubspec.yaml",       // Flutter — never named in this file
+            "flake.nix",          // Nix — never named either
+            "zig.build",
+            "Cargo.lock",         // generated: skipped
+            "LICENSE",            // no signal: skipped
+            "assets/logo.png",    // binary: skipped
+            "src/main.rs",        // source: described by the census instead
+            ".github/workflows/ci.yml",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let picked = inlinable_files(&files);
+        for want in ["pubspec.yaml", "flake.nix", "zig.build", ".github/workflows/ci.yml"] {
+            assert!(picked.iter().any(|p| p == want), "{want} should be inlined: {picked:?}");
+        }
+        for skip in ["Cargo.lock", "LICENSE", "assets/logo.png", "src/main.rs"] {
+            assert!(!picked.iter().any(|p| p == skip), "{skip} should be skipped: {picked:?}");
+        }
     }
 
     #[test]

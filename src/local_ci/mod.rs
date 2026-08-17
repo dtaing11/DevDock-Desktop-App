@@ -393,7 +393,7 @@ pub fn repo_scan(repo_root: &Path) -> String {
     // reached its manifest — which reproduced the original bug (a Flutter
     // repo with 1868 files whose pubspec.yaml never made it into the prompt).
     let mut manifests = String::new();
-    for path in inlinable_files(&files, &source) {
+    for path in inlinable_files(repo_root, &files, &source, &census) {
         if manifests.len() > SCAN_BUDGET * 2 / 3 {
             break;
         }
@@ -445,10 +445,64 @@ pub fn repo_scan(repo_root: &Path) -> String {
     out
 }
 
-/// Paths worth inlining, shallowest first: manifests, task runners, CI
-/// workflows, and the README all fall out of this without being named.
-fn inlinable_files(files: &[String], source_exts: &[String]) -> Vec<String> {
+/// Paths worth inlining, most informative first.
+///
+/// Ordering matters as much as selection: the model reads this top-down and
+/// the budget cuts the tail, so whichever manifest lands last may as well not
+/// have been sent. Sorting by name length put `frontend/pubspec.yaml` 19th in
+/// a Flutter monorepo, behind `package.json` and `functions/.npmrc` — and the
+/// review came back calling it a Node project.
+///
+/// Three signals decide the order, all derived from data already collected:
+///
+/// 1. **How concentrated the project's code is under this file.** A manifest in
+///    the directory holding 1405 of the repo's 1405 Dart files describes the
+///    project; one beside eighteen JavaScript files describes a corner of it.
+/// 2. **Depth**, deeper first, so the specific package manifest beats the
+///    repository-wide config it ties with.
+/// 3. **Size**, larger first. A manifest listing dependencies says more than a
+///    one-line version pin, and this is what separates `pubspec.yaml` from
+///    `.fvmrc` and `.metadata` sitting in the same directory.
+fn inlinable_files(
+    repo_root: &Path,
+    files: &[String],
+    source_exts: &[String],
+    census: &[(String, usize)],
+) -> Vec<String> {
     let depth = |p: &str| p.matches('/').count();
+    fn dir_of(p: &str) -> &str {
+        match p.rfind('/') {
+            Some(i) => &p[..=i],
+            None => "",
+        }
+    }
+    // The extension the project is mostly written in; its distribution is what
+    // says which directories hold the real code.
+    let top_ext = census.first().map(|(e, _)| format!(".{e}"));
+    // Density, not a raw count: the repository root contains every source
+    // file by construction, so counting would always rank a root-level
+    // Firebase rules file above the `frontend/pubspec.yaml` describing the
+    // 1395 Dart files beneath it. What matters is how *concentrated* the
+    // project's main language is under a directory. Returned in permille.
+    let code_density = |prefix: &str| -> usize {
+        let Some(ext) = &top_ext else { return 0 };
+        let (mut total, mut code) = (0usize, 0usize);
+        for f in files.iter().filter(|f| f.starts_with(prefix)) {
+            total += 1;
+            if f.ends_with(ext.as_str()) {
+                code += 1;
+            }
+        }
+        // A directory holding one or two source files is not evidence of
+        // anything; without this a stray sibling would score a perfect 1000.
+        if code < 3 {
+            return 0;
+        }
+        // Magnitude times concentration. Density alone crowns whichever deep
+        // narrow folder happens to be purest; count alone always crowns the
+        // root, which contains everything. The product wants both.
+        code * (code * 1000 / total.max(1))
+    };
     let is_source = |p: &str| {
         p.rsplit_once('.').map(|(_, e)| source_exts.iter().any(|s| s == e)).unwrap_or(false)
     };
@@ -468,11 +522,19 @@ fn inlinable_files(files: &[String], source_exts: &[String]) -> Vec<String> {
                 && !is_source(p)
         })
         .collect();
-    // Configuration before prose. A repo with several long markdown documents
-    // would otherwise spend the budget on them and push its actual manifest
-    // out — which is how a Flutter monorepo lost `frontend/pubspec.yaml` to
-    // its README. Docs are still useful context, so a couple are kept.
-    candidates.sort_by_key(|p| (is_doc(p), depth(p), p.len(), (*p).clone()));
+    // Configuration before prose, then the three signals above. A repo with
+    // several long markdown documents would otherwise spend the budget on
+    // them and push its actual manifest out.
+    candidates.sort_by_key(|p| {
+        let size = std::fs::metadata(repo_root.join(p)).map(|m| m.len()).unwrap_or(0);
+        (
+            is_doc(p),
+            std::cmp::Reverse(code_density(dir_of(p))),
+            std::cmp::Reverse(depth(p)),
+            std::cmp::Reverse(size),
+            (*p).clone(),
+        )
+    });
     let mut docs = 0;
     candidates
         .into_iter()
@@ -538,9 +600,30 @@ const ASSET_EXTS: &[&str] = &[
     "exe", "lock", "riv", "psd", "ai", "sketch", "keystore", "jks",
 ];
 
+/// Directories that cross-platform toolkits generate to host an app: the
+/// Xcode project, the Gradle wrapper, the Win32 shim. They are full of `.h`,
+/// `.plist`, `.xcconfig`, and `.swift` that nobody on the project writes, and
+/// in a small app they outnumber the real code — a Flutter scaffold reads as
+/// a C project on extension counts alone.
+///
+/// Only the census skips them; their config files are still inlinable. And if
+/// skipping leaves nothing, the census is recomputed over everything, so a
+/// project that genuinely lives in `linux/` is not erased.
+const HOST_SCAFFOLD_DIRS: &[&str] =
+    &["ios/", "android/", "macos/", "windows/", "linux/", "web/"];
+
 /// Extension counts of *code and configuration*, most common first.
 /// Extensionless files and assets are skipped.
 fn extension_census(files: &[String]) -> Vec<(String, usize)> {
+    let is_scaffold = |p: &String| HOST_SCAFFOLD_DIRS.iter().any(|d| p.starts_with(d));
+    let authored: Vec<String> =
+        files.iter().filter(|p| !is_scaffold(p)).cloned().collect();
+    // Falling back keeps a genuine `linux/`-rooted project from vanishing.
+    let counted = if authored.is_empty() { files } else { &authored };
+    census_of(counted)
+}
+
+fn census_of(files: &[String]) -> Vec<(String, usize)> {
     let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for path in files {
         let name = path.rsplit('/').next().unwrap_or(path);
@@ -929,6 +1012,64 @@ mod ai_config_tests {
 
     /// The census is what settles "what kind of project is this", and it is
     /// pure counting — no per-language table involved.
+    /// Regression: a Flutter monorepo was reviewed as a Node project because
+    /// the package manifest arrived last. The repository root contains every
+    /// source file by construction, so ranking by raw count always put a
+    /// root-level Firebase config above the `frontend/pubspec.yaml` that
+    /// describes the 1395 Dart files under it.
+    #[test]
+    fn the_manifest_nearest_the_code_is_inlined_first() {
+        let mut files: Vec<String> = (0..1395).map(|i| format!("frontend/lib/f{i}.dart")).collect();
+        files.push("frontend/pubspec.yaml".into());
+        files.push("package.json".into());          // Cloud Functions, at the root
+        files.push(".firebaserc".into());
+        files.extend((0..18).map(|i| format!("functions/f{i}.js")));
+        files.push("functions/package.json".into());
+        files.sort();
+
+        let census = extension_census(&files);
+        assert_eq!(census[0].0, "dart", "census should lead with dart: {census:?}");
+
+        let source = source_extensions(&census, files.len());
+        let picked = inlinable_files(Path::new("."), &files, &source, &census);
+        assert_eq!(
+            picked.first().map(String::as_str),
+            Some("frontend/pubspec.yaml"),
+            "the Dart manifest must come first, got {picked:?}"
+        );
+        let pos = |n: &str| picked.iter().position(|p| p == n);
+        assert!(
+            pos("frontend/pubspec.yaml") < pos("package.json"),
+            "pubspec must precede the root package.json: {picked:?}"
+        );
+    }
+
+    /// Generated host scaffolding must not decide what language a project is
+    /// in. A small Flutter app has more `.h` and `.plist` under ios/ and
+    /// windows/ than it has Dart, and used to be counted as a C project.
+    #[test]
+    fn generated_platform_directories_do_not_skew_the_census() {
+        let mut files: Vec<String> = Vec::new();
+        for d in ["ios", "windows", "macos"] {
+            files.extend((0..8).map(|i| format!("{d}/runner/f{i}.h")));
+            files.extend((0..4).map(|i| format!("{d}/runner/f{i}.plist")));
+        }
+        files.extend((0..5).map(|i| format!("lib/f{i}.dart")));
+        files.push("pubspec.yaml".into());
+
+        let census = extension_census(&files);
+        assert_eq!(census[0].0, "dart", "scaffolding outvoted the app: {census:?}");
+    }
+
+    /// But a project that genuinely lives in one of those directories is not
+    /// erased: with nothing outside them, everything is counted.
+    #[test]
+    fn a_project_rooted_in_a_platform_directory_still_counts() {
+        let files: Vec<String> = (0..6).map(|i| format!("linux/src/f{i}.c")).collect();
+        let census = extension_census(&files);
+        assert_eq!(census[0], ("c".to_string(), 6), "fallback failed: {census:?}");
+    }
+
     #[test]
     fn census_counts_extensions_most_common_first() {
         let files: Vec<String> = ["lib/a.dart", "lib/b.dart", "lib/c.dart", "pubspec.yaml", "x.md"]
@@ -959,7 +1100,7 @@ mod ai_config_tests {
         .map(|s| s.to_string())
         .collect();
 
-        let picked = inlinable_files(&files, &[]);
+        let picked = inlinable_files(Path::new("."), &files, &[], &[]);
         for want in
             ["pubspec.yaml", "flake.nix", "zig.build", "README.md", ".github/workflows/ci.yml"]
         {
@@ -985,7 +1126,7 @@ mod ai_config_tests {
         assert!(source.iter().any(|e| e == "dart"), "dart should be source: {source:?}");
         assert!(!source.iter().any(|e| e == "md"), "a lone README is not source: {source:?}");
 
-        let picked = inlinable_files(&files, &source);
+        let picked = inlinable_files(Path::new("."), &files, &source, &census);
         assert!(picked.iter().any(|p| p == "pubspec.yaml"));
         assert!(picked.iter().any(|p| p == "README.md"));
         assert!(!picked.iter().any(|p| p.ends_with(".dart")), "source leaked in: {picked:?}");

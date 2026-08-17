@@ -51,13 +51,36 @@ Optional targets:
 - `make app`: builds `dist/DevDock.app` (macOS bundle)
 - `make deb`: builds a Debian package (needs `cargo install cargo-deb`)
 
-## Ollama setup
+## AI setup
 
-1. Install [Ollama](https://ollama.com) and pull a model, e.g. `ollama pull llama3.2`.
+AI features (commit messages, PR text, conflict resolution, and the
+[code reviewer](docs/local-ci.md#ai-code-review)) need a model. Set up either
+provider — DevDock does not ship one.
+
+### Ollama (local)
+
+1. Install [Ollama](https://ollama.com) and pull a model your machine can run,
+   e.g. `ollama pull llama3.2`. Confirm with `ollama list`.
 2. In the app, open **Settings (⚙)**, confirm the server URL
    (default `http://localhost:11434`), and pick a model.
 3. Click **✨ AI message** in the commit box. The model reads the staged diff and
    fills in the summary and description.
+
+Pick a model that fits your RAM/VRAM. Code review in particular sends a whole
+diff, so an oversized model will be slow or fail to load.
+
+### Claude (Anthropic)
+
+Open **Settings (⚙)** → the Claude section, then either:
+
+- **Browser sign-in** — approve access in the tab that opens and paste the code
+  shown afterwards. Uses your Claude subscription.
+- **API key** — paste a key (`sk-ant-…`) from
+  [console.anthropic.com](https://console.anthropic.com). Bills per token.
+
+A subscription meters Opus and Sonnet far lower than Haiku; if you hit the cap
+the client falls back to Haiku so the request still completes. Use an API key to
+stay on a large model consistently.
 
 ## CLI
 
@@ -71,7 +94,8 @@ Define per-repo checks in `.git-manage-ci.toml` and run them from the
 Pull Request dialog, on your machine or inside Docker containers, with
 secrets support. Add `[on_push]` to gate pushes on them, and `[review]` to
 have an AI review the outgoing diff first — it reports findings with its
-reasoning, and you can always proceed anyway.
+reasoning, and you can always proceed anyway. The reviewer needs a model set
+up first (see [AI setup](#ai-setup)).
 
 See the full guide: [docs/local-ci.md](docs/local-ci.md)
 ([gating pushes](docs/local-ci.md#gating-pushes-and-pull-requests),

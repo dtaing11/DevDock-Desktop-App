@@ -9,6 +9,7 @@ Docker containers for reproducible environments.
 - [Running checks](#running-checks)
 - [Gating pushes and pull requests](#gating-pushes-and-pull-requests)
 - [AI code review](#ai-code-review)
+  - [Before you start: sign in to a model](#before-you-start-sign-in-to-a-model)
   - [Enabling it](#enabling-it)
   - [Severity and the `fail_on` threshold](#severity-and-the-fail_on-threshold)
   - [Reading a review, and overriding it](#reading-a-review-and-overriding-it)
@@ -47,7 +48,8 @@ From there you can go two ways, independently:
 - Make the checks run automatically and gate a push — see
   [Gating pushes and pull requests](#gating-pushes-and-pull-requests).
 - Add an AI review of the diff before it is published — see
-  [AI code review](#ai-code-review).
+  [AI code review](#ai-code-review). That one needs a model set up first:
+  [Before you start](#before-you-start-sign-in-to-a-model).
 
 The starter config written by **Create config** includes both as commented-out
 examples, so you can uncomment rather than type them from scratch.
@@ -125,6 +127,68 @@ pass, on both pushes and pull requests.
 It is advisory by design. It reports findings with its reasoning, and you can
 always proceed anyway — see [Reading a review, and overriding
 it](#reading-a-review-and-overriding-it).
+
+### Before you start: sign in to a model
+
+**The reviewer needs a working model before any of the config below does
+anything.** DevDock does not ship one. Set up whichever provider you intend to
+use first, then come back and enable `[review]`.
+
+Without this, the review is skipped with *"AI review is enabled but no model is
+available"* and your push or pull request proceeds unreviewed. That is
+deliberate — the gate never blocks work because its own dependency is missing —
+but it does mean a misconfigured reviewer is easy to miss. If you never see
+review output, check here first.
+
+#### Option A — Claude (Anthropic)
+
+Open **Settings (⚙)** → the Claude section, and use either:
+
+- **Browser sign-in.** Click sign-in, approve access in the browser tab that
+  opens, and paste the code shown after approval. This uses your Claude
+  subscription.
+- **API key.** Paste a key (`sk-ant-…`) from
+  [console.anthropic.com](https://console.anthropic.com) into the API-key
+  field. This bills per token against your Anthropic account.
+
+Then pick a model, or pin one in the config with `provider = "claude"` and
+`model = "…"`.
+
+> ⚠️ **Subscription sign-in and large models.** A Claude subscription meters
+> Opus and Sonnet on much smaller quotas than Haiku, and reviewing a whole diff
+> is a token-heavy request. If you pin a large model and keep hitting the cap,
+> the client falls back to Haiku so the review still happens — so a review may
+> come from a smaller model than the one you configured. An API key is the way
+> to use a large model consistently.
+
+#### Option B — Ollama (local)
+
+1. **Install [Ollama](https://ollama.com)** and confirm it runs:
+   `ollama --version`.
+2. **Pull a model your machine can actually run**, e.g.
+   `ollama pull llama3.2`. Check it is there with `ollama list`.
+3. In **Settings (⚙)**, confirm the server URL (default
+   `http://localhost:11434`) and pick the model.
+
+Two things specific to reviewing locally:
+
+- **Size the model to your hardware.** A model larger than your available RAM
+  or VRAM will either fail to load or run too slowly to be useful, and reviews
+  send a whole diff rather than a few lines. If a review times out or the
+  machine grinds, use a smaller model or lower `max_diff_bytes`.
+- **Small models often cannot hold the findings format.** The default output is
+  structured JSON, and a small local model frequently produces something
+  unparseable — you will see *"did not return a usable review"*. Either use a
+  larger model, switch to `provider = "claude"`, or use
+  [`output = "markdown"`](#custom-output-format), which has no format to parse
+  and is much more forgiving.
+
+#### If you leave `provider` and `model` out
+
+The reviewer uses whatever you selected for AI features in the app, so it
+follows your existing sign-in. Pin both in the config when everyone on the team
+should review with the same model — see [Choosing a provider and
+model](#choosing-a-provider-and-model).
 
 ### Enabling it
 
@@ -586,8 +650,12 @@ tools. See [extending-local-ci.md](extending-local-ci.md).
 | Container job can't find your toolchain | The container only has what the image ships; pick a toolchain image (`rust:1.80`, `node:22`) or install inside `commands` |
 | Changes not picked up after editing the config | Click **Reload** in the LOCAL CHECKS section |
 | Job output cut off | Output is capped at 64 KB per job to keep the UI responsive; run the command in a terminal for the full log |
-| `AI review is enabled but no model is available` | Sign in to Claude in Settings, or pick an Ollama model — or pin `provider`/`model` under `[review]`. The push still goes through |
-| `did not return a usable review` | The model could not hold the JSON format. Use a larger Ollama model or set `provider = "claude"` under `[review]` |
+| `AI review is enabled but no model is available` | No provider is set up. Sign in to Claude in Settings, or install Ollama and pull a model — see [Before you start](#before-you-start-sign-in-to-a-model). The push still goes through |
+| `did not return a usable review` | The model could not hold the JSON format — usually a small local model. Use a larger one, set `provider = "claude"`, or switch to `output = "markdown"`, which has no format to parse |
+| `Claude is not signed in. Open Settings.` | Browser sign-in or an API key is missing. `[review] provider = "claude"` needs one of the two |
+| Ollama review times out, or the machine grinds | The model is too large for your hardware, or the diff is. Pull a smaller model, or lower `max_diff_bytes` |
+| `Ollama request failed` | Ollama is not running or is on another port. Check `ollama list`, then the server URL in Settings (default `http://localhost:11434`) |
+| Review came from a different model than configured | On a Claude subscription, Opus/Sonnet caps are much lower than Haiku's; the client falls back to Haiku when the cap is hit. Use an API key for a large model consistently |
 | `Nothing to review: no outgoing changes found` | Everything on the branch is already pushed, or your work is still uncommitted — the reviewer reads commits, not the working tree |
 | Review never runs on push | Check `[review] run = true` (or `on_push = true`), and that `on_push` is not explicitly `false`. It runs *after* the jobs, so a failing job with `[on_push] block_on_failure = true` cancels the push before the review starts |
 | Review runs on push but not on PR (or vice versa) | One trigger is off. `run` covers both; `on_push` / `on_pull_request` override it per trigger |

@@ -17,6 +17,11 @@ commands = ["cargo test"]
 name = "release build"
 commands = ["cargo build --release"]
 
+[[job]]
+name = "tests on Debian stable"
+image = "rust:1.80-slim-bookworm"
+commands = ["cargo test"]
+
 # AI review of the outgoing diff, after the jobs above pass. Advisory: it
 # reports findings with its reasoning and you can always proceed anyway.
 [review]

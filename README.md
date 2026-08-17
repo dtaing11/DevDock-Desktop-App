@@ -69,7 +69,13 @@ request), `ci`, and `hook`. See [docs/cli.md](docs/cli.md).
 
 Define per-repo checks in `.git-manage-ci.toml` and run them from the
 Pull Request dialog, on your machine or inside Docker containers, with
-secrets support. See the full guide: [docs/local-ci.md](docs/local-ci.md)
+secrets support. Add `[on_push]` to gate pushes on them, and `[review]` to
+have an AI review the outgoing diff first — it reports findings with its
+reasoning, and you can always proceed anyway.
+
+See the full guide: [docs/local-ci.md](docs/local-ci.md)
+([gating pushes](docs/local-ci.md#gating-pushes-and-pull-requests),
+[AI code review](docs/local-ci.md#ai-code-review))
 and the extension API: [docs/extending-local-ci.md](docs/extending-local-ci.md).
 
 ## GitHub sign-in

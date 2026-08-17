@@ -92,6 +92,9 @@ pub struct Config {
     /// Push integration settings.
     #[serde(default)]
     pub on_push: OnPush,
+    /// AI code review gate, run after the jobs pass. See [`crate::review`].
+    #[serde(default)]
+    pub review: crate::review::ReviewConfig,
 }
 
 /// How local CI hooks into pushing.
@@ -162,6 +165,18 @@ commands = ["echo hello from local CI"]
 # name = "integration tests with a secret"
 # commands = ["./scripts/integration.sh"]
 # secrets = ["API_TOKEN"]        # values come from .git-manage-ci.secrets
+
+# Have an AI review the outgoing diff before a push or pull request. It runs
+# after the jobs above pass, reports findings with its reasoning, and you can
+# always choose to proceed anyway.
+# [review]
+# run = true
+# block_on_failure = true   # findings at or above fail_on stop to ask first
+# fail_on = "high"          # low | medium | high
+# provider = "claude"       # claude | ollama; defaults to the app's selection
+# model = "claude-opus-5"
+# max_diff_bytes = 24000
+# instructions = "Flag any new blocking call on the UI thread."
 "#;
     std::fs::write(repo_root.join(CONFIG_FILE), template).map_err(|e| CiError(e.to_string()))
 }
@@ -181,6 +196,13 @@ Format specification:
   [on_push]
   run = true               # run all jobs automatically before every push
   block_on_failure = true  # failing jobs cancel the push
+- An optional [review] section adds an AI review of the outgoing diff, run
+  after the jobs pass:
+  [review]
+  run = true
+  block_on_failure = true  # findings at or above fail_on stop to ask first
+  fail_on = "high"         # low | medium | high
+  # instructions = "..."   # project-specific things to look for
 
 Guidelines:
 - Infer jobs from the project's actual stack (the user message lists the repo files and manifests). Typical jobs: lint/format check, tests, build.
@@ -188,6 +210,7 @@ Guidelines:
 - Only suggest a Docker image when the project clearly benefits (e.g. pinned toolchain); otherwise run on the host.
 - Do not invent commands for tools the project does not use.
 - Include [on_push] with run = true and block_on_failure = true unless the project seems experimental.
+- Include [review] with run = true, block_on_failure = true, and fail_on = "high". Add `instructions` only when the repository has a genuine project-specific rule worth stating; leave it out otherwise.
 - Add short `#` comments explaining non-obvious choices."#;
 
 /// Collects a compact description of the repository for the AI: top-level

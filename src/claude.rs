@@ -358,6 +358,25 @@ impl Client {
         Ok(crate::ollama::extract_merged_content(&text))
     }
 
+    /// Reviews an outgoing diff. Returns the model's raw response for
+    /// [`crate::review::parse`], which tolerates fences and stray prose.
+    pub fn review(
+        &self,
+        diff: &str,
+        instructions: Option<&str>,
+        max_diff_bytes: usize,
+    ) -> Result<crate::review::ReviewOutcome> {
+        let prompt = crate::review::user_prompt(diff, instructions, max_diff_bytes);
+        let text = self.request_with_system(crate::review::SYSTEM_PROMPT, &prompt, 8192)?;
+        if !crate::review::parsed_cleanly(&text) {
+            return Err(ClaudeError(format!(
+                "The reviewer did not return a usable review: {}",
+                crate::review::excerpt(&text)
+            )));
+        }
+        Ok(crate::review::parse(&text))
+    }
+
     fn request(&self, prompt: &str, max_tokens: u32) -> Result<String> {
         self.request_with_system(SYSTEM_PROMPT, prompt, max_tokens)
     }

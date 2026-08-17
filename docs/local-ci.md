@@ -7,6 +7,14 @@ Docker containers for reproducible environments.
 - [Quick start](#quick-start)
 - [The config file](#the-config-file)
 - [Running checks](#running-checks)
+- [Gating pushes and pull requests](#gating-pushes-and-pull-requests)
+- [AI code review](#ai-code-review)
+  - [Enabling it](#enabling-it)
+  - [Severity and the `fail_on` threshold](#severity-and-the-fail_on-threshold)
+  - [Reading a review, and overriding it](#reading-a-review-and-overriding-it)
+  - [Choosing a provider and model](#choosing-a-provider-and-model)
+  - [Project-specific instructions](#project-specific-instructions)
+  - [What the reviewer sees](#what-the-reviewer-sees)
 - [Docker environments](#docker-environments)
 - [Secrets](#secrets)
 - [Recipes](#recipes)
@@ -32,6 +40,16 @@ Docker containers for reproducible environments.
 
 Each job shows `[pending]` → `[running]` → `[pass 2.3s]` or `[fail 0.8s]`.
 Click a job's name to expand its full output log.
+
+From there you can go two ways, independently:
+
+- Make the checks run automatically and gate a push — see
+  [Gating pushes and pull requests](#gating-pushes-and-pull-requests).
+- Add an AI review of the diff before it is published — see
+  [AI code review](#ai-code-review).
+
+The starter config written by **Create config** includes both as commented-out
+examples, so you can uncomment rather than type them from scratch.
 
 ## The config file
 
@@ -71,8 +89,179 @@ secrets = ["API_TOKEN"]             # optional: secret names (values elsewhere)
 - The whole repository working tree is the job's working directory,
   including uncommitted changes, so you test exactly what you are about
   to push.
-- A failing check does **not** block PR creation; you get a clear red
-  warning and can decide.
+- Run manually, a failing check does **not** block anything; you get a clear
+  red warning and decide what to do. Configure `[on_push]` below to make
+  failures actually gate a push.
+
+## Gating pushes and pull requests
+
+By default the jobs only run when you ask them to. Add an `[on_push]` section
+to run them automatically before every push from the app:
+
+```toml
+[on_push]
+run = true                # run all jobs before each push
+block_on_failure = true   # a failing job cancels the push
+```
+
+| Field              | Default | Meaning                                                     |
+|--------------------|---------|-------------------------------------------------------------|
+| `run`              | `false` | Run every job automatically before a push                   |
+| `block_on_failure` | `true`  | A failing job cancels the push instead of only warning      |
+
+With `run = true`, pushing switches to the **Checks** tab and runs the jobs
+first. If they pass, the push proceeds. If one fails and
+`block_on_failure = true`, the push is cancelled and the first failing job is
+expanded for you. Set `block_on_failure = false` to be warned but pushed
+anyway.
+
+## AI code review
+
+Separately from the jobs, Git Manage can have an AI model review the diff you
+are about to publish and report what it finds. It runs **after** the jobs
+pass, on both pushes and pull requests.
+
+It is advisory by design. It reports findings with its reasoning, and you can
+always proceed anyway — see [Reading a review, and overriding
+it](#reading-a-review-and-overriding-it).
+
+### Enabling it
+
+Add a `[review]` section to the same `.git-manage-ci.toml`:
+
+```toml
+[review]
+run = true                # review before every push and pull request
+block_on_failure = true   # findings at or above fail_on stop to ask first
+fail_on = "high"          # low | medium | high
+
+# Optional:
+# provider = "claude"                  # claude | ollama
+# model = "claude-opus-5"
+# max_diff_bytes = 24000               # cap on how much diff is sent
+# instructions = "Flag any new blocking call on the UI thread."
+```
+
+| Field              | Default  | Meaning                                                            |
+|--------------------|----------|--------------------------------------------------------------------|
+| `run`              | `false`  | Review before pushes and pull requests                             |
+| `block_on_failure` | `true`   | Findings at or above `fail_on` stop and ask before proceeding      |
+| `fail_on`          | `"high"` | Lowest severity that stops to ask (`low`, `medium`, `high`)        |
+| `provider`         | app's    | `claude` or `ollama`; defaults to your selection in the app        |
+| `model`            | app's    | Model for that provider                                            |
+| `max_diff_bytes`   | `24000`  | Diff is truncated past this, with a marker so the model knows      |
+| `instructions`     | none     | Extra project-specific things to look for                          |
+
+Omitting `[review]` entirely leaves the reviewer off, so adding it to an
+existing repository changes nothing until you opt in.
+
+You can also run a review at any time without gating anything: the **AI
+review** button in the Checks tab reports on the current outgoing diff, and
+works even with `run = false`.
+
+### Severity and the `fail_on` threshold
+
+Every finding carries one of three severities:
+
+| Severity | Means                                                                                       |
+|----------|---------------------------------------------------------------------------------------------|
+| `high`   | The change is incorrect or unsafe: wrong results, crashes, data loss, races, leaks, injection, auth or secret exposure, a broken API contract |
+| `medium` | A real problem that is not a correctness failure: missing error handling on a path that can fail, a missing test for new branching logic, a performance cliff, a misleading name |
+| `low`    | Style, naming, formatting, preference                                                       |
+
+`fail_on` sets the lowest severity that stops to ask you. With the default
+`"high"`, medium and low findings are reported but never interrupt a push.
+
+The model is deliberately asked to report **every** finding at its honest
+severity, and this threshold does the filtering. That is why `fail_on` exists
+rather than an instruction to "only report serious issues": a model told to
+self-censor investigates just as hard and then withholds the rest, which
+reads back as a clean review of code that is not clean.
+
+Tighten to `fail_on = "medium"` on code you want held to a higher bar. Set
+`block_on_failure = false` to get reviews without any interruption.
+
+### Reading a review, and overriding it
+
+When findings reach the threshold, a dialog holds the push or pull request
+and shows:
+
+- the tally (`3 high · 1 medium · 0 low`) and how many crossed `fail_on`
+- a one-line **summary** of the change's state
+- **Reviewer's reasoning** — what it examined, what it is confident is
+  correct, and what it could not verify from the diff alone
+- each finding: severity, `file:line`, a one-line title, and an expandable
+  detail with the failing case and a suggested fix
+
+Two choices:
+
+- **Cancel and fix** — abandons the push/PR. Findings stay in the Checks tab.
+- **Push anyway** / **Create pull request anyway** — proceeds regardless.
+
+The override is a plain button, not a hidden setting, because the reviewer
+can be wrong. Reading the reasoning is what makes overriding a judgement
+rather than a coin flip. Closing the dialog with the X is the same as
+Cancel — dismissing a blocking review is never treated as approval.
+
+Findings persist in the Checks tab after the dialog closes, so a review you
+overrode is still there to come back to.
+
+A review that **cannot run** — no provider signed in, request failed, model
+returned something unusable — reports the reason and lets the action through.
+It never blocks on its own failure.
+
+### Choosing a provider and model
+
+With no `provider`/`model` set, the reviewer uses whatever you selected for
+AI features in the app, so it follows your Claude or Ollama sign-in. Pin them
+in the config when the whole team should review with the same model:
+
+```toml
+[review]
+run = true
+provider = "claude"
+model = "claude-opus-5"
+```
+
+Reviewing is the most demanding AI task in the app: it has to hold a whole
+diff in context and return structured JSON. Small local models often cannot
+keep to the format — if you see "did not return a usable review", try a
+larger Ollama model or switch to `provider = "claude"`.
+
+### Project-specific instructions
+
+`instructions` is appended to the prompt. Use it for rules a reviewer could
+not infer from the diff alone:
+
+```toml
+[review]
+run = true
+instructions = """
+Flag any new blocking I/O on the UI thread — this app has a single render
+loop and a blocked frame is a visible freeze.
+Flag new `unwrap()` outside tests.
+Database migrations must be reversible; flag any that are not.
+"""
+```
+
+Keep these to genuine project rules. Restating general good practice adds
+tokens without changing the review.
+
+### What the reviewer sees
+
+The reviewer reads the **committed work you are about to publish**, not your
+working tree:
+
+| Action                          | Diff reviewed                                          |
+|---------------------------------|--------------------------------------------------------|
+| Pull request                    | `base...HEAD` — against the PR's target branch         |
+| Push, branch has an upstream    | `@{upstream}...HEAD` — the commits that would be sent  |
+| Push, no upstream yet           | Everything on the branch that no remote has            |
+
+Uncommitted edits are **not** reviewed, because a push does not publish them.
+This is the opposite of the jobs, which run against the working tree. If you
+want a review of work in progress, commit it first (or use the Checks tab
+button after committing).
 
 ## Docker environments
 
@@ -262,9 +451,15 @@ commands = ["go vet ./...", "go test ./..."]
 | `env`                     | `env`                                        |
 | `secrets.*`               | `secrets` + `.git-manage-ci.secrets` file    |
 | matrix                    | multiple jobs with different `image`s        |
+| branch protection rules   | `[on_push] block_on_failure`                 |
+| a review-bot Action       | `[review]` (runs before the push, not after) |
 
 Both can coexist: run checks locally before the PR, and let the hosted
 workflow (`.github/workflows/ci.yml`) validate after pushing.
+
+The `[review]` gate differs from a review bot in one way worth noting: it runs
+*before* the code leaves your machine, so findings never appear in the PR's
+public history. Nothing is posted to GitHub.
 
 ## Limitations
 
@@ -276,6 +471,12 @@ workflow (`.github/workflows/ci.yml`) validate after pushing.
 - Caching is whatever the host/container sees. Host jobs reuse your local
   caches (fast); fresh containers download dependencies each run unless you
   bake them into a custom image.
+- The AI reviewer sees the diff and nothing else — not the surrounding files,
+  not the tests, not the build. It cannot tell you whether the change
+  actually works; that is what the jobs are for. Treat it as a second pair of
+  eyes on the patch, not a substitute for running the tests.
+- Large diffs are truncated at `max_diff_bytes`. A very large change is
+  reviewed only in part, and the model is told so.
 
 ## Building on top of the engine
 
@@ -292,3 +493,8 @@ tools. See [extending-local-ci.md](extending-local-ci.md).
 | Container job can't find your toolchain | The container only has what the image ships; pick a toolchain image (`rust:1.80`, `node:22`) or install inside `commands` |
 | Changes not picked up after editing the config | Click **Reload** in the LOCAL CHECKS section |
 | Job output cut off | Output is capped at 64 KB per job to keep the UI responsive; run the command in a terminal for the full log |
+| `AI review is enabled but no model is available` | Sign in to Claude in Settings, or pick an Ollama model — or pin `provider`/`model` under `[review]`. The push still goes through |
+| `did not return a usable review` | The model could not hold the JSON format. Use a larger Ollama model or set `provider = "claude"` under `[review]` |
+| `Nothing to review: no outgoing changes found` | Everything on the branch is already pushed, or your work is still uncommitted — the reviewer reads commits, not the working tree |
+| Review never runs on push | Check `[review] run = true`. It runs *after* the jobs, so a failing job with `block_on_failure = true` cancels the push before the review starts |
+| Review interrupts too often | Raise `fail_on` (e.g. to `"high"`), or set `block_on_failure = false` to get reviews without interruption |

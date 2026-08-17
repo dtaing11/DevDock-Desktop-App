@@ -771,3 +771,251 @@ fn patch_line_numbering() {
     assert_eq!(lines[5].old_line, Some(3)); // trailing context advances both
     assert_eq!(lines[5].new_line, Some(4));
 }
+
+// ---------------------------------------------------------------------------
+// AI review gate
+// ---------------------------------------------------------------------------
+
+/// The reviewer must see the commits a push would publish, not the working
+/// tree: reviewing uncommitted edits would review code that isn't going out.
+#[test]
+fn review_diff_covers_outgoing_commits_not_working_tree() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "base\n", "init");
+    repo.push(true, None).unwrap();
+
+    commit_file(&repo, "a.txt", "published\n", "feat: committed work");
+    write(&repo, "a.txt", "uncommitted scratch\n");
+
+    let diff = repo.diff_for_review(None).unwrap();
+    assert!(diff.contains("+published"), "outgoing commit missing: {diff}");
+    assert!(
+        !diff.contains("uncommitted scratch"),
+        "working-tree edit must not be reviewed: {diff}"
+    );
+}
+
+/// With no upstream there is no `@{upstream}` to diff against, so the range
+/// is derived from the oldest commit no remote has.
+#[test]
+fn review_diff_works_without_an_upstream() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "base\n", "init");
+    repo.push(true, None).unwrap();
+
+    repo.create_branch("feature", true).unwrap();
+    commit_file(&repo, "b.txt", "feature work\n", "feat: b");
+
+    let diff = repo.diff_for_review(None).unwrap();
+    assert!(diff.contains("+feature work"), "unpushed commit missing: {diff}");
+}
+
+/// A pull request is reviewed against its target branch.
+#[test]
+fn review_diff_against_a_base_branch() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "base\n", "init");
+    repo.create_branch("feature", true).unwrap();
+    commit_file(&repo, "b.txt", "pr work\n", "feat: b");
+
+    let diff = repo.diff_for_review(Some("main")).unwrap();
+    assert!(diff.contains("+pr work"), "PR diff missing the change: {diff}");
+}
+
+/// A branch with nothing outgoing yields an empty diff rather than an error,
+/// so the gate reports "nothing to review" instead of failing.
+#[test]
+fn review_diff_is_empty_when_nothing_is_outgoing() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "base\n", "init");
+    repo.push(true, None).unwrap();
+
+    assert!(repo.diff_for_review(None).unwrap().trim().is_empty());
+}
+
+/// Review settings live beside the jobs in the same config file, and are
+/// off unless the repository opts in.
+#[test]
+fn review_config_parses_from_the_ci_file() {
+    use git_manage::review::Severity;
+
+    let (_tmp, repo) = setup();
+    fs::write(
+        repo.path().join(git_manage::local_ci::CONFIG_FILE),
+        r#"
+[[job]]
+name = "tests"
+commands = ["true"]
+
+[review]
+run = true
+fail_on = "medium"
+instructions = "Watch the UI thread."
+"#,
+    )
+    .unwrap();
+
+    let config = git_manage::local_ci::load_config(repo.path()).unwrap().unwrap();
+    assert_eq!(config.jobs.len(), 1);
+    assert!(config.review.run);
+    assert_eq!(config.review.fail_on, Severity::Medium);
+    assert_eq!(config.review.instructions.as_deref(), Some("Watch the UI thread."));
+    // Unset fields keep their defaults.
+    assert!(config.review.block_on_failure);
+    assert_eq!(config.review.max_diff_bytes, 24_000);
+}
+
+/// A config with no `[review]` section leaves the reviewer off, so adding
+/// the feature cannot change behaviour for existing repositories.
+#[test]
+fn review_is_off_when_the_config_omits_it() {
+    let (_tmp, repo) = setup();
+    fs::write(
+        repo.path().join(git_manage::local_ci::CONFIG_FILE),
+        "[[job]]\nname = \"tests\"\ncommands = [\"true\"]\n",
+    )
+    .unwrap();
+
+    let config = git_manage::local_ci::load_config(repo.path()).unwrap().unwrap();
+    assert!(!config.review.run, "review must be opt-in");
+}
+
+/// Keeps the guide honest: every `[review]`/`[on_push]` example in
+/// `docs/local-ci.md` must deserialize into the real config types. A
+/// documented field that no longer exists is a silent lie otherwise.
+#[test]
+fn documented_config_examples_match_the_real_schema() {
+    let doc = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/local-ci.md");
+    let text = fs::read_to_string(&doc).expect("docs/local-ci.md should exist");
+
+    // Pull out fenced ```toml blocks.
+    let mut blocks: Vec<String> = Vec::new();
+    let mut current: Option<String> = None;
+    for line in text.lines() {
+        match (&mut current, line.trim()) {
+            (None, "```toml") => current = Some(String::new()),
+            (Some(_), "```") => blocks.push(current.take().unwrap()),
+            (Some(buf), _) => {
+                buf.push_str(line);
+                buf.push('\n');
+            }
+            _ => {}
+        }
+    }
+    assert!(blocks.len() >= 10, "expected the guide's toml examples, found {}", blocks.len());
+
+    let mut checked = 0;
+    for block in &blocks {
+        if !block.contains("[review]") && !block.contains("[on_push]") {
+            continue;
+        }
+        // `deny_unknown_fields` is not set on the config types, so compare
+        // against a strict parse of the same text to catch stale field names.
+        let parsed: git_manage::local_ci::Config = toml::from_str(block)
+            .unwrap_or_else(|e| panic!("documented example does not parse:\n{block}\n{e}"));
+        let raw: toml::Table = toml::from_str(block).unwrap();
+        if let Some(toml::Value::Table(review)) = raw.get("review") {
+            let round_trip = toml::Value::try_from(&parsed.review).unwrap();
+            for key in review.keys() {
+                assert!(
+                    round_trip.get(key).is_some(),
+                    "docs document `[review] {key}`, which the ReviewConfig struct \
+                     does not have"
+                );
+            }
+            checked += 1;
+        }
+        if let Some(toml::Value::Table(on_push)) = raw.get("on_push") {
+            let round_trip = toml::Value::try_from(&parsed.on_push).unwrap();
+            for key in on_push.keys() {
+                assert!(
+                    round_trip.get(key).is_some(),
+                    "docs document `[on_push] {key}`, which the OnPush struct \
+                     does not have"
+                );
+            }
+            checked += 1;
+        }
+    }
+    assert!(checked >= 3, "expected several gate examples in the guide, checked {checked}");
+}
+
+/// Regression: a tracked file inside a gitignored directory must not be able
+/// to block staging everything else.
+///
+/// `git add` refuses any path under an ignored directory — even a tracked
+/// one — and fails the *whole* invocation, so batching every path into one
+/// `git add` meant a single such file broke every commit. (This is the state
+/// a repo lands in when a build directory is committed and `.gitignore` gains
+/// the directory afterwards.)
+#[test]
+fn staging_survives_a_tracked_file_in_an_ignored_directory() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "one\n", "init");
+
+    // Commit a build artifact, then start ignoring the directory.
+    fs::create_dir_all(repo.path().join("dist")).unwrap();
+    write(&repo, "dist/app.bin", "v1\n");
+    repo.git(&["add", "--force", "--", "dist/app.bin"]).unwrap();
+    repo.commit("chore: add build output", "", false).unwrap();
+    write(&repo, ".gitignore", "/dist\n");
+    commit_file(&repo, ".gitignore", "/dist\n", "chore: ignore dist");
+
+    // Now change both the ignored-but-tracked artifact and a normal file.
+    write(&repo, "dist/app.bin", "v2\n");
+    write(&repo, "a.txt", "two\n");
+
+    // Batching these into one `git add` fails outright; staging must cope.
+    let skipped = repo
+        .stage(&["a.txt".into(), "dist/app.bin".into()])
+        .expect("staging must not fail because of the ignored directory");
+    assert!(skipped.is_empty(), "tracked paths should be force-added, not skipped: {skipped:?}");
+
+    let status = repo.status().unwrap();
+    let staged: Vec<&str> =
+        status.files.iter().filter(|f| f.staged).map(|f| f.path.as_str()).collect();
+    assert!(staged.contains(&"a.txt"), "normal file was not staged: {staged:?}");
+    assert!(staged.contains(&"dist/app.bin"), "tracked artifact was not staged: {staged:?}");
+
+    // And the commit actually goes through.
+    repo.commit("chore: both", "", false).unwrap();
+    assert!(repo.status().unwrap().files.is_empty());
+}
+
+/// A path that is ignored *and* untracked is reported, not forced into the
+/// repository, and does not stop the rest from staging.
+#[test]
+fn staging_skips_but_reports_an_ignored_untracked_path() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, ".gitignore", "/dist\n", "chore: ignore dist");
+    commit_file(&repo, "a.txt", "one\n", "init");
+
+    fs::create_dir_all(repo.path().join("dist")).unwrap();
+    write(&repo, "dist/app.bin", "fresh\n");
+    write(&repo, "a.txt", "two\n");
+
+    let skipped = repo.stage(&["a.txt".into(), "dist/app.bin".into()]).unwrap();
+    assert_eq!(skipped, vec!["dist/app.bin".to_string()], "should report what it left out");
+
+    let status = repo.status().unwrap();
+    assert!(status.files.iter().any(|f| f.path == "a.txt" && f.staged));
+    // The ignored file must not have been sneaked in.
+    assert!(
+        !repo.git(&["ls-files", "--", "dist/app.bin"]).unwrap().contains("app.bin"),
+        "an ignored, untracked file must never be force-added"
+    );
+}
+
+/// When every requested path is unstageable that is a real error, not a
+/// silent no-op commit.
+#[test]
+fn staging_errors_when_nothing_could_be_staged() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, ".gitignore", "/dist\n", "chore: ignore dist");
+
+    fs::create_dir_all(repo.path().join("dist")).unwrap();
+    write(&repo, "dist/app.bin", "fresh\n");
+
+    let err = repo.stage(&["dist/app.bin".into()]).unwrap_err().to_string();
+    assert!(err.contains("Could not stage"), "unexpected error: {err}");
+}

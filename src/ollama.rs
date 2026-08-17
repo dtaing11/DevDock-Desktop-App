@@ -154,6 +154,47 @@ impl Client {
         Ok(extract_merged_content(text))
     }
 
+    /// Reviews an outgoing diff. See [`crate::review`] for the contract.
+    pub fn review(
+        &self,
+        model: &str,
+        diff: &str,
+        instructions: Option<&str>,
+        max_diff_bytes: usize,
+    ) -> Result<crate::review::ReviewOutcome> {
+        let prompt = crate::review::user_prompt(diff, instructions, max_diff_bytes);
+        let payload = serde_json::json!({
+            "model": model,
+            "prompt": prompt,
+            "system": crate::review::SYSTEM_PROMPT,
+            "stream": false,
+            // Reviews should be reproducible run to run, and the schema is
+            // fixed, so there is nothing for sampling variance to add.
+            "options": {"temperature": 0.1}
+        });
+        let resp = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(300))
+            .build()
+            .post(&format!("{}/api/generate", self.base_url))
+            .send_json(payload)
+            .map_err(|e| OllamaError(format!("Ollama request failed: {e}")))?;
+        let value: serde_json::Value =
+            resp.into_json().map_err(|e| OllamaError(format!("Bad response from Ollama: {e}")))?;
+        let text = value
+            .get("response")
+            .and_then(|r| r.as_str())
+            .ok_or_else(|| OllamaError("Ollama returned no response text".into()))?;
+        if !crate::review::parsed_cleanly(text) {
+            return Err(OllamaError(format!(
+                "The reviewer did not return a usable review: {}. Smaller local \
+                 models often cannot hold the JSON format — try a larger model \
+                 or set provider = \"claude\" under [review].",
+                crate::review::excerpt(text)
+            )));
+        }
+        Ok(crate::review::parse(text))
+    }
+
     /// Asks the model to merge a conflicted file from its three stages.
     /// Returns the full merged file content.
     pub fn resolve_conflict(

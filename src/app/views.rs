@@ -1400,6 +1400,84 @@ pub fn panel_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Resp
 
 /// Checks tab: live status of the current CI run plus a history of past
 /// runs with per-job timing and expandable logs.
+/// The latest AI review, kept visible after the gate dialog is dismissed so
+/// the findings a user overrode are still there to come back to.
+fn review_section(app: &mut App, ui: &mut egui::Ui) {
+    use crate::review::Severity;
+
+    if let Some(err) = app.review.error.clone() {
+        ui.add_space(8.0);
+        ui.label(RichText::new(format!("AI review failed: {err}")).color(theme::DANGER));
+    }
+
+    let Some(outcome) = app.review.outcome.clone() else { return };
+    let (high, medium, low) = outcome.tally();
+    let fail_on = app.review.config.fail_on;
+
+    ui.add_space(10.0);
+    let header = if outcome.findings.is_empty() {
+        "AI review — nothing found".to_string()
+    } else {
+        format!("AI review — {high} high · {medium} medium · {low} low")
+    };
+    egui::CollapsingHeader::new(RichText::new(header).strong())
+        .default_open(!outcome.findings.is_empty())
+        .show(ui, |ui| {
+            if !outcome.summary.is_empty() {
+                ui.label(&outcome.summary);
+            }
+            if !outcome.reasoning.is_empty() {
+                ui.add_space(4.0);
+                egui::CollapsingHeader::new("Reviewer's reasoning").default_open(false).show(
+                    ui,
+                    |ui| {
+                        ui.label(RichText::new(&outcome.reasoning).color(theme::FG_DIM));
+                    },
+                );
+            }
+            ui.add_space(6.0);
+            for (i, finding) in outcome.findings.iter().enumerate() {
+                let color = match finding.severity {
+                    Severity::High => theme::DANGER,
+                    Severity::Medium => theme::EMBER,
+                    Severity::Low => theme::FG_DIM,
+                };
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(finding.severity.label().to_uppercase())
+                            .color(color)
+                            .small()
+                            .strong(),
+                    );
+                    if !finding.file.is_empty() {
+                        let loc = match finding.line {
+                            Some(l) => format!("{}:{l}", finding.file),
+                            None => finding.file.clone(),
+                        };
+                        ui.label(RichText::new(loc).color(theme::FG_DIM).small().monospace());
+                    }
+                    if finding.severity >= fail_on {
+                        ui.label(
+                            RichText::new("blocks").color(theme::DANGER).small().italics(),
+                        );
+                    }
+                    ui.label(&finding.title);
+                });
+                if !finding.detail.is_empty() {
+                    let expanded = app.review.expanded == Some(i);
+                    if ui.small_button(if expanded { "Hide" } else { "Detail" }).clicked() {
+                        app.review.expanded = if expanded { None } else { Some(i) };
+                    }
+                    if expanded {
+                        ui.label(RichText::new(&finding.detail).color(theme::FG_DIM));
+                    }
+                }
+                ui.add_space(4.0);
+            }
+        });
+    ui.add_space(4.0);
+}
+
 fn checks_tab(app: &mut App, ui: &mut egui::Ui) {
     use crate::app::CiTrigger;
 
@@ -1427,7 +1505,20 @@ fn checks_tab(app: &mut App, ui: &mut egui::Ui) {
         {
             app.load_local_ci();
         }
+        let reviewing = app.review.running;
+        let review_label = if reviewing { "Reviewing…" } else { "AI review" };
+        if panel_button(ui, review_label, !reviewing)
+            .on_hover_text(
+                "Ask the configured AI model to review the diff this branch \
+                 would push. Reports only — nothing is blocked.",
+            )
+            .clicked()
+        {
+            app.review_now();
+        }
     });
+
+    review_section(app, ui);
 
     if app.local_ci.jobs.is_empty() {
         ui.add_space(12.0);

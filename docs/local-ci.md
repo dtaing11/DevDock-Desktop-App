@@ -132,20 +132,51 @@ Add a `[review]` section to the same `.git-manage-ci.toml`:
 
 ```toml
 [review]
-run = true                # review before every push and pull request
+run = true                # review before every push AND pull request
 block_on_failure = true   # findings at or above fail_on stop to ask first
 fail_on = "high"          # low | medium | high
 
 # Optional:
+# on_push = true                       # gate each trigger on its own
+# on_pull_request = true
 # provider = "claude"                  # claude | ollama
 # model = "claude-opus-5"
 # max_diff_bytes = 24000               # cap on how much diff is sent
 # instructions = "Flag any new blocking call on the UI thread."
 ```
 
+`run = true` is the shorthand for "both triggers". To review one and not the
+other, set the trigger directly:
+
+```toml
+# Review pull requests only. Everyday pushes go straight through.
+[review]
+on_pull_request = true
+```
+
+```toml
+# Review every push, but not PR creation (the code was already reviewed).
+[review]
+on_push = true
+```
+
+```toml
+# Both, except pushes — an explicit false overrides `run`.
+[review]
+run = true
+on_push = false
+```
+
+Each trigger falls back to `run` when left out, so a config that only sets
+`run` behaves exactly as before. `on_pr` is accepted as a spelling of
+`on_pull_request`. The **AI review** button in the Checks tab ignores all of
+this — asking for a review is its own consent.
+
 | Field              | Default  | Meaning                                                            |
 |--------------------|----------|--------------------------------------------------------------------|
-| `run`              | `false`  | Review before pushes and pull requests                             |
+| `run`              | `false`  | Review before pushes **and** pull requests                         |
+| `on_push`          | `run`    | Review before a push, overriding `run`                             |
+| `on_pull_request`  | `run`    | Review before creating a PR, overriding `run` (alias: `on_pr`)     |
 | `block_on_failure` | `true`   | Findings at or above `fail_on` stop and ask before proceeding      |
 | `fail_on`          | `"high"` | Lowest severity that stops to ask (`low`, `medium`, `high`)        |
 | `provider`         | app's    | `claude` or `ollama`; defaults to your selection in the app        |
@@ -558,5 +589,6 @@ tools. See [extending-local-ci.md](extending-local-ci.md).
 | `AI review is enabled but no model is available` | Sign in to Claude in Settings, or pick an Ollama model — or pin `provider`/`model` under `[review]`. The push still goes through |
 | `did not return a usable review` | The model could not hold the JSON format. Use a larger Ollama model or set `provider = "claude"` under `[review]` |
 | `Nothing to review: no outgoing changes found` | Everything on the branch is already pushed, or your work is still uncommitted — the reviewer reads commits, not the working tree |
-| Review never runs on push | Check `[review] run = true`. It runs *after* the jobs, so a failing job with `block_on_failure = true` cancels the push before the review starts |
+| Review never runs on push | Check `[review] run = true` (or `on_push = true`), and that `on_push` is not explicitly `false`. It runs *after* the jobs, so a failing job with `[on_push] block_on_failure = true` cancels the push before the review starts |
+| Review runs on push but not on PR (or vice versa) | One trigger is off. `run` covers both; `on_push` / `on_pull_request` override it per trigger |
 | Review interrupts too often | Raise `fail_on` (e.g. to `"high"`), or set `block_on_failure = false` to get reviews without interruption |

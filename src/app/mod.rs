@@ -1588,7 +1588,15 @@ impl App {
     /// resume afterwards, or `None` for a review that gates nothing.
     fn start_review(&mut self, gated: Option<GatedAction>, force: bool) {
         let Some(repo) = self.repo.clone() else { return };
-        if (!self.review.config.run && !force) || self.review.running {
+        // Each trigger is enabled independently, falling back to `run` when
+        // the repo only set the simple switch.
+        let enabled = match &gated {
+            Some(GatedAction::Push { .. }) => self.review.config.runs_on_push(),
+            Some(GatedAction::PullRequest) => self.review.config.runs_on_pull_request(),
+            // A manual review from the Checks tab is its own consent.
+            None => true,
+        };
+        if (!enabled && !force) || self.review.running {
             if let Some(gated) = gated {
                 self.perform(gated);
             }

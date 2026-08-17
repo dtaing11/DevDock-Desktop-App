@@ -170,7 +170,9 @@ commands = ["echo hello from local CI"]
 # after the jobs above pass, reports findings with its reasoning, and you can
 # always choose to proceed anyway.
 # [review]
-# run = true
+# run = true                # review before both pushes and pull requests
+# on_push = true            # or gate each trigger on its own — either one
+# on_pull_request = true    # falls back to `run` when left out
 # block_on_failure = true   # findings at or above fail_on stop to ask first
 # fail_on = "high"          # low | medium | high
 # provider = "claude"       # claude | ollama; defaults to the app's selection
@@ -216,7 +218,7 @@ Format specification:
 - An optional [review] section adds an AI review of the outgoing diff, run
   after the jobs pass:
   [review]
-  run = true
+  run = true               # both triggers; or set on_push / on_pull_request
   block_on_failure = true  # findings at or above fail_on stop to ask first
   fail_on = "high"         # low | medium | high
   # instructions = "..."   # project-specific things to look for

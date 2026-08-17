@@ -4,7 +4,7 @@
 //!
 //! ```toml
 //! [review]
-//! run = true               # review before every push and pull request
+//! run = true               # review before every push AND pull request
 //! block_on_failure = true  # findings at or above `fail_on` cancel it
 //! fail_on = "high"         # low | medium | high
 //! # provider = "claude"    # claude | ollama; defaults to the app's selection
@@ -12,6 +12,28 @@
 //! # max_diff_bytes = 24000
 //! # instructions = "Flag any new blocking call on the UI thread."
 //! ```
+//!
+//! # Triggers
+//!
+//! `run` is the both-triggers shorthand. To review one and not the other, set
+//! the trigger directly — each falls back to `run` when unset, so existing
+//! configs keep working:
+//!
+//! ```toml
+//! [review]
+//! on_pull_request = true   # review PRs only; pushes go straight through
+//! ```
+//!
+//! ```toml
+//! [review]
+//! run = true
+//! on_push = false          # an explicit false overrides `run`
+//! ```
+//!
+//! `on_pr` is accepted as a spelling of `on_pull_request`. A manual review
+//! from the Checks tab ignores all of this — asking for one is its own
+//! consent. See [`ReviewConfig::runs_on_push`] and
+//! [`ReviewConfig::runs_on_pull_request`].
 //!
 //! The model is asked to report *every* finding with a severity, and the
 //! `fail_on` threshold decides what blocks. Filtering here rather than in the
@@ -162,9 +184,19 @@ impl ReviewOutcome {
 /// `[review]` settings from `.git-manage-ci.toml`.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ReviewConfig {
-    /// Run the reviewer before pushes and pull requests.
+    /// Run the reviewer before **both** pushes and pull requests. The simple
+    /// switch; use [`Self::on_push`] / [`Self::on_pull_request`] to gate one
+    /// trigger without the other.
     #[serde(default)]
     pub run: bool,
+    /// Review before a push. Falls back to [`Self::run`] when unset, so
+    /// `run = true` alone still covers pushes.
+    #[serde(default)]
+    pub on_push: Option<bool>,
+    /// Review before creating a pull request. Falls back to [`Self::run`]
+    /// when unset. `on_pr` is accepted as a spelling of this.
+    #[serde(default, alias = "on_pr")]
+    pub on_pull_request: Option<bool>,
     /// When true, findings at or above [`Self::fail_on`] cancel the push or
     /// pull request. When false, they are reported and the action proceeds.
     #[serde(default = "default_true")]
@@ -209,10 +241,30 @@ fn default_max_diff() -> usize {
     24_000
 }
 
+impl ReviewConfig {
+    /// Whether a push should be reviewed.
+    pub fn runs_on_push(&self) -> bool {
+        self.on_push.unwrap_or(self.run)
+    }
+
+    /// Whether creating a pull request should be reviewed.
+    pub fn runs_on_pull_request(&self) -> bool {
+        self.on_pull_request.unwrap_or(self.run)
+    }
+
+    /// Whether the reviewer is enabled for any trigger at all. Used to decide
+    /// whether to mention it in the UI.
+    pub fn runs_at_all(&self) -> bool {
+        self.runs_on_push() || self.runs_on_pull_request()
+    }
+}
+
 impl Default for ReviewConfig {
     fn default() -> Self {
         Self {
             run: false,
+            on_push: None,
+            on_pull_request: None,
             block_on_failure: true,
             fail_on: default_fail_on(),
             max_diff_bytes: default_max_diff(),
@@ -703,6 +755,67 @@ mod tests {
         // Still Markdown, still the same review criteria.
         assert!(advisory.contains("Markdown"));
         assert!(advisory.contains("data loss"));
+    }
+
+    #[test]
+    fn run_covers_both_triggers() {
+        let cfg = ReviewConfig { run: true, ..Default::default() };
+        assert!(cfg.runs_on_push());
+        assert!(cfg.runs_on_pull_request());
+        assert!(cfg.runs_at_all());
+    }
+
+    #[test]
+    fn off_by_default_for_both_triggers() {
+        let cfg = ReviewConfig::default();
+        assert!(!cfg.runs_on_push());
+        assert!(!cfg.runs_on_pull_request());
+        assert!(!cfg.runs_at_all());
+    }
+
+    /// Either trigger can be enabled on its own, without `run`.
+    #[test]
+    fn a_single_trigger_can_be_enabled_alone() {
+        let push_only = ReviewConfig { on_push: Some(true), ..Default::default() };
+        assert!(push_only.runs_on_push());
+        assert!(!push_only.runs_on_pull_request());
+        assert!(push_only.runs_at_all());
+
+        let pr_only = ReviewConfig { on_pull_request: Some(true), ..Default::default() };
+        assert!(!pr_only.runs_on_push());
+        assert!(pr_only.runs_on_pull_request());
+    }
+
+    /// An explicit per-trigger `false` overrides `run = true`, so you can
+    /// review PRs but not every push.
+    #[test]
+    fn a_trigger_can_opt_out_of_run() {
+        let cfg = ReviewConfig { run: true, on_push: Some(false), ..Default::default() };
+        assert!(!cfg.runs_on_push(), "explicit false must win over run");
+        assert!(cfg.runs_on_pull_request());
+        assert!(cfg.runs_at_all());
+
+        // Opting out of both is explicit and allowed.
+        let none = ReviewConfig {
+            run: true,
+            on_push: Some(false),
+            on_pull_request: Some(false),
+            ..Default::default()
+        };
+        assert!(!none.runs_at_all());
+    }
+
+    #[test]
+    fn triggers_parse_from_toml_including_the_on_pr_spelling() {
+        let cfg: ReviewConfig =
+            toml::from_str("on_push = true\non_pr = false\n").expect("should parse");
+        assert!(cfg.runs_on_push());
+        assert!(!cfg.runs_on_pull_request(), "on_pr should alias on_pull_request");
+
+        // The long spelling works too.
+        let long: ReviewConfig = toml::from_str("on_pull_request = true\n").unwrap();
+        assert!(long.runs_on_pull_request());
+        assert!(!long.runs_on_push(), "unset trigger falls back to run = false");
     }
 
     #[test]

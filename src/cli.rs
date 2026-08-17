@@ -103,19 +103,47 @@ fn cmd_ci(rest: &[String]) -> ExitCode {
         Some("init") => {
             let flags = &rest[1..];
             let ai = flags.iter().any(|a| a == "--ai");
-            let provider = flag_value(flags, "--provider");
-            let model = flag_value(flags, "--model");
-            if !ai && (provider.is_some() || model.is_some()) {
-                eprintln!("devdock ci init: --provider/--model only apply with --ai");
-                return ExitCode::from(2);
-            }
+
+            // Reject unknown flags before parsing values, so a typo is not
+            // silently ignored. `--provider=x` has to be matched by prefix.
             if let Some(unknown) = flags.iter().find(|a| {
-                a.starts_with("--") && !["--ai", "--provider", "--model"].contains(&a.as_str())
+                a.starts_with("--")
+                    && !["--ai", "--provider", "--model"]
+                        .iter()
+                        .any(|k| *a == k || a.starts_with(&format!("{k}=")))
             }) {
                 eprintln!(
                     "devdock ci init: unknown flag \"{unknown}\" \
                      (try: --ai [--provider claude|ollama] [--model NAME])"
                 );
+                return ExitCode::from(2);
+            }
+
+            let (provider, model) = match (
+                flag_value(flags, "--provider"),
+                flag_value(flags, "--model"),
+            ) {
+                (Ok(p), Ok(m)) => (p, m),
+                (Err(e), _) | (_, Err(e)) => {
+                    eprintln!("devdock ci init: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            // Provider names are lowercase everywhere else, but rejecting
+            // "Claude" over capitalisation helps nobody.
+            let provider = match provider.map(str::to_ascii_lowercase) {
+                Some(p) if !PROVIDERS.contains(&p.as_str()) => {
+                    eprintln!(
+                        "devdock ci init: unknown --provider \"{p}\" (expected {})",
+                        PROVIDERS.join(" or ")
+                    );
+                    return ExitCode::from(2);
+                }
+                other => other,
+            };
+            let provider = provider.as_deref();
+            if !ai && (provider.is_some() || model.is_some()) {
+                eprintln!("devdock ci init: --provider/--model only apply with --ai");
                 return ExitCode::from(2);
             }
             return cmd_ci_init(ai, provider, model);
@@ -140,19 +168,46 @@ fn cmd_ci(rest: &[String]) -> ExitCode {
     }
 }
 
-/// Value of `--name VALUE` or `--name=VALUE`, if present.
-fn flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+/// Value of `--name VALUE` or `--name=VALUE`.
+///
+/// Distinguishes *absent* from *present but unusable*. `--provider` with
+/// nothing after it, or `--provider=`, used to come back as "not given", so
+/// the resolver silently fell through to a different provider than the one
+/// asked for — the command appeared to work and used the wrong model. Those
+/// now report the mistake.
+fn flag_value<'a>(
+    args: &'a [String],
+    name: &str,
+) -> std::result::Result<Option<&'a str>, String> {
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         if let Some(inline) = arg.strip_prefix(&format!("{name}=")) {
-            return Some(inline);
+            return non_empty(inline, name).map(Some);
         }
         if arg == name {
-            return it.next().map(String::as_str).filter(|v| !v.starts_with("--"));
+            let next = it
+                .next()
+                .map(String::as_str)
+                // A following flag is the next option, not this one's value.
+                .filter(|v| !v.starts_with("--"))
+                .ok_or_else(|| format!("{name} needs a value"))?;
+            return non_empty(next, name).map(Some);
         }
     }
-    None
+    Ok(None)
 }
+
+fn non_empty<'a>(value: &'a str, name: &str) -> std::result::Result<&'a str, String> {
+    if value.trim().is_empty() {
+        Err(format!("{name} needs a value"))
+    } else {
+        Ok(value.trim())
+    }
+}
+
+/// Providers the CLI accepts, checked when the flag is parsed rather than
+/// deep inside resolution, so a typo fails immediately and says what is valid.
+const PROVIDERS: &[&str] = &["claude", "ollama"];
 
 /// Picks the provider and model for an AI command.
 ///
@@ -1161,5 +1216,65 @@ fn cmd_pr(rest: &[String]) -> ExitCode {
             eprintln!("devdock: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn flag_value_reads_both_spellings() {
+        let a = args(&["--ai", "--provider", "claude", "--model=opus"]);
+        assert_eq!(flag_value(&a, "--provider").unwrap(), Some("claude"));
+        assert_eq!(flag_value(&a, "--model").unwrap(), Some("opus"));
+        assert_eq!(flag_value(&a, "--missing").unwrap(), None);
+    }
+
+    /// Regression: a flag with no usable value used to come back as `None`,
+    /// which is indistinguishable from "not given" — so the resolver fell
+    /// through to a different provider than the one asked for and the command
+    /// quietly used the wrong model. These are mistakes, not absences.
+    #[test]
+    fn a_flag_without_a_value_is_an_error_not_an_absence() {
+        for bad in [
+            vec!["--provider"],              // nothing follows
+            vec!["--provider="],             // empty inline
+            vec!["--provider", ""],          // empty argument
+            vec!["--provider", "   "],       // whitespace only
+            vec!["--provider", "--model"],   // the next flag is not a value
+        ] {
+            let a = args(&bad);
+            assert!(
+                flag_value(&a, "--provider").is_err(),
+                "{bad:?} should be rejected, got {:?}",
+                flag_value(&a, "--provider")
+            );
+        }
+    }
+
+    /// A following flag must not be swallowed as this flag's value.
+    #[test]
+    fn a_following_flag_is_left_for_its_own_parse() {
+        let a = args(&["--provider", "--model", "opus"]);
+        assert!(flag_value(&a, "--provider").is_err());
+        assert_eq!(flag_value(&a, "--model").unwrap(), Some("opus"));
+    }
+
+    #[test]
+    fn values_are_trimmed() {
+        let a = args(&["--model", "  opus  "]);
+        assert_eq!(flag_value(&a, "--model").unwrap(), Some("opus"));
+    }
+
+    #[test]
+    fn provider_list_is_what_the_error_message_offers() {
+        assert!(PROVIDERS.contains(&"claude"));
+        assert!(PROVIDERS.contains(&"ollama"));
+        assert_eq!(PROVIDERS.len(), 2, "keep the help text in step");
     }
 }

@@ -678,17 +678,29 @@ pub fn run_job_with(registry: &RunnerRegistry, repo_root: &Path, job: &Job) -> J
 /// Returns `true` when everything passed. Used by the `ci` CLI subcommand
 /// (which the git pre-push hook invokes).
 pub fn run_all_cli(repo_root: &Path) -> Result<bool> {
-    let Some(config) = load_config(repo_root)? else {
+    // Discovery, not load_config: the CLI and the pre-push hook must see the
+    // same jobs as the app, including a monorepo's per-package configs.
+    // Running only the root config here would let `devdock ci` (and therefore
+    // the hook that gates pushes) pass while the app reports failures.
+    let loaded = discover_configs(repo_root)?;
+    let config = loaded.config;
+    if loaded.sources.is_empty() {
         println!("devdock ci: no {CONFIG_FILE} found, nothing to run");
         return Ok(true);
-    };
+    }
     if config.jobs.is_empty() {
         println!("devdock ci: no jobs configured");
         return Ok(true);
     }
+    for dir in &loaded.ignored_gates {
+        println!(
+            "devdock ci: note: [on_push]/[review] in {dir} ignored (they are \
+             repository-wide; set them in the root {CONFIG_FILE})"
+        );
+    }
     let mut all_ok = true;
     for job in &config.jobs {
-        print!("devdock ci: {} ... ", job.name);
+        print!("devdock ci: {} ... ", job.display_name());
         use std::io::Write as _;
         let _ = std::io::stdout().flush();
         let result = run_job(repo_root, job);

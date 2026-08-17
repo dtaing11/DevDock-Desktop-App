@@ -1156,3 +1156,28 @@ fn a_broken_nested_config_is_skipped() {
     assert!(names.contains(&"good: ok".to_string()), "{names:?}");
     assert_eq!(names.len(), 2, "the broken config should be skipped: {names:?}");
 }
+
+/// Regression: `devdock ci` and the pre-push hook must run the same jobs as
+/// the app. Loading only the root config meant a monorepo's package checks
+/// were skipped on the CLI — so the hook that gates pushes reported success
+/// while the app showed failures.
+#[test]
+fn the_cli_runner_sees_nested_configs() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "x\n", "init");
+    write_ci(&repo, "", "[[job]]\nname = \"root\"\ncommands = [\"true\"]\n");
+    write_ci(&repo, "packages/api", "[[job]]\nname = \"t\"\ncommands = [\"false\"]\n");
+
+    // The nested job fails, so the whole run must fail.
+    let ok = git_manage::local_ci::run_all_cli(repo.path()).unwrap();
+    assert!(!ok, "a failing nested job must fail the CLI run");
+}
+
+/// With only a root config the CLI behaves exactly as before.
+#[test]
+fn the_cli_runner_still_handles_a_single_config() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "x\n", "init");
+    write_ci(&repo, "", "[[job]]\nname = \"root\"\ncommands = [\"true\"]\n");
+    assert!(git_manage::local_ci::run_all_cli(repo.path()).unwrap());
+}

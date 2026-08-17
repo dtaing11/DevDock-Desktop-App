@@ -1181,3 +1181,112 @@ fn the_cli_runner_still_handles_a_single_config() {
     write_ci(&repo, "", "[[job]]\nname = \"root\"\ncommands = [\"true\"]\n");
     assert!(git_manage::local_ci::run_all_cli(repo.path()).unwrap());
 }
+
+// ---------------------------------------------------------------------------
+// Review instructions from a file
+// ---------------------------------------------------------------------------
+
+fn review_cfg(toml: &str) -> git_manage::review::ReviewConfig {
+    toml::from_str(toml).expect("config should parse")
+}
+
+#[test]
+fn instructions_can_come_from_a_file() {
+    let (_tmp, repo) = setup();
+    fs::create_dir_all(repo.path().join("docs")).unwrap();
+    fs::write(
+        repo.path().join("docs/review.md"),
+        "# House rules\n\nFlag any blocking call on the UI thread.\n",
+    )
+    .unwrap();
+
+    let cfg = review_cfg("instructions_file = \"docs/review.md\"\n");
+    let resolved = cfg.resolve_files(repo.path()).unwrap();
+    let text = resolved.instructions.expect("should have instructions");
+    assert!(text.contains("blocking call on the UI thread"), "{text}");
+    // The path is consumed, so providers never touch the filesystem.
+    assert!(resolved.instructions_file.is_none());
+}
+
+/// Inline text and a file combine, so a shared guidelines document can be
+/// topped up with a line specific to one repository.
+#[test]
+fn inline_instructions_and_a_file_combine() {
+    let (_tmp, repo) = setup();
+    fs::write(repo.path().join("rules.md"), "From the file.\n").unwrap();
+
+    let cfg = review_cfg("instructions = \"Inline note.\"\ninstructions_file = \"rules.md\"\n");
+    let text = cfg.resolve_files(repo.path()).unwrap().instructions.unwrap();
+    assert!(text.contains("Inline note."), "{text}");
+    assert!(text.contains("From the file."), "{text}");
+}
+
+/// A path that escapes the repository is refused. The config may have arrived
+/// with a cloned repo, and the contents are sent to an AI provider.
+#[test]
+fn an_instructions_path_cannot_escape_the_repository() {
+    let (tmp, repo) = setup();
+    fs::write(tmp.path().join("outside.md"), "secrets\n").unwrap();
+
+    for bad in ["../outside.md", "/etc/hosts"] {
+        let cfg = review_cfg(&format!("instructions_file = \"{bad}\"\n"));
+        let err = cfg
+            .resolve_files(repo.path())
+            .expect_err(&format!("{bad} should be refused"));
+        assert!(
+            err.contains("outside the repository") || err.contains("must be relative"),
+            "unexpected error for {bad}: {err}"
+        );
+    }
+}
+
+/// A missing file is an error, not a silent skip: reviewing without the rules
+/// you configured produces an authoritative-looking review that is not the
+/// one you asked for.
+#[test]
+fn a_missing_instructions_file_is_reported() {
+    let (_tmp, repo) = setup();
+    let cfg = review_cfg("instructions_file = \"docs/nope.md\"\n");
+    let err = cfg.resolve_files(repo.path()).unwrap_err();
+    assert!(err.contains("no such file"), "{err}");
+
+    // An empty one is equally useless and equally reported.
+    fs::write(repo.path().join("empty.md"), "   \n").unwrap();
+    let cfg = review_cfg("instructions_file = \"empty.md\"\n");
+    assert!(cfg.resolve_files(repo.path()).unwrap_err().contains("is empty"));
+}
+
+/// The house style for Markdown output can come from a file too.
+#[test]
+fn output_instructions_can_come_from_a_file() {
+    let (_tmp, repo) = setup();
+    fs::write(repo.path().join("style.md"), "## Verdict\n## Must fix\n").unwrap();
+
+    let cfg = review_cfg("output = \"markdown\"\noutput_instructions_file = \"style.md\"\n");
+    let resolved = cfg.resolve_files(repo.path()).unwrap();
+    assert!(resolved.output_instructions.unwrap().contains("## Must fix"));
+    assert!(resolved.output_instructions_file.is_none());
+}
+
+/// A very long guidance file is truncated rather than crowding out the diff.
+#[test]
+fn an_oversized_instructions_file_is_truncated() {
+    let (_tmp, repo) = setup();
+    let huge = "x".repeat(git_manage::review::MAX_INSTRUCTIONS_BYTES + 5_000);
+    fs::write(repo.path().join("big.md"), &huge).unwrap();
+
+    let cfg = review_cfg("instructions_file = \"big.md\"\n");
+    let text = cfg.resolve_files(repo.path()).unwrap().instructions.unwrap();
+    assert!(text.contains("[instructions truncated]"), "should mark the cut");
+    assert!(text.len() < huge.len(), "should be shorter than the source");
+}
+
+/// Nothing configured stays nothing — resolution is a no-op.
+#[test]
+fn no_instructions_configured_resolves_to_none() {
+    let (_tmp, repo) = setup();
+    let cfg = review_cfg("run = true\n");
+    let resolved = cfg.resolve_files(repo.path()).unwrap();
+    assert!(resolved.instructions.is_none());
+    assert!(resolved.output_instructions.is_none());
+}

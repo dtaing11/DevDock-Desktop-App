@@ -323,8 +323,10 @@ this — asking for a review is its own consent.
 | `model`            | app's    | Model for that provider                                            |
 | `max_diff_bytes`   | `24000`  | Diff is truncated past this, with a marker so the model knows      |
 | `instructions`     | none     | Extra project-specific things to look for                          |
+| `instructions_file`| none     | A file holding that guidance, relative to the repo root; combines with `instructions` |
 | `output`           | `"findings"` | `"markdown"` to answer in your own format — see [Custom output format](#custom-output-format) |
 | `output_instructions` | none  | The house style for `output = "markdown"`                          |
+| `output_instructions_file` | none | A file holding that house style, relative to the repo root  |
 
 Omitting `[review]` entirely leaves the reviewer off, so adding it to an
 existing repository changes nothing until you opt in.
@@ -409,6 +411,42 @@ keep to the format — if you see "did not return a usable review", try a
 larger Ollama model or switch to `provider = "claude"`.
 
 ### Project-specific instructions
+
+For anything longer than a few lines, keep the guidance in a file and point at
+it with a path relative to the repository root:
+
+```toml
+[review]
+run = true
+instructions_file = "docs/review-guidelines.md"
+```
+
+That beats a 500-line TOML string: the file can be edited, reviewed, and
+diffed like any other document, and it is re-read on every review, so editing
+it takes effect without reloading the config.
+
+Both forms can be used together — a shared guidelines file plus a line or two
+specific to this repository:
+
+```toml
+[review]
+instructions_file = "docs/review-guidelines.md"
+instructions = "This package also owns the migration scripts; check those hardest."
+```
+
+The same applies to the Markdown house style via `output_instructions_file`.
+
+Three things to know about the file:
+
+- **It must be inside the repository.** An absolute path or one that escapes
+  via `..` is refused. The config is committed and may arrive with a cloned
+  repo, and the contents are sent to an AI provider.
+- **A missing or empty file is an error**, reported rather than skipped —
+  reviewing without the rules you configured produces an authoritative-looking
+  review that is not the one you asked for. As with any review failure, the
+  push still goes through; it just tells you why there was no review.
+- **It is capped at 32 KB** and truncated with a marker past that. The guidance
+  shares the prompt with the diff.
 
 `instructions` is appended to the prompt. Use it for rules a reviewer could
 not infer from the diff alone:

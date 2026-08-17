@@ -1667,6 +1667,10 @@ impl App {
 
         self.worker.spawn(move || {
             let result = (|| -> Result<crate::review::ReviewOutcome, String> {
+                // Read instructions files now rather than at config load, so
+                // editing the guidance takes effect on the next review without
+                // reloading the config.
+                let cfg = cfg.resolve_files(repo.path())?;
                 let diff = strerr(repo.diff_for_review(base.as_deref()))?;
                 if diff.trim().is_empty() {
                     return Err("Nothing to review: no outgoing changes found.".into());

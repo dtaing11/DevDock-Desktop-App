@@ -71,6 +71,7 @@
 //! them, the same way commit-message generation works.
 
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 /// How serious a finding is. Ordered, so `>=` implements the `fail_on` gate.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -217,6 +218,15 @@ pub struct ReviewConfig {
     /// Extra project-specific guidance appended to the prompt.
     #[serde(default)]
     pub instructions: Option<String>,
+    /// A file holding the review guidance, as a path relative to the
+    /// repository root. For anything longer than a few lines this beats a
+    /// TOML multi-line string: it can be edited, reviewed, and diffed like
+    /// any other document.
+    ///
+    /// Combines with [`Self::instructions`] when both are set — a shared file
+    /// plus a line or two specific to this repository.
+    #[serde(default)]
+    pub instructions_file: Option<String>,
     /// Whether the reviewer answers with structured findings (the default) or
     /// free-form Markdown in the project's own style.
     #[serde(default)]
@@ -225,6 +235,11 @@ pub struct ReviewConfig {
     /// anything the review should look like. Ignored in findings mode.
     #[serde(default)]
     pub output_instructions: Option<String>,
+    /// A file holding the house style, relative to the repository root. Same
+    /// idea as [`Self::instructions_file`], and combines with
+    /// [`Self::output_instructions`] the same way.
+    #[serde(default)]
+    pub output_instructions_file: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -241,7 +256,89 @@ fn default_max_diff() -> usize {
     24_000
 }
 
+/// Cap on an instructions file. Guidance shares the prompt with the diff, so
+/// a runaway document would crowd out the code under review.
+pub const MAX_INSTRUCTIONS_BYTES: usize = 32_000;
+
+/// Reads an instructions file, confined to the repository.
+///
+/// The path comes from a committed config, which may have arrived with a
+/// cloned repository, and its contents are sent to an AI provider. So the
+/// resolved path must stay inside the worktree: absolute paths and `..`
+/// escapes are refused rather than quietly read.
+fn read_instructions_file(repo_root: &Path, rel: &str) -> std::result::Result<String, String> {
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute() {
+        return Err(format!(
+            "{rel}: must be relative to the repository root, not an absolute path"
+        ));
+    }
+    let joined = repo_root.join(rel_path);
+    let canonical = joined
+        .canonicalize()
+        .map_err(|_| format!("{rel}: no such file (relative to the repository root)"))?;
+    let root = repo_root
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve the repository root: {e}"))?;
+    if !canonical.starts_with(&root) {
+        return Err(format!("{rel}: resolves outside the repository"));
+    }
+
+    let text = std::fs::read_to_string(&canonical).map_err(|e| format!("{rel}: {e}"))?;
+    if text.trim().is_empty() {
+        return Err(format!("{rel}: is empty"));
+    }
+    if text.len() > MAX_INSTRUCTIONS_BYTES {
+        let mut end = MAX_INSTRUCTIONS_BYTES;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        return Ok(format!("{}\n\n[instructions truncated]", &text[..end]));
+    }
+    Ok(text)
+}
+
+/// Joins inline text with a file's contents, either of which may be absent.
+fn combine(inline: Option<&String>, from_file: Option<String>) -> Option<String> {
+    let inline = inline.map(|s| s.trim()).filter(|s| !s.is_empty());
+    match (inline, from_file) {
+        (Some(a), Some(b)) => Some(format!("{a}\n\n{}", b.trim())),
+        (Some(a), None) => Some(a.to_string()),
+        (None, Some(b)) => Some(b.trim().to_string()),
+        (None, None) => None,
+    }
+}
+
 impl ReviewConfig {
+    /// Resolves `*_file` paths into a config whose instruction fields hold the
+    /// final text, so the providers never touch the filesystem.
+    ///
+    /// A missing or unreadable file is an error rather than a silent skip:
+    /// reviewing without the rules you asked for produces a review that looks
+    /// authoritative and is not the one you configured.
+    pub fn resolve_files(&self, repo_root: &Path) -> std::result::Result<Self, String> {
+        let mut resolved = self.clone();
+
+        let review_file = match &self.instructions_file {
+            Some(p) => Some(read_instructions_file(repo_root, p)?),
+            None => None,
+        };
+        resolved.instructions = combine(self.instructions.as_ref(), review_file);
+        resolved.instructions_file = None;
+
+        // Only relevant in Markdown mode, but resolving unconditionally keeps
+        // a broken path from hiding until someone switches output style.
+        let style_file = match &self.output_instructions_file {
+            Some(p) => Some(read_instructions_file(repo_root, p)?),
+            None => None,
+        };
+        resolved.output_instructions =
+            combine(self.output_instructions.as_ref(), style_file);
+        resolved.output_instructions_file = None;
+
+        Ok(resolved)
+    }
+
     /// Whether a push should be reviewed.
     pub fn runs_on_push(&self) -> bool {
         self.on_push.unwrap_or(self.run)
@@ -271,8 +368,10 @@ impl Default for ReviewConfig {
             provider: None,
             model: None,
             instructions: None,
+            instructions_file: None,
             output: OutputStyle::Findings,
             output_instructions: None,
+            output_instructions_file: None,
         }
     }
 }

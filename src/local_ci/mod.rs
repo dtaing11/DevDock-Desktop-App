@@ -293,6 +293,8 @@ commands = ["echo hello from local CI"]
 # model = "claude-opus-5"
 # max_diff_bytes = 24000
 # instructions = "Flag any new blocking call on the UI thread."
+# instructions_file = "docs/review-guidelines.md"   # relative to the repo root;
+                                                    # combines with `instructions`
 
 # Want the review in your own format instead of the built-in findings list?
 # Set output = "markdown" and describe the shape you want. It is rendered as
@@ -336,6 +338,7 @@ Format specification:
   block_on_failure = true  # findings at or above fail_on stop to ask first
   fail_on = "high"         # low | medium | high
   # instructions = "..."   # project-specific things to look for
+  # instructions_file = "docs/review-guidelines.md"  # or keep it in a file
   # output = "markdown"    # answer in the project's own format instead of
   # output_instructions = "..."   # findings; describe the shape you want
 

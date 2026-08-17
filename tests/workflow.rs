@@ -335,6 +335,70 @@ fn discard_and_unstage() {
     assert!(!repo.status().unwrap().files[0].staged);
 }
 
+/// Regression: discarding must clear *staged* work, not just unstaged edits.
+/// `git checkout -- <path>` copies the index over the working tree, so
+/// against a staged change it rewrites the file with the very content being
+/// discarded: the edit survives in both places and the discard silently does
+/// nothing. Restoring from `HEAD` is what actually clears it.
+#[test]
+fn discard_clears_staged_changes() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "clean\n", "init");
+
+    write(&repo, "a.txt", "dirty\n");
+    repo.stage_all().unwrap();
+    assert!(repo.status().unwrap().files[0].staged, "setup should have staged the edit");
+
+    repo.discard(&["a.txt".into()]).unwrap();
+    assert_eq!(read(&repo, "a.txt"), "clean\n", "working tree kept the discarded edit");
+    assert!(repo.status().unwrap().files.is_empty(), "index kept the discarded edit");
+}
+
+/// A file staged but never committed has no state in `HEAD` to restore to,
+/// so discarding it removes it from the index and the working tree.
+#[test]
+fn discard_removes_staged_new_file() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "clean\n", "init");
+
+    write(&repo, "added.txt", "new\n");
+    repo.stage_all().unwrap();
+
+    repo.discard(&["added.txt".into()]).unwrap();
+    assert!(!repo.path().join("added.txt").exists(), "file left on disk");
+    assert!(repo.status().unwrap().files.is_empty(), "index still lists the addition");
+}
+
+#[test]
+fn discard_restores_staged_deletion() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "clean\n", "init");
+
+    repo.git(&["rm", "--quiet", "a.txt"]).unwrap();
+    repo.discard(&["a.txt".into()]).unwrap();
+
+    assert_eq!(read(&repo, "a.txt"), "clean\n", "deleted file not restored");
+    assert!(repo.status().unwrap().files.is_empty());
+}
+
+/// A rename is staged as a deletion of the original path plus an addition of
+/// the new one, and the UI lists it under the new path alone. Discarding it
+/// has to put the original back rather than just dropping the new name.
+#[test]
+fn discard_reverses_staged_rename() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "clean\n", "init");
+
+    repo.git(&["mv", "a.txt", "b.txt"]).unwrap();
+    let listed = repo.status().unwrap();
+    assert_eq!(listed.files[0].path, "b.txt", "rename should be listed under its new path");
+
+    repo.discard(&["b.txt".into()]).unwrap();
+    assert_eq!(read(&repo, "a.txt"), "clean\n", "original path not restored");
+    assert!(!repo.path().join("b.txt").exists(), "renamed path not removed");
+    assert!(repo.status().unwrap().files.is_empty());
+}
+
 #[test]
 fn diff_for_ai_prefers_staged_changes() {
     let (_tmp, repo) = setup();

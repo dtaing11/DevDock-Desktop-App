@@ -419,33 +419,66 @@ impl Repo {
         self.git(&["reset", "HEAD"]).map(drop)
     }
 
-    /// Discards changes: restores tracked files, deletes untracked ones.
+    /// True when `path` exists in the `HEAD` commit.
+    fn in_head(&self, path: &str) -> bool {
+        self.git(&["ls-tree", "--name-only", "HEAD", "--", path])
+            .map(|out| !out.trim().is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Discards every change to `files`, returning each to its committed
+    /// state: staged and unstaged edits alike, plus untracked files.
+    ///
+    /// Restoring from `HEAD` rather than the index is what makes this cover
+    /// staged work. `git checkout -- <path>` copies the *index* over the
+    /// working tree, so against a staged change it rewrites the file with
+    /// the very content being discarded — the file keeps its edit and stays
+    /// staged, and the discard silently does nothing.
     pub fn discard(&self, files: &[String]) -> Result<()> {
         let status = self.status()?;
-        let untracked: HashSet<&str> = status
-            .files
-            .iter()
-            .filter(|f| {
-                f.index_status == Some(FileStatus::Untracked)
-                    || f.work_status == Some(FileStatus::Untracked)
-            })
-            .map(|f| f.path.as_str())
-            .collect();
 
-        let tracked: Vec<String> = files
-            .iter()
-            .filter(|f| !untracked.contains(f.as_str()))
-            .cloned()
-            .collect();
-        if !tracked.is_empty() {
-            self.run_on_files(&["checkout", "--"], &tracked)?;
+        // A rename is staged as a deletion of the original path plus an
+        // addition of the new one. Restoring only the path the UI lists
+        // would leave the original still deleted.
+        let mut targets: Vec<String> = Vec::new();
+        for path in files {
+            targets.push(path.clone());
+            let orig = status
+                .files
+                .iter()
+                .find(|f| &f.path == path)
+                .and_then(|f| f.orig_path.clone());
+            if let Some(orig) = orig {
+                targets.push(orig);
+            }
         }
-        for file in files.iter().filter(|f| untracked.contains(f.as_str())) {
-            let target = self.root.join(file);
-            if target.is_dir() {
-                std::fs::remove_dir_all(&target)?;
-            } else if target.exists() {
-                std::fs::remove_file(&target)?;
+        targets.sort();
+        targets.dedup();
+
+        // Paths in HEAD are restored from it. Everything else — untracked
+        // files and staged additions — has no committed state to return to,
+        // so it leaves the index and the working tree entirely.
+        let (restore, remove): (Vec<String>, Vec<String>) =
+            targets.into_iter().partition(|p| self.in_head(p));
+
+        if !restore.is_empty() {
+            self.run_on_files(&["checkout", "HEAD", "--"], &restore)?;
+        }
+        if !remove.is_empty() {
+            // Drops staged additions from the index. `--ignore-unmatch`
+            // keeps untracked paths, which were never in the index, from
+            // failing the whole call.
+            self.run_on_files(
+                &["rm", "--force", "--quiet", "--ignore-unmatch", "--"],
+                &remove,
+            )?;
+            for path in &remove {
+                let target = self.root.join(path);
+                if target.is_dir() {
+                    std::fs::remove_dir_all(&target)?;
+                } else if target.exists() {
+                    std::fs::remove_file(&target)?;
+                }
             }
         }
         Ok(())

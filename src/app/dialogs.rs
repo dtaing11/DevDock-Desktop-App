@@ -26,11 +26,14 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         Dialog::SwitchBranch(_) => switch_branch(app, ctx, &mut open),
         Dialog::Confirm(_) => confirm_dialog(app, ctx, &mut open),
         Dialog::ReviewGate => review_gate(app, ctx, &mut open),
+        Dialog::ChecksGate => checks_gate(app, ctx, &mut open),
     }
-    // Dismissing the gate with the X abandons the held action, same as
-    // Cancel: closing a blocking review must never be a silent approval.
-    if !open && app.dialog == Dialog::ReviewGate {
-        app.review.pending = None;
+    // Dismissing a gate with the X is a deferred decision, not an approval:
+    // the modal closes but the held action stays available behind the
+    // explicit button in the Checks tab. Only "Cancel and fix" discards it.
+    if !open && matches!(app.dialog, Dialog::ReviewGate | Dialog::ChecksGate) {
+        app.toast("Still held — proceed or discard it from the Checks tab.", false);
+        app.tab = crate::app::Tab::Checks;
     }
     // The window's X button was clicked.
     if !open {
@@ -576,6 +579,73 @@ fn review_gate(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         ui.separator();
         ui.add_space(6.0);
         review_gate_buttons(app, ui, noun, override_label);
+    });
+}
+
+/// Failing local CI checks, with the option to proceed anyway.
+///
+/// Overriding here does **not** skip the AI reviewer: the two gates are
+/// independent, and clearing one is not consent to skip the other.
+fn checks_gate(app: &mut App, ctx: &egui::Context, open: &mut bool) {
+    let Some(held) = app.local_ci.blocked.clone() else {
+        app.dialog = Dialog::None;
+        return;
+    };
+    let failed: Vec<(String, String)> = app
+        .local_ci
+        .results
+        .iter()
+        .flatten()
+        .filter(|r| !r.ok)
+        .map(|r| (r.name.clone(), r.output.clone()))
+        .collect();
+    let noun = held.noun();
+
+    modal(ctx, "Checks failed", open, |ui| {
+        ui.set_min_width(560.0);
+        ui.label(RichText::new(format!(
+            "{} check(s) failed, holding this {noun}.",
+            failed.len()
+        )));
+        ui.add_space(8.0);
+
+        for (name, output) in &failed {
+            ui.label(RichText::new(name).color(theme::DANGER).strong());
+            // The tail is where the failure is; the head is usually setup.
+            let tail: Vec<&str> = output.lines().rev().take(8).collect();
+            for line in tail.into_iter().rev() {
+                ui.label(RichText::new(line).color(theme::FG_DIM).monospace().small());
+            }
+            ui.add_space(6.0);
+        }
+
+        ui.separator();
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let fix = egui::Button::new(RichText::new("Cancel and fix").strong())
+                .min_size(egui::vec2(0.0, theme::CONTROL_MD));
+            if ui.add(fix).clicked() {
+                app.local_ci.blocked = None;
+                app.dialog = Dialog::None;
+                app.toast(format!("{noun} cancelled."), false);
+            }
+            let label = held.override_label();
+            let proceed = egui::Button::new(RichText::new(label).color(theme::FG_DIM))
+                .min_size(egui::vec2(0.0, theme::CONTROL_MD));
+            if ui
+                .add(proceed)
+                .on_hover_text("The AI review still runs; this only overrides the checks.")
+                .clicked()
+            {
+                app.dialog = Dialog::None;
+                if let Some(held) = app.local_ci.blocked.take() {
+                    app.toast("Overriding failed checks.", true);
+                    // Still subject to the review gate — one override is not
+                    // consent to skip the other.
+                    app.gate_with_review(held);
+                }
+            }
+        });
     });
 }
 

@@ -172,6 +172,8 @@ pub enum Dialog {
     Confirm(ConfirmAction),
     /// AI review findings, with the option to act on them or proceed anyway.
     ReviewGate,
+    /// Failing local CI checks, with the option to proceed anyway.
+    ChecksGate,
 }
 
 /// A destructive action awaiting user confirmation.
@@ -416,6 +418,9 @@ pub struct LocalCiState {
     /// A push waiting for the current CI run to finish:
     /// (action, set_upstream). Executed when all jobs pass.
     pub pending_push: Option<(String, bool)>,
+    /// An action held back because checks failed, kept so the user can look
+    /// at the failures and still choose to proceed. Dropped on cancel.
+    pub blocked: Option<GatedAction>,
     /// Completed runs, newest first, for the Checks tab.
     pub history: Vec<CiRun>,
     /// When the current run started.
@@ -1408,17 +1413,20 @@ impl App {
                             self.toast("Checks passed.", false);
                             self.gate_with_review(GatedAction::Push { action, set_upstream });
                         } else if self.local_ci.on_push.block_on_failure {
-                            // Surface the failure prominently.
+                            // Hold the push and show what failed, rather than
+                            // discarding it. The checks are the developer's own
+                            // and can be wrong or irrelevant to this change, so
+                            // the gate offers a way through — the same bargain
+                            // the AI reviewer makes.
                             self.tab = Tab::Checks;
                             self.local_ci.expanded = self
                                 .local_ci
                                 .results
                                 .iter()
                                 .position(|r| r.as_ref().map(|x| !x.ok).unwrap_or(false));
-                            self.toast(
-                                "Push cancelled: checks failed. See the Checks tab.",
-                                true,
-                            );
+                            self.local_ci.blocked =
+                                Some(GatedAction::Push { action, set_upstream });
+                            self.dialog = Dialog::ChecksGate;
                         } else {
                             self.toast("Checks failed (non-blocking). Pushing anyway…", true);
                             self.execute_push(&action, set_upstream);

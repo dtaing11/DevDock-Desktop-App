@@ -178,9 +178,21 @@ block_on_failure = true   # a failing job cancels the push
 
 With `run = true`, pushing switches to the **Checks** tab and runs the jobs
 first. If they pass, the push proceeds. If one fails and
-`block_on_failure = true`, the push is cancelled and the first failing job is
-expanded for you. Set `block_on_failure = false` to be warned but pushed
-anyway.
+`block_on_failure = true`, the push is **held** — not discarded — the first
+failing job is expanded, and a dialog shows the failures with two choices:
+
+- **Cancel and fix** — drops the push.
+- **Push anyway** — proceeds despite the failures.
+
+Closing that dialog is a deferred decision, not an approval: the push stays
+held, and a banner at the top of the Checks tab says what is holding it with
+the same two buttons. Nothing is pushed until you press one.
+
+Overriding the checks does **not** skip the AI reviewer. The two are separate
+gates, and clearing one is not consent to skip the other — if `[review]` is
+enabled it still runs, and can hold the push again on its own terms.
+
+Set `block_on_failure = false` to be warned and pushed without the prompt.
 
 ## AI code review
 
@@ -362,11 +374,17 @@ Two choices:
 
 The override is a plain button, not a hidden setting, because the reviewer
 can be wrong. Reading the reasoning is what makes overriding a judgement
-rather than a coin flip. Closing the dialog with the X is the same as
-Cancel — dismissing a blocking review is never treated as approval.
+rather than a coin flip.
 
-Findings persist in the Checks tab after the dialog closes, so a review you
-overrode is still there to come back to.
+Closing the dialog does not approve **or** discard: the action stays held, and
+a banner at the top of the Checks tab shows what is holding it and why, with
+**Push anyway** / **Create pull request anyway**, **Discard**, and **Show
+findings** to reopen the full review. Nothing proceeds until you press one, so
+dismissing is never a silent approval — but the choice is also not lost, which
+would otherwise mean redoing the push to get it back.
+
+Findings persist in the Checks tab either way, so a review you overrode is
+still there to come back to.
 
 A review that **cannot run** — no provider signed in, request failed, model
 returned something unusable — reports the reason and lets the action through.

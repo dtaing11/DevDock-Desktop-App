@@ -1400,6 +1400,107 @@ pub fn panel_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Resp
 
 /// Checks tab: live status of the current CI run plus a history of past
 /// runs with per-job timing and expandable logs.
+/// A push or pull request currently held by a gate, with why and a way
+/// through.
+///
+/// Without this the decision only existed inside a modal: dismissing it lost
+/// the action and there was no way back short of redoing the push. Holding it
+/// here keeps the choice available without making dismissal an approval — the
+/// user still has to press the button.
+fn held_action_banner(app: &mut App, ui: &mut egui::Ui) {
+    // Checks and the reviewer can each hold something; the checks gate runs
+    // first, so prefer its message when both are set.
+    enum Held {
+        Checks,
+        Review,
+    }
+    let (held, action) = if let Some(a) = app.local_ci.blocked.clone() {
+        (Held::Checks, a)
+    } else if app.review.pending.is_some()
+        && app.review.outcome.as_ref().map(|o| o.should_block(&app.review.config)).unwrap_or(false)
+    {
+        (Held::Review, app.review.pending.clone().unwrap())
+    } else {
+        return;
+    };
+
+    let reason = match held {
+        Held::Checks => {
+            let names: Vec<&str> = app
+                .local_ci
+                .results
+                .iter()
+                .flatten()
+                .filter(|r| !r.ok)
+                .map(|r| r.name.as_str())
+                .collect();
+            format!("{} check(s) failed: {}", names.len(), names.join(", "))
+        }
+        Held::Review => {
+            let o = app.review.outcome.as_ref();
+            let blocking = o
+                .map(|o| o.blocking(app.review.config.fail_on).len())
+                .unwrap_or(0);
+            match o.and_then(|o| o.markdown.as_ref()) {
+                // Custom-Markdown mode has no severities to count.
+                Some(_) => "the AI reviewer asked to hold this change".to_string(),
+                None => format!(
+                    "AI review found {blocking} finding(s) at or above \"{}\"",
+                    app.review.config.fail_on.label()
+                ),
+            }
+        }
+    };
+
+    ui.add_space(8.0);
+    egui::Frame::new()
+        .fill(theme::PANEL2)
+        .stroke(egui::Stroke::new(1.0_f32, theme::DANGER))
+        .corner_radius(theme::RADIUS_MD as f32)
+        .inner_margin(egui::Margin::symmetric(12, 10))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(format!("{} held", action.noun()))
+                    .color(theme::DANGER)
+                    .strong(),
+            );
+            ui.label(RichText::new(reason).color(theme::FG_DIM));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .button(RichText::new(action.override_label()).strong())
+                    .on_hover_text("Proceed despite the gate. The details stay on this tab.")
+                    .clicked()
+                {
+                    match held {
+                        Held::Checks => {
+                            if let Some(a) = app.local_ci.blocked.take() {
+                                app.toast("Overriding failed checks.", true);
+                                // The reviewer is a separate gate and still applies.
+                                app.gate_with_review(a);
+                            }
+                        }
+                        Held::Review => {
+                            if let Some(a) = app.review.pending.take() {
+                                app.toast("Overriding the review.", true);
+                                app.perform(a);
+                            }
+                        }
+                    }
+                }
+                if ui.button("Discard").on_hover_text("Drop the held action").clicked() {
+                    app.local_ci.blocked = None;
+                    app.review.pending = None;
+                    app.toast("Discarded.", false);
+                }
+                if matches!(held, Held::Review) && ui.button("Show findings").clicked() {
+                    app.dialog = crate::app::Dialog::ReviewGate;
+                }
+            });
+        });
+    ui.add_space(4.0);
+}
+
 /// The latest AI review, kept visible after the gate dialog is dismissed so
 /// the findings a user overrode are still there to come back to.
 fn review_section(app: &mut App, ui: &mut egui::Ui) {
@@ -1529,6 +1630,7 @@ fn checks_tab(app: &mut App, ui: &mut egui::Ui) {
         }
     });
 
+    held_action_banner(app, ui);
     review_section(app, ui);
 
     if app.local_ci.jobs.is_empty() {

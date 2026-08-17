@@ -1,6 +1,6 @@
 //! End-to-end tests of the git backend against throwaway repositories.
 
-use git_manage::git::{FileStatus, Repo, RepoState, Resolution};
+use git_manage::git::{FileStatus, PullStrategy, Repo, RepoState, Resolution};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -87,7 +87,158 @@ fn push_pull_fetch_remotes() {
     assert_eq!(remotes[0].name, "origin");
 
     repo.fetch(None).unwrap();
-    repo.pull(None).unwrap();
+    repo.pull(PullStrategy::FastForwardOnly, None).unwrap();
+}
+
+/// Rewinds `main` to `base` and refreshes tracking refs, leaving the repo in
+/// the state of a machine that has not pulled since the remote moved on.
+fn rewind_to(repo: &Repo, base: &str) {
+    repo.git(&["reset", "--hard", base]).unwrap();
+    repo.fetch(None).unwrap();
+}
+
+/// Pushes a merge of `feature` to origin, then rewinds local `main` — the
+/// shape a pull request merged on GitHub leaves behind locally.
+///
+/// `main` gets a commit of its own before the merge so that merging
+/// `feature` is a true three-way merge rather than a fast-forward. Without
+/// that the duplicate would fast-forward away harmlessly and never
+/// reproduce the divergence this guards against.
+fn merge_on_remote_only(repo: &Repo) -> String {
+    commit_file(repo, "a.txt", "base\n", "init");
+    repo.push(true, None).unwrap();
+
+    repo.create_branch("feature", true).unwrap();
+    commit_file(repo, "b.txt", "feature\n", "feat: b");
+    repo.push(true, None).unwrap();
+
+    repo.checkout("main").unwrap();
+    commit_file(repo, "c.txt", "main\n", "chore: c");
+    repo.push(false, None).unwrap();
+    let base = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+
+    // GitHub writes its own merge message, which is what makes the remote's
+    // merge a *different commit* from the local one despite identical parents
+    // and tree. With the default message both merges would hash identically
+    // inside a fast test and no divergence would appear at all.
+    repo.git(&["merge", "--no-ff", "-m", "Merge pull request #1 from tester/feature", "feature"])
+        .unwrap();
+    let remote_merge = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+    repo.push(false, None).unwrap();
+
+    rewind_to(repo, &base);
+    assert_ne!(base, remote_merge, "setup must leave a real merge on the remote");
+    base
+}
+
+#[test]
+fn merge_refuses_branch_already_in_history() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "base\n", "init");
+    repo.create_branch("feature", true).unwrap();
+    commit_file(&repo, "b.txt", "feature\n", "feat: b");
+    repo.checkout("main").unwrap();
+    assert!(repo.merge("feature").ok);
+
+    let outcome = repo.merge("feature");
+    assert!(!outcome.ok, "re-merging an absorbed branch should be refused");
+    assert!(
+        outcome.message.contains("already merged here"),
+        "unexpected message: {}",
+        outcome.message
+    );
+}
+
+/// Regression: merging a branch the remote already absorbed must be refused.
+/// Running it builds a second merge commit carrying the same parents and tree
+/// as the remote's; git compares commits by hash, so the two never reconcile
+/// and the branch reports "ahead 1, behind 1" against its own upstream.
+#[test]
+fn merge_refuses_branch_the_remote_already_merged() {
+    let (_tmp, repo) = setup();
+    merge_on_remote_only(&repo);
+
+    let outcome = repo.merge("feature");
+    assert!(!outcome.ok, "duplicate merge should be refused");
+    assert!(
+        outcome.message.contains("already merged") && outcome.message.contains("remote"),
+        "unexpected message: {}",
+        outcome.message
+    );
+
+    let status = repo.status().unwrap();
+    assert_eq!(status.ahead, 0, "a refused merge must not leave a local commit");
+}
+
+/// The refusal above is what keeps the branch fast-forwardable: after it,
+/// a plain pull still lands cleanly instead of dead-ending on divergence.
+#[test]
+fn refused_duplicate_merge_leaves_branch_fast_forwardable() {
+    let (_tmp, repo) = setup();
+    merge_on_remote_only(&repo);
+    let _ = repo.merge("feature");
+
+    repo.pull(PullStrategy::FastForwardOnly, None).unwrap();
+    let status = repo.status().unwrap();
+    assert_eq!((status.ahead, status.behind), (0, 0));
+}
+
+/// Sets up a branch that has genuinely diverged from its upstream.
+fn diverge(repo: &Repo) {
+    commit_file(repo, "a.txt", "base\n", "init");
+    repo.push(true, None).unwrap();
+    let base = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+
+    commit_file(repo, "remote.txt", "remote\n", "remote work");
+    repo.push(false, None).unwrap();
+
+    repo.git(&["reset", "--hard", &base]).unwrap();
+    commit_file(repo, "local.txt", "local\n", "local work");
+    repo.fetch(None).unwrap();
+}
+
+/// Regression: a fast-forward pull that hits divergence must explain the two
+/// ways out, never leak git's bare "Need to specify how to reconcile
+/// divergent branches" fatal, which leaves the user stuck inside the app.
+#[test]
+fn fast_forward_pull_explains_divergence() {
+    let (_tmp, repo) = setup();
+    diverge(&repo);
+
+    let err = repo.pull(PullStrategy::FastForwardOnly, None).unwrap_err().to_string();
+    assert!(err.contains("Pull (rebase)"), "no way forward offered: {err}");
+    assert!(
+        !err.contains("Need to specify how to reconcile"),
+        "raw git fatal leaked to the user: {err}"
+    );
+
+    let status = repo.status().unwrap();
+    assert_eq!((status.ahead, status.behind), (1, 1), "failed pull must not alter history");
+}
+
+#[test]
+fn rebase_pull_reconciles_diverged_branch() {
+    let (_tmp, repo) = setup();
+    diverge(&repo);
+
+    repo.pull(PullStrategy::Rebase, None).unwrap();
+    let status = repo.status().unwrap();
+    assert_eq!(status.behind, 0, "rebase pull should absorb the remote commits");
+    assert_eq!(status.ahead, 1, "the local commit should be replayed on top");
+    assert!(repo.path().join("remote.txt").exists());
+    assert!(repo.path().join("local.txt").exists());
+}
+
+#[test]
+fn merge_pull_reconciles_diverged_branch() {
+    let (_tmp, repo) = setup();
+    diverge(&repo);
+
+    repo.pull(PullStrategy::Merge, None).unwrap();
+    let status = repo.status().unwrap();
+    assert_eq!(status.behind, 0, "merge pull should absorb the remote commits");
+    assert!(repo.path().join("remote.txt").exists());
+    assert!(repo.path().join("local.txt").exists());
 }
 
 #[test]

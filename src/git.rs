@@ -156,6 +156,32 @@ impl OpOutcome {
     }
 }
 
+/// How a pull reconciles when the branch and its upstream have both moved.
+///
+/// Git refuses to guess since 2.27 and aborts with "Need to specify how to
+/// reconcile divergent branches", so every pull picks one explicitly rather
+/// than depending on the user's `pull.rebase` config being set.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullStrategy {
+    /// Advance only when there are no local-only commits. Never invents a
+    /// merge commit; the default, because the other two rewrite history.
+    FastForwardOnly,
+    /// Join the two histories with a merge commit.
+    Merge,
+    /// Replay local commits on top of the upstream.
+    Rebase,
+}
+
+impl PullStrategy {
+    fn flag(self) -> &'static str {
+        match self {
+            Self::FastForwardOnly => "--ff-only",
+            Self::Merge => "--no-rebase",
+            Self::Rebase => "--rebase",
+        }
+    }
+}
+
 /// One commit from [`Repo::log`].
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Commit {
@@ -611,8 +637,46 @@ impl Repo {
 
     // -- merge / rebase -----------------------------------------------------
 
+    /// True when every commit in `commitish` is already reachable from `HEAD`.
+    fn contains(&self, commitish: &str) -> bool {
+        self.git(&["merge-base", "--is-ancestor", commitish, "HEAD"]).is_ok()
+    }
+
+    /// True when the current branch's upstream already contains `commitish`
+    /// but the local branch does not — i.e. the merge already happened on the
+    /// remote, typically because its pull request was merged on GitHub.
+    fn upstream_contains(&self, commitish: &str) -> bool {
+        self.git(&["merge-base", "--is-ancestor", commitish, "@{upstream}"]).is_ok()
+    }
+
     /// Merges `branch` into the current branch.
+    ///
+    /// Two no-op cases are reported instead of run. Merging a branch already
+    /// reachable from `HEAD` would only make an empty commit; merging one the
+    /// upstream already absorbed produces a *second* merge commit with the
+    /// same parents and tree as the remote's, which git cannot recognise as
+    /// equivalent — that is what leaves a branch diverged from its own remote
+    /// after a PR is merged on GitHub and the same branch is merged locally.
     pub fn merge(&self, branch: &str) -> OpOutcome {
+        if self.contains(branch) {
+            return OpOutcome {
+                ok: false,
+                conflict: false,
+                message: format!("{branch} is already merged here — nothing to do."),
+            };
+        }
+        if self.upstream_contains(branch) {
+            return OpOutcome {
+                ok: false,
+                conflict: false,
+                message: format!(
+                    "{branch} was already merged into this branch on the remote \
+                     (most likely by merging its pull request). Pull instead — \
+                     merging again would create a second merge commit and leave \
+                     you diverged from origin."
+                ),
+            };
+        }
         OpOutcome::from(self.git(&["merge", "--no-edit", branch]))
     }
 
@@ -755,9 +819,36 @@ impl Repo {
         self.git_auth(&["fetch", "--all", "--prune"], auth).map(drop)
     }
 
-    /// Pulls the current branch. See [`Repo::fetch`] for `auth`.
-    pub fn pull(&self, auth: Option<&str>) -> Result<String> {
-        Ok(self.git_auth(&["pull", "--no-edit"], auth)?.trim().to_string())
+    /// Pulls the current branch with an explicit reconciliation `strategy`.
+    /// See [`Repo::fetch`] for `auth`.
+    ///
+    /// The strategy is always passed on the command line. A bare `git pull`
+    /// aborts with "Need to specify how to reconcile divergent branches" the
+    /// moment both sides have moved and no `pull.rebase`/`pull.ff` config is
+    /// set, which reaches the user as a raw git fatal with no way forward.
+    /// A fast-forward refused because of divergence is turned into a message
+    /// naming the two ways out instead.
+    pub fn pull(&self, strategy: PullStrategy, auth: Option<&str>) -> Result<String> {
+        match self.git_auth(&["pull", "--no-edit", strategy.flag()], auth) {
+            Ok(out) => Ok(out.trim().to_string()),
+            Err(e) => {
+                let (ahead, behind, has_upstream) = self.ahead_behind();
+                if strategy == PullStrategy::FastForwardOnly
+                    && has_upstream
+                    && ahead > 0
+                    && behind > 0
+                {
+                    return Err(GitError::Command(format!(
+                        "Cannot fast-forward: this branch and origin have both moved \
+                         ({ahead} local, {behind} remote). Right-click the sync button \
+                         and pick \"Pull (rebase)\" to replay your commits on top of \
+                         origin, or \"Pull (merge)\" to join the histories with a \
+                         merge commit."
+                    )));
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Pushes the current branch. See [`Repo::fetch`] for `auth`.

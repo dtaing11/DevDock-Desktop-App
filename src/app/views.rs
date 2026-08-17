@@ -3,7 +3,7 @@
 use super::theme;
 use super::worker::{pickable_branches, strerr, Msg};
 use super::{App, Dialog, Tab};
-use crate::git::{FileStatus, RepoState};
+use crate::git::{FileStatus, PullStrategy, RepoState};
 use egui::text::LayoutJob;
 use egui::{Color32, FontId, RichText, ScrollArea, TextFormat};
 
@@ -30,6 +30,10 @@ fn segment_text(caption: &str, value: &str) -> LayoutJob {
 
 /// Uniform width for all toolbar segments.
 const SEGMENT_W: f32 = 190.0;
+
+/// How many "Stage hunk N" buttons the hunk bar shows before collapsing the
+/// rest behind a "Show N more" toggle.
+pub(crate) const HUNK_BAR_LIMIT: usize = 10;
 
 /// Menu-style toolbar segment: same size as `segment`, opens a dropdown.
 fn segment_menu<R>(
@@ -708,7 +712,7 @@ fn sync_segment(app: &mut App, ui: &mut egui::Ui) {
     if let Some(op) = app.sync_op {
         let (caption, value) = match op {
             "fetch" => ("REMOTE", "Fetching…"),
-            "pull" => ("PULL", "Pulling…"),
+            "pull" | "pull-merge" | "pull-rebase" => ("PULL", "Pulling…"),
             "force-push" => ("PUSH", "Force-pushing…"),
             _ => ("PUSH", "Pushing…"),
         };
@@ -768,8 +772,28 @@ fn sync_segment(app: &mut App, ui: &mut egui::Ui) {
             run_sync(app, "fetch");
             ui.close();
         }
-        if ui.button("Pull").clicked() {
+        if ui
+            .button("Pull")
+            .on_hover_text("Fast-forward only. Stops safely if your branch and origin have both moved.")
+            .clicked()
+        {
             run_sync(app, "pull");
+            ui.close();
+        }
+        if ui
+            .button("Pull (rebase)")
+            .on_hover_text("Replays your local commits on top of origin. Keeps history linear.")
+            .clicked()
+        {
+            run_sync(app, "pull-rebase");
+            ui.close();
+        }
+        if ui
+            .button("Pull (merge)")
+            .on_hover_text("Joins the two histories with a merge commit.")
+            .clicked()
+        {
+            run_sync(app, "pull-merge");
             ui.close();
         }
         if ui.button("Push").clicked() {
@@ -815,9 +839,16 @@ fn run_sync(app: &mut App, action: &'static str) {
         let auth = token.as_deref();
         let result = match action {
             "fetch" => repo.fetch(auth).map(|_| "Fetched.".to_string()),
-            "pull" => repo.pull(auth).map(|out| {
-                out.lines().last().unwrap_or("Pulled.").to_string()
-            }),
+            "pull" | "pull-merge" | "pull-rebase" => {
+                let strategy = match action {
+                    "pull-merge" => PullStrategy::Merge,
+                    "pull-rebase" => PullStrategy::Rebase,
+                    _ => PullStrategy::FastForwardOnly,
+                };
+                repo.pull(strategy, auth).map(|out| {
+                    out.lines().last().unwrap_or("Pulled.").to_string()
+                })
+            }
             _ => unreachable!(),
         };
         Msg::Done { message: strerr(result), refresh: true }
@@ -1143,6 +1174,7 @@ fn select_file(app: &mut App, path: &str, staged: bool) {
     app.show_staged = staged;
     app.blame = None;
     app.hunks.clear();
+    app.hunks_expanded = false;
     app.commit_file_list.clear();
     load_file_diff(app);
 }
@@ -1192,6 +1224,7 @@ pub fn clear_diff_view(app: &mut App) {
     app.diff_title.clear();
     app.diff_text.clear();
     app.hunks.clear();
+    app.hunks_expanded = false;
     app.line_sel.clear();
     app.blame = None;
     app.commit_file_list.clear();
@@ -1770,19 +1803,25 @@ fn interactive_diff(app: &mut App, ui: &mut egui::Ui) {
 }
 
 /// Buttons to stage hunks or the selected lines of the current file.
+///
+/// Files with more than [`HUNK_BAR_LIMIT`] hunks show only the first
+/// `HUNK_BAR_LIMIT` buttons behind a "Show N more" toggle: a heavily edited
+/// file can produce dozens, and an unbounded wrapped row of them pushes the
+/// diff itself off screen.
 fn hunk_bar(app: &mut App, ui: &mut egui::Ui) {
     egui::Frame::new()
         .fill(theme::PANEL)
         .inner_margin(egui::Margin::symmetric(12, 6))
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
+                let total = app.hunks.len();
                 ui.label(
-                    RichText::new(format!("{} hunk(s):", app.hunks.len()))
-                        .color(theme::FG_DIM)
-                        .small(),
+                    RichText::new(format!("{total} hunk(s):")).color(theme::FG_DIM).small(),
                 );
+                let collapsed = total > HUNK_BAR_LIMIT && !app.hunks_expanded;
+                let shown = if collapsed { HUNK_BAR_LIMIT } else { total };
                 let hunks = app.hunks.clone();
-                for (i, hunk) in hunks.iter().enumerate() {
+                for (i, hunk) in hunks.iter().enumerate().take(shown) {
                     if ui
                         .small_button(format!("Stage hunk {}", i + 1))
                         .on_hover_text(&hunk.header)
@@ -1800,6 +1839,23 @@ fn hunk_bar(app: &mut App, ui: &mut egui::Ui) {
                             }
                         }
                     }
+                }
+                if collapsed {
+                    let hidden = total - HUNK_BAR_LIMIT;
+                    if ui
+                        .small_button(format!("Show {hidden} more…"))
+                        .on_hover_text(format!("Show the remaining {hidden} hunk buttons"))
+                        .clicked()
+                    {
+                        app.hunks_expanded = true;
+                    }
+                } else if total > HUNK_BAR_LIMIT
+                    && ui
+                        .small_button("Show less")
+                        .on_hover_text(format!("Collapse back to the first {HUNK_BAR_LIMIT}"))
+                        .clicked()
+                {
+                    app.hunks_expanded = false;
                 }
                 // Line-level staging of the checkbox selection.
                 let selected = app.line_sel.len();

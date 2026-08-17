@@ -504,6 +504,10 @@ pub struct App {
     pub diff_text: String,
     /// Hunks of the currently selected file (for partial staging).
     pub hunks: Vec<crate::git::Hunk>,
+    /// Whether the hunk bar shows every hunk. Files with many hunks collapse
+    /// to [`views::HUNK_BAR_LIMIT`] buttons so the bar cannot crowd out the
+    /// diff. Reset whenever the selected file or its hunks change.
+    pub hunks_expanded: bool,
     /// Selected changed lines per hunk index (for line-level staging).
     pub line_sel: std::collections::HashSet<(usize, usize)>,
     /// Which diff side is shown for the selected file.
@@ -591,6 +595,7 @@ impl App {
             diff_title: String::new(),
             diff_text: String::new(),
             hunks: Vec::new(),
+            hunks_expanded: false,
             line_sel: Default::default(),
             show_staged: false,
             blame: None,
@@ -826,6 +831,7 @@ impl App {
         self.diff_text.clear();
         self.diff_title.clear();
         self.hunks.clear();
+        self.hunks_expanded = false;
         self.worker.spawn(move || {
             let result = (|| -> Result<String, crate::git::GitError> {
                 if !files.is_empty() {
@@ -1128,6 +1134,7 @@ impl App {
             Msg::Hunks { file, hunks } => {
                 if self.selected_file.as_deref() == Some(file.as_str()) {
                     self.hunks = hunks;
+                    self.hunks_expanded = false;
                 }
             }
             Msg::CommitFiles { sha, files } => {
@@ -1836,7 +1843,9 @@ impl App {
         let token = self.gh_token();
         self.worker.spawn(move || {
             let auth = token.as_deref();
-            let result = repo.pull(auth).map(|_| "Pulled.".to_string());
+            let result = repo
+                .pull(crate::git::PullStrategy::FastForwardOnly, auth)
+                .map(|_| "Pulled.".to_string());
             Msg::Done { message: strerr(result), refresh: true }
         });
     }

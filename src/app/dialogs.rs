@@ -499,6 +499,19 @@ fn review_gate(app: &mut App, ctx: &egui::Context, open: &mut bool) {
     modal(ctx, "AI code review", open, |ui| {
         ui.set_min_width(560.0);
 
+        // Markdown mode has no severities: the reviewer's own verdict line is
+        // what held the action, and the body is rendered as it was written.
+        if let Some(md) = outcome.markdown.clone() {
+            ui.label(RichText::new(format!("The reviewer asked to hold this {noun}.")));
+            ui.add_space(6.0);
+            ui.separator();
+            super::markdown::render(ui, &md);
+            ui.separator();
+            ui.add_space(6.0);
+            review_gate_buttons(app, ui, noun, override_label);
+            return;
+        }
+
         ui.label(RichText::new(format!(
             "{blocking} finding(s) at or above \"{}\" held this {noun}.",
             fail_on.label()
@@ -562,29 +575,34 @@ fn review_gate(app: &mut App, ctx: &egui::Context, open: &mut bool) {
 
         ui.separator();
         ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            // Fixing is the default action, so it reads first and is plain.
-            let fix = egui::Button::new(RichText::new("Cancel and fix").strong())
-                .min_size(egui::vec2(0.0, theme::CONTROL_MD));
-            if ui.add(fix).clicked() {
-                app.review.pending = None;
-                app.dialog = Dialog::None;
-                app.toast(format!("{noun} cancelled. Findings kept in the Checks tab."), false);
+        review_gate_buttons(app, ui, noun, override_label);
+    });
+}
+
+/// The gate's two choices, shared by both output styles.
+fn review_gate_buttons(app: &mut App, ui: &mut egui::Ui, noun: &str, override_label: &str) {
+    ui.horizontal(|ui| {
+        // Fixing is the default action, so it reads first and is plain.
+        let fix = egui::Button::new(RichText::new("Cancel and fix").strong())
+            .min_size(egui::vec2(0.0, theme::CONTROL_MD));
+        if ui.add(fix).clicked() {
+            app.review.pending = None;
+            app.dialog = Dialog::None;
+            app.toast(format!("{noun} cancelled. Review kept in the Checks tab."), false);
+        }
+        let proceed = egui::Button::new(RichText::new(override_label).color(theme::FG_DIM))
+            .min_size(egui::vec2(0.0, theme::CONTROL_MD));
+        if ui
+            .add(proceed)
+            .on_hover_text("The reviewer is advisory. The review stays in the Checks tab.")
+            .clicked()
+        {
+            app.dialog = Dialog::None;
+            if let Some(gated) = app.review.pending.take() {
+                app.toast("Overriding the review.", false);
+                app.perform(gated);
             }
-            let proceed = egui::Button::new(RichText::new(override_label).color(theme::FG_DIM))
-                .min_size(egui::vec2(0.0, theme::CONTROL_MD));
-            if ui
-                .add(proceed)
-                .on_hover_text("The reviewer is advisory. Findings stay in the Checks tab.")
-                .clicked()
-            {
-                app.dialog = Dialog::None;
-                if let Some(gated) = app.review.pending.take() {
-                    app.toast("Overriding the review.", false);
-                    app.perform(gated);
-                }
-            }
-        });
+        }
     });
 }
 

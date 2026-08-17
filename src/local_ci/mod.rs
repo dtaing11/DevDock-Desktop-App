@@ -177,6 +177,23 @@ commands = ["echo hello from local CI"]
 # model = "claude-opus-5"
 # max_diff_bytes = 24000
 # instructions = "Flag any new blocking call on the UI thread."
+
+# Want the review in your own format instead of the built-in findings list?
+# Set output = "markdown" and describe the shape you want. It is rendered as
+# Markdown in the app. With block_on_failure = true the model also leads with
+# a "VERDICT: block" or "VERDICT: pass" line, which drives the gate and is not
+# shown.
+# [review]
+# run = true
+# output = "markdown"
+# output_instructions = """
+# ## Verdict
+# One sentence.
+# ## Must fix
+# Bullets, each with `file:line` and the failing case.
+# ## Nits
+# Bullets, or "none".
+# """
 "#;
     std::fs::write(repo_root.join(CONFIG_FILE), template).map_err(|e| CiError(e.to_string()))
 }
@@ -203,6 +220,8 @@ Format specification:
   block_on_failure = true  # findings at or above fail_on stop to ask first
   fail_on = "high"         # low | medium | high
   # instructions = "..."   # project-specific things to look for
+  # output = "markdown"    # answer in the project's own format instead of
+  # output_instructions = "..."   # findings; describe the shape you want
 
 Guidelines:
 - Infer jobs from the project's actual stack (the user message lists the repo files and manifests). Typical jobs: lint/format check, tests, build.

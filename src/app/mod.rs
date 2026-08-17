@@ -11,6 +11,7 @@
 
 pub mod dialogs;
 pub mod graph;
+pub mod markdown;
 pub mod shortcuts;
 pub mod syntax;
 pub mod theme;
@@ -1333,20 +1334,23 @@ impl App {
                 self.review.running = false;
                 match result {
                     Ok(outcome) => {
-                        let blocking = outcome.blocking(self.review.config.fail_on).len();
+                        // `should_block` covers both output styles: the
+                        // fail_on threshold for findings, the reviewer's
+                        // verdict line for custom Markdown.
+                        let blocks = outcome.should_block(&self.review.config);
                         let (high, medium, low) = outcome.tally();
+                        let markdown = outcome.markdown.is_some();
                         self.review.outcome = Some(outcome);
                         // The gate dialog only makes sense when an action is
                         // actually being held; a manual review just reports.
-                        if blocking > 0
-                            && self.review.config.block_on_failure
-                            && self.review.pending.is_some()
-                        {
+                        if blocks && self.review.pending.is_some() {
                             // Hold the action and put the findings and the
                             // reviewer's reasoning in front of the user.
                             self.dialog = Dialog::ReviewGate;
                         } else {
-                            let note = if high + medium + low == 0 {
+                            let note = if markdown {
+                                "Review ready — see the Checks tab.".to_string()
+                            } else if high + medium + low == 0 {
                                 "Review found nothing.".to_string()
                             } else {
                                 format!(
@@ -1609,7 +1613,6 @@ impl App {
             _ => None,
         };
         let cfg = self.review.config.clone();
-        let instructions = cfg.instructions.clone();
         let url = self.effective_ollama_url();
 
         self.review.running = true;
@@ -1628,14 +1631,9 @@ impl App {
                 if provider == "claude" {
                     let client = claude::Client::from_store(model)
                         .ok_or("Claude is not signed in. Open Settings.")?;
-                    strerr(client.review(&diff, instructions.as_deref(), cfg.max_diff_bytes))
+                    strerr(client.review(&diff, &cfg))
                 } else {
-                    strerr(ollama::Client::new(url).review(
-                        &model,
-                        &diff,
-                        instructions.as_deref(),
-                        cfg.max_diff_bytes,
-                    ))
+                    strerr(ollama::Client::new(url).review(&model, &diff, &cfg))
                 }
             })();
             Msg::ReviewDone(result)

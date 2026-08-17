@@ -159,14 +159,25 @@ impl Client {
         &self,
         model: &str,
         diff: &str,
-        instructions: Option<&str>,
-        max_diff_bytes: usize,
+        config: &crate::review::ReviewConfig,
     ) -> Result<crate::review::ReviewOutcome> {
-        let prompt = crate::review::user_prompt(diff, instructions, max_diff_bytes);
+        use crate::review::{self, OutputStyle};
+
+        let markdown_mode = config.output == OutputStyle::Markdown;
+        let system = if markdown_mode {
+            review::markdown_system_prompt(
+                config.output_instructions.as_deref(),
+                config.block_on_failure,
+            )
+        } else {
+            review::SYSTEM_PROMPT.to_string()
+        };
+        let prompt =
+            review::user_prompt(diff, config.instructions.as_deref(), config.max_diff_bytes);
         let payload = serde_json::json!({
             "model": model,
             "prompt": prompt,
-            "system": crate::review::SYSTEM_PROMPT,
+            "system": system,
             "stream": false,
             // Reviews should be reproducible run to run, and the schema is
             // fixed, so there is nothing for sampling variance to add.
@@ -184,15 +195,22 @@ impl Client {
             .get("response")
             .and_then(|r| r.as_str())
             .ok_or_else(|| OllamaError("Ollama returned no response text".into()))?;
-        if !crate::review::parsed_cleanly(text) {
+        if markdown_mode {
+            if text.trim().is_empty() {
+                return Err(OllamaError("The reviewer returned nothing.".into()));
+            }
+            return Ok(review::parse_markdown(text));
+        }
+        if !review::parsed_cleanly(text) {
             return Err(OllamaError(format!(
                 "The reviewer did not return a usable review: {}. Smaller local \
-                 models often cannot hold the JSON format — try a larger model \
-                 or set provider = \"claude\" under [review].",
-                crate::review::excerpt(text)
+                 models often cannot hold the JSON format — try a larger model, \
+                 set provider = \"claude\", or use output = \"markdown\" under \
+                 [review], which has no format to parse.",
+                review::excerpt(text)
             )));
         }
-        Ok(crate::review::parse(text))
+        Ok(review::parse(text))
     }
 
     /// Asks the model to merge a conflicted file from its three stages.

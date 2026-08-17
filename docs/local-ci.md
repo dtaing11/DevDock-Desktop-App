@@ -14,6 +14,7 @@ Docker containers for reproducible environments.
   - [Reading a review, and overriding it](#reading-a-review-and-overriding-it)
   - [Choosing a provider and model](#choosing-a-provider-and-model)
   - [Project-specific instructions](#project-specific-instructions)
+  - [Custom output format](#custom-output-format)
   - [What the reviewer sees](#what-the-reviewer-sees)
 - [Docker environments](#docker-environments)
 - [Secrets](#secrets)
@@ -151,6 +152,8 @@ fail_on = "high"          # low | medium | high
 | `model`            | app's    | Model for that provider                                            |
 | `max_diff_bytes`   | `24000`  | Diff is truncated past this, with a marker so the model knows      |
 | `instructions`     | none     | Extra project-specific things to look for                          |
+| `output`           | `"findings"` | `"markdown"` to answer in your own format — see [Custom output format](#custom-output-format) |
+| `output_instructions` | none  | The house style for `output = "markdown"`                          |
 
 Omitting `[review]` entirely leaves the reviewer off, so adding it to an
 existing repository changes nothing until you opt in.
@@ -246,6 +249,65 @@ Database migrations must be reversible; flag any that are not.
 
 Keep these to genuine project rules. Restating general good practice adds
 tokens without changing the review.
+
+### Custom output format
+
+By default the reviewer answers in a fixed structure and the app renders the
+findings list itself. Set `output = "markdown"` to have it answer in **your**
+format instead, rendered as Markdown in the app:
+
+```toml
+[review]
+run = true
+output = "markdown"
+output_instructions = """
+## Verdict
+One sentence: ship it, or don't.
+
+## Must fix
+Bullets. Each one gives `file:line`, what breaks, and the input that breaks it.
+
+## Nits
+Bullets, or the single word "none".
+
+Keep the whole thing under 200 words. No preamble, no praise.
+"""
+```
+
+| Field                 | Meaning                                                                 |
+|-----------------------|-------------------------------------------------------------------------|
+| `output`              | `"findings"` (default) or `"markdown"`                                  |
+| `output_instructions` | The house style: sections, tone, length. Ignored in findings mode.      |
+
+What is rendered: headings, `**bold**`, `*italic*`, `` `inline code` ``,
+fenced code blocks (syntax-highlighted with the same highlighter as the diff
+views), bulleted and numbered lists, blockquotes, horizontal rules, and links.
+Anything outside that subset falls back to plain text — nothing is dropped.
+
+The review criteria do not change between modes. Only the output contract
+does, so you still get correctness-first review, concrete failing cases, and
+no commentary on untouched code.
+
+**Gating in this mode works differently.** There are no severities to compare
+against `fail_on`, so with `block_on_failure = true` the model is required to
+lead with one of:
+
+```
+VERDICT: block
+VERDICT: pass
+```
+
+That line drives the gate and is stripped before your review is shown — it
+never appears in the rendered output. `fail_on` is ignored in this mode.
+
+With `block_on_failure = false` no verdict line is requested at all, and the
+review is purely advisory: it appears in the Checks tab and nothing is ever
+held. That is the simplest setup if you want a second opinion in your own
+format without any interruption.
+
+> A local model that cannot reliably produce the structured findings JSON may
+> still do well here, since there is no format to parse. If you saw
+> "did not return a usable review" with Ollama, this mode is worth trying.
 
 ### What the reviewer sees
 

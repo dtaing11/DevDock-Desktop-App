@@ -19,6 +19,30 @@
 //! investigates just as hard and then withholds the rest, which reads back as
 //! a clean review of code that isn't clean.
 //!
+//! # Custom output
+//!
+//! `output = "markdown"` swaps the structured contract for the project's own
+//! format, written to `output_instructions` and rendered as Markdown by
+//! [`crate::app::markdown`]:
+//!
+//! ```toml
+//! [review]
+//! run = true
+//! output = "markdown"
+//! output_instructions = """
+//! ## Verdict
+//! One line.
+//! ## Must fix
+//! ## Nits
+//! """
+//! ```
+//!
+//! There are no severities in that mode, so `fail_on` does not apply. When
+//! `block_on_failure = true` the model is additionally required to lead with a
+//! [`VERDICT_PREFIX`] line, which is parsed out and drives the gate before the
+//! body is rendered. [`ReviewOutcome::should_block`] hides that difference from
+//! callers.
+//!
 //! This module owns the config, the prompt, and the parsing. It deliberately
 //! knows nothing about the providers — [`crate::claude`] and
 //! [`crate::ollama`] each send the prompt, and the app layer picks between
@@ -57,6 +81,20 @@ impl Severity {
     }
 }
 
+/// What shape the reviewer should answer in.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputStyle {
+    /// Structured findings with severities. The `fail_on` threshold applies,
+    /// and the app renders the list itself.
+    #[default]
+    Findings,
+    /// Free-form Markdown written to the project's own house style, rendered
+    /// as Markdown in the app. There are no severities to threshold, so
+    /// blocking relies on a verdict line — see [`VERDICT_PREFIX`].
+    Markdown,
+}
+
 /// One issue the reviewer reported.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Finding {
@@ -80,7 +118,14 @@ pub struct ReviewOutcome {
     /// matter. Shown alongside the findings so the decision to override is
     /// made against the argument, not just a verdict.
     pub reasoning: String,
+    /// Structured findings. Empty in [`OutputStyle::Markdown`] mode.
     pub findings: Vec<Finding>,
+    /// The review body in [`OutputStyle::Markdown`] mode, rendered as
+    /// Markdown by the app. `None` in findings mode.
+    pub markdown: Option<String>,
+    /// Whether the reviewer itself asked to hold the action. Only meaningful
+    /// in Markdown mode, where there are no severities to threshold.
+    pub verdict_blocks: bool,
 }
 
 impl ReviewOutcome {
@@ -96,6 +141,21 @@ impl ReviewOutcome {
     pub fn tally(&self) -> (usize, usize, usize) {
         let count = |s: Severity| self.findings.iter().filter(|f| f.severity == s).count();
         (count(Severity::High), count(Severity::Medium), count(Severity::Low))
+    }
+
+    /// Whether this review should hold the push or pull request, for either
+    /// output style. Keeps the two gating rules in one place so callers do
+    /// not have to know which mode produced the outcome.
+    pub fn should_block(&self, config: &ReviewConfig) -> bool {
+        if !config.block_on_failure {
+            return false;
+        }
+        match config.output {
+            OutputStyle::Findings => !self.blocking(config.fail_on).is_empty(),
+            // Custom Markdown has no severities to threshold, so the
+            // reviewer's own verdict line is the only signal available.
+            OutputStyle::Markdown => self.verdict_blocks,
+        }
     }
 }
 
@@ -125,6 +185,14 @@ pub struct ReviewConfig {
     /// Extra project-specific guidance appended to the prompt.
     #[serde(default)]
     pub instructions: Option<String>,
+    /// Whether the reviewer answers with structured findings (the default) or
+    /// free-form Markdown in the project's own style.
+    #[serde(default)]
+    pub output: OutputStyle,
+    /// The house style for [`OutputStyle::Markdown`]: sections, tone, length,
+    /// anything the review should look like. Ignored in findings mode.
+    #[serde(default)]
+    pub output_instructions: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -151,6 +219,8 @@ impl Default for ReviewConfig {
             provider: None,
             model: None,
             instructions: None,
+            output: OutputStyle::Findings,
+            output_instructions: None,
         }
     }
 }
@@ -180,6 +250,133 @@ Rules:
 - Every finding needs a concrete failing case in "detail": the input, state, or sequence that produces the bad outcome. If you cannot name one, the finding is speculation — either lower its severity or drop it.
 - Do not restate what the diff does, praise it, or suggest unrelated refactors.
 - An empty "findings" array is the correct answer for a clean change. Do not invent findings to appear thorough."#;
+
+/// The line a Markdown-mode reviewer must lead with when the gate is armed,
+/// so a free-form review can still hold a push. Stripped before rendering.
+pub const VERDICT_PREFIX: &str = "VERDICT:";
+
+/// System prompt for [`OutputStyle::Markdown`]: the review criteria stay the
+/// same, only the output contract changes to the project's own style.
+///
+/// `require_verdict` adds the machine-readable first line the gate needs.
+/// Without it the review is advisory and nothing is parsed out of the body,
+/// which is the point of this mode — the user owns the format.
+pub fn markdown_system_prompt(style: Option<&str>, require_verdict: bool) -> String {
+    let mut p = String::from(
+        "You are reviewing a git diff before it is pushed or opened as a pull request. \
+         Report defects in the changed code.\n\n\
+         What to look for:\n\
+         - Incorrectness and unsafety first: wrong results, crashes, data loss, races, \
+         resource leaks, injection, auth or secret exposure, a broken API contract.\n\
+         - Then real problems that are not correctness failures: missing error handling \
+         on a path that can fail, a missing test for new branching logic, a performance \
+         cliff, a misleading name or comment that will cause a future bug.\n\
+         - Style and naming last, and only briefly.\n\n\
+         Rules:\n\
+         - Judge only the changed lines and code they directly affect. Do not report \
+         pre-existing issues in untouched code.\n\
+         - Give a concrete failing case for each problem: the input, state, or sequence \
+         that produces the bad outcome. If you cannot name one, say so plainly instead \
+         of asserting it.\n\
+         - Cite locations as file and line.\n\
+         - Do not restate what the diff does, praise it, or suggest unrelated refactors.\n\
+         - Saying the change looks correct is a valid review. Do not invent problems to \
+         appear thorough.\n\n",
+    );
+
+    if require_verdict {
+        p.push_str(&format!(
+            "Your response MUST begin with exactly one of these two lines, on its own \
+             line, before anything else:\n\
+             {VERDICT_PREFIX} block\n\
+             {VERDICT_PREFIX} pass\n\
+             Use \"block\" only when you found something that should be fixed before \
+             this code is published; \"pass\" otherwise. The line is read by the tool \
+             and removed before your review is shown.\n\n"
+        ));
+    }
+
+    p.push_str("Write the rest of your response as GitHub-flavoured Markdown.");
+
+    match style.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(style) => {
+            p.push_str(&format!(
+                " Follow this house style exactly — it overrides any formatting \
+                 preference of your own:\n\n{style}"
+            ));
+        }
+        None => {
+            p.push_str(
+                " Lead with a one-line verdict, then the problems worth acting on, \
+                 worst first. Keep it short enough to read in full.",
+            );
+        }
+    }
+    p
+}
+
+/// Extracts a Markdown-mode review: strips an outer code fence and the
+/// verdict line, keeping the body for rendering.
+pub fn parse_markdown(text: &str) -> ReviewOutcome {
+    // Models sometimes wrap the whole answer in a ```markdown fence.
+    let body = strip_outer_fence(text.trim());
+
+    let mut verdict_blocks = false;
+    let mut summary = String::new();
+    let mut lines = body.lines();
+    let mut rest_start = 0usize;
+
+    // The verdict line is only honoured at the very top, so the word
+    // appearing later in prose cannot flip the gate.
+    for line in lines.by_ref() {
+        let trimmed = line.trim();
+        rest_start += line.len() + 1;
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(v) = trimmed.strip_prefix(VERDICT_PREFIX) {
+            verdict_blocks = v.trim().eq_ignore_ascii_case("block");
+            break;
+        }
+        // No verdict line: nothing to strip.
+        rest_start = 0;
+        break;
+    }
+
+    let markdown = if rest_start > 0 && rest_start <= body.len() {
+        body[rest_start..].trim_start().to_string()
+    } else {
+        body.to_string()
+    };
+
+    // First non-heading, non-empty line doubles as the one-line summary in
+    // compact places like the Checks tab header.
+    for line in markdown.lines() {
+        let t = line.trim().trim_start_matches('#').trim();
+        if !t.is_empty() {
+            summary = t.to_string();
+            break;
+        }
+    }
+
+    ReviewOutcome {
+        summary,
+        reasoning: String::new(),
+        findings: Vec::new(),
+        markdown: Some(markdown),
+        verdict_blocks,
+    }
+}
+
+/// Removes a fence wrapping the entire text, leaving inner fences alone.
+fn strip_outer_fence(text: &str) -> &str {
+    let Some(rest) = text.strip_prefix("```") else { return text };
+    let Some((_info, body)) = rest.split_once('\n') else { return text };
+    match body.trim_end().strip_suffix("```") {
+        Some(inner) => inner.trim_end(),
+        None => text,
+    }
+}
 
 /// Builds the user turn: the diff, plus any project-specific guidance.
 pub fn user_prompt(diff: &str, instructions: Option<&str>, max_diff_bytes: usize) -> String {
@@ -267,6 +464,8 @@ pub fn parse(text: &str) -> ReviewOutcome {
         summary: raw.summary.trim().to_string(),
         reasoning: raw.reasoning.trim().to_string(),
         findings,
+        markdown: None,
+        verdict_blocks: false,
     }
 }
 
@@ -424,6 +623,91 @@ mod tests {
     fn diff_is_truncated_with_a_marker() {
         let prompt = user_prompt(&"x".repeat(100), None, 20);
         assert!(prompt.contains("[diff truncated"));
+    }
+
+    #[test]
+    fn markdown_mode_keeps_the_body_verbatim() {
+        let out = parse_markdown("## Verdict\n\nLooks wrong in `foo()`.\n");
+        assert_eq!(out.markdown.as_deref(), Some("## Verdict\n\nLooks wrong in `foo()`."));
+        assert!(out.findings.is_empty(), "markdown mode has no structured findings");
+        // The first meaningful line doubles as the compact summary.
+        assert_eq!(out.summary, "Verdict");
+    }
+
+    #[test]
+    fn verdict_line_drives_the_gate_and_is_stripped() {
+        let block = parse_markdown("VERDICT: block\n\n## Problems\n\nRace in `sync`.\n");
+        assert!(block.verdict_blocks);
+        let md = block.markdown.unwrap();
+        assert!(!md.contains("VERDICT"), "verdict line must not be rendered: {md:?}");
+        assert!(md.starts_with("## Problems"));
+
+        let pass = parse_markdown("VERDICT: pass\n\nLooks fine.\n");
+        assert!(!pass.verdict_blocks);
+        assert_eq!(pass.markdown.as_deref(), Some("Looks fine."));
+    }
+
+    /// The word appearing later in prose must not flip the gate.
+    #[test]
+    fn verdict_is_only_honoured_at_the_top() {
+        let out = parse_markdown("## Notes\n\nI would VERDICT: block this normally.\n");
+        assert!(!out.verdict_blocks);
+        assert!(out.markdown.unwrap().contains("VERDICT: block"), "prose kept verbatim");
+    }
+
+    #[test]
+    fn an_outer_fence_is_stripped_but_inner_ones_survive() {
+        let out = parse_markdown("```markdown\n## R\n\n```rust\nlet a = 1;\n```\n");
+        let md = out.markdown.unwrap();
+        assert!(md.starts_with("## R"), "outer fence not stripped: {md:?}");
+        assert!(md.contains("```rust"), "inner fence must survive: {md:?}");
+    }
+
+    #[test]
+    fn should_block_uses_the_right_rule_per_output_style() {
+        let mut cfg = ReviewConfig { block_on_failure: true, ..Default::default() };
+
+        // Findings mode: the fail_on threshold decides.
+        let findings = parse(r#"{"findings":[{"severity":"medium","title":"t","detail":"d"}]}"#);
+        cfg.output = OutputStyle::Findings;
+        cfg.fail_on = Severity::High;
+        assert!(!findings.should_block(&cfg));
+        cfg.fail_on = Severity::Medium;
+        assert!(findings.should_block(&cfg));
+
+        // Markdown mode: the verdict line decides, and fail_on is irrelevant.
+        cfg.output = OutputStyle::Markdown;
+        cfg.fail_on = Severity::High;
+        assert!(parse_markdown("VERDICT: block\n\nbad").should_block(&cfg));
+        assert!(!parse_markdown("VERDICT: pass\n\nfine").should_block(&cfg));
+        // No verdict line at all: advisory, never blocks.
+        assert!(!parse_markdown("just prose").should_block(&cfg));
+
+        // block_on_failure = false never blocks in either mode.
+        cfg.block_on_failure = false;
+        assert!(!parse_markdown("VERDICT: block\n\nbad").should_block(&cfg));
+        cfg.output = OutputStyle::Findings;
+        cfg.fail_on = Severity::Low;
+        assert!(!findings.should_block(&cfg));
+    }
+
+    #[test]
+    fn markdown_prompt_carries_the_house_style_and_verdict_contract() {
+        let styled = markdown_system_prompt(Some("Use ## Verdict then ## Nits."), true);
+        assert!(styled.contains("## Verdict then ## Nits."), "house style must be included");
+        assert!(styled.contains(VERDICT_PREFIX), "gate needs the verdict contract");
+
+        // Advisory mode asks for no verdict line.
+        let advisory = markdown_system_prompt(None, false);
+        assert!(!advisory.contains(VERDICT_PREFIX));
+        // Still Markdown, still the same review criteria.
+        assert!(advisory.contains("Markdown"));
+        assert!(advisory.contains("data loss"));
+    }
+
+    #[test]
+    fn output_style_defaults_to_findings() {
+        assert_eq!(ReviewConfig::default().output, OutputStyle::Findings);
     }
 
     #[test]

@@ -1415,6 +1415,17 @@ fn review_section(app: &mut App, ui: &mut egui::Ui) {
     let fail_on = app.review.config.fail_on;
 
     ui.add_space(10.0);
+
+    // Markdown mode: render the reviewer's own formatting.
+    if let Some(md) = outcome.markdown.clone() {
+        let held = if outcome.verdict_blocks { " — reviewer asked to hold" } else { "" };
+        egui::CollapsingHeader::new(RichText::new(format!("AI review{held}")).strong())
+            .default_open(true)
+            .show(ui, |ui| super::markdown::render(ui, &md));
+        ui.add_space(4.0);
+        return;
+    }
+
     let header = if outcome.findings.is_empty() {
         "AI review — nothing found".to_string()
     } else {

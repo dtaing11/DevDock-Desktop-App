@@ -19,8 +19,14 @@ commands = ["cargo build --release"]
 
 [[job]]
 name = "tests on Debian stable"
-image = "rust:1.80-slim-bookworm"
-commands = ["cargo test"]
+# 1.88+ is required: the `image` crate (pulled in by eframe) declares that MSRV,
+# and several others need 1.87. Older tags fail before compiling anything.
+# `slim` has no C toolchain, so install what the crypto/font crates need to link.
+image = "rust:1.88-slim-bookworm"
+commands = [
+  "apt-get update -qq && apt-get install -y -qq --no-install-recommends build-essential pkg-config",
+  "cargo test",
+]
 
 # AI review of the outgoing diff, after the jobs above pass. Advisory: it
 # reports findings with its reasoning and you can always proceed anyway.

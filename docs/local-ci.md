@@ -427,7 +427,7 @@ Add `image = "..."` to run a job inside a container:
 ```toml
 [[job]]
 name = "tests on Debian stable"
-image = "rust:1.80-slim-bookworm"
+image = "rust:1.88-slim-bookworm"
 commands = ["cargo test"]
 ```
 
@@ -438,7 +438,7 @@ docker run --rm \
   -v /path/to/your/repo:/work \
   -w /work \
   -e KEY=VALUE ... \
-  rust:1.80-slim-bookworm sh -c "cargo test"
+  rust:1.88-slim-bookworm sh -c "cargo test"
 ```
 
 - The repository is mounted read-write at `/work`.
@@ -450,13 +450,38 @@ Useful images:
 
 | Purpose            | Image                        |
 |--------------------|------------------------------|
-| Rust               | `rust:1.80`, `rust:latest`   |
+| Rust               | `rust:latest`, `rust:1.88`   |
 | Node.js            | `node:22`, `node:20-alpine`  |
 | Python             | `python:3.12`, `python:3.12-slim` |
 | Go                 | `golang:1.23`                |
 | Ubuntu base        | `ubuntu:24.04`               |
 | Debian base        | `debian:bookworm`            |
 | Alpine (small)     | `alpine:3.20`                |
+
+Two things that bite when pinning a toolchain version:
+
+- **Pin at or above your dependencies' minimum.** A container job with an older
+  toolchain than any dependency requires fails before compiling a line of your
+  code (`package X requires rustc 1.88 or newer`). Your host toolchain being
+  newer hides this, so the job fails while `cargo test` passes locally. Find the
+  floor with:
+
+  ```sh
+  cargo metadata --format-version 1 \
+    | python3 -c 'import json,sys; print(max((p["rust_version"] for p in json.load(sys.stdin)["packages"] if p.get("rust_version")), key=lambda v: [int(x) for x in v.split(".")]))'
+  ```
+
+- **`-slim` and `-alpine` images have no C toolchain.** Anything with a C
+  dependency (crypto, fonts, native bindings) fails on `cc`, `ld`, or
+  `pkg-config`. Use the non-slim tag, or install what you need as the job's
+  first command:
+
+  ```toml
+  commands = [
+    "apt-get update -qq && apt-get install -y -qq --no-install-recommends build-essential pkg-config",
+    "cargo test",
+  ]
+  ```
 
 ## Secrets
 
@@ -645,7 +670,11 @@ tools. See [extending-local-ci.md](extending-local-ci.md).
 
 | Symptom | Fix |
 |---------|-----|
-| `Docker is not available` on a container job | Install Docker (or Docker Desktop / colima on macOS) and make sure `docker --version` works in a terminal |
+| `Docker is installed but its daemon is not running` | Start Docker Desktop (macOS/Windows) or `sudo systemctl start docker` (Linux). `docker --version` succeeding is **not** enough — it only prints the client version; `docker info` is the check that needs the daemon |
+| `Docker is not installed, or docker is not on PATH` | Install Docker Desktop (or colima / podman-docker), or drop `image` from the job so it runs on this machine |
+| `Cannot connect to the Docker daemon` in a job's stderr | The daemon stopped after the pre-flight check, or something else is holding the socket. Start Docker and re-run |
+| Container job fails before compiling (`requires rustc 1.xx or newer`) | The image's toolchain is older than a dependency's minimum. Check with `cargo metadata` and pin a newer tag, e.g. `rust:1.88-slim-bookworm` |
+| Container job fails on `cc`, `ld`, or `pkg-config` | `-slim` images ship no C toolchain. Use the non-slim tag, or `apt-get install -y build-essential pkg-config` as the job's first command |
 | `Missing secret(s): X` | Add `X = value` to `.git-manage-ci.secrets` or `export X=...` before launching the app |
 | Container job can't find your toolchain | The container only has what the image ships; pick a toolchain image (`rust:1.80`, `node:22`) or install inside `commands` |
 | Changes not picked up after editing the config | Click **Reload** in the LOCAL CHECKS section |

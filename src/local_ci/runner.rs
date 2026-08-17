@@ -132,22 +132,55 @@ impl Runner for HostRunner {
 /// Runs commands inside a Docker container (Linux), repo mounted at `/work`.
 pub struct DockerRunner;
 
+/// Outcome of running `docker info`, split so the two failures can be told
+/// apart (and tested) without Docker installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DockerProbe {
+    /// The binary launched. `success` is whether it reached the daemon.
+    Ran { success: bool },
+    /// The binary could not be launched at all.
+    NotLaunched,
+}
+
+/// Turns a probe into an availability verdict.
+///
+/// The daemon-down and not-installed cases have different fixes, so they get
+/// different messages instead of one "Docker is not available".
+fn classify_docker_probe(probe: DockerProbe) -> Result<(), String> {
+    match probe {
+        DockerProbe::Ran { success: true } => Ok(()),
+        DockerProbe::Ran { success: false } => Err(
+            "Docker is installed but its daemon is not running. Start Docker \
+             Desktop (macOS/Windows) or `sudo systemctl start docker` (Linux), \
+             then run the checks again. Jobs without `image` are unaffected."
+                .into(),
+        ),
+        DockerProbe::NotLaunched => Err(
+            "Docker is not installed, or `docker` is not on PATH. Install \
+             Docker Desktop (or colima/podman-docker), or drop `image` from \
+             the job to run it on this machine instead."
+                .into(),
+        ),
+    }
+}
+
 impl Runner for DockerRunner {
     fn id(&self) -> &'static str {
         "docker"
     }
 
+    /// Probes with `docker info`, which needs the daemon.
+    ///
+    /// `docker --version` is not a usable check: it only prints the client
+    /// version and succeeds with the daemon stopped, so the job would run and
+    /// fail on a raw "Cannot connect to the Docker daemon" from stderr instead
+    /// of this message. The two cases also have different fixes, so they get
+    /// different messages.
     fn available(&self) -> Result<(), String> {
-        let ok = Command::new("docker")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if ok {
-            Ok(())
-        } else {
-            Err("Docker is not available. Install Docker or use the host runner.".into())
-        }
+        classify_docker_probe(match Command::new("docker").arg("info").output() {
+            Ok(out) => DockerProbe::Ran { success: out.status.success() },
+            Err(_) => DockerProbe::NotLaunched,
+        })
     }
 
     fn exec(&self, request: &ExecRequest<'_>) -> Result<ExecOutput, String> {
@@ -243,6 +276,26 @@ mod tests {
                 stderr: String::new(),
             })
         }
+    }
+
+
+    /// `docker --version` succeeds with the daemon stopped, so it cannot be
+    /// the availability probe: the job would run and fail on a raw "Cannot
+    /// connect to the Docker daemon" instead of a message that says what to do.
+    #[test]
+    fn docker_probe_tells_daemon_down_apart_from_not_installed() {
+        assert!(classify_docker_probe(DockerProbe::Ran { success: true }).is_ok());
+
+        let daemon_down =
+            classify_docker_probe(DockerProbe::Ran { success: false }).unwrap_err();
+        assert!(daemon_down.contains("daemon is not running"), "got: {daemon_down}");
+        assert!(daemon_down.contains("Start Docker"), "should say what to do: {daemon_down}");
+
+        let missing = classify_docker_probe(DockerProbe::NotLaunched).unwrap_err();
+        assert!(missing.contains("not installed"), "got: {missing}");
+
+        // The two must not be the same message — they have different fixes.
+        assert_ne!(daemon_down, missing);
     }
 
     #[test]

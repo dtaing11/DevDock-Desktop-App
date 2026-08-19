@@ -63,26 +63,51 @@ fn modal(
     add_contents: impl FnOnce(&mut egui::Ui),
 ) {
     let screen = ctx.screen_rect();
-    let max_height = (screen.height() - 60.0).max(200.0);
-    let max_width = (screen.width() - 40.0).max(280.0);
-    // default_pos + pivot centers the dialog on first open but, unlike
-    // anchor(), leaves it draggable, so it never blocks the whole app.
-    // Collapsible gives a one-click way to shrink it to its title bar,
-    // and Escape still closes it.
-    egui::Window::new(RichText::new(title).strong())
-        .collapsible(true)
-        .resizable(false)
-        .open(open)
-        .default_pos(screen.center())
-        .pivot(egui::Align2::CENTER_CENTER)
-        .max_width(max_width)
-        .max_height(max_height)
+    // Leave a visible margin of the app around the dialog so it reads as
+    // an overlay, not a screen takeover.
+    let max_height = (screen.height() * 0.82).max(200.0);
+    let max_width = (screen.width() * 0.85).max(280.0);
+
+    let response = egui::Modal::new(egui::Id::new(title))
+        .backdrop_color(egui::Color32::from_black_alpha(140))
+        .frame(
+            egui::Frame::window(&ctx.style())
+                .fill(theme::PANEL)
+                .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+                .inner_margin(16.0),
+        )
         .show(ctx, |ui| {
+            ui.set_max_width(max_width);
+            ui.set_max_height(max_height);
+
+            // Title bar with a close button.
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(title).strong().size(16.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(egui::Button::new(RichText::new("Close").size(13.0)))
+                        .on_hover_text("Or press Esc")
+                        .clicked()
+                    {
+                        ui.close();
+                    }
+                });
+            });
+            ui.separator();
+
             ScrollArea::vertical()
-                .max_height(max_height - 40.0)
-                .auto_shrink([false, true])
+                .max_height(max_height - 60.0)
+                .auto_shrink([true, true])
                 .show(ui, add_contents);
         });
+
+    // The X button (ui.close) closes; Escape is handled by the global
+    // shortcut layer. Backdrop clicks deliberately do NOT close: dialogs
+    // like the PR form hold typed text, and a stray click must not
+    // destroy it. The dimmed backdrop still signals modality.
+    if response.response.should_close() {
+        *open = false;
+    }
 }
 
 // ---------------------------------------------------------------------------

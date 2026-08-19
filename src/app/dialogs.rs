@@ -65,11 +65,16 @@ fn modal(
     let screen = ctx.screen_rect();
     let max_height = (screen.height() - 60.0).max(200.0);
     let max_width = (screen.width() - 40.0).max(280.0);
+    // default_pos + pivot centers the dialog on first open but, unlike
+    // anchor(), leaves it draggable, so it never blocks the whole app.
+    // Collapsible gives a one-click way to shrink it to its title bar,
+    // and Escape still closes it.
     egui::Window::new(RichText::new(title).strong())
-        .collapsible(false)
+        .collapsible(true)
         .resizable(false)
         .open(open)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .default_pos(screen.center())
+        .pivot(egui::Align2::CENTER_CENTER)
         .max_width(max_width)
         .max_height(max_height)
         .show(ctx, |ui| {

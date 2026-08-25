@@ -28,6 +28,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         Dialog::ReviewGate => review_gate(app, ctx, &mut open),
         Dialog::ChecksGate => checks_gate(app, ctx, &mut open),
         Dialog::AgentChanges => agent_changes(app, ctx, &mut open),
+        Dialog::Rename => rename_dialog(app, ctx, &mut open),
     }
     // Dismissing a gate with the X is a deferred decision, not an approval:
     // the modal closes but the held action stays available behind the
@@ -1568,50 +1569,7 @@ fn agent_changes(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         // Diff of the selected proposal.
         if let Some(proposed) = app.agent.selected.and_then(|i| app.agent.edits.get(i)) {
             ui.separator();
-            ui.label(RichText::new(&proposed.edit.path).color(theme::EMBER).strong());
-            let lines = crate::app::textdiff::diff(
-                proposed.edit.before.as_deref().unwrap_or(""),
-                &proposed.edit.after,
-            );
-            let lang = crate::app::syntax::Lang::from_path(&proposed.edit.path);
-            let font = egui::TextStyle::Small.resolve(ui.style());
-            ScrollArea::vertical().max_height(320.0).id_salt("agent-diff").show(ui, |ui| {
-                for line in &lines {
-                    use crate::app::textdiff::Line;
-                    match line {
-                        Line::Skipped(n) => {
-                            ui.label(
-                                RichText::new(format!("    … {n} unchanged line(s)"))
-                                    .small()
-                                    .color(theme::FG_DIM),
-                            );
-                        }
-                        Line::Context(text) => {
-                            ui.label(crate::app::syntax::diff_line_job(
-                                lang,
-                                &format!("  {text}"),
-                                theme::FG,
-                                font.clone(),
-                                true,
-                            ));
-                        }
-                        Line::Added(text) => {
-                            ui.label(
-                                RichText::new(format!("+ {text}"))
-                                    .color(theme::ADD)
-                                    .font(font.clone()),
-                            );
-                        }
-                        Line::Removed(text) => {
-                            ui.label(
-                                RichText::new(format!("- {text}"))
-                                    .color(theme::DEL)
-                                    .font(font.clone()),
-                            );
-                        }
-                    }
-                }
-            });
+            proposal_diff(ui, &proposed.edit, "agent-diff");
         }
 
         ui.separator();
@@ -1651,6 +1609,110 @@ fn agent_changes(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                 app.agent.edits.retain(|e| e.applied);
                 app.agent.selected = None;
                 app.dialog = Dialog::Conflicts;
+            }
+        });
+    });
+}
+
+/// Renders one proposed change as a unified diff.
+///
+/// Shared by the conflict resolver's dialog and the coding agent's tab:
+/// both are asking the same question — is this change right? — and they
+/// should not answer it in two different visual languages.
+pub fn proposal_diff(ui: &mut egui::Ui, edit: &crate::agent::PendingEdit, salt: &str) {
+    use crate::app::textdiff::Line;
+
+    ui.label(RichText::new(&edit.path).color(theme::EMBER).strong());
+    let lines = crate::app::textdiff::diff(edit.before.as_deref().unwrap_or(""), &edit.after);
+    let lang = crate::app::syntax::Lang::from_path(&edit.path);
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    ScrollArea::vertical().max_height(320.0).id_salt(salt).show(ui, |ui| {
+        for line in &lines {
+            match line {
+                Line::Skipped(n) => {
+                    ui.label(
+                        RichText::new(format!("    … {n} unchanged line(s)"))
+                            .small()
+                            .color(theme::FG_DIM),
+                    );
+                }
+                Line::Context(text) => {
+                    ui.label(crate::app::syntax::diff_line_job(
+                        lang,
+                        &format!("  {text}"),
+                        theme::FG,
+                        font.clone(),
+                        true,
+                    ));
+                }
+                Line::Added(text) => {
+                    ui.label(
+                        RichText::new(format!("+ {text}")).color(theme::ADD).font(font.clone()),
+                    );
+                }
+                Line::Removed(text) => {
+                    ui.label(
+                        RichText::new(format!("- {text}")).color(theme::DEL).font(font.clone()),
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// Names a symbol for a workspace-wide rename.
+///
+/// The rename itself is computed by the language server and applied through
+/// the proposal dialog, so this only collects the new name.
+fn rename_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
+    let Some(rename) = app.editor.rename.as_ref() else {
+        app.dialog = Dialog::None;
+        return;
+    };
+    let (path, position, old_name) = (rename.path.clone(), rename.position, rename.old_name.clone());
+
+    modal(ctx, "Rename symbol", open, |ui| {
+        ui.set_min_width(360.0);
+        ui.label(
+            RichText::new(format!("Renaming `{old_name}` everywhere the language server finds it."))
+                .color(theme::FG_DIM)
+                .small(),
+        );
+        ui.add_space(6.0);
+
+        let response = {
+            let Some(rename) = app.editor.rename.as_mut() else { return };
+            ui.add(
+                egui::TextEdit::singleline(&mut rename.new_name)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("new name"),
+            )
+        };
+        response.request_focus();
+
+        let new_name = app
+            .editor
+            .rename
+            .as_ref()
+            .map(|r| r.new_name.trim().to_string())
+            .unwrap_or_default();
+        let valid = !new_name.is_empty() && new_name != old_name;
+        let submit = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let clicked = ui
+                .add_enabled(valid, egui::Button::new("Rename").fill(theme::EMBER))
+                .on_hover_text("Every change is shown for review before anything is written")
+                .clicked();
+            if clicked || (submit && valid) {
+                app.editor.rename = None;
+                app.dialog = Dialog::None;
+                app.lsp_rename(&path, position, &new_name);
+            }
+            if ui.button("Cancel").clicked() {
+                app.editor.rename = None;
+                app.dialog = Dialog::None;
             }
         });
     });

@@ -14,7 +14,7 @@
 //!   cross that boundary.
 
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, Read, Write};
+use std::io::{BufRead, Write};
 
 // ---------------------------------------------------------------------------
 // Framing

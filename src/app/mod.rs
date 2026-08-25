@@ -9,7 +9,9 @@
 //! State lives in [`App`]; long operations run on worker threads and report
 //! back through [`worker::Msg`], keeping the UI responsive.
 
+pub mod agent_tab;
 pub mod dialogs;
+pub mod editor;
 pub mod graph;
 pub mod markdown;
 pub mod shortcuts;
@@ -27,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
-use worker::{strerr, Msg, Worker};
+use worker::{strerr, AgentKind, LspReply, Msg, Worker};
 
 /// Runs the desktop app. Blocks until the window closes.
 pub fn run() -> eframe::Result<()> {
@@ -84,6 +86,10 @@ pub struct Config {
     /// `.git-manage-ci.toml` overrides this when the repository sets it.
     #[serde(default)]
     pub review_ai: Option<AiSelection>,
+    /// Model that drives the coding agent. It reads, edits, and verifies, so
+    /// this is the one worth pointing at your strongest model.
+    #[serde(default)]
+    pub coding_ai: Option<AiSelection>,
     /// Keyboard shortcuts; missing/invalid entries fall back to defaults.
     #[serde(default)]
     pub shortcuts: shortcuts::Shortcuts,
@@ -203,15 +209,19 @@ impl Config {
 // ---------------------------------------------------------------------------
 
 /// Which sidebar tab is active.
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum Tab {
     Changes,
     History,
     Checks,
+    /// The code editor, with language server support.
+    Editor,
+    /// The coding agent.
+    Agent,
 }
 
 /// Which modal dialog is open, if any.
-#[derive(PartialEq, Eq, Clone)]
+#[derive(PartialEq, Eq, Clone, Debug)]
 pub enum Dialog {
     None,
     RepoPicker,
@@ -237,13 +247,15 @@ pub enum Dialog {
     /// Changes the conflict harness proposed, each awaiting confirmation
     /// before anything is written to the worktree.
     AgentChanges,
+    /// Name a symbol for a workspace-wide rename.
+    Rename,
 }
 
 /// A destructive action awaiting user confirmation.
 ///
 /// Every irreversible (or hard-to-reverse) operation routes through this
 /// gate so nothing is destroyed on a single misclick.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ConfirmAction {
     /// Discard working changes to one file (restore/delete).
     DiscardFile(String),
@@ -666,6 +678,15 @@ pub struct App {
     pub conflicts: ConflictState,
     /// The conflict-resolution harness and the changes it proposes.
     pub agent: AgentState,
+    /// Open buffers and everything the language server contributes.
+    pub editor: editor::EditorState,
+    /// The coding agent's tab: task, transcript, and pending changes.
+    pub coding: agent_tab::CodingState,
+    /// Language servers for the open repository, started on demand.
+    pub lsp: std::sync::Arc<crate::lsp::Manager>,
+    /// The egui context, kept so background work started from a message
+    /// handler can still ask for repaints.
+    ctx: egui::Context,
     /// AI CI-config generation: busy flag and the editable proposal text
     /// shown in the review dialog. Nothing is written until confirmed.
     pub ci_ai_busy: bool,
@@ -745,6 +766,15 @@ impl App {
             review: Default::default(),
             conflicts: Default::default(),
             agent: Default::default(),
+            editor: Default::default(),
+            coding: Default::default(),
+            // Replaced when a repository opens; a manager with no servers
+            // running costs nothing until a file needs one.
+            lsp: std::sync::Arc::new(crate::lsp::Manager::new(
+                std::path::Path::new("."),
+                Some(repaint_handle(ctx)),
+            )),
+            ctx: ctx.clone(),
             ollama_models: Vec::new(),
             toast: None,
             busy: false,
@@ -990,6 +1020,7 @@ impl App {
             worker::AiTarget::PullRequest => self.config.pr_ai.clone(),
             worker::AiTarget::Conflict => self.config.conflict_ai.clone(),
             worker::AiTarget::Review => self.config.review_ai.clone(),
+            worker::AiTarget::Coding => self.config.coding_ai.clone(),
         };
         explicit.or_else(|| {
             let provider = self.config.ai_provider.clone().unwrap_or_else(|| "ollama".into());
@@ -1009,6 +1040,7 @@ impl App {
             worker::AiTarget::PullRequest => self.config.pr_ai = Some(sel),
             worker::AiTarget::Conflict => self.config.conflict_ai = Some(sel),
             worker::AiTarget::Review => self.config.review_ai = Some(sel),
+            worker::AiTarget::Coding => self.config.coding_ai = Some(sel),
         }
         self.config.save();
     }
@@ -1063,6 +1095,10 @@ impl App {
             // Review guidance is per-repository and committed: it comes from
             // `[review] instructions` in .git-manage-ci.toml, not from here.
             worker::AiTarget::Review => return None,
+            // The coding agent uses the repository's review instructions,
+            // which is where a project already describes how its code should
+            // be written; see `coding_instructions`.
+            worker::AiTarget::Coding => return None,
         };
         let mut parts: Vec<String> = Vec::new();
         let inline = inline.trim();
@@ -1184,6 +1220,14 @@ impl App {
                     // Graph belongs to the previous repo too.
                     self.graph.clear();
                     self.graph_open = false;
+                    // Language servers are per-workspace: stop the previous
+                    // repository's and start fresh, and drop its buffers.
+                    self.lsp.shutdown_all();
+                    self.lsp = std::sync::Arc::new(crate::lsp::Manager::new(
+                        std::path::Path::new(&path),
+                        Some(repaint_handle(&self.ctx)),
+                    ));
+                    self.editor = Default::default();
                     self.refresh();
                 }
                 Err(e) => self.toast(e.to_string(), true),
@@ -1555,10 +1599,19 @@ impl App {
                     Err(e) => self.toast(e, true),
                 }
             }
-            Msg::AgentEvent(line) => {
-                self.agent.log.push(line);
+            Msg::TrackedFiles(files) => {
+                self.editor.quick_open.loading = false;
+                self.editor.quick_open.files = files;
             }
-            Msg::AgentDone(result) => {
+            Msg::Lsp(reply) => self.handle_lsp(reply),
+            Msg::AgentEvent { kind, line } => match kind {
+                AgentKind::Conflict => self.agent.log.push(line),
+                AgentKind::Coding => self.coding.log.push(line),
+            },
+            Msg::AgentDone { kind: AgentKind::Coding, result } => {
+                self.finish_coding_run(result)
+            }
+            Msg::AgentDone { kind: _, result } => {
                 self.agent.running = false;
                 match result {
                     Ok(report) => {
@@ -1615,11 +1668,168 @@ impl App {
                         self.toast("PR title and description generated.", false);
                     }
                     // The harness tasks report through Msg::AgentDone.
-                    (worker::AiTarget::Conflict | worker::AiTarget::Review, Ok(_)) => {}
+                    (
+                        worker::AiTarget::Conflict
+                        | worker::AiTarget::Review
+                        | worker::AiTarget::Coding,
+                        Ok(_),
+                    ) => {}
                     (_, Err(e)) => self.toast(e, true),
                 }
             }
         }
+    }
+
+    /// Applies one language server answer to the editor.
+    fn handle_lsp(&mut self, reply: LspReply) {
+        use crate::lsp::protocol;
+        self.editor.busy = self.editor.busy.saturating_sub(1);
+        match reply {
+            LspReply::Opened { path, server, error } => match error {
+                Some(e) => {
+                    // Not having a language server is a normal state, not a
+                    // failure: the editor still edits.
+                    self.editor.error = Some(e);
+                    if let Some(file) = self.editor.file_mut(&path) {
+                        file.synced = false;
+                    }
+                }
+                None => {
+                    self.editor.error = None;
+                    self.editor.status = Some(server);
+                }
+            },
+            LspReply::Hover { path, text } => {
+                self.editor.hover.requesting = false;
+                // Ignore an answer for a file that is no longer in front.
+                if self.editor.active_file().is_some_and(|f| f.path == path) {
+                    self.editor.hover.text = text;
+                }
+            }
+            LspReply::Definition(locations) => {
+                let Some(location) = locations.first() else {
+                    self.toast("No definition found.", true);
+                    return;
+                };
+                let Some(path) = protocol::uri_to_path(&location.uri) else { return };
+                self.editor_open(&path, Some(location.range.start.line));
+            }
+            LspReply::References(locations) => {
+                if locations.is_empty() {
+                    self.toast("No references found.", true);
+                }
+                self.editor.references = locations;
+                self.editor.bottom = editor::BottomPanel::References;
+            }
+            LspReply::Symbols { path, symbols } => {
+                if let Some(file) = self.editor.file_mut(&path) {
+                    file.symbols = symbols;
+                }
+            }
+            LspReply::Completion { path, items, anchor } => {
+                self.editor.completion.requesting = false;
+                if !self.editor.active_file().is_some_and(|f| f.path == path) {
+                    return;
+                }
+                if items.is_empty() {
+                    self.editor.completion.close();
+                    return;
+                }
+                self.editor.completion.open = true;
+                self.editor.completion.items = items;
+                self.editor.completion.anchor = anchor;
+                self.editor.completion.selected = 0;
+            }
+            LspReply::Formatted { path, text, save } => {
+                self.editor_replace_text(&path, text);
+                if save {
+                    self.editor_write_active();
+                }
+            }
+            LspReply::Renamed { new_name, edits } => {
+                if edits.is_empty() {
+                    self.toast("The language server proposed no changes.", true);
+                    return;
+                }
+                self.stage_rename_proposal(&new_name, edits);
+            }
+            LspReply::Failed(e) => {
+                self.editor.completion.requesting = false;
+                self.editor.hover.requesting = false;
+                self.toast(e, true);
+            }
+        }
+    }
+
+    /// Turns a rename's edits into proposals in the same review dialog the
+    /// AI harness uses.
+    ///
+    /// A rename touches files that are not open and may not even be in the
+    /// current diff, so it goes through confirmation like any other
+    /// multi-file change rather than rewriting the worktree behind the
+    /// user's back.
+    fn stage_rename_proposal(
+        &mut self,
+        new_name: &str,
+        edits: Vec<(std::path::PathBuf, Vec<crate::lsp::protocol::TextEdit>)>,
+    ) {
+        use crate::lsp::protocol;
+        let mut proposals = Vec::new();
+        let mut failed = Vec::new();
+        for (path, file_edits) in edits {
+            // Buffers are keyed by canonical path, and a server's URI may
+            // not be canonical (/var vs /private/var on macOS).
+            let path = std::fs::canonicalize(&path).unwrap_or(path);
+            // Prefer the open buffer's text: it may differ from disk, and
+            // that is the text the server just computed offsets against.
+            let before = match self.editor.files.iter().find(|f| f.path == path) {
+                Some(file) => file.text.clone(),
+                None => match std::fs::read_to_string(&path) {
+                    Ok(text) => text,
+                    Err(e) => {
+                        failed.push(format!("{}: {e}", path.display()));
+                        continue;
+                    }
+                },
+            };
+            let after = protocol::apply_edits(&before, &file_edits);
+            if after == before {
+                continue;
+            }
+            let rel = self
+                .repo
+                .as_ref()
+                .and_then(|r| path.strip_prefix(r.path()).ok())
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            proposals.push(ProposedEdit {
+                edit: crate::agent::PendingEdit { path: rel, before: Some(before), after },
+                accepted: false,
+                applied: false,
+                unresolved: false,
+            });
+        }
+
+        if proposals.is_empty() {
+            self.toast("Nothing to rename.", true);
+            return;
+        }
+        let count = proposals.len();
+        self.agent = AgentState {
+            summary: format!(
+                "Language server rename to `{new_name}` across {count} file(s).{}",
+                if failed.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n\nCould not read: {}", failed.join(", "))
+                }
+            ),
+            edits: proposals,
+            selected: Some(0),
+            ..Default::default()
+        };
+        self.dialog = Dialog::AgentChanges;
     }
 
     pub fn load_conflicts(&mut self) {
@@ -2009,6 +2219,656 @@ impl App {
         });
     }
 
+    // -- editor -------------------------------------------------------------
+
+    /// Opens `path` in the editor, or focuses it if already open, and
+    /// optionally reveals a line.
+    ///
+    /// A file already open is never re-read from disk: doing so would throw
+    /// away unsaved edits every time a diagnostic or a search result pointed
+    /// at it.
+    pub fn editor_open(&mut self, path: &std::path::Path, reveal: Option<u32>) {
+        self.tab = Tab::Editor;
+        // Canonicalize first: the same file reached through a symlink or a
+        // relative path would otherwise open as a second buffer, and the two
+        // would overwrite each other on save.
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let path = canonical.as_path();
+        if let Some(index) = self.editor.index_of(path) {
+            self.editor.active = Some(index);
+            if let Some(file) = self.editor.files.get_mut(index) {
+                file.reveal = reveal;
+            }
+            return;
+        }
+
+        let text = match std::fs::read(path) {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(text) => text,
+                Err(_) => {
+                    self.toast(format!("{} is not a text file.", path.display()), true);
+                    return;
+                }
+            },
+            Err(e) => {
+                self.toast(format!("{}: {e}", path.display()), true);
+                return;
+            }
+        };
+
+        let rel = self
+            .repo
+            .as_ref()
+            .and_then(|r| path.strip_prefix(r.path()).ok())
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        let read_only = text.len() > editor::MAX_EDITABLE_BYTES;
+        if read_only {
+            self.toast(
+                format!("{rel} is large; opened read-only.",),
+                false,
+            );
+        }
+        self.editor.files.push(editor::OpenFile {
+            path: path.to_path_buf(),
+            rel,
+            lang: syntax::Lang::from_path(&path.display().to_string()),
+            saved: text.clone(),
+            text,
+            symbols: Vec::new(),
+            cursor: 0,
+            reveal,
+            dirty_since: None,
+            synced: false,
+            read_only,
+        });
+        self.editor.active = Some(self.editor.files.len() - 1);
+        self.editor.completion.close();
+        self.lsp_open(path);
+    }
+
+    /// Opens the file finder, loading the tracked file list the first time.
+    pub fn editor_quick_open(&mut self) {
+        self.tab = Tab::Editor;
+        self.editor.quick_open.open = true;
+        self.editor.quick_open.selected = 0;
+        if !self.editor.quick_open.files.is_empty() || self.editor.quick_open.loading {
+            return;
+        }
+        let Some(repo) = self.repo.clone() else { return };
+        self.editor.quick_open.loading = true;
+        self.worker
+            .spawn(move || Msg::TrackedFiles(repo.tracked_files().unwrap_or_default()));
+    }
+
+    /// Closes a buffer, warning rather than discarding unsaved work.
+    pub fn editor_close(&mut self, index: usize) {
+        let Some(file) = self.editor.files.get(index) else { return };
+        if file.is_dirty() {
+            self.toast(
+                format!("{} has unsaved changes. Save it first (Ctrl+S).", file.rel),
+                true,
+            );
+            return;
+        }
+        let path = file.path.clone();
+        self.editor.files.remove(index);
+        self.editor.active = match self.editor.active {
+            Some(active) if active == index => {
+                (!self.editor.files.is_empty()).then(|| index.min(self.editor.files.len() - 1))
+            }
+            Some(active) if active > index => Some(active - 1),
+            other => other,
+        };
+        self.editor.completion.close();
+
+        let lsp = self.lsp.clone();
+        self.worker.spawn(move || {
+            if let Some(client) = lsp.running_for(&path) {
+                let _ = client.did_close(&path);
+            }
+            Msg::Noop
+        });
+    }
+
+    /// Writes the active buffer to disk.
+    ///
+    /// With format-on-save enabled this formats first and saves the result,
+    /// so what lands on disk is what the language server would produce.
+    pub fn editor_save(&mut self) {
+        let Some(file) = self.editor.active_file() else { return };
+        if self.editor.format_on_save {
+            let path = file.path.clone();
+            let text = file.text.clone();
+            self.lsp_format(&path, &text, true);
+            return;
+        }
+        self.editor_write_active();
+    }
+
+    /// The write half of saving, after any formatting.
+    fn editor_write_active(&mut self) {
+        let Some(file) = self.editor.active_file() else { return };
+        let (path, text, rel) = (file.path.clone(), file.text.clone(), file.rel.clone());
+        if let Err(e) = std::fs::write(&path, &text) {
+            self.toast(format!("{rel}: {e}"), true);
+            return;
+        }
+        if let Some(file) = self.editor.file_mut(&path) {
+            file.saved = text.clone();
+            file.dirty_since = None;
+        }
+        self.toast(format!("Saved {rel}"), false);
+        // The file changed on disk, so the rest of the app should notice.
+        self.refresh();
+
+        let lsp = self.lsp.clone();
+        let progress = self.worker.progress();
+        self.worker.spawn(move || {
+            if let Some(client) = lsp.running_for(&path) {
+                let _ = client.did_change(&path, &text);
+                let _ = client.did_save(&path, &text);
+                // Symbols move around on save; refresh the outline with them.
+                if let Ok(symbols) = client.document_symbols(&path) {
+                    progress.send(Msg::Lsp(LspReply::Symbols { path, symbols }));
+                }
+            }
+            Msg::Noop
+        });
+    }
+
+    /// Formats the active buffer through the language server.
+    pub fn editor_format(&mut self) {
+        let Some(file) = self.editor.active_file() else { return };
+        let (path, text) = (file.path.clone(), file.text.clone());
+        self.lsp_format(&path, &text, false);
+    }
+
+    /// Replaces a buffer's text, keeping the caret from jumping to the top.
+    fn editor_replace_text(&mut self, path: &std::path::Path, text: String) {
+        let Some(file) = self.editor.file_mut(path) else { return };
+        if file.text == text {
+            return;
+        }
+        file.cursor = file.cursor.min(text.len());
+        file.text = text;
+        file.dirty_since = Some(std::time::Instant::now());
+    }
+
+    // -- language server ------------------------------------------------------
+
+    /// Hands a file to its language server, starting the server if needed.
+    pub fn lsp_open(&mut self, path: &std::path::Path) {
+        let Some(file) = self.editor.file_mut(path) else { return };
+        if file.synced {
+            return;
+        }
+        file.synced = true;
+        let (path, text) = (file.path.clone(), file.text.clone());
+        let lsp = self.lsp.clone();
+        let progress = self.worker.progress();
+        self.editor.busy += 1;
+        self.worker.spawn(move || {
+            let reply = match lsp.ensure_for(&path) {
+                Ok(client) => {
+                    let error = client.did_open(&path, &text).err();
+                    if error.is_none() {
+                        if let Ok(symbols) = client.document_symbols(&path) {
+                            progress.send(Msg::Lsp(LspReply::Symbols {
+                                path: path.clone(),
+                                symbols,
+                            }));
+                        }
+                    }
+                    LspReply::Opened {
+                        path,
+                        server: client.spec().name.clone(),
+                        error,
+                    }
+                }
+                Err(e) => LspReply::Opened { path, server: String::new(), error: Some(e) },
+            };
+            Msg::Lsp(reply)
+        });
+    }
+
+    /// Sends the buffer's current text to the server.
+    pub fn lsp_sync(&mut self, path: &std::path::Path) {
+        let Some(file) = self.editor.file_mut(path) else { return };
+        let (path, text) = (file.path.clone(), file.text.clone());
+        let lsp = self.lsp.clone();
+        self.worker.spawn(move || {
+            if let Some(client) = lsp.running_for(&path) {
+                let _ = client.did_change(&path, &text);
+            }
+            Msg::Noop
+        });
+    }
+
+    pub fn lsp_hover(&mut self, path: &std::path::Path, position: crate::lsp::protocol::Position) {
+        let path = path.to_path_buf();
+        let lsp = self.lsp.clone();
+        self.worker.spawn(move || {
+            let Some(client) = lsp.running_for(&path) else {
+                return Msg::Lsp(LspReply::Hover { path, text: None });
+            };
+            match client.hover(&path, position) {
+                Ok(text) => Msg::Lsp(LspReply::Hover { path, text }),
+                // A failed hover is not worth a toast: it happens constantly
+                // while a server is still indexing.
+                Err(_) => Msg::Lsp(LspReply::Hover { path, text: None }),
+            }
+        });
+    }
+
+    pub fn lsp_definition(
+        &mut self,
+        path: &std::path::Path,
+        position: crate::lsp::protocol::Position,
+    ) {
+        let path = path.to_path_buf();
+        let lsp = self.lsp.clone();
+        self.editor.busy += 1;
+        self.worker.spawn(move || {
+            let Some(client) = lsp.running_for(&path) else {
+                return Msg::Lsp(LspReply::Failed("no language server for this file".into()));
+            };
+            match client.definition(&path, position) {
+                Ok(locations) => Msg::Lsp(LspReply::Definition(locations)),
+                Err(e) => Msg::Lsp(LspReply::Failed(e)),
+            }
+        });
+    }
+
+    pub fn lsp_references(
+        &mut self,
+        path: &std::path::Path,
+        position: crate::lsp::protocol::Position,
+    ) {
+        let path = path.to_path_buf();
+        let lsp = self.lsp.clone();
+        self.editor.busy += 1;
+        self.worker.spawn(move || {
+            let Some(client) = lsp.running_for(&path) else {
+                return Msg::Lsp(LspReply::Failed("no language server for this file".into()));
+            };
+            match client.references(&path, position) {
+                Ok(locations) => Msg::Lsp(LspReply::References(locations)),
+                Err(e) => Msg::Lsp(LspReply::Failed(e)),
+            }
+        });
+    }
+
+    pub fn lsp_symbols(&mut self, path: &std::path::Path) {
+        let path = path.to_path_buf();
+        let lsp = self.lsp.clone();
+        self.worker.spawn(move || {
+            let Some(client) = lsp.running_for(&path) else { return Msg::Noop };
+            match client.document_symbols(&path) {
+                Ok(symbols) => Msg::Lsp(LspReply::Symbols { path, symbols }),
+                Err(_) => Msg::Noop,
+            }
+        });
+    }
+
+    pub fn lsp_completion(
+        &mut self,
+        path: &std::path::Path,
+        position: crate::lsp::protocol::Position,
+        anchor: usize,
+    ) {
+        let path = path.to_path_buf();
+        let lsp = self.lsp.clone();
+        self.editor.completion.requesting = true;
+        self.worker.spawn(move || {
+            let Some(client) = lsp.running_for(&path) else {
+                return Msg::Lsp(LspReply::Failed("no language server for this file".into()));
+            };
+            match client.completion(&path, position) {
+                Ok(items) => Msg::Lsp(LspReply::Completion { path, items, anchor }),
+                Err(e) => Msg::Lsp(LspReply::Failed(e)),
+            }
+        });
+    }
+
+    /// Formats a buffer. `save` continues into a write once the formatted
+    /// text comes back.
+    fn lsp_format(&mut self, path: &std::path::Path, text: &str, save: bool) {
+        let (path, text) = (path.to_path_buf(), text.to_string());
+        let lsp = self.lsp.clone();
+        self.editor.busy += 1;
+        self.worker.spawn(move || {
+            let Some(client) = lsp.running_for(&path) else {
+                return Msg::Lsp(LspReply::Formatted { path, text, save });
+            };
+            // Format the text the buffer actually has, not what the server
+            // last heard about.
+            let _ = client.did_change(&path, &text);
+            match client.format(&path, &text, 4) {
+                Ok(Some(formatted)) => {
+                    Msg::Lsp(LspReply::Formatted { path, text: formatted, save })
+                }
+                // No edits, or no formatter: saving still has to happen.
+                Ok(None) => Msg::Lsp(LspReply::Formatted { path, text, save }),
+                // Never let a formatter failure lose a save: write what the
+                // buffer has rather than reporting and dropping it.
+                Err(_) if save => Msg::Lsp(LspReply::Formatted { path, text, save }),
+                Err(e) => Msg::Lsp(LspReply::Failed(e)),
+            }
+        });
+    }
+
+    /// Asks for a workspace-wide rename. The edits come back as a proposal:
+    /// nothing is written until the user accepts them.
+    pub fn lsp_rename(
+        &mut self,
+        path: &std::path::Path,
+        position: crate::lsp::protocol::Position,
+        new_name: &str,
+    ) {
+        let (path, new_name) = (path.to_path_buf(), new_name.to_string());
+        let lsp = self.lsp.clone();
+        self.editor.busy += 1;
+        self.worker.spawn(move || {
+            let Some(client) = lsp.running_for(&path) else {
+                return Msg::Lsp(LspReply::Failed("no language server for this file".into()));
+            };
+            match client.rename(&path, position, &new_name) {
+                Ok(edits) => Msg::Lsp(LspReply::Renamed { new_name, edits }),
+                Err(e) => Msg::Lsp(LspReply::Failed(e)),
+            }
+        });
+    }
+
+    /// Stops every language server. They start again on the next file that
+    /// needs one, which is how a wedged server gets fixed.
+    pub fn lsp_restart(&mut self) {
+        let lsp = self.lsp.clone();
+        for file in &mut self.editor.files {
+            file.synced = false;
+        }
+        let paths: Vec<std::path::PathBuf> =
+            self.editor.files.iter().map(|f| f.path.clone()).collect();
+        let texts: Vec<String> = self.editor.files.iter().map(|f| f.text.clone()).collect();
+        self.toast("Restarting language servers…", false);
+        self.worker.spawn(move || {
+            lsp.shutdown_all();
+            lsp.forget_failures();
+            for (path, text) in paths.iter().zip(texts) {
+                if let Ok(client) = lsp.ensure_for(path) {
+                    let _ = client.did_open(path, &text);
+                }
+            }
+            Msg::Done { message: Ok("Language servers restarted.".into()), refresh: false }
+        });
+    }
+
+    // -- coding agent ---------------------------------------------------------
+
+    /// Starts a coding run on the task in the agent tab.
+    ///
+    /// What the model can do is decided here, not by the model: read and
+    /// edit always; the language server when one is available; the
+    /// repository's own checks only in "let it iterate" mode, where its
+    /// edits are on disk for those checks to actually test.
+    pub fn start_coding_agent(&mut self) {
+        let Some(repo) = self.repo.clone() else { return };
+        if self.coding.running {
+            return;
+        }
+        let task = self.coding.task.trim().to_string();
+        if task.is_empty() {
+            return;
+        }
+        let Some(sel) = self.ai_selection(worker::AiTarget::Coding) else {
+            self.toast("No AI model selected. Pick one next to the task box.", true);
+            return;
+        };
+
+        let live = self.coding.iterate;
+        let history = self.coding.turns();
+        let branch = self.status.as_ref().map(|s| s.branch.clone());
+        let instructions = self.coding_instructions();
+        // Only the checks this repository already declares, and only when
+        // there is something on disk for them to check.
+        let checks = if live { self.local_ci.jobs.clone() } else { Vec::new() };
+        let url = self.effective_ollama_url();
+        let lsp = self.lsp.clone();
+
+        self.coding.running = true;
+        self.coding.log.clear();
+        self.coding.summary.clear();
+        self.coding.error = None;
+        self.coding.edits.clear();
+        self.coding.selected = None;
+        self.coding.truncated = false;
+        self.coding.live = live;
+        self.tab = Tab::Agent;
+
+        let progress = self.worker.progress();
+        let run_task = task.clone();
+        self.worker.spawn(move || {
+            let result = (|| -> Result<AgentReport, String> {
+                let provider = agent_provider(&sel, &url)?;
+                let tracked = strerr(repo.tracked_files())?;
+                let mut workspace = crate::agent::Workspace::new(
+                    repo.path(),
+                    tracked,
+                    crate::agent::Access::ReadWrite,
+                )?
+                .with_language_support(lsp)
+                .with_write_mode(if live {
+                    crate::agent::WriteMode::Live
+                } else {
+                    crate::agent::WriteMode::Overlay
+                })
+                .with_checks(checks);
+
+                let run = crate::agent::coding::run(
+                    provider.as_ref(),
+                    &mut workspace,
+                    crate::agent::coding::Request {
+                        task: &run_task,
+                        history: &history,
+                        branch: branch.as_deref(),
+                        instructions: instructions.as_deref(),
+                        limits: crate::agent::coding::limits(),
+                    },
+                    &mut |event| {
+                        progress.send(Msg::AgentEvent {
+                            kind: AgentKind::Coding,
+                            line: event.line(),
+                        })
+                    },
+                )?;
+                Ok(AgentReport {
+                    summary: run.text,
+                    edits: run.edits,
+                    truncated: run.truncated,
+                })
+            })();
+            Msg::AgentDone { kind: AgentKind::Coding, result }
+        });
+    }
+
+    /// Guidance for the coding agent: the repository's own review
+    /// instructions, which is where a project already writes down how its
+    /// code is supposed to look.
+    fn coding_instructions(&self) -> Option<String> {
+        let repo = self.repo.as_ref()?;
+        let cfg = self.review.config.resolve_files(repo.path()).ok()?;
+        cfg.instructions
+    }
+
+    /// Files the run changed, ready for review.
+    fn finish_coding_run(&mut self, result: Result<AgentReport, String>) {
+        self.coding.running = false;
+        let task = std::mem::take(&mut self.coding.task);
+        match result {
+            Ok(report) => {
+                self.coding.truncated = report.truncated;
+                self.coding.summary = report.summary.clone();
+                self.coding.edits = report
+                    .edits
+                    .into_iter()
+                    .map(|edit| ProposedEdit {
+                        edit,
+                        // In live mode the change is already on disk, so the
+                        // tick means "revert this one" and starts clear.
+                        accepted: false,
+                        applied: false,
+                        unresolved: false,
+                    })
+                    .collect();
+                self.coding.selected = (!self.coding.edits.is_empty()).then_some(0);
+                self.coding.history.push(agent_tab::Exchange {
+                    task,
+                    summary: report.summary,
+                    changed: self.coding.edits.len(),
+                });
+                // A live run already changed the working tree.
+                if self.coding.live {
+                    self.refresh();
+                }
+            }
+            Err(e) => {
+                // Keep the task so it can be retried or edited.
+                self.coding.task = task;
+                self.coding.error = Some(e.clone());
+                self.toast(e, true);
+            }
+        }
+    }
+
+    /// Writes the proposals the user ticked (overlay mode).
+    pub fn apply_coding_edits(&mut self) {
+        let Some(repo) = self.repo.clone() else { return };
+        let root = repo.path().to_path_buf();
+        let mut applied = 0usize;
+        let mut errors = Vec::new();
+        for proposed in &mut self.coding.edits {
+            if !proposed.accepted || proposed.applied {
+                continue;
+            }
+            match write_worktree_file(&root, &proposed.edit.path, &proposed.edit.after) {
+                Ok(()) => {
+                    proposed.applied = true;
+                    proposed.accepted = false;
+                    applied += 1;
+                }
+                Err(e) => errors.push(format!("{}: {e}", proposed.edit.path)),
+            }
+        }
+        if errors.is_empty() {
+            self.toast(format!("Applied {applied} change(s)."), false);
+        } else {
+            self.toast(format!("Applied {applied}; failed: {}", errors.join("; ")), true);
+        }
+        self.reload_changed_buffers();
+        self.refresh();
+    }
+
+    /// Restores the ticked files to what they were before the run (live
+    /// mode). A file the run created is deleted.
+    pub fn revert_coding_edits(&mut self) {
+        let Some(repo) = self.repo.clone() else { return };
+        let root = repo.path().to_path_buf();
+        let mut reverted = 0usize;
+        let mut errors = Vec::new();
+        let mut done: Vec<String> = Vec::new();
+
+        for proposed in &mut self.coding.edits {
+            if !proposed.accepted || proposed.applied {
+                continue;
+            }
+            let path = root.join(&proposed.edit.path);
+            let result = match &proposed.edit.before {
+                Some(before) => std::fs::write(&path, before).map_err(|e| e.to_string()),
+                None => std::fs::remove_file(&path).map_err(|e| e.to_string()),
+            };
+            match result {
+                Ok(()) => {
+                    reverted += 1;
+                    done.push(proposed.edit.path.clone());
+                }
+                Err(e) => errors.push(format!("{}: {e}", proposed.edit.path)),
+            }
+        }
+        // A reverted change is gone, not "applied": drop it from the list.
+        self.coding.edits.retain(|e| !done.contains(&e.edit.path));
+        self.coding.selected = (!self.coding.edits.is_empty()).then_some(0);
+
+        if errors.is_empty() {
+            self.toast(format!("Reverted {reverted} file(s)."), false);
+        } else {
+            self.toast(format!("Reverted {reverted}; failed: {}", errors.join("; ")), true);
+        }
+        self.reload_changed_buffers();
+        self.refresh();
+    }
+
+    /// Accepts every remaining live change and clears the review list.
+    pub fn keep_coding_edits(&mut self) {
+        let kept = self.coding.edits.iter().filter(|e| !e.applied).count();
+        for proposed in &mut self.coding.edits {
+            proposed.applied = true;
+            proposed.accepted = false;
+        }
+        self.toast(format!("Kept {kept} change(s)."), false);
+        self.reload_changed_buffers();
+        self.refresh();
+    }
+
+    /// Opens the selected proposal's file in the editor.
+    pub fn open_selected_coding_edit(&mut self) {
+        let Some(repo) = self.repo.clone() else { return };
+        let Some(edit) = self
+            .coding
+            .selected
+            .and_then(|i| self.coding.edits.get(i))
+            .map(|p| p.edit.path.clone())
+        else {
+            return;
+        };
+        self.editor_open(&repo.path().join(edit), None);
+    }
+
+    /// Re-reads open buffers whose file changed underneath them.
+    ///
+    /// The agent writes files the editor may have open. A buffer showing
+    /// stale text would overwrite the agent's work the next time it is
+    /// saved, so clean buffers are refreshed; dirty ones are left alone and
+    /// reported, because the user's unsaved edits are not ours to discard.
+    fn reload_changed_buffers(&mut self) {
+        let mut conflicted = Vec::new();
+        for file in &mut self.editor.files {
+            let Ok(disk) = std::fs::read_to_string(&file.path) else { continue };
+            if disk == file.text {
+                file.saved = disk;
+                continue;
+            }
+            if file.is_dirty() {
+                conflicted.push(file.rel.clone());
+                continue;
+            }
+            file.text = disk.clone();
+            file.saved = disk;
+            file.cursor = 0;
+            file.dirty_since = Some(std::time::Instant::now());
+        }
+        if !conflicted.is_empty() {
+            self.toast(
+                format!(
+                    "Changed on disk while you had unsaved edits: {}. Your buffer was left \
+                     as it is.",
+                    conflicted.join(", ")
+                ),
+                true,
+            );
+        }
+    }
+
     /// Runs the conflict-resolution harness across every conflicted file.
     ///
     /// Unlike [`Self::ai_resolve_conflict`], which shows one file's three
@@ -2070,7 +2930,12 @@ impl App {
                     &files,
                     custom.as_deref(),
                     crate::agent::conflict::limits(),
-                    &mut |event| progress.send(Msg::AgentEvent(event.line())),
+                    &mut |event| {
+                        progress.send(Msg::AgentEvent {
+                            kind: AgentKind::Conflict,
+                            line: event.line(),
+                        })
+                    },
                 )?;
                 Ok(AgentReport {
                     summary: run.text,
@@ -2078,7 +2943,7 @@ impl App {
                     truncated: run.truncated,
                 })
             })();
-            Msg::AgentDone(result)
+            Msg::AgentDone { kind: AgentKind::Conflict, result }
         });
     }
 
@@ -2182,7 +3047,9 @@ impl App {
                 worker::AiTarget::PullRequest => self.generate_pr_text(),
                 // The harness tasks write no text field, so nothing can be
                 // overwritten and this gate never fires for them.
-                worker::AiTarget::Conflict | worker::AiTarget::Review => {}
+                worker::AiTarget::Conflict
+                | worker::AiTarget::Review
+                | worker::AiTarget::Coding => {}
             }
             return;
         }
@@ -2350,6 +3217,7 @@ impl App {
                     self.tab = if self.tab == Tab::Changes { Tab::History } else { Tab::Changes };
                     self.refresh();
                 }
+                Action::QuickOpen => self.editor_quick_open(),
             }
         }
         if escape && self.dialog != Dialog::None {
@@ -2442,6 +3310,14 @@ impl eframe::App for App {
     }
 }
 
+/// A repaint callback for background threads that change state nobody
+/// asked for — diagnostics arriving, indexing progress — so the UI wakes up
+/// and shows them.
+fn repaint_handle(ctx: &egui::Context) -> std::sync::Arc<dyn Fn() + Send + Sync> {
+    let ctx = ctx.clone();
+    std::sync::Arc::new(move || ctx.request_repaint())
+}
+
 /// Builds the harness provider for a task's provider/model selection, the
 /// same pair the model picker writes.
 pub fn agent_provider(
@@ -2515,4 +3391,320 @@ fn review_single_shot(
 fn lacks_tool_support(error: &str) -> bool {
     let e = error.to_lowercase();
     e.contains("cannot call tools") || e.contains("does not support tools")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    /// A repository with one file, and an app pointed at it.
+    fn app_with_repo() -> (tempfile::TempDir, App, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "t@t.io"],
+            vec!["config", "user.name", "T"],
+        ] {
+            let out = Command::new("git").args(&args).current_dir(tmp.path()).output().unwrap();
+            assert!(out.status.success());
+        }
+        // .txt so no language server is ever started by these tests.
+        let file = tmp.path().join("notes.txt");
+        std::fs::write(&file, "one\ntwo\nthree\n").unwrap();
+
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx);
+        app.repo = Some(crate::git::Repo::open(tmp.path()).unwrap());
+        (tmp, app, file)
+    }
+
+    #[test]
+    fn opening_a_file_twice_focuses_it_rather_than_rereading_disk() {
+        let (_tmp, mut app, file) = app_with_repo();
+        app.editor_open(&file, None);
+        assert_eq!(app.editor.files.len(), 1);
+        assert_eq!(app.tab, Tab::Editor);
+        assert_eq!(app.editor.files[0].rel, "notes.txt");
+
+        // An unsaved edit must survive the file being "opened" again, which
+        // is what a diagnostic or a search result does.
+        app.editor.files[0].text.push_str("edited\n");
+        app.editor_open(&file, Some(2));
+        assert_eq!(app.editor.files.len(), 1);
+        assert!(app.editor.files[0].text.ends_with("edited\n"));
+        assert_eq!(app.editor.files[0].reveal, Some(2));
+    }
+
+    #[test]
+    fn closing_refuses_to_discard_unsaved_work() {
+        let (_tmp, mut app, file) = app_with_repo();
+        app.editor_open(&file, None);
+        app.editor.files[0].text = "changed\n".into();
+        app.editor_close(0);
+        assert_eq!(app.editor.files.len(), 1, "a dirty buffer must not close silently");
+
+        app.editor.files[0].saved = app.editor.files[0].text.clone();
+        app.editor_close(0);
+        assert!(app.editor.files.is_empty());
+        assert_eq!(app.editor.active, None);
+    }
+
+    #[test]
+    fn saving_writes_the_buffer_and_clears_the_dirty_marker() {
+        let (_tmp, mut app, file) = app_with_repo();
+        app.editor_open(&file, None);
+        app.editor.files[0].text = "rewritten\n".into();
+        assert!(app.editor.files[0].is_dirty());
+
+        app.editor_save();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "rewritten\n");
+        assert!(!app.editor.files[0].is_dirty());
+    }
+
+    #[test]
+    fn closing_the_active_tab_activates_a_neighbour() {
+        let (tmp, mut app, first) = app_with_repo();
+        let second = tmp.path().join("other.txt");
+        std::fs::write(&second, "x\n").unwrap();
+        app.editor_open(&first, None);
+        app.editor_open(&second, None);
+        assert_eq!(app.editor.active, Some(1));
+
+        app.editor_close(1);
+        assert_eq!(app.editor.active, Some(0));
+        app.editor_close(0);
+        assert_eq!(app.editor.active, None);
+    }
+
+    #[test]
+    fn a_rename_becomes_a_proposal_instead_of_writing_files() {
+        use crate::lsp::protocol::{Position, Range, TextEdit};
+        let (_tmp, mut app, file) = app_with_repo();
+        let edits = vec![(
+            file.clone(),
+            vec![TextEdit {
+                range: Range {
+                    start: Position::new(0, 0),
+                    end: Position::new(0, 3),
+                },
+                new_text: "ONE".into(),
+            }],
+        )];
+        app.stage_rename_proposal("ONE", edits);
+
+        assert_eq!(app.dialog, Dialog::AgentChanges);
+        assert_eq!(app.agent.edits.len(), 1);
+        assert_eq!(app.agent.edits[0].edit.path, "notes.txt");
+        assert!(app.agent.edits[0].edit.after.starts_with("ONE\n"));
+        assert!(!app.agent.edits[0].accepted, "nothing is pre-accepted");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "one\ntwo\nthree\n",
+            "the file itself must be untouched until the user applies it"
+        );
+    }
+
+    #[test]
+    fn a_rename_uses_the_open_buffer_rather_than_stale_disk_contents() {
+        use crate::lsp::protocol::{Position, Range, TextEdit};
+        let (_tmp, mut app, file) = app_with_repo();
+        app.editor_open(&file, None);
+        app.editor.files[0].text = "ONE\ntwo\nthree\n".into();
+
+        let edits = vec![(
+            file,
+            vec![TextEdit {
+                range: Range {
+                    start: Position::new(1, 0),
+                    end: Position::new(1, 3),
+                },
+                new_text: "TWO".into(),
+            }],
+        )];
+        app.stage_rename_proposal("TWO", edits);
+        assert_eq!(app.agent.edits[0].edit.after, "ONE\nTWO\nthree\n");
+    }
+
+    /// Renders the editor tab for real, which is the only way to catch a
+    /// panic in the layouter, the gutter, or an id clash.
+    #[test]
+    fn the_editor_tab_renders_without_panicking() {
+        let (_tmp, mut app, file) = app_with_repo();
+        app.editor_open(&file, None);
+        app.editor.files[0].symbols = vec![crate::lsp::protocol::Symbol {
+            name: "section".into(),
+            kind: 12,
+            range: Default::default(),
+            depth: 0,
+            detail: None,
+        }];
+        app.editor.outline_open = true;
+        app.editor.completion.open = true;
+        app.editor.completion.items = vec![crate::lsp::protocol::CompletionItem {
+            label: "candidate".into(),
+            detail: Some("fn()".into()),
+            insert: "candidate".into(),
+            range: None,
+            sort_text: None,
+            kind: Some(3),
+        }];
+
+        egui::__run_test_ctx(|ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                editor::editor_tab(&mut app, ui);
+            });
+        });
+    }
+
+    /// The agent tab renders in every state it can be in.
+    #[test]
+    fn the_agent_tab_renders_without_panicking() {
+        let (_tmp, mut app, _file) = app_with_repo();
+        app.coding.task = "add a flag".into();
+        app.coding.log = vec!["· read src/main.rs".into()];
+        app.coding.summary = "- did the thing".into();
+        app.coding.history.push(agent_tab::Exchange {
+            task: "earlier task".into(),
+            summary: "earlier summary".into(),
+            changed: 1,
+        });
+        app.coding.edits = vec![ProposedEdit {
+            edit: crate::agent::PendingEdit {
+                path: "notes.txt".into(),
+                before: Some("one\n".into()),
+                after: "ONE\n".into(),
+            },
+            accepted: true,
+            applied: false,
+            unresolved: false,
+        }];
+        app.coding.selected = Some(0);
+
+        for live in [false, true] {
+            app.coding.live = live;
+            egui::__run_test_ctx(|ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    agent_tab::agent_tab(&mut app, ui);
+                });
+            });
+        }
+    }
+
+    #[test]
+    fn applying_a_coding_proposal_writes_only_the_ticked_files() {
+        let (tmp, mut app, file) = app_with_repo();
+        let other = tmp.path().join("skip.txt");
+        std::fs::write(&other, "keep\n").unwrap();
+        app.coding.live = false;
+        app.coding.edits = vec![
+            ProposedEdit {
+                edit: crate::agent::PendingEdit {
+                    path: "notes.txt".into(),
+                    before: Some("one\n".into()),
+                    after: "ONE\n".into(),
+                },
+                accepted: true,
+                applied: false,
+                unresolved: false,
+            },
+            ProposedEdit {
+                edit: crate::agent::PendingEdit {
+                    path: "skip.txt".into(),
+                    before: Some("keep\n".into()),
+                    after: "CHANGED\n".into(),
+                },
+                accepted: false,
+                applied: false,
+                unresolved: false,
+            },
+        ];
+
+        app.apply_coding_edits();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "ONE\n");
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "keep\n");
+        assert!(app.coding.edits[0].applied);
+        assert!(!app.coding.edits[1].applied);
+    }
+
+    #[test]
+    fn reverting_a_live_change_restores_the_original_and_deletes_new_files() {
+        let (tmp, mut app, file) = app_with_repo();
+        // A live run has already written both of these.
+        std::fs::write(&file, "AGENT\n").unwrap();
+        let created = tmp.path().join("created.txt");
+        std::fs::write(&created, "new file\n").unwrap();
+
+        app.coding.live = true;
+        app.coding.edits = vec![
+            ProposedEdit {
+                edit: crate::agent::PendingEdit {
+                    path: "notes.txt".into(),
+                    before: Some("one\ntwo\nthree\n".into()),
+                    after: "AGENT\n".into(),
+                },
+                accepted: true,
+                applied: false,
+                unresolved: false,
+            },
+            ProposedEdit {
+                edit: crate::agent::PendingEdit {
+                    path: "created.txt".into(),
+                    before: None,
+                    after: "new file\n".into(),
+                },
+                accepted: true,
+                applied: false,
+                unresolved: false,
+            },
+        ];
+
+        app.revert_coding_edits();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\ntwo\nthree\n");
+        assert!(!created.exists(), "a file the run created must not survive a revert");
+        assert!(app.coding.edits.is_empty(), "reverted changes leave the review list");
+    }
+
+    #[test]
+    fn a_clean_buffer_follows_the_file_but_a_dirty_one_is_left_alone() {
+        let (tmp, mut app, file) = app_with_repo();
+        let second = tmp.path().join("second.txt");
+        std::fs::write(&second, "before\n").unwrap();
+        app.editor_open(&file, None);
+        app.editor_open(&second, None);
+
+        // The user is mid-edit in the second buffer.
+        app.editor.files[1].text = "my unsaved work\n".into();
+
+        // The agent rewrites both files underneath the editor.
+        std::fs::write(&file, "agent wrote this\n").unwrap();
+        std::fs::write(&second, "agent wrote this too\n").unwrap();
+        app.reload_changed_buffers();
+
+        assert_eq!(app.editor.files[0].text, "agent wrote this\n");
+        assert!(!app.editor.files[0].is_dirty());
+        assert_eq!(
+            app.editor.files[1].text, "my unsaved work\n",
+            "unsaved edits must never be overwritten"
+        );
+    }
+
+    /// The same, with no repository and no open files: the empty states.
+    #[test]
+    fn the_editor_tab_renders_when_there_is_nothing_to_show() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx);
+        egui::__run_test_ctx(|ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                editor::editor_tab(&mut app, ui);
+            });
+        });
+
+        let (_tmp, mut app, _file) = app_with_repo();
+        egui::__run_test_ctx(|ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                editor::editor_tab(&mut app, ui);
+            });
+        });
+    }
 }

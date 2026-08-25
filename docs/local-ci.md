@@ -593,6 +593,17 @@ right files deserves more weight than one from a reviewer that never looked.
 the review falls back to diff-only automatically and says so in the reading
 list rather than failing. Claude models all support it.
 
+### The checks the coding agent can run
+
+The jobs you declare here are also the only commands the
+[coding agent](editor-and-agent.md#the-coding-agent) can run. In "let it
+iterate" mode it may call `run_check` with a job's **name**, so it can prove
+a change builds before reporting it as done — and it cannot run anything you
+have not already written down.
+
+A repository with no `[[job]]` blocks gives the agent no way to execute
+anything at all.
+
 ## Docker environments
 
 Add `image = "..."` to run a job inside a container:

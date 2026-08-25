@@ -43,7 +43,7 @@ pub struct CiError(pub String);
 pub type Result<T> = std::result::Result<T, CiError>;
 
 /// One configured check.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct Job {
     pub name: String,
     /// Shell commands, run in order; the job fails on the first non-zero exit.

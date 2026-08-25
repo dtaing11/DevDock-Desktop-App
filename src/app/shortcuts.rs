@@ -14,6 +14,8 @@ pub enum Action {
     Pull,
     RepoPicker,
     ToggleHistory,
+    /// Open the editor's file finder.
+    QuickOpen,
 }
 
 impl Action {
@@ -25,6 +27,7 @@ impl Action {
         Action::Pull,
         Action::RepoPicker,
         Action::ToggleHistory,
+        Action::QuickOpen,
     ];
 
     /// Human-readable label for Settings.
@@ -36,6 +39,7 @@ impl Action {
             Action::Pull => "Pull",
             Action::RepoPicker => "Open repository picker",
             Action::ToggleHistory => "Toggle Changes/History tab",
+            Action::QuickOpen => "Open a file in the editor",
         }
     }
 }
@@ -101,6 +105,14 @@ pub struct Shortcuts {
     pub pull: Binding,
     pub repo_picker: Binding,
     pub toggle_history: Binding,
+    /// Added after the first release: an older config file has no entry for
+    /// it, and a missing field must not invalidate the whole config.
+    #[serde(default = "default_quick_open")]
+    pub quick_open: Binding,
+}
+
+fn default_quick_open() -> Binding {
+    Binding::new(true, false, false, egui::Key::O)
 }
 
 impl Default for Shortcuts {
@@ -112,6 +124,7 @@ impl Default for Shortcuts {
             pull: Binding::new(true, true, false, egui::Key::P),
             repo_picker: Binding::new(true, false, false, egui::Key::K),
             toggle_history: Binding::new(true, false, false, egui::Key::H),
+            quick_open: default_quick_open(),
         }
     }
 }
@@ -125,6 +138,7 @@ impl Shortcuts {
             Action::Pull => self.pull,
             Action::RepoPicker => self.repo_picker,
             Action::ToggleHistory => self.toggle_history,
+            Action::QuickOpen => self.quick_open,
         }
     }
 
@@ -136,6 +150,7 @@ impl Shortcuts {
             Action::Pull => self.pull = binding,
             Action::RepoPicker => self.repo_picker = binding,
             Action::ToggleHistory => self.toggle_history = binding,
+            Action::QuickOpen => self.quick_open = binding,
         }
     }
 
@@ -185,6 +200,25 @@ pub fn capture(input: &egui::InputState) -> Option<Binding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A config written before a binding existed must still load: serde
+    /// fails the whole struct on a missing field, and `Config::load` falls
+    /// back to defaults for everything when that happens — silently
+    /// resetting every other setting the user has.
+    #[test]
+    fn an_older_config_without_the_newest_binding_still_loads() {
+        let json = r#"{
+            "commit": {"command": true, "shift": false, "alt": false, "key": "Enter"},
+            "refresh": {"command": true, "shift": false, "alt": false, "key": "R"},
+            "push": {"command": true, "shift": false, "alt": false, "key": "P"},
+            "pull": {"command": true, "shift": true, "alt": false, "key": "P"},
+            "repo_picker": {"command": true, "shift": false, "alt": false, "key": "K"},
+            "toggle_history": {"command": true, "shift": false, "alt": false, "key": "H"}
+        }"#;
+        let shortcuts: Shortcuts = serde_json::from_str(json).expect("old config must load");
+        assert_eq!(shortcuts.quick_open, default_quick_open());
+        assert_eq!(shortcuts.commit.key, egui::Key::Enter);
+    }
 
     #[test]
     fn defaults_have_no_conflicts() {

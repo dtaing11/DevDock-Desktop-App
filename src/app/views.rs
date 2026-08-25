@@ -976,6 +976,43 @@ pub fn sidebar(app: &mut App, ctx: &egui::Context) {
                     app.tab = Tab::History;
                     app.refresh();
                 }
+                // Problem count across every open buffer, so a broken file
+                // is visible from any tab.
+                let problems: usize = app
+                    .editor
+                    .files
+                    .iter()
+                    .map(|f| {
+                        app.lsp
+                            .diagnostics(&f.path)
+                            .iter()
+                            .filter(|d| {
+                                d.severity == crate::lsp::protocol::Severity::Error
+                            })
+                            .count()
+                    })
+                    .sum();
+                let dirty = app.editor.dirty_files().len();
+                let editor_label = match (dirty, problems) {
+                    (0, 0) => "Editor".to_string(),
+                    (0, p) => format!("Editor ({p})"),
+                    (d, 0) => format!("Editor ({d} unsaved)"),
+                    (d, p) => format!("Editor ({d} unsaved, {p})"),
+                };
+                if ui.selectable_label(app.tab == Tab::Editor, editor_label).clicked() {
+                    app.tab = Tab::Editor;
+                }
+                let agent_label = if app.coding.running {
+                    "Agent (working)".to_string()
+                } else {
+                    match app.coding.edits.iter().filter(|e| !e.applied).count() {
+                        0 => "Agent".to_string(),
+                        n => format!("Agent ({n} to review)"),
+                    }
+                };
+                if ui.selectable_label(app.tab == Tab::Agent, agent_label).clicked() {
+                    app.tab = Tab::Agent;
+                }
                 let checks_label = match (&app.local_ci.running, app.local_ci.history.first()) {
                     (true, _) => "Checks (running)".to_string(),
                     (false, Some(run)) if run.passed => "Checks (pass)".to_string(),
@@ -994,6 +1031,8 @@ pub fn sidebar(app: &mut App, ctx: &egui::Context) {
                 Tab::Changes => changes_tab(app, ui),
                 Tab::History => history_tab(app, ui),
                 Tab::Checks => checks_tab(app, ui),
+                Tab::Editor => super::editor::editor_tab(app, ui),
+                Tab::Agent => super::agent_tab::agent_tab(app, ui),
             }
         });
 }
@@ -1138,16 +1177,22 @@ fn changes_tab(app: &mut App, ui: &mut egui::Ui) {
                         .map(|o| format!("{o} → {}", file.path))
                         .unwrap_or_else(|| file.path.clone());
                     let display = elide_path(&full, max_chars);
-                    if ui
+                    let row = ui
                         .selectable_label(selected, RichText::new(display))
-                        .on_hover_text(&full)
-                        .clicked()
-                    {
+                        .on_hover_text(format!("{full}\n(double-click to edit)"));
+                    if row.clicked() {
                         if selected {
                             // Clicking the viewed file again deselects it.
                             clear_diff_view(app);
                         } else {
                             select_file(app, &file.path, file.staged && !file.unstaged);
+                        }
+                    }
+                    // Double-click opens the file in the editor, which is
+                    // what every file list in every IDE does.
+                    if row.double_clicked() {
+                        if let Some(repo) = app.repo.clone() {
+                            app.editor_open(&repo.path().join(&file.path), None);
                         }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1326,7 +1371,8 @@ pub fn ai_controls(
                 // Conflict resolution and review are started from their own
                 // panels; these controls only drive text generation.
                 crate::app::worker::AiTarget::Conflict
-                | crate::app::worker::AiTarget::Review => {}
+                | crate::app::worker::AiTarget::Review
+                | crate::app::worker::AiTarget::Coding => {}
             }
         }
         ai_model_picker(app, ui, target);

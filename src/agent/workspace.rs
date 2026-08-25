@@ -20,6 +20,26 @@
 use super::{ToolCall, ToolResult, ToolSpec};
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+/// Where proposed writes go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WriteMode {
+    /// Held in memory until the user accepts them. Nothing on disk changes,
+    /// which means nothing can compile or test them either.
+    #[default]
+    Overlay,
+    /// Written to the worktree as they are made, so the language server and
+    /// the project's own checks can see them.
+    ///
+    /// The pre-run content of every touched file is kept, so rejecting a
+    /// change restores it exactly. This is what "let it iterate" costs: the
+    /// working tree really does change while the model works, and the
+    /// confirmation at the end is a keep-or-revert rather than an
+    /// apply-or-discard.
+    Live,
+}
 
 /// What the model may do to the worktree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +113,15 @@ pub struct Workspace {
     originals: BTreeMap<String, Option<String>>,
     calls: usize,
     bytes_read: usize,
+    write_mode: WriteMode,
+    /// Language servers, when the task is allowed to consult them.
+    lsp: Option<Arc<crate::lsp::Manager>>,
+    /// Diagnostic epoch per file at the moment it was last written, so
+    /// `diagnostics` can wait for results about the new text.
+    epochs: BTreeMap<String, u64>,
+    /// The project's own checks, the only commands that may be run.
+    checks: Vec<crate::local_ci::Job>,
+    check_runs: usize,
 }
 
 impl Workspace {
@@ -116,7 +145,60 @@ impl Workspace {
             originals: BTreeMap::new(),
             calls: 0,
             bytes_read: 0,
+            write_mode: WriteMode::Overlay,
+            lsp: None,
+            epochs: BTreeMap::new(),
+            checks: Vec::new(),
+            check_runs: 0,
         })
+    }
+
+    /// Writes straight to the worktree instead of an overlay. Only for a run
+    /// that has to compile or test what it wrote — see [`WriteMode::Live`].
+    pub fn with_write_mode(mut self, mode: WriteMode) -> Self {
+        self.write_mode = mode;
+        self
+    }
+
+    /// Lets the model consult language servers: diagnostics, definitions,
+    /// references, and workspace symbols.
+    pub fn with_language_support(mut self, lsp: Arc<crate::lsp::Manager>) -> Self {
+        self.lsp = Some(lsp);
+        self
+    }
+
+    /// Allows running the project's own checks, and nothing else. The model
+    /// picks a job by name from what the repository already declares, so
+    /// there is no arbitrary command to inject into.
+    pub fn with_checks(mut self, checks: Vec<crate::local_ci::Job>) -> Self {
+        self.checks = checks;
+        self
+    }
+
+    pub fn write_mode(&self) -> WriteMode {
+        self.write_mode
+    }
+
+    /// Restores every file this run changed to its pre-run content. Used
+    /// when a live run is rejected wholesale.
+    pub fn revert_all(&self) -> Result<(), String> {
+        let mut failed = Vec::new();
+        for (rel, before) in &self.originals {
+            let full = self.root.join(rel);
+            let result = match before {
+                Some(text) => std::fs::write(&full, text).map_err(|e| e.to_string()),
+                // The file did not exist before this run.
+                None => std::fs::remove_file(&full).map_err(|e| e.to_string()),
+            };
+            if let Err(e) = result {
+                failed.push(format!("{rel}: {e}"));
+            }
+        }
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(failed.join("; "))
+        }
     }
 
     pub fn calls_used(&self) -> usize {
@@ -194,6 +276,88 @@ impl Workspace {
             },
         ];
 
+        if self.lsp.is_some() {
+            tools.push(ToolSpec {
+                name: "diagnostics",
+                description: "Ask the language server what is wrong with a file: compiler \
+                              errors, warnings, and lints, with line numbers. After changing \
+                              a file, call this to check your work before moving on. Omit \
+                              the path for every file the server has looked at.",
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Repo-relative path, or omit for everything."}
+                    }
+                }),
+            });
+            tools.push(ToolSpec {
+                name: "definition",
+                description: "Where a symbol is defined, from the language server. Give the \
+                              file and line you saw it on and the exact symbol text.",
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Repo-relative path."},
+                        "line": {"type": "integer", "description": "1-based line the symbol appears on."},
+                        "symbol": {"type": "string", "description": "The symbol's exact text on that line."}
+                    },
+                    "required": ["path", "line", "symbol"]
+                }),
+            });
+            tools.push(ToolSpec {
+                name: "references",
+                description: "Every use of a symbol, from the language server. This is how \
+                              you find what a signature change breaks — more reliable than \
+                              a text search, which cannot tell two same-named things apart.",
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Repo-relative path."},
+                        "line": {"type": "integer", "description": "1-based line the symbol appears on."},
+                        "symbol": {"type": "string", "description": "The symbol's exact text on that line."}
+                    },
+                    "required": ["path", "line", "symbol"]
+                }),
+            });
+            tools.push(ToolSpec {
+                name: "find_symbol",
+                description: "Search the whole workspace for a symbol by name, from the \
+                              language server. Use it to locate a definition when you do \
+                              not know which file it is in.",
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Symbol name or part of one."}
+                    },
+                    "required": ["query"]
+                }),
+            });
+        }
+
+        if !self.checks.is_empty() {
+            let names: Vec<&str> = self.checks.iter().map(|c| c.name.as_str()).collect();
+            tools.push(ToolSpec {
+                name: "run_check",
+                description: Box::leak(
+                    format!(
+                        "Run one of this project's own checks and get its output. \
+                         Available: {}. These are the commands the repository already \
+                         declares; nothing else can be run. Use this to prove a change \
+                         builds and passes before you report it as done.",
+                        names.join(", ")
+                    )
+                    .into_boxed_str(),
+                ),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Which check to run."}
+                    },
+                    "required": ["name"]
+                }),
+            });
+        }
+
         if self.access == Access::ReadWrite {
             tools.push(ToolSpec {
                 name: "write_file",
@@ -243,6 +407,11 @@ impl Workspace {
             "search" => self.search(&call.input),
             "write_file" if self.access == Access::ReadWrite => self.write_file(&call.input),
             "edit_file" if self.access == Access::ReadWrite => self.edit_file(&call.input),
+            "diagnostics" if self.lsp.is_some() => self.diagnostics(&call.input),
+            "definition" if self.lsp.is_some() => self.locate(&call.input, false),
+            "references" if self.lsp.is_some() => self.locate(&call.input, true),
+            "find_symbol" if self.lsp.is_some() => self.find_symbol(&call.input),
+            "run_check" if !self.checks.is_empty() => self.run_check(&call.input),
             "write_file" | "edit_file" => {
                 Err("This run is read-only: you can inspect the repository but not change \
                      it. Report what you found instead."
@@ -417,10 +586,8 @@ impl Workspace {
         self.remember_original(&rel);
         let lines = content.lines().count();
         self.overlay.insert(rel.clone(), content);
-        Ok(format!(
-            "Proposed new content for {rel} ({lines} lines). Not written yet: the user \
-             confirms every change at the end of the run."
-        ))
+        self.persist(&rel)?;
+        Ok(format!("Wrote {rel} ({lines} lines). {}", self.write_note()))
     }
 
     fn edit_file(&mut self, input: &serde_json::Value) -> Result<String, String> {
@@ -453,11 +620,267 @@ impl Workspace {
         };
         self.remember_original(&rel);
         self.overlay.insert(rel.clone(), updated);
+        self.persist(&rel)?;
         Ok(format!(
-            "Proposed an edit to {rel} ({} replacement{}). Not written yet: the user \
-             confirms every change at the end of the run.",
+            "Edited {rel} ({} replacement{}). {}",
             if all { count } else { 1 },
-            if all && count != 1 { "s" } else { "" }
+            if all && count != 1 { "s" } else { "" },
+            self.write_note()
+        ))
+    }
+
+    /// What just happened to the file, which differs by write mode and is
+    /// what the model needs to know to plan its next step.
+    fn write_note(&self) -> &'static str {
+        match self.write_mode {
+            WriteMode::Overlay => {
+                "Nothing is on disk yet: the user reviews every change at the end of the \
+                 run and accepts or rejects it file by file."
+            }
+            WriteMode::Live => {
+                "It is on disk, so diagnostics and checks now see it. The user reviews \
+                 every change at the end and can revert any of them."
+            }
+        }
+    }
+
+    /// Writes an overlay entry to the worktree, for a [`WriteMode::Live`]
+    /// run, and tells the language server about it.
+    fn persist(&mut self, rel: &str) -> Result<(), String> {
+        if self.write_mode != WriteMode::Live {
+            return Ok(());
+        }
+        let Some(content) = self.overlay.get(rel).cloned() else { return Ok(()) };
+        let full = self.root.join(rel);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("{rel}: {e}"))?;
+        }
+        std::fs::write(&full, &content).map_err(|e| format!("{rel}: {e}"))?;
+
+        // Record where the diagnostics stood *before* this edit, so a later
+        // `diagnostics` call waits for results about the new text.
+        if let Some(lsp) = self.lsp.clone() {
+            if let Some(client) = lsp.running_for(&full) {
+                self.epochs.insert(rel.to_string(), client.diagnostic_epoch(&full));
+                let _ = client.did_change(&full, &content);
+                let _ = client.did_save(&full, &content);
+            }
+        }
+        Ok(())
+    }
+
+    // -- language server ----------------------------------------------------
+
+    /// Diagnostics for one file (or all of them), waiting for results that
+    /// reflect the most recent edit.
+    fn diagnostics(&mut self, input: &serde_json::Value) -> Result<String, String> {
+        let lsp = self.lsp.clone().ok_or("no language server support in this run")?;
+
+        let Some(path) = input.get("path").and_then(|p| p.as_str()) else {
+            let all = lsp.all_diagnostics();
+            if all.is_empty() {
+                return Ok(
+                    "No diagnostics. Note that a language server only reports on files it \
+                     has opened; ask for a specific path to make it look."
+                        .into(),
+                );
+            }
+            let mut out = String::new();
+            for (path, list) in all {
+                let rel = path.strip_prefix(&self.root).unwrap_or(&path).display();
+                out.push_str(&format!("{rel}:\n"));
+                for d in list.iter().take(20) {
+                    out.push_str(&format!("  {}\n", d.line()));
+                }
+            }
+            return Ok(out);
+        };
+
+        let rel = self.normalize(path)?;
+        let full = self.root.join(&rel);
+        let client = lsp
+            .ensure_for(&full)
+            .map_err(|e| format!("{rel}: {e}"))?;
+
+        // The server can only diagnose text it has been given.
+        let text = self.current_content(&rel)?;
+        if client.is_open(&full) {
+            client.did_change(&full, &text)?;
+            client.did_save(&full, &text)?;
+        } else {
+            client.did_open(&full, &text)?;
+        }
+
+        let after = self.epochs.get(&rel).copied().unwrap_or(0);
+        let (list, fresh) =
+            client.wait_for_diagnostics(&full, after, Duration::from_secs(20));
+        self.epochs.insert(rel.clone(), client.diagnostic_epoch(&full));
+
+        if list.is_empty() {
+            return Ok(if fresh {
+                format!("{rel}: no problems reported by {}.", client.spec().name)
+            } else {
+                format!(
+                    "{rel}: no problems reported by {}, but it did not answer within 20s \
+                     — it may still be indexing, so treat this as inconclusive.",
+                    client.spec().name
+                )
+            });
+        }
+        let lines: Vec<String> = list.iter().take(60).map(|d| format!("  {}", d.line())).collect();
+        Ok(format!("{rel}:\n{}", lines.join("\n")))
+    }
+
+    /// Go-to-definition or find-references for a symbol named on a line.
+    ///
+    /// Positions are asked for the way a model can actually supply them —
+    /// a line number it just read and the symbol's text — rather than a
+    /// column it would have to count out by hand.
+    fn locate(&mut self, input: &serde_json::Value, references: bool) -> Result<String, String> {
+        let lsp = self.lsp.clone().ok_or("no language server support in this run")?;
+        let path = self.arg_str(input, "path")?;
+        let symbol = self.arg_str(input, "symbol")?;
+        let line = input
+            .get("line")
+            .and_then(|l| l.as_u64())
+            .ok_or("Missing required integer argument \"line\".")?;
+
+        let rel = self.resolve_readable(&path)?;
+        let full = self.root.join(&rel);
+        let text = self.current_content(&rel)?;
+
+        let line_index = line.saturating_sub(1) as usize;
+        let line_text = text.lines().nth(line_index).ok_or_else(|| {
+            format!("{rel} has {} lines; there is no line {line}.", text.lines().count())
+        })?;
+        let column = line_text.find(&symbol).ok_or_else(|| {
+            format!("\"{symbol}\" does not appear on line {line} of {rel}: {line_text:?}")
+        })?;
+        let position = crate::lsp::protocol::Position::new(
+            line_index as u32,
+            crate::lsp::protocol::byte_to_utf16(line_text, column),
+        );
+
+        let client = lsp.ensure_for(&full).map_err(|e| format!("{rel}: {e}"))?;
+        if !client.is_open(&full) {
+            client.did_open(&full, &text)?;
+        }
+        let locations = if references {
+            client.references(&full, position)?
+        } else {
+            client.definition(&full, position)?
+        };
+        if locations.is_empty() {
+            return Ok(format!(
+                "The language server found no {} for {symbol}.",
+                if references { "references" } else { "definition" }
+            ));
+        }
+        Ok(self.format_locations(&locations))
+    }
+
+    fn find_symbol(&mut self, input: &serde_json::Value) -> Result<String, String> {
+        let lsp = self.lsp.clone().ok_or("no language server support in this run")?;
+        let query = self.arg_str(input, "query")?;
+        // Any open server can answer; prefer one that already has a file
+        // from this workspace open.
+        let client = lsp
+            .running()
+            .into_iter()
+            .find(|c| c.alive())
+            .ok_or("no language server is running yet; read a source file first")?;
+        let matches = client.workspace_symbol_names(&query)?;
+        if matches.is_empty() {
+            return Ok(format!("No workspace symbol matches {query}."));
+        }
+        let lines: Vec<String> = matches
+            .iter()
+            .take(40)
+            .filter_map(|(name, location)| {
+                let path = crate::lsp::protocol::uri_to_path(&location.uri)?;
+                let rel = path.strip_prefix(&self.root).unwrap_or(&path).display();
+                Some(format!("{name} — {rel}:{}", location.range.start.line + 1))
+            })
+            .collect();
+        Ok(lines.join("\n"))
+    }
+
+    fn format_locations(&self, locations: &[crate::lsp::protocol::Location]) -> String {
+        let mut lines = Vec::new();
+        for location in locations.iter().take(60) {
+            let Some(path) = crate::lsp::protocol::uri_to_path(&location.uri) else { continue };
+            let rel = path.strip_prefix(&self.root).unwrap_or(&path).display().to_string();
+            let line_number = location.range.start.line + 1;
+            // Quote the line itself: a list of file:line without the code is
+            // just another round of read_file calls.
+            let text = self
+                .current_content(&rel)
+                .ok()
+                .and_then(|content| {
+                    content.lines().nth(location.range.start.line as usize).map(str::to_string)
+                })
+                .unwrap_or_default();
+            lines.push(format!("{rel}:{line_number}: {}", text.trim()));
+        }
+        lines.join("\n")
+    }
+
+    // -- checks -------------------------------------------------------------
+
+    /// Runs one of the repository's declared checks.
+    fn run_check(&mut self, input: &serde_json::Value) -> Result<String, String> {
+        /// A hard stop on a model that would otherwise run the test suite
+        /// after every edit.
+        const MAX_CHECK_RUNS: usize = 8;
+        /// Enough output to diagnose a failure without burying the context.
+        const MAX_OUTPUT: usize = 8_000;
+
+        if self.check_runs >= MAX_CHECK_RUNS {
+            return Err(format!(
+                "Check budget spent ({MAX_CHECK_RUNS} runs). Finish with what you know."
+            ));
+        }
+        let name = self.arg_str(input, "name")?;
+        let job = self
+            .checks
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name.trim()))
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "No check named \"{name}\". Available: {}",
+                    self.checks
+                        .iter()
+                        .map(|c| c.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+
+        if self.write_mode != WriteMode::Live {
+            return Err(
+                "This run proposes changes without writing them, so a check would test the \
+                 old code. Report what you changed instead."
+                    .into(),
+            );
+        }
+
+        self.check_runs += 1;
+        let result = crate::local_ci::run_job(&self.root, &job);
+        let mut output = result.output;
+        if output.len() > MAX_OUTPUT {
+            // Failures print the useful part last, so keep the tail.
+            let start = output.len() - MAX_OUTPUT;
+            let start = (start..output.len())
+                .find(|i| output.is_char_boundary(*i))
+                .unwrap_or(output.len());
+            output = format!("[earlier output trimmed]\n{}", &output[start..]);
+        }
+        Ok(format!(
+            "{} {} in {:.1}s\n{output}",
+            result.name,
+            if result.ok { "PASSED" } else { "FAILED" },
+            result.duration_secs
         ))
     }
 
@@ -740,6 +1163,104 @@ mod tests {
         let out = ws.dispatch(&c, 1);
         assert!(out.is_error);
         assert!(out.content.contains("budget"));
+    }
+
+    #[test]
+    fn a_live_run_writes_to_disk_and_can_be_reverted() {
+        let (tmp, ws) = fixture(Access::ReadWrite);
+        let mut ws = ws.with_write_mode(WriteMode::Live);
+        let out = ws.dispatch(
+            &call("write_file", serde_json::json!({"path": "src/lib.rs", "content": "pub fn run() { work() }\n"})),
+            10,
+        );
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("on disk"), "{}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("src/lib.rs")).unwrap(),
+            "pub fn run() { work() }\n"
+        );
+
+        // A new file the run created is removed by a revert, not left behind.
+        ws.dispatch(
+            &call("write_file", serde_json::json!({"path": "src/new.rs", "content": "fn x() {}\n"})),
+            10,
+        );
+        assert!(tmp.path().join("src/new.rs").exists());
+
+        ws.revert_all().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("src/lib.rs")).unwrap(),
+            "pub fn run() {}\n"
+        );
+        assert!(!tmp.path().join("src/new.rs").exists());
+    }
+
+    #[test]
+    fn checks_are_offered_only_when_the_repository_declares_them() {
+        let (_tmp, ws) = fixture(Access::ReadWrite);
+        assert!(!ws.tools().iter().any(|t| t.name == "run_check"));
+
+        let job = crate::local_ci::Job {
+            name: "tests".into(),
+            commands: vec!["true".into()],
+            ..Default::default()
+        };
+        let ws = ws.with_checks(vec![job]);
+        let spec = ws.tools().into_iter().find(|t| t.name == "run_check").unwrap();
+        // The available names go in the description, so the model does not
+        // have to guess what it may run.
+        assert!(spec.description.contains("tests"), "{}", spec.description);
+    }
+
+    #[test]
+    fn a_check_is_refused_when_the_edits_are_not_on_disk() {
+        let (_tmp, ws) = fixture(Access::ReadWrite);
+        let job = crate::local_ci::Job {
+            name: "tests".into(),
+            commands: vec!["true".into()],
+            ..Default::default()
+        };
+        let mut ws = ws.with_checks(vec![job]);
+        let out = ws.dispatch(&call("run_check", serde_json::json!({"name": "tests"})), 10);
+        assert!(out.is_error);
+        assert!(out.content.contains("without writing them"), "{}", out.content);
+    }
+
+    #[test]
+    fn only_declared_checks_can_run() {
+        let (tmp, ws) = fixture(Access::ReadWrite);
+        let job = crate::local_ci::Job {
+            name: "tests".into(),
+            commands: vec!["echo ran-the-real-check".into()],
+            ..Default::default()
+        };
+        let mut ws = ws.with_checks(vec![job]).with_write_mode(WriteMode::Live);
+
+        let out = ws.dispatch(
+            &call("run_check", serde_json::json!({"name": "rm -rf /"})),
+            10,
+        );
+        assert!(out.is_error);
+        assert!(out.content.contains("No check named"), "{}", out.content);
+
+        let out = ws.dispatch(&call("run_check", serde_json::json!({"name": "tests"})), 10);
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("PASSED"), "{}", out.content);
+        assert!(out.content.contains("ran-the-real-check"), "{}", out.content);
+        let _ = tmp;
+    }
+
+    #[test]
+    fn language_tools_appear_only_with_a_manager() {
+        let (tmp, ws) = fixture(Access::ReadOnly);
+        assert!(!ws.tools().iter().any(|t| t.name == "diagnostics"));
+
+        let manager = std::sync::Arc::new(crate::lsp::Manager::new(tmp.path(), None));
+        let ws = ws.with_language_support(manager);
+        let names: Vec<&str> = ws.tools().iter().map(|t| t.name).collect();
+        for expected in ["diagnostics", "definition", "references", "find_symbol"] {
+            assert!(names.contains(&expected), "{expected} missing from {names:?}");
+        }
     }
 
     #[test]

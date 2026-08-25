@@ -6,7 +6,8 @@
 //! merge — not a model's judgement.
 
 use git_manage::agent::{
-    self, conflict, Access, Limits, Message, Provider, Reply, ToolCall, ToolSpec, Workspace,
+    self, coding, conflict, Access, Limits, Message, Provider, Reply, ToolCall, ToolSpec,
+    Workspace, WriteMode,
 };
 use git_manage::git::{Repo, RepoState, Resolution};
 use std::cell::RefCell;
@@ -271,4 +272,240 @@ fn a_reviewer_cannot_edit_the_repository() {
     assert!(outcome.findings.is_empty());
     assert!(provider.tool_results()[0].contains("read-only"));
     assert!(fs::read_to_string(repo.path().join("conflict.txt")).unwrap().contains("<<<<<<<"));
+}
+
+// ---------------------------------------------------------------------------
+// The coding agent
+// ---------------------------------------------------------------------------
+
+/// A repository the coding agent can actually work in: a source file, a
+/// language server it can consult, and a check it can run.
+fn coding_repo() -> (tempfile::TempDir, Repo) {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sh(dir, &["init", "-b", "main"]);
+    sh(dir, &["config", "user.email", "t@t.io"]);
+    sh(dir, &["config", "user.name", "T"]);
+
+    let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_lsp.py");
+    fs::write(
+        dir.join(".git-manage-ci.toml"),
+        format!(
+            "[[job]]\nname = \"tests\"\ncommands = [\"echo the-suite-ran\"]\n\n\
+             [[lsp]]\nextensions = [\"rs\"]\ncommand = \"python3\"\n\
+             args = [\"{}\"]\nlanguage_id = \"rust\"\n",
+            fake.display()
+        ),
+    )
+    .unwrap();
+    fs::write(dir.join("lib.rs"), "pub fn halve(n: u32) -> u32 {\n    n / 2\n}\n").unwrap();
+    sh(dir, &["add", "-A"]);
+    sh(dir, &["commit", "-m", "init"]);
+
+    let repo = Repo::open(dir).unwrap();
+    (tmp, repo)
+}
+
+#[test]
+fn the_coding_agent_edits_consults_the_server_and_runs_a_check() {
+    let (_tmp, repo) = coding_repo();
+    let lsp = std::sync::Arc::new(git_manage::lsp::Manager::new(repo.path(), None));
+    let jobs = git_manage::local_ci::discover_configs(repo.path()).unwrap().config.jobs;
+    assert_eq!(jobs.len(), 1);
+
+    let mut ws = Workspace::new(repo.path(), repo.tracked_files().unwrap(), Access::ReadWrite)
+        .unwrap()
+        .with_write_mode(WriteMode::Live)
+        .with_language_support(lsp)
+        .with_checks(jobs);
+
+    // Every tool the agent should have in a fully equipped run.
+    let names: Vec<&str> = ws.tools().iter().map(|t| t.name).collect();
+    for expected in ["read_file", "edit_file", "diagnostics", "references", "run_check"] {
+        assert!(names.contains(&expected), "{expected} missing from {names:?}");
+    }
+
+    let provider = Scripted::new(vec![
+        calls("", vec![call("1", "read_file", serde_json::json!({"path": "lib.rs"}))]),
+        calls(
+            "",
+            vec![call(
+                "2",
+                "edit_file",
+                serde_json::json!({"path": "lib.rs", "old_text": "n / 2", "new_text": "n / 2 + 0"}),
+            )],
+        ),
+        calls("", vec![call("3", "diagnostics", serde_json::json!({"path": "lib.rs"}))]),
+        calls(
+            "",
+            vec![call(
+                "4",
+                "references",
+                serde_json::json!({"path": "lib.rs", "line": 1, "symbol": "halve"}),
+            )],
+        ),
+        calls("", vec![call("5", "run_check", serde_json::json!({"name": "tests"}))]),
+        calls("- lib.rs: adjusted halve()", vec![]),
+    ]);
+
+    let run = coding::run(
+        &provider,
+        &mut ws,
+        coding::Request { branch: Some("main"), ..coding::Request::new("tweak halve") },
+        &mut |_| {},
+    )
+    .unwrap();
+
+    let results = provider.tool_results();
+    // The edit went to disk, because that is what "let it iterate" means.
+    assert!(results[1].contains("on disk"), "{}", results[1]);
+    assert_eq!(
+        fs::read_to_string(repo.path().join("lib.rs")).unwrap(),
+        "pub fn halve(n: u32) -> u32 {\n    n / 2 + 0\n}\n"
+    );
+    // The language server was consulted and answered.
+    assert!(results[2].contains("something is wrong"), "{}", results[2]);
+    assert!(results[3].contains("lib.rs:"), "{}", results[3]);
+    // The project's own check ran, and its output came back.
+    assert!(results[4].contains("PASSED"), "{}", results[4]);
+    assert!(results[4].contains("the-suite-ran"), "{}", results[4]);
+
+    assert_eq!(run.edits.len(), 1);
+    assert_eq!(run.edits[0].path, "lib.rs");
+    assert!(run.text.contains("adjusted halve"));
+
+    // And the whole run can be undone exactly.
+    ws.revert_all().unwrap();
+    assert_eq!(
+        fs::read_to_string(repo.path().join("lib.rs")).unwrap(),
+        "pub fn halve(n: u32) -> u32 {\n    n / 2\n}\n"
+    );
+}
+
+#[test]
+fn a_proposing_run_cannot_run_checks_and_says_why() {
+    let (_tmp, repo) = coding_repo();
+    let jobs = git_manage::local_ci::discover_configs(repo.path()).unwrap().config.jobs;
+    let mut ws = Workspace::new(repo.path(), repo.tracked_files().unwrap(), Access::ReadWrite)
+        .unwrap()
+        .with_checks(jobs);
+
+    let provider = Scripted::new(vec![
+        calls(
+            "",
+            vec![call(
+                "1",
+                "edit_file",
+                serde_json::json!({"path": "lib.rs", "old_text": "n / 2", "new_text": "n / 3"}),
+            )],
+        ),
+        calls("", vec![call("2", "run_check", serde_json::json!({"name": "tests"}))]),
+        calls("- could not verify", vec![]),
+    ]);
+
+    let run = coding::run(&provider, &mut ws, coding::Request::new("change it"), &mut |_| {})
+        .unwrap();
+
+    let results = provider.tool_results();
+    assert!(results[0].contains("Nothing is on disk yet"), "{}", results[0]);
+    assert!(results[1].contains("would test the old code"), "{}", results[1]);
+    // Nothing was written, so the check refusing was the right call.
+    assert_eq!(
+        fs::read_to_string(repo.path().join("lib.rs")).unwrap(),
+        "pub fn halve(n: u32) -> u32 {\n    n / 2\n}\n"
+    );
+    assert_eq!(run.edits.len(), 1);
+}
+
+/// The coding agent against a real model, a real language server, and a
+/// real build — the whole loop, on a repository with an actual bug in it.
+///
+/// Ignored by default: it needs Claude credentials, clangd, and a C
+/// compiler, and it costs tokens. Run it with
+/// `cargo test --test agent -- --ignored --nocapture live_coding_agent`.
+#[test]
+#[ignore]
+fn live_coding_agent() {
+    if !git_manage::lsp::registry::on_path("clangd") {
+        eprintln!("clangd not installed; skipping");
+        return;
+    }
+    let Some(client) = git_manage::claude::Client::from_store("claude-opus-5") else {
+        eprintln!("Claude is not signed in; skipping");
+        return;
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sh(dir, &["init", "-b", "main"]);
+    sh(dir, &["config", "user.email", "t@t.io"]);
+    sh(dir, &["config", "user.name", "T"]);
+    fs::write(
+        dir.join(".git-manage-ci.toml"),
+        "[[job]]\nname = \"build\"\ncommands = [\"cc -Wall -Werror -c main.c -o /dev/null\"]\n",
+    )
+    .unwrap();
+    // total() is declared to return int but falls off the end, and main
+    // passes the wrong type. Both are only visible if you actually build it.
+    fs::write(
+        dir.join("main.c"),
+        "#include <stdio.h>\n\n\
+         int total(int *values, int count) {\n\
+         \x20   int sum = 0;\n\
+         \x20   for (int i = 0; i <= count; i++) {\n\
+         \x20       sum += values[i];\n\
+         \x20   }\n\
+         }\n\n\
+         int main(void) {\n\
+         \x20   int values[3] = {1, 2, 3};\n\
+         \x20   printf(\"%d\\n\", total(values, 3));\n\
+         \x20   return 0;\n\
+         }\n",
+    )
+    .unwrap();
+    sh(dir, &["add", "-A"]);
+    sh(dir, &["commit", "-m", "init"]);
+    let repo = Repo::open(dir).unwrap();
+
+    let lsp = std::sync::Arc::new(git_manage::lsp::Manager::new(repo.path(), None));
+    let jobs = git_manage::local_ci::discover_configs(repo.path()).unwrap().config.jobs;
+    let mut ws = Workspace::new(repo.path(), repo.tracked_files().unwrap(), Access::ReadWrite)
+        .unwrap()
+        .with_write_mode(WriteMode::Live)
+        .with_language_support(lsp)
+        .with_checks(jobs);
+
+    let run = coding::run(
+        &client,
+        &mut ws,
+        coding::Request {
+            branch: Some("main"),
+            ..coding::Request::new(
+                "main.c does not build. Find out why, fix it, and make sure the build \
+                 check passes.",
+            )
+        },
+        &mut |event| println!("  {}", event.line()),
+    )
+    .expect("the agent should finish");
+
+    println!("\n--- SUMMARY ---\n{}\n", run.text);
+    println!("--- EDITS: {} file(s) ---", run.edits.len());
+    for edit in &run.edits {
+        let (added, removed) = edit.line_delta();
+        println!("  {} +{added} -{removed}", edit.path);
+    }
+
+    // The proof is not what it said, but whether the code builds now.
+    let result = git_manage::local_ci::run_job(
+        repo.path(),
+        &git_manage::local_ci::Job {
+            name: "verify".into(),
+            commands: vec!["cc -Wall -Werror -c main.c -o /dev/null".into()],
+            ..Default::default()
+        },
+    );
+    println!("--- VERIFY ---\n{}", result.output);
+    assert!(result.ok, "the agent reported done but the code still does not build");
+    assert!(!run.edits.is_empty(), "it cannot have fixed anything without editing");
 }

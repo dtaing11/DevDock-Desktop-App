@@ -69,15 +69,58 @@ pub enum Msg {
     /// AI-drafted local CI config (TOML). Never written automatically:
     /// the user reviews and confirms in a dialog first.
     AiCiConfig { result: Result<String, String> },
+    /// Every file git tracks, for the editor's file finder.
+    TrackedFiles(Vec<String>),
+    /// A language server answered, or failed to.
+    Lsp(LspReply),
     /// One step of an agentic run (a file read, an edit proposed), for the
     /// progress log the user watches while it works.
-    AgentEvent(String),
+    AgentEvent { kind: AgentKind, line: String },
     /// An agentic run finished. Its edits are proposals: the user accepts or
     /// rejects each one before anything is written.
-    AgentDone(Result<crate::app::AgentReport, String>),
+    AgentDone { kind: AgentKind, result: Result<crate::app::AgentReport, String> },
 
     /// Background task finished with nothing to report.
     Noop,
+}
+
+/// An answer from a language server, on its way back to the UI thread.
+///
+/// Every request runs on a worker: `rust-analyzer` can take a minute to
+/// answer while it indexes, and a render pass cannot wait for that.
+#[derive(Debug)]
+pub enum LspReply {
+    /// A file was handed to a server (or could not be).
+    Opened { path: std::path::PathBuf, server: String, error: Option<String> },
+    Hover { path: std::path::PathBuf, text: Option<String> },
+    Definition(Vec<crate::lsp::protocol::Location>),
+    References(Vec<crate::lsp::protocol::Location>),
+    Symbols { path: std::path::PathBuf, symbols: Vec<crate::lsp::protocol::Symbol> },
+    Completion {
+        path: std::path::PathBuf,
+        items: Vec<crate::lsp::protocol::CompletionItem>,
+        anchor: usize,
+    },
+    /// Formatted text for a buffer. `save` carries the format-then-save flow.
+    Formatted { path: std::path::PathBuf, text: String, save: bool },
+    /// A rename's edits, grouped by file. Nothing is written yet.
+    Renamed {
+        new_name: String,
+        edits: Vec<(std::path::PathBuf, Vec<crate::lsp::protocol::TextEdit>)>,
+    },
+    /// A request failed; the message is user-presentable.
+    Failed(String),
+}
+
+/// Which agentic run a message belongs to. Both run the same harness, and
+/// both can be in flight at once, so their progress must not land in the
+/// same log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentKind {
+    /// The conflict resolver, in the conflict dialog.
+    Conflict,
+    /// The coding agent, in its own tab.
+    Coding,
 }
 
 /// Which AI task a provider/model selection belongs to. Each task picks its
@@ -93,6 +136,8 @@ pub enum AiTarget {
     Conflict,
     /// The code review gate, which reads them.
     Review,
+    /// The coding agent, which does both and runs checks.
+    Coding,
 }
 
 impl AiTarget {
@@ -103,6 +148,7 @@ impl AiTarget {
             Self::PullRequest => "pull request text",
             Self::Conflict => "conflict resolution",
             Self::Review => "code review",
+            Self::Coding => "the coding agent",
         }
     }
 }

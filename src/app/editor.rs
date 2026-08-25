@@ -1,0 +1,1434 @@
+//! The code editor: buffers, syntax highlighting, and everything the
+//! language server contributes.
+//!
+//! The editor is a text area over a [`OpenFile`] buffer, plus the four
+//! things that make it more than a text area: diagnostics underlined in
+//! place, hover types, navigation (definition, references, outline), and
+//! edits the server produces (format, rename).
+//!
+//! # How it talks to a language server
+//!
+//! Every LSP request blocks — `rust-analyzer` can take a minute while it
+//! indexes — so nothing here calls the server directly. The UI records what
+//! it wants as an [`Action`], and [`show`] hands those to the app, which
+//! runs them on the worker thread and delivers answers back as
+//! [`crate::app::worker::LspReply`]. The one exception is reading
+//! diagnostics, which are already in memory and only need a lock.
+//!
+//! # Offsets
+//!
+//! Three coordinate systems meet in this file and mixing them silently
+//! corrupts a buffer, so each conversion is named:
+//!
+//! - **char index** — what egui's cursor uses ([`CCursor`]).
+//! - **byte offset** — what Rust string slicing uses.
+//! - **line + UTF-16 column** — what LSP uses ([`Position`]).
+
+use super::worker::AiTarget;
+use super::{theme, App};
+use crate::lsp::protocol::{
+    self, CompletionItem, Diagnostic, Location, Position, Severity, Symbol,
+};
+use egui::text::{CCursor, CCursorRange, LayoutJob};
+use egui::{FontId, RichText, ScrollArea, TextFormat};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// How long the buffer must sit still before its text is sent to the server.
+/// Every keystroke would be correct and wasteful; this is short enough that
+/// diagnostics still feel live.
+const SYNC_DEBOUNCE: Duration = Duration::from_millis(350);
+
+/// How long the pointer must rest before a hover is requested.
+const HOVER_DELAY: Duration = Duration::from_millis(400);
+
+/// Files larger than this open read-only. The layouter is per-line and
+/// re-runs on every frame the buffer changes; past this size that stops
+/// being interactive, and a git client is not where you edit a 5 MB blob.
+pub const MAX_EDITABLE_BYTES: usize = 2_000_000;
+
+/// One open buffer.
+pub struct OpenFile {
+    pub path: PathBuf,
+    /// Repo-relative path, for tabs and messages.
+    pub rel: String,
+    pub text: String,
+    /// Text as it is on disk, for the dirty marker.
+    pub saved: String,
+    pub lang: super::syntax::Lang,
+    /// Symbol outline, refreshed on open and save.
+    pub symbols: Vec<Symbol>,
+    /// Cursor as a byte offset, tracked so requests can name a position.
+    pub cursor: usize,
+    /// A line to scroll to on the next frame, from navigation.
+    pub reveal: Option<u32>,
+    /// When the buffer last changed, for debounced syncing.
+    pub dirty_since: Option<Instant>,
+    /// Whether the server has this file open.
+    pub synced: bool,
+    /// Read-only because it is too large to edit comfortably.
+    pub read_only: bool,
+}
+
+impl OpenFile {
+    pub fn is_dirty(&self) -> bool {
+        self.text != self.saved
+    }
+
+    /// The LSP position of the cursor.
+    pub fn cursor_position(&self) -> Position {
+        protocol::offset_to_position(&self.text, self.cursor)
+    }
+
+    /// The word the cursor sits in, as a byte range — the anchor a
+    /// completion replaces.
+    fn word_at(&self, offset: usize) -> (usize, usize) {
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        let start = self.text[..offset]
+            .char_indices()
+            .rev()
+            .take_while(|(_, c)| is_word(*c))
+            .last()
+            .map(|(i, _)| i)
+            .unwrap_or(offset);
+        let end = offset
+            + self.text[offset..]
+                .char_indices()
+                .take_while(|(_, c)| is_word(*c))
+                .map(|(i, c)| i + c.len_utf8())
+                .last()
+                .unwrap_or(0);
+        (start, end)
+    }
+}
+
+/// The completion popup.
+#[derive(Default)]
+pub struct Completion {
+    pub open: bool,
+    pub items: Vec<CompletionItem>,
+    /// What has been typed since the popup opened, used to filter.
+    pub filter: String,
+    pub selected: usize,
+    /// Byte offset where the word being completed starts.
+    pub anchor: usize,
+    pub requesting: bool,
+    /// Where to draw it, from the galley.
+    pub screen_pos: Option<egui::Pos2>,
+}
+
+impl Completion {
+    /// Items matching what has been typed, best first. Case-insensitive
+    /// prefix matches rank above contains-matches, which is what every
+    /// editor does and what makes the first entry usually right.
+    pub fn filtered(&self) -> Vec<&CompletionItem> {
+        if self.filter.is_empty() {
+            return self.items.iter().collect();
+        }
+        let needle = self.filter.to_lowercase();
+        let mut prefix = Vec::new();
+        let mut contains = Vec::new();
+        for item in &self.items {
+            let label = item.label.to_lowercase();
+            if label.starts_with(&needle) {
+                prefix.push(item);
+            } else if label.contains(&needle) {
+                contains.push(item);
+            }
+        }
+        prefix.extend(contains);
+        prefix
+    }
+
+    pub fn close(&mut self) {
+        self.open = false;
+        self.items.clear();
+        self.filter.clear();
+        self.selected = 0;
+    }
+}
+
+/// A hover tooltip waiting on, or holding, an answer.
+#[derive(Default)]
+pub struct Hover {
+    pub text: Option<String>,
+    pub at: Option<Position>,
+    pub requesting: bool,
+    pub screen_pos: Option<egui::Pos2>,
+    /// When the pointer arrived where it now rests.
+    pub resting_since: Option<Instant>,
+    pub resting_at: Option<egui::Pos2>,
+}
+
+/// What the bottom panel shows.
+#[derive(PartialEq, Eq, Clone, Copy, Default)]
+pub enum BottomPanel {
+    #[default]
+    Diagnostics,
+    References,
+}
+
+/// An in-progress rename: the symbol, and the name being typed for it.
+pub struct Rename {
+    pub path: PathBuf,
+    pub position: Position,
+    pub old_name: String,
+    pub new_name: String,
+}
+
+/// The file finder: a filter over every tracked file.
+#[derive(Default)]
+pub struct QuickOpen {
+    pub open: bool,
+    pub query: String,
+    /// Tracked paths, loaded once per repository.
+    pub files: Vec<String>,
+    pub loading: bool,
+    pub selected: usize,
+}
+
+impl QuickOpen {
+    /// Paths matching the query, best first: a match in the file name beats
+    /// one anywhere in the path, which is what you mean when you type a
+    /// name rather than a directory.
+    pub fn matches(&self) -> Vec<&String> {
+        let needle = self.query.trim().to_lowercase();
+        if needle.is_empty() {
+            return self.files.iter().take(200).collect();
+        }
+        let mut by_name = Vec::new();
+        let mut by_path = Vec::new();
+        for path in &self.files {
+            let lower = path.to_lowercase();
+            let name = lower.rsplit('/').next().unwrap_or(&lower).to_string();
+            if name.contains(&needle) {
+                by_name.push(path);
+            } else if lower.contains(&needle) {
+                by_path.push(path);
+            }
+        }
+        by_name.extend(by_path);
+        by_name.truncate(200);
+        by_name
+    }
+}
+
+/// Everything the editor tab owns.
+#[derive(Default)]
+pub struct EditorState {
+    pub files: Vec<OpenFile>,
+    pub active: Option<usize>,
+    pub completion: Completion,
+    pub hover: Hover,
+    pub rename: Option<Rename>,
+    pub bottom: BottomPanel,
+    /// Results of the last find-references.
+    pub references: Vec<Location>,
+    pub outline_open: bool,
+    /// Run the server's formatter on save.
+    pub format_on_save: bool,
+    /// Language server status line and last error.
+    pub status: Option<String>,
+    pub error: Option<String>,
+    /// Requests in flight, so the UI can say so.
+    pub busy: usize,
+    pub quick_open: QuickOpen,
+}
+
+impl EditorState {
+    pub fn active_file(&self) -> Option<&OpenFile> {
+        self.active.and_then(|i| self.files.get(i))
+    }
+
+    pub fn active_file_mut(&mut self) -> Option<&mut OpenFile> {
+        match self.active {
+            Some(i) => self.files.get_mut(i),
+            None => None,
+        }
+    }
+
+    pub fn index_of(&self, path: &Path) -> Option<usize> {
+        self.files.iter().position(|f| f.path == path)
+    }
+
+    pub fn file_mut(&mut self, path: &Path) -> Option<&mut OpenFile> {
+        self.files.iter_mut().find(|f| f.path == path)
+    }
+
+    /// Files with unsaved edits, for the close-the-repo warning.
+    pub fn dirty_files(&self) -> Vec<&OpenFile> {
+        self.files.iter().filter(|f| f.is_dirty()).collect()
+    }
+}
+
+/// Something the UI decided to do, carried out after rendering so the
+/// borrow of `app.editor` can end first.
+pub enum Action {
+    Open { path: PathBuf, reveal: Option<u32> },
+    Close(usize),
+    Save,
+    Format,
+    Sync(PathBuf),
+    Hover { path: PathBuf, position: Position, screen_pos: egui::Pos2 },
+    Definition { path: PathBuf, position: Position },
+    References { path: PathBuf, position: Position },
+    Symbols(PathBuf),
+    Completion { path: PathBuf, position: Position, anchor: usize },
+    StartRename { path: PathBuf, position: Position, old_name: String },
+    ApplyRename { path: PathBuf, position: Position, new_name: String },
+    RestartServers,
+    /// Open the file finder, loading the tracked file list if needed.
+    QuickOpen,
+}
+
+/// Draws the editor tab.
+pub fn editor_tab(app: &mut App, ui: &mut egui::Ui) {
+    let mut actions: Vec<Action> = Vec::new();
+
+    if app.repo.is_none() {
+        ui.label(RichText::new("Open a repository to edit files.").color(theme::FG_DIM));
+        return;
+    }
+
+    toolbar(app, ui, &mut actions);
+    quick_open(app, ui, &mut actions);
+
+    if app.editor.files.is_empty() {
+        empty_state(app, ui, &mut actions);
+        run_actions(app, actions);
+        return;
+    }
+
+    tab_bar(app, ui, &mut actions);
+    ui.separator();
+
+    // Diagnostics come straight from the server's shared state; they change
+    // without anything in the UI asking, so they are read fresh each frame.
+    let diagnostics: Vec<Diagnostic> = app
+        .editor
+        .active_file()
+        .map(|f| app.lsp.diagnostics(&f.path))
+        .unwrap_or_default();
+
+    let available = ui.available_height();
+    let bottom_height = (available * 0.28).clamp(90.0, 260.0);
+
+    ui.horizontal_top(|ui| {
+        if app.editor.outline_open {
+            outline(app, ui, &mut actions);
+            ui.separator();
+        }
+        ui.vertical(|ui| {
+            code_area(app, ui, available - bottom_height, &diagnostics, &mut actions);
+            ui.separator();
+            bottom_panel(app, ui, bottom_height, &diagnostics, &mut actions);
+        });
+    });
+
+    run_actions(app, actions);
+}
+
+fn toolbar(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+    ui.horizontal(|ui| {
+        if super::views::panel_button(ui, "Open file…", app.repo.is_some())
+            .on_hover_text("Filter every tracked file (Cmd/Ctrl+O)")
+            .clicked()
+        {
+            actions.push(Action::QuickOpen);
+        }
+        let dirty = app.editor.active_file().is_some_and(|f| f.is_dirty());
+        let save_label = if dirty { "Save*" } else { "Save" };
+        if super::views::panel_button(ui, save_label, dirty)
+            .on_hover_text("Ctrl+S — writes the buffer and tells the language server")
+            .clicked()
+        {
+            actions.push(Action::Save);
+        }
+        if super::views::panel_button(ui, "Format", app.editor.active_file().is_some())
+            .on_hover_text("Format with the language server")
+            .clicked()
+        {
+            actions.push(Action::Format);
+        }
+        ui.checkbox(&mut app.editor.format_on_save, "on save");
+        ui.checkbox(&mut app.editor.outline_open, "Outline");
+
+        ui.separator();
+        // Language server status: which one, and what it is doing.
+        match app.editor.active_file().and_then(|f| app.lsp.running_for(&f.path)) {
+            Some(client) => {
+                let (text, color) = match (client.alive(), client.status()) {
+                    (false, _) => ("stopped".to_string(), theme::DANGER),
+                    (true, Some(status)) => (status, theme::WARN),
+                    (true, None) => ("ready".to_string(), theme::ADD),
+                };
+                ui.label(
+                    RichText::new(format!("{}: {text}", client.spec().name)).small().color(color),
+                );
+            }
+            None => {
+                ui.label(RichText::new("no language server").small().color(theme::FG_DIM));
+            }
+        }
+        if app.editor.busy > 0 {
+            ui.add(egui::Spinner::new().size(12.0));
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if super::views::panel_button(ui, "Restart servers", true)
+                .on_hover_text("Stops every language server; they start again on the next file")
+                .clicked()
+            {
+                actions.push(Action::RestartServers);
+            }
+        });
+    });
+    if let Some(error) = app.editor.error.clone() {
+        ui.label(RichText::new(error).color(theme::DANGER).small());
+    }
+}
+
+/// The file finder, shown inline above the tabs while it is open.
+fn quick_open(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+    if !app.editor.quick_open.open {
+        return;
+    }
+    let Some(repo) = app.repo.clone() else { return };
+
+    egui::Frame::popup(ui.style()).show(ui, |ui| {
+        ui.set_min_width(520.0);
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut app.editor.quick_open.query)
+                .hint_text("file name or path")
+                .desired_width(f32::INFINITY),
+        );
+        response.request_focus();
+
+        if app.editor.quick_open.loading {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(12.0));
+                ui.label(RichText::new("listing files…").small().color(theme::FG_DIM));
+            });
+            return;
+        }
+
+        let matches: Vec<String> =
+            app.editor.quick_open.matches().into_iter().cloned().collect();
+        if matches.is_empty() {
+            ui.label(RichText::new("no matching file").small().color(theme::FG_DIM));
+            return;
+        }
+        let selected = app.editor.quick_open.selected.min(matches.len() - 1);
+
+        let (up, down, accept, escape) = ui.input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+            )
+        });
+        if down {
+            app.editor.quick_open.selected = (selected + 1) % matches.len();
+        }
+        if up {
+            app.editor.quick_open.selected = (selected + matches.len() - 1) % matches.len();
+        }
+        if escape {
+            app.editor.quick_open.open = false;
+        }
+
+        let mut chosen: Option<String> = None;
+        if accept {
+            chosen = matches.get(selected).cloned();
+        }
+        ScrollArea::vertical().max_height(260.0).id_salt("quick-open").show(ui, |ui| {
+            for (i, path) in matches.iter().enumerate() {
+                if ui
+                    .selectable_label(i == selected, RichText::new(path).monospace().small())
+                    .clicked()
+                {
+                    chosen = Some(path.clone());
+                }
+            }
+        });
+
+        if let Some(path) = chosen {
+            app.editor.quick_open.open = false;
+            app.editor.quick_open.query.clear();
+            app.editor.quick_open.selected = 0;
+            actions.push(Action::Open { path: repo.path().join(path), reveal: None });
+        }
+    });
+}
+
+fn empty_state(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+    ui.add_space(12.0);
+    ui.label(
+        RichText::new("No file open. Pick one from Changes, or from the list below.")
+            .color(theme::FG_DIM),
+    );
+    ui.add_space(8.0);
+
+    // The recently changed files are the ones you actually want to edit.
+    let Some(status) = app.status.clone() else { return };
+    let Some(repo) = app.repo.clone() else { return };
+    ScrollArea::vertical().max_height(260.0).id_salt("editor-empty").show(ui, |ui| {
+        for file in status.files.iter().take(40) {
+            if ui.selectable_label(false, &file.path).clicked() {
+                actions.push(Action::Open {
+                    path: repo.path().join(&file.path),
+                    reveal: None,
+                });
+            }
+        }
+    });
+}
+
+fn tab_bar(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+    ScrollArea::horizontal().id_salt("editor-tabs").show(ui, |ui| {
+        ui.horizontal(|ui| {
+            for (i, file) in app.editor.files.iter().enumerate() {
+                let errors = app
+                    .lsp
+                    .diagnostics(&file.path)
+                    .iter()
+                    .filter(|d| d.severity == Severity::Error)
+                    .count();
+                let name = file
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| file.rel.clone());
+                let label = format!(
+                    "{name}{}{}",
+                    if file.is_dirty() { " •" } else { "" },
+                    if errors > 0 { format!(" ({errors})") } else { String::new() }
+                );
+                let color = if errors > 0 { theme::DANGER } else { theme::FG };
+                if ui
+                    .selectable_label(app.editor.active == Some(i), RichText::new(label).color(color))
+                    .on_hover_text(&file.rel)
+                    .clicked()
+                {
+                    app.editor.active = Some(i);
+                    app.editor.completion.close();
+                }
+                if ui.small_button("×").on_hover_text("Close").clicked() {
+                    actions.push(Action::Close(i));
+                }
+            }
+        });
+    });
+}
+
+/// The outline, from `textDocument/documentSymbol`.
+fn outline(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+    let Some(file) = app.editor.active_file() else { return };
+    let path = file.path.clone();
+    let symbols = file.symbols.clone();
+    ui.vertical(|ui| {
+        ui.set_width(200.0);
+        ui.label(theme::overline("OUTLINE"));
+        if symbols.is_empty() {
+            ui.label(RichText::new("no symbols").small().color(theme::FG_DIM));
+            return;
+        }
+        ScrollArea::vertical().id_salt("editor-outline").show(ui, |ui| {
+            for symbol in &symbols {
+                let indent = "  ".repeat(symbol.depth);
+                let label = format!("{indent}{}", symbol.name);
+                if ui
+                    .selectable_label(false, RichText::new(label).small())
+                    .on_hover_text(symbol.kind_label())
+                    .clicked()
+                {
+                    actions.push(Action::Open {
+                        path: path.clone(),
+                        reveal: Some(symbol.range.start.line),
+                    });
+                }
+            }
+        });
+    });
+}
+
+/// The text area itself, with the gutter, highlighting, and every keyboard
+/// interaction the language server drives.
+fn code_area(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    height: f32,
+    diagnostics: &[Diagnostic],
+    actions: &mut Vec<Action>,
+) {
+    let Some(index) = app.editor.active else { return };
+    let font = egui::FontId::monospace(13.0);
+    let row_height = ui.fonts(|f| f.row_height(&font));
+
+    // Keys are consumed before the text area sees them, so the completion
+    // popup can own the arrows and Enter while it is open.
+    let keys = read_keys(ui, app.editor.completion.open);
+
+    let path = app.editor.files[index].path.clone();
+    let read_only = app.editor.files[index].read_only;
+    let reveal = app.editor.files[index].reveal.take();
+
+    // The layouter closes over the diagnostics so their ranges can be
+    // underlined in place, which is the whole point of having them here.
+    let lang = app.editor.files[index].lang;
+    let diagnostics = diagnostics.to_vec();
+    let mut layouter = move |ui: &egui::Ui, buffer: &dyn egui::TextBuffer, wrap: f32| {
+        let mut job = highlight(buffer.as_str(), lang, &diagnostics, font.clone());
+        job.wrap.max_width = wrap;
+        ui.fonts(|f| f.layout_job(job))
+    };
+
+    let mut scroll = ScrollArea::vertical().id_salt("editor-code").max_height(height);
+    if let Some(line) = reveal {
+        // Put the target line a third of the way down rather than at the very
+        // top, so the code around it is visible too.
+        let offset = (line as f32 * row_height - height / 3.0).max(0.0);
+        scroll = scroll.vertical_scroll_offset(offset);
+    }
+
+    let response = scroll.show(ui, |ui| {
+        ui.horizontal_top(|ui| {
+            gutter(app, ui, index, row_height, &diagnostics_by_line(&app.lsp.diagnostics(&path)));
+            let file = &mut app.editor.files[index];
+            let output = egui::TextEdit::multiline(&mut file.text)
+                .id(egui::Id::new(("editor-buffer", &file.path)))
+                .code_editor()
+                .desired_width(f32::INFINITY)
+                .desired_rows(24)
+                .interactive(!read_only)
+                .layouter(&mut layouter)
+                .show(ui);
+            output
+        })
+        .inner
+    });
+    let output = response.inner;
+
+    let file = &mut app.editor.files[index];
+
+    // Cursor, as a byte offset.
+    if let Some(range) = output.cursor_range {
+        file.cursor = char_to_byte(&file.text, range.primary.index);
+    }
+
+    // Typing: mark for a debounced didChange, and keep the completion filter
+    // in step with what has been typed since the popup opened.
+    if output.response.changed() {
+        file.dirty_since = Some(Instant::now());
+        if app.editor.completion.open {
+            let anchor = app.editor.completion.anchor.min(file.text.len());
+            let cursor = file.cursor.min(file.text.len());
+            if cursor >= anchor {
+                app.editor.completion.filter = file.text[anchor..cursor].to_string();
+            } else {
+                app.editor.completion.close();
+            }
+        }
+    }
+
+    // Debounced sync: send the buffer once typing pauses.
+    let should_sync = file
+        .dirty_since
+        .is_some_and(|at| at.elapsed() >= SYNC_DEBOUNCE);
+    if should_sync {
+        file.dirty_since = None;
+        actions.push(Action::Sync(path.clone()));
+    } else if file.dirty_since.is_some() {
+        // Keep frames coming so the debounce actually fires while idle.
+        ui.ctx().request_repaint_after(SYNC_DEBOUNCE);
+    }
+
+    let position = file.cursor_position();
+    let cursor_screen = output
+        .cursor_range
+        .map(|r| output.galley.pos_from_cursor(r.primary))
+        .map(|rect| output.galley_pos + rect.left_bottom().to_vec2());
+
+    // -- keyboard ----------------------------------------------------------
+    if keys.save {
+        actions.push(Action::Save);
+    }
+    if keys.format {
+        actions.push(Action::Format);
+    }
+    if keys.definition {
+        actions.push(Action::Definition { path: path.clone(), position });
+    }
+    if keys.references {
+        actions.push(Action::References { path: path.clone(), position });
+    }
+    if keys.rename {
+        let (start, end) = file.word_at(file.cursor);
+        actions.push(Action::StartRename {
+            path: path.clone(),
+            position,
+            old_name: file.text[start..end].to_string(),
+        });
+    }
+    if keys.completion && !app.editor.completion.requesting {
+        let (start, _) = file.word_at(file.cursor);
+        app.editor.completion.anchor = start;
+        app.editor.completion.filter = file.text[start..file.cursor].to_string();
+        app.editor.completion.screen_pos = cursor_screen;
+        actions.push(Action::Completion { path: path.clone(), position, anchor: start });
+    }
+    if keys.escape {
+        app.editor.completion.close();
+        app.editor.hover.text = None;
+    }
+
+    // Ctrl/Cmd-click is go-to-definition, the way every editor does it.
+    if output.response.clicked() && (keys.command_down) {
+        if let Some(pos) = ui.ctx().pointer_interact_pos() {
+            let cursor = output.galley.cursor_from_pos(pos - output.galley_pos);
+            let offset = char_to_byte(&file.text, cursor.index);
+            actions.push(Action::Definition {
+                path: path.clone(),
+                position: protocol::offset_to_position(&file.text, offset),
+            });
+        }
+    }
+
+    // -- hover -------------------------------------------------------------
+    hover_interaction(app, ui, index, &output, actions);
+
+    // -- completion popup --------------------------------------------------
+    completion_popup(app, ui, index, keys, actions);
+}
+
+/// Line numbers plus a marker for the worst diagnostic on each line.
+fn gutter(
+    app: &App,
+    ui: &mut egui::Ui,
+    index: usize,
+    row_height: f32,
+    by_line: &std::collections::HashMap<u32, Severity>,
+) {
+    let file = &app.editor.files[index];
+    let lines = file.text.lines().count().max(1);
+    let width = format!("{lines}").len() as f32 * 9.0 + 18.0;
+
+    ui.vertical(|ui| {
+        ui.set_width(width);
+        ui.spacing_mut().item_spacing.y = 0.0;
+        for line in 0..lines {
+            let marker = by_line.get(&(line as u32));
+            let (glyph, color) = match marker {
+                Some(Severity::Error) => ("●", theme::DANGER),
+                Some(Severity::Warning) => ("●", theme::WARN),
+                Some(_) => ("·", theme::FG_DIM),
+                None => (" ", theme::FG_DIM),
+            };
+            ui.horizontal(|ui| {
+                ui.set_height(row_height);
+                ui.label(RichText::new(glyph).color(color).monospace().size(11.0));
+                ui.label(
+                    RichText::new(format!("{:>width$}", line + 1, width = format!("{lines}").len()))
+                        .color(theme::FG_DIM)
+                        .monospace()
+                        .size(11.0),
+                );
+            });
+        }
+    });
+}
+
+/// The worst severity per line, for the gutter.
+fn diagnostics_by_line(
+    diagnostics: &[Diagnostic],
+) -> std::collections::HashMap<u32, Severity> {
+    let mut map = std::collections::HashMap::new();
+    for d in diagnostics {
+        let entry = map.entry(d.range.start.line).or_insert(d.severity);
+        if d.severity > *entry {
+            *entry = d.severity;
+        }
+    }
+    map
+}
+
+/// Requests a hover when the pointer rests, and shows the last answer.
+fn hover_interaction(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    index: usize,
+    output: &egui::text_edit::TextEditOutput,
+    actions: &mut Vec<Action>,
+) {
+    let Some(pointer) = ui.ctx().pointer_hover_pos() else {
+        app.editor.hover.resting_since = None;
+        return;
+    };
+    if !output.response.hovered() {
+        app.editor.hover.text = None;
+        app.editor.hover.resting_since = None;
+        return;
+    }
+
+    // Restart the clock whenever the pointer moves more than a character.
+    let moved = app
+        .editor
+        .hover
+        .resting_at
+        .is_none_or(|at| (at - pointer).length() > 6.0);
+    if moved {
+        app.editor.hover.resting_at = Some(pointer);
+        app.editor.hover.resting_since = Some(Instant::now());
+        app.editor.hover.text = None;
+        ui.ctx().request_repaint_after(HOVER_DELAY);
+        return;
+    }
+
+    let rested = app
+        .editor
+        .hover
+        .resting_since
+        .is_some_and(|since| since.elapsed() >= HOVER_DELAY);
+    if rested && app.editor.hover.text.is_none() && !app.editor.hover.requesting {
+        let file = &app.editor.files[index];
+        let cursor = output.galley.cursor_from_pos(pointer - output.galley_pos);
+        let offset = char_to_byte(&file.text, cursor.index);
+        let position = protocol::offset_to_position(&file.text, offset);
+        app.editor.hover.requesting = true;
+        app.editor.hover.screen_pos = Some(pointer);
+        actions.push(Action::Hover {
+            path: file.path.clone(),
+            position,
+            screen_pos: pointer,
+        });
+    }
+
+    if let Some(text) = app.editor.hover.text.clone() {
+        let anchor = app.editor.hover.screen_pos.unwrap_or(pointer) + egui::vec2(0.0, 18.0);
+        egui::Tooltip::always_open(
+            ui.ctx().clone(),
+            ui.layer_id(),
+            egui::Id::new("editor-hover"),
+            egui::PopupAnchor::Position(anchor),
+        )
+        .width(520.0)
+        .show(|ui| {
+            super::markdown::render(ui, &text);
+        });
+    }
+}
+
+/// The completion list, drawn at the cursor.
+fn completion_popup(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    index: usize,
+    keys: Keys,
+    _actions: &mut [Action],
+) {
+    if !app.editor.completion.open {
+        return;
+    }
+    let filtered: Vec<CompletionItem> =
+        app.editor.completion.filtered().into_iter().cloned().collect();
+    if filtered.is_empty() {
+        app.editor.completion.close();
+        return;
+    }
+
+    let count = filtered.len();
+    if keys.down {
+        app.editor.completion.selected = (app.editor.completion.selected + 1) % count;
+    }
+    if keys.up {
+        app.editor.completion.selected =
+            (app.editor.completion.selected + count - 1) % count;
+    }
+    let selected = app.editor.completion.selected.min(count - 1);
+
+    let pos = app
+        .editor
+        .completion
+        .screen_pos
+        .unwrap_or_else(|| ui.next_widget_position());
+
+    let mut chosen: Option<CompletionItem> = None;
+    egui::Area::new(egui::Id::new("editor-completion"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(pos + egui::vec2(0.0, 4.0))
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_max_width(460.0);
+                ScrollArea::vertical().max_height(220.0).id_salt("completion-list").show(
+                    ui,
+                    |ui| {
+                        for (i, item) in filtered.iter().enumerate() {
+                            let row = ui.horizontal(|ui| {
+                                let kind = item.kind_label();
+                                if !kind.is_empty() {
+                                    ui.label(
+                                        RichText::new(kind)
+                                            .small()
+                                            .color(theme::TEAL)
+                                            .monospace(),
+                                    );
+                                }
+                                let label = RichText::new(&item.label).monospace();
+                                let label =
+                                    if i == selected { label.strong() } else { label };
+                                ui.label(label);
+                                if let Some(detail) = &item.detail {
+                                    ui.label(
+                                        RichText::new(detail).small().color(theme::FG_DIM),
+                                    );
+                                }
+                            });
+                            let response = row.response.interact(egui::Sense::click());
+                            if i == selected {
+                                ui.painter().rect_stroke(
+                                    response.rect.expand(1.0),
+                                    2.0_f32,
+                                    egui::Stroke::new(1.0_f32, theme::EMBER),
+                                    egui::StrokeKind::Outside,
+                                );
+                            }
+                            if response.clicked() {
+                                chosen = Some(item.clone());
+                            }
+                        }
+                    },
+                );
+            });
+        });
+
+    if keys.accept {
+        chosen = filtered.get(selected).cloned();
+    }
+    if let Some(item) = chosen {
+        insert_completion(app, ui.ctx(), index, &item);
+        app.editor.completion.close();
+    }
+}
+
+/// Writes a chosen completion into the buffer and puts the cursor after it.
+fn insert_completion(
+    app: &mut App,
+    ctx: &egui::Context,
+    index: usize,
+    item: &CompletionItem,
+) {
+    let anchor = app.editor.completion.anchor;
+    let file = &mut app.editor.files[index];
+
+    // A server-supplied range wins: it knows what it means to replace,
+    // including the dot in `foo.bar`.
+    let (start, end) = match item.range {
+        Some(range) => protocol::range_to_offsets(&file.text, range),
+        None => (anchor.min(file.text.len()), file.cursor.min(file.text.len())),
+    };
+    let (start, end) = (start.min(file.text.len()), end.min(file.text.len()));
+    if start > end {
+        return;
+    }
+    file.text.replace_range(start..end, &item.insert);
+    file.cursor = start + item.insert.len();
+    file.dirty_since = Some(Instant::now());
+
+    // Move egui's own cursor, or the caret jumps back to where it was.
+    let id = egui::Id::new(("editor-buffer", &file.path));
+    if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
+        let chars = byte_to_char(&file.text, file.cursor);
+        state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(chars))));
+        state.store(ctx, id);
+    }
+}
+
+/// Diagnostics or references, under the code.
+fn bottom_panel(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    height: f32,
+    diagnostics: &[Diagnostic],
+    actions: &mut Vec<Action>,
+) {
+    ui.horizontal(|ui| {
+        let errors = diagnostics.iter().filter(|d| d.severity == Severity::Error).count();
+        let warnings = diagnostics.iter().filter(|d| d.severity == Severity::Warning).count();
+        let label = format!("Problems ({errors} errors, {warnings} warnings)");
+        if ui
+            .selectable_label(app.editor.bottom == BottomPanel::Diagnostics, label)
+            .clicked()
+        {
+            app.editor.bottom = BottomPanel::Diagnostics;
+        }
+        let label = format!("References ({})", app.editor.references.len());
+        if ui
+            .selectable_label(app.editor.bottom == BottomPanel::References, label)
+            .clicked()
+        {
+            app.editor.bottom = BottomPanel::References;
+        }
+    });
+
+    ScrollArea::vertical().max_height(height).id_salt("editor-bottom").show(ui, |ui| {
+        match app.editor.bottom {
+            BottomPanel::Diagnostics => {
+                let path = app.editor.active_file().map(|f| f.path.clone());
+                if diagnostics.is_empty() {
+                    ui.label(RichText::new("No problems reported.").small().color(theme::ADD));
+                }
+                for d in diagnostics {
+                    let color = match d.severity {
+                        Severity::Error => theme::DANGER,
+                        Severity::Warning => theme::WARN,
+                        _ => theme::FG_DIM,
+                    };
+                    let line = d.line();
+                    if ui
+                        .selectable_label(false, RichText::new(line).color(color).small())
+                        .clicked()
+                    {
+                        if let Some(path) = path.clone() {
+                            actions.push(Action::Open {
+                                path,
+                                reveal: Some(d.range.start.line),
+                            });
+                        }
+                    }
+                }
+            }
+            BottomPanel::References => {
+                if app.editor.references.is_empty() {
+                    ui.label(
+                        RichText::new("Put the cursor on a symbol and press Shift+F12.")
+                            .small()
+                            .color(theme::FG_DIM),
+                    );
+                }
+                let references = app.editor.references.clone();
+                for reference in &references {
+                    let Some(path) = protocol::uri_to_path(&reference.uri) else { continue };
+                    let name = app
+                        .repo
+                        .as_ref()
+                        .and_then(|r| path.strip_prefix(r.path()).ok())
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string();
+                    let label = format!("{name}:{}", reference.range.start.line + 1);
+                    if ui.selectable_label(false, RichText::new(label).small().monospace()).clicked()
+                    {
+                        actions.push(Action::Open {
+                            path: path.clone(),
+                            reveal: Some(reference.range.start.line),
+                        });
+                    }
+                }
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Keyboard
+// ---------------------------------------------------------------------------
+
+/// The editor's key bindings for one frame, already consumed so the text
+/// area never sees them.
+#[derive(Clone, Copy, Default)]
+pub struct Keys {
+    pub save: bool,
+    pub format: bool,
+    pub definition: bool,
+    pub references: bool,
+    pub rename: bool,
+    pub completion: bool,
+    pub escape: bool,
+    pub up: bool,
+    pub down: bool,
+    pub accept: bool,
+    pub command_down: bool,
+}
+
+fn read_keys(ui: &egui::Ui, completion_open: bool) -> Keys {
+    use egui::{Key, Modifiers};
+    let command = Modifiers::COMMAND;
+    ui.input_mut(|i| Keys {
+        save: i.consume_key(command, Key::S),
+        format: i.consume_key(command | Modifiers::SHIFT, Key::F),
+        definition: i.consume_key(Modifiers::NONE, Key::F12),
+        references: i.consume_key(Modifiers::SHIFT, Key::F12),
+        rename: i.consume_key(Modifiers::NONE, Key::F2),
+        completion: i.consume_key(command, Key::Space),
+        escape: i.consume_key(Modifiers::NONE, Key::Escape),
+        // The popup owns the arrows and Enter only while it is open, so
+        // normal editing keeps working when it is not.
+        up: completion_open && i.consume_key(Modifiers::NONE, Key::ArrowUp),
+        down: completion_open && i.consume_key(Modifiers::NONE, Key::ArrowDown),
+        accept: completion_open
+            && (i.consume_key(Modifiers::NONE, Key::Enter)
+                || i.consume_key(Modifiers::NONE, Key::Tab)),
+        command_down: i.modifiers.command,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Highlighting
+// ---------------------------------------------------------------------------
+
+/// Lays out the buffer: syntax colours, with diagnostic ranges underlined.
+pub fn highlight(
+    text: &str,
+    lang: super::syntax::Lang,
+    diagnostics: &[Diagnostic],
+    font: FontId,
+) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    let lines: Vec<&str> = text.split('\n').collect();
+    let langs = super::syntax::langs_per_line(&lines, lang);
+
+    for (number, line) in lines.iter().enumerate() {
+        let line_lang = langs.get(number).copied().unwrap_or(lang);
+        let underlines = underline_ranges(diagnostics, number as u32, line);
+        // Spans carry text, not offsets, so the offset is accumulated as
+        // they are walked — that is what the diagnostic ranges are in.
+        let mut at = 0usize;
+        for span in super::syntax::highlight_line(line_lang, line, theme::FG) {
+            let (span_start, span_end) = (at, at + span.text.len());
+            at = span_end;
+            // A span can straddle the start or end of a diagnostic, so it is
+            // split at every boundary rather than underlined wholesale.
+            for (start, end, severity) in split_span(span_start, span_end, &underlines) {
+                let mut format = TextFormat::simple(font.clone(), span.color);
+                if let Some(severity) = severity {
+                    format.underline = egui::Stroke::new(
+                        if severity == Severity::Error { 2.0_f32 } else { 1.0_f32 },
+                        match severity {
+                            Severity::Error => theme::DANGER,
+                            Severity::Warning => theme::WARN,
+                            _ => theme::FG_DIM,
+                        },
+                    );
+                }
+                job.append(&span.text[start - span_start..end - span_start], 0.0, format);
+            }
+        }
+        if number + 1 < lines.len() {
+            job.append("\n", 0.0, TextFormat::simple(font.clone(), theme::FG));
+        }
+    }
+    job
+}
+
+/// Byte ranges within one line that a diagnostic covers.
+fn underline_ranges(
+    diagnostics: &[Diagnostic],
+    line: u32,
+    text: &str,
+) -> Vec<(usize, usize, Severity)> {
+    let mut out = Vec::new();
+    for d in diagnostics {
+        if line < d.range.start.line || line > d.range.end.line {
+            continue;
+        }
+        let start = if line == d.range.start.line {
+            protocol::utf16_to_byte(text, d.range.start.character)
+        } else {
+            0
+        };
+        let end = if line == d.range.end.line {
+            protocol::utf16_to_byte(text, d.range.end.character)
+        } else {
+            text.len()
+        };
+        // A zero-width diagnostic (a missing token) still needs something to
+        // underline, so it claims one character.
+        let end = if end > start { end } else { (start + 1).min(text.len()) };
+        if start < end {
+            out.push((start, end, d.severity));
+        }
+    }
+    out.sort_by_key(|(start, ..)| *start);
+    out
+}
+
+/// Splits `start..end` at every underline boundary, tagging each piece.
+fn split_span(
+    start: usize,
+    end: usize,
+    underlines: &[(usize, usize, Severity)],
+) -> Vec<(usize, usize, Option<Severity>)> {
+    let mut cuts: Vec<usize> = vec![start, end];
+    for (u_start, u_end, _) in underlines {
+        if *u_start > start && *u_start < end {
+            cuts.push(*u_start);
+        }
+        if *u_end > start && *u_end < end {
+            cuts.push(*u_end);
+        }
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+
+    let mut out = Vec::new();
+    for pair in cuts.windows(2) {
+        let (piece_start, piece_end) = (pair[0], pair[1]);
+        if piece_start >= piece_end {
+            continue;
+        }
+        let severity = underlines
+            .iter()
+            .filter(|(u_start, u_end, _)| *u_start <= piece_start && *u_end >= piece_end)
+            .map(|(.., severity)| *severity)
+            .max();
+        out.push((piece_start, piece_end, severity));
+    }
+    if out.is_empty() && start < end {
+        out.push((start, end, None));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Offsets
+// ---------------------------------------------------------------------------
+
+/// Byte offset for a character index, as egui's cursor counts them.
+pub fn char_to_byte(text: &str, chars: usize) -> usize {
+    text.char_indices().nth(chars).map(|(i, _)| i).unwrap_or(text.len())
+}
+
+/// Character index for a byte offset.
+pub fn byte_to_char(text: &str, byte: usize) -> usize {
+    text[..byte.min(text.len())].chars().count()
+}
+
+// ---------------------------------------------------------------------------
+// Actions
+// ---------------------------------------------------------------------------
+
+/// Carries out what the UI decided, now that `app.editor` is no longer
+/// borrowed.
+fn run_actions(app: &mut App, actions: Vec<Action>) {
+    for action in actions {
+        match action {
+            Action::Open { path, reveal } => app.editor_open(&path, reveal),
+            Action::Close(index) => app.editor_close(index),
+            Action::Save => app.editor_save(),
+            Action::Format => app.editor_format(),
+            Action::Sync(path) => app.lsp_sync(&path),
+            Action::Hover { path, position, screen_pos } => {
+                app.editor.hover.screen_pos = Some(screen_pos);
+                app.lsp_hover(&path, position);
+            }
+            Action::Definition { path, position } => app.lsp_definition(&path, position),
+            Action::References { path, position } => app.lsp_references(&path, position),
+            Action::Symbols(path) => app.lsp_symbols(&path),
+            Action::Completion { path, position, anchor } => {
+                app.lsp_completion(&path, position, anchor)
+            }
+            Action::StartRename { path, position, old_name } => {
+                app.editor.rename = Some(Rename {
+                    path,
+                    position,
+                    new_name: old_name.clone(),
+                    old_name,
+                });
+                app.dialog = super::Dialog::Rename;
+            }
+            Action::ApplyRename { path, position, new_name } => {
+                app.lsp_rename(&path, position, &new_name)
+            }
+            Action::RestartServers => app.lsp_restart(),
+            Action::QuickOpen => app.editor_quick_open(),
+        }
+    }
+}
+
+/// Unused import guard: the AI model picker is used by the agent tab, which
+/// shares this module's toolbar helpers.
+#[allow(dead_code)]
+fn _target() -> AiTarget {
+    AiTarget::Review
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lsp::protocol::Range;
+
+    fn diagnostic(line: u32, start: u32, end: u32, severity: Severity) -> Diagnostic {
+        Diagnostic {
+            range: Range {
+                start: Position::new(line, start),
+                end: Position::new(line, end),
+            },
+            severity,
+            code: None,
+            message: "problem".into(),
+            source: None,
+        }
+    }
+
+    fn file(text: &str) -> OpenFile {
+        OpenFile {
+            path: PathBuf::from("/repo/src/main.rs"),
+            rel: "src/main.rs".into(),
+            text: text.to_string(),
+            saved: text.to_string(),
+            lang: super::super::syntax::Lang::Rust,
+            symbols: Vec::new(),
+            cursor: 0,
+            reveal: None,
+            dirty_since: None,
+            synced: false,
+            read_only: false,
+        }
+    }
+
+    #[test]
+    fn a_buffer_is_dirty_only_once_it_differs_from_disk() {
+        let mut f = file("fn main() {}\n");
+        assert!(!f.is_dirty());
+        f.text.push_str("// edit\n");
+        assert!(f.is_dirty());
+        f.saved = f.text.clone();
+        assert!(!f.is_dirty());
+    }
+
+    #[test]
+    fn the_word_under_the_cursor_is_found_in_both_directions() {
+        let f = file("let value = compute_it(x);\n");
+        let offset = f.text.find("compute_it").unwrap() + 3;
+        let (start, end) = f.word_at(offset);
+        assert_eq!(&f.text[start..end], "compute_it");
+    }
+
+    #[test]
+    fn the_word_at_a_boundary_is_empty_rather_than_wrong() {
+        let f = file("a + b\n");
+        let offset = f.text.find('+').unwrap();
+        let (start, end) = f.word_at(offset);
+        assert_eq!(&f.text[start..end], "");
+    }
+
+    #[test]
+    fn char_and_byte_offsets_round_trip_through_wide_characters() {
+        let text = "let s = \"🦀 crab\";\n";
+        let byte = text.find("crab").unwrap();
+        let chars = byte_to_char(text, byte);
+        assert_eq!(char_to_byte(text, chars), byte);
+        assert_eq!(char_to_byte(text, 9999), text.len());
+    }
+
+    #[test]
+    fn a_diagnostic_underlines_only_its_own_range() {
+        let text = "let x = broken();";
+        let start = protocol::byte_to_utf16(text, text.find("broken").unwrap());
+        let end = protocol::byte_to_utf16(text, text.find("()").unwrap());
+        let diagnostics = vec![diagnostic(0, start, end, Severity::Error)];
+        let ranges = underline_ranges(&diagnostics, 0, text);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(&text[ranges[0].0..ranges[0].1], "broken");
+    }
+
+    #[test]
+    fn a_zero_width_diagnostic_still_underlines_something() {
+        let text = "let x = ;";
+        let at = protocol::byte_to_utf16(text, 8);
+        let ranges = underline_ranges(&[diagnostic(0, at, at, Severity::Error)], 0, text);
+        assert_eq!(ranges.len(), 1);
+        assert!(ranges[0].1 > ranges[0].0);
+    }
+
+    #[test]
+    fn a_multi_line_diagnostic_covers_whole_middle_lines() {
+        let d = Diagnostic {
+            range: Range {
+                start: Position::new(0, 4),
+                end: Position::new(2, 2),
+            },
+            severity: Severity::Warning,
+            code: None,
+            message: "spans lines".into(),
+            source: None,
+        };
+        let middle = underline_ranges(std::slice::from_ref(&d), 1, "the whole line");
+        assert_eq!(middle, vec![(0, 14, Severity::Warning)]);
+        let last = underline_ranges(&[d], 2, "abcdef");
+        assert_eq!(last, vec![(0, 2, Severity::Warning)]);
+    }
+
+    #[test]
+    fn spans_split_at_diagnostic_boundaries() {
+        // A highlight span 0..10 with a diagnostic covering 4..7 becomes
+        // three pieces, only the middle one underlined.
+        let pieces = split_span(0, 10, &[(4, 7, Severity::Error)]);
+        assert_eq!(
+            pieces,
+            vec![
+                (0, 4, None),
+                (4, 7, Some(Severity::Error)),
+                (7, 10, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_span_outside_every_diagnostic_is_one_piece() {
+        assert_eq!(split_span(20, 30, &[(4, 7, Severity::Error)]), vec![(20, 30, None)]);
+    }
+
+    #[test]
+    fn highlighting_reproduces_the_buffer_exactly() {
+        // The layout job must contain the text verbatim: a highlighter that
+        // drops or duplicates a character puts the cursor in the wrong place
+        // for the rest of the session.
+        let text = "fn main() {\n    let x = broken(); // 🦀\n}\n";
+        let d = vec![diagnostic(1, 12, 18, Severity::Error)];
+        let job = highlight(text, super::super::syntax::Lang::Rust, &d, FontId::monospace(13.0));
+        assert_eq!(job.text, text);
+    }
+
+    #[test]
+    fn the_worst_severity_wins_in_the_gutter() {
+        let by_line = diagnostics_by_line(&[
+            diagnostic(3, 0, 1, Severity::Warning),
+            diagnostic(3, 2, 3, Severity::Error),
+            diagnostic(4, 0, 1, Severity::Info),
+        ]);
+        assert_eq!(by_line[&3], Severity::Error);
+        assert_eq!(by_line[&4], Severity::Info);
+    }
+
+    #[test]
+    fn completion_filtering_puts_prefix_matches_first() {
+        let item = |label: &str| CompletionItem {
+            label: label.into(),
+            detail: None,
+            insert: label.into(),
+            range: None,
+            sort_text: None,
+            kind: None,
+        };
+        let mut completion = Completion {
+            open: true,
+            items: vec![item("unwrap_or"), item("map"), item("unwrap")],
+            ..Default::default()
+        };
+        completion.filter = "unwrap".into();
+        let labels: Vec<&str> =
+            completion.filtered().iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["unwrap_or", "unwrap"]);
+
+        // Nothing starts with "ap", so all three are contains-matches and
+        // the server's own order is preserved.
+        completion.filter = "ap".into();
+        let labels: Vec<&str> =
+            completion.filtered().iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["unwrap_or", "map", "unwrap"]);
+
+        completion.close();
+        assert!(!completion.open && completion.items.is_empty());
+    }
+}

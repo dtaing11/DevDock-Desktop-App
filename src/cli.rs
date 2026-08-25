@@ -810,12 +810,27 @@ fn ai_message(repo: &Repo) -> Result<crate::ollama::CommitSuggestion, String> {
     }
 }
 
+/// Prompts and reads one answer, lowercased.
+///
+/// `None` means end of input: a piped or closed stdin answers nothing, and a
+/// loop that re-prompts on it spins forever. Every prompt in this file treats
+/// `None` as "stop", never as "try again".
+fn ask(prompt: &str, stdin: &std::io::Stdin) -> Option<String> {
+    use std::io::{BufRead, Write};
+    print!("{prompt}");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    match stdin.lock().read_line(&mut line) {
+        Ok(0) | Err(_) => None,
+        Ok(_) => Some(line.trim().to_lowercase()),
+    }
+}
+
 /// Interactive merge-conflict resolver. For each conflicted file the user
 /// picks ours/theirs, or asks the AI for a proposed merge. AI output is
 /// never applied silently: it is printed in full and must be explicitly
 /// accepted (or regenerated/skipped) before anything is written.
 fn cmd_resolve(rest: &[String]) -> ExitCode {
-    use std::io::{BufRead, Write};
     let repo = match repo() {
         Ok(r) => r,
         Err(code) => return code,
@@ -843,8 +858,13 @@ fn cmd_resolve(rest: &[String]) -> ExitCode {
     // --agent: one repository-wide pass first. Whatever it does not resolve
     // falls through to the per-file loop below.
     if rest.iter().any(|a| a == "--agent" || a == "-a") {
-        if let Err(e) = agent_resolve(&repo, &conflicts, &stdin) {
-            eprintln!("devdock: {e}");
+        match agent_resolve(&repo, &conflicts, &stdin) {
+            Ok(Flow::Quit) => {
+                println!("devdock: stopped; applied resolutions are kept");
+                return ExitCode::SUCCESS;
+            }
+            Ok(Flow::Continue) => {}
+            Err(e) => eprintln!("devdock: {e}"),
         }
         match repo.conflicts() {
             Ok(remaining) if remaining.is_empty() => {
@@ -867,6 +887,13 @@ fn cmd_resolve(rest: &[String]) -> ExitCode {
     per_file_resolve(&repo, state, conflicts, &stdin)
 }
 
+/// Whether the user wants to keep going after a prompt.
+#[derive(PartialEq, Eq)]
+enum Flow {
+    Continue,
+    Quit,
+}
+
 /// The repository-wide AI pass: the model reads what it needs, proposes
 /// changes to any file the merge requires, and every proposal is printed as
 /// a diff and applied only when the user says so.
@@ -874,9 +901,7 @@ fn agent_resolve(
     repo: &Repo,
     conflicts: &[crate::git::ConflictFile],
     stdin: &std::io::Stdin,
-) -> Result<(), String> {
-    use std::io::{BufRead, Write};
-
+) -> Result<Flow, String> {
     let config = crate::app::Config::load();
     let sel = config
         .conflict_ai
@@ -929,7 +954,7 @@ fn agent_resolve(
     }
     if run.edits.is_empty() {
         println!("{}", style::dim("the model proposed no changes"));
-        return Ok(());
+        return Ok(Flow::Continue);
     }
 
     let conflicted: Vec<&str> = conflicts.iter().map(|f| f.path.as_str()).collect();
@@ -954,18 +979,14 @@ fn agent_resolve(
             println!("{}", style::red("  still contains conflict markers"));
         }
         loop {
-            print!(
+            let prompt = format!(
                 "{} {} {} ? ",
                 style::green("[a]pply"),
                 style::dim("[s]kip"),
                 style::red("[q]uit")
             );
-            let _ = std::io::stdout().flush();
-            let mut line = String::new();
-            if stdin.lock().read_line(&mut line).is_err() {
-                return Err("could not read your answer".into());
-            }
-            match line.trim().to_lowercase().as_str() {
+            let Some(answer) = ask(&prompt, stdin) else { return Ok(Flow::Quit) };
+            match answer.as_str() {
                 "a" => {
                     let result = if conflicted.contains(&edit.path.as_str()) {
                         repo.resolve(
@@ -986,12 +1007,12 @@ fn agent_resolve(
                     println!("{} skipped {}", style::dim("·"), edit.path);
                     break;
                 }
-                "q" => return Ok(()),
+                "q" => return Ok(Flow::Quit),
                 other => println!("devdock: \"{other}\"? a / s / q"),
             }
         }
     }
-    Ok(())
+    Ok(Flow::Continue)
 }
 
 /// Prints one proposal as a colored unified diff.
@@ -1024,14 +1045,13 @@ fn per_file_resolve(
     conflicts: Vec<crate::git::ConflictFile>,
     stdin: &std::io::Stdin,
 ) -> ExitCode {
-    use std::io::{BufRead, Write};
     let mut resolved = 0usize;
     for file in &conflicts {
         let path = &file.path;
         println!("
 {} {}", style::yellow("[conflict]"), style::bold(path));
         loop {
-            print!(
+            let prompt = format!(
                 "{} {} {} {} {} ? ",
                 style::green("[a]i merge"),
                 style::teal("[o]urs"),
@@ -1039,16 +1059,15 @@ fn per_file_resolve(
                 style::dim("[s]kip"),
                 style::red("[q]uit")
             );
-            let _ = std::io::stdout().flush();
-            let mut line = String::new();
-            if stdin.lock().read_line(&mut line).is_err() {
-                return ExitCode::FAILURE;
-            }
-            match line.trim().to_lowercase().as_str() {
+            let Some(answer) = ask(&prompt, stdin) else {
+                println!("\ndevdock: stopping; {resolved} file(s) resolved so far");
+                return ExitCode::SUCCESS;
+            };
+            match answer.as_str() {
                 "a" | "" => {
-                    match ai_merge(&repo, file) {
+                    match ai_merge(repo, file) {
                         Ok(merged) => {
-                            if review_ai_merge(&repo, path, &merged, &stdin) {
+                            if review_ai_merge(repo, path, &merged, stdin) {
                                 resolved += 1;
                                 break;
                             }
@@ -1097,22 +1116,19 @@ fn finish_resolve(
     total: usize,
     stdin: &std::io::Stdin,
 ) -> ExitCode {
-    use std::io::{BufRead, Write};
     if resolved == total {
         let verb = match state {
             crate::git::RepoState::Rebasing => "rebase",
             _ => "merge",
         };
-        print!(
+        let prompt = format!(
             "\nall conflicts resolved. continue the {verb} now? {} {} ? ",
             style::green("[y]es"),
             style::dim("[n]o")
         );
-        let _ = std::io::stdout().flush();
-        let mut line = String::new();
-        if stdin.lock().read_line(&mut line).is_ok()
-            && matches!(line.trim().to_lowercase().as_str(), "y" | "yes" | "")
-        {
+        // EOF (a piped stdin) declines: continuing a merge is not something
+        // to do because nobody answered.
+        if ask(&prompt, stdin).is_some_and(|a| matches!(a.as_str(), "y" | "yes" | "")) {
             let outcome = match state {
                 crate::git::RepoState::Rebasing => repo.rebase_continue(),
                 _ => repo.merge_continue(),
@@ -1142,7 +1158,6 @@ fn review_ai_merge(
     merged: &str,
     stdin: &std::io::Stdin,
 ) -> bool {
-    use std::io::{BufRead, Write};
     println!("\n{}", style::header(&format!("AI proposed merge for {path}")));
     for line in merged.lines() {
         println!("  {line}");
@@ -1153,17 +1168,10 @@ fn review_ai_merge(
         style::dim("nothing is applied until you accept")
     );
     loop {
-        print!(
-            "{} {} ? ",
-            style::green("[a]ccept"),
-            style::red("[d]ecline")
-        );
-        let _ = std::io::stdout().flush();
-        let mut line = String::new();
-        if stdin.lock().read_line(&mut line).is_err() {
-            return false;
-        }
-        match line.trim().to_lowercase().as_str() {
+        let prompt =
+            format!("{} {} ? ", style::green("[a]ccept"), style::red("[d]ecline"));
+        let Some(answer) = ask(&prompt, stdin) else { return false };
+        match answer.as_str() {
             "a" | "y" | "yes" => {
                 match repo.resolve(path, &crate::git::Resolution::Manual(merged.to_string())) {
                     Ok(()) => {

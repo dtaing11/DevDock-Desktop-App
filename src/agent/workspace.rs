@@ -77,6 +77,10 @@ const MAX_READ_BYTES: usize = 60_000;
 const MAX_READ_LINES: usize = 600;
 const MAX_LIST_ENTRIES: usize = 400;
 const MAX_SEARCH_HITS: usize = 80;
+/// How much file content one search may scan. A repository with tens of
+/// thousands of files would otherwise turn every search into a full read of
+/// the tree, and the user is watching a spinner.
+const MAX_SEARCH_SCAN_BYTES: usize = 8_000_000;
 
 /// One repository, its tracked files, and the edits proposed so far.
 pub struct Workspace {
@@ -355,11 +359,18 @@ impl Workspace {
 
         let mut hits = Vec::new();
         let mut more = 0usize;
+        let mut scanned = 0usize;
+        let mut unscanned = 0usize;
         for rel in self.visible_paths() {
             if !glob.is_none_or(|g| glob_match(g, rel)) {
                 continue;
             }
+            if scanned >= MAX_SEARCH_SCAN_BYTES {
+                unscanned += 1;
+                continue;
+            }
             let Ok(content) = self.current_content(rel) else { continue };
+            scanned += content.len();
             for (i, line) in content.lines().enumerate() {
                 if !line.to_lowercase().contains(&needle) {
                     continue;
@@ -378,11 +389,23 @@ impl Workspace {
             }
         }
         if hits.is_empty() {
-            return Ok(format!("No matches for {query}."));
+            return Ok(match unscanned {
+                0 => format!("No matches for {query}."),
+                n => format!(
+                    "No matches for {query} in what was searched; {n} file(s) were skipped \
+                     after the scan limit. Narrow with a glob to cover them."
+                ),
+            });
         }
         let mut out = hits.join("\n");
         if more > 0 {
             out.push_str(&format!("\n\n[{more} more matches; narrow the query or glob]"));
+        }
+        if unscanned > 0 {
+            out.push_str(&format!(
+                "\n\n[stopped after {MAX_SEARCH_SCAN_BYTES} bytes; {unscanned} file(s) were \
+                 not searched. Narrow with a glob to cover them]"
+            ));
         }
         Ok(out)
     }

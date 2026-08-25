@@ -21,6 +21,7 @@ pub mod cli_style;
 pub mod git;
 pub mod github;
 pub mod local_ci;
+pub mod lsp;
 pub mod ollama;
 pub mod review;
 pub mod secure_store;

@@ -14,6 +14,7 @@ pub mod graph;
 pub mod markdown;
 pub mod shortcuts;
 pub mod syntax;
+pub mod textdiff;
 pub mod theme;
 pub mod views;
 pub mod worker;
@@ -74,6 +75,15 @@ pub struct Config {
     pub commit_ai: Option<AiSelection>,
     /// Model used for PR title/body (may be a stronger model).
     pub pr_ai: Option<AiSelection>,
+    /// Model that drives the conflict-resolution harness. It reads the
+    /// repository and proposes edits, so it is usually worth a stronger
+    /// model than commit messages get.
+    #[serde(default)]
+    pub conflict_ai: Option<AiSelection>,
+    /// Model that drives the code review gate. `[review] provider/model` in
+    /// `.git-manage-ci.toml` overrides this when the repository sets it.
+    #[serde(default)]
+    pub review_ai: Option<AiSelection>,
     /// Keyboard shortcuts; missing/invalid entries fall back to defaults.
     #[serde(default)]
     pub shortcuts: shortcuts::Shortcuts,
@@ -103,6 +113,56 @@ pub struct RepoPrompts {
     /// Optional Markdown file whose contents are appended for conflicts.
     #[serde(default)]
     pub conflict_file: Option<String>,
+}
+
+/// What one agentic run produced, on its way back to the UI thread.
+#[derive(Debug, Clone)]
+pub struct AgentReport {
+    /// The model's closing summary, rendered as Markdown.
+    pub summary: String,
+    /// Proposed file changes. Nothing has been written.
+    pub edits: Vec<crate::agent::PendingEdit>,
+    /// Whether a budget cut the run short.
+    pub truncated: bool,
+}
+
+/// One proposed change plus the user's decision about it.
+#[derive(Debug, Clone)]
+pub struct ProposedEdit {
+    pub edit: crate::agent::PendingEdit,
+    /// Whether the user has ticked this change for applying. Off by default:
+    /// the model has worktree-wide reach, so every write is a deliberate
+    /// choice rather than something to click past.
+    pub accepted: bool,
+    /// Set once written to disk, so a second Apply cannot double-write.
+    pub applied: bool,
+    /// Set when the proposal still contains conflict markers, which means
+    /// the file is not actually resolved.
+    pub unresolved: bool,
+}
+
+/// The conflict-resolution harness: what it is doing, and what it wants to
+/// change. See [`crate::agent`] for the loop itself.
+#[derive(Default)]
+pub struct AgentState {
+    pub running: bool,
+    /// Live progress lines: what the model read, searched, and proposed.
+    pub log: Vec<String>,
+    /// The model's closing summary, once it finishes.
+    pub summary: String,
+    pub error: Option<String>,
+    /// Proposed changes awaiting the user's decision.
+    pub edits: Vec<ProposedEdit>,
+    /// Which proposal's diff is open.
+    pub selected: Option<usize>,
+    pub truncated: bool,
+}
+
+impl AgentState {
+    /// How many proposals are ticked and not yet written.
+    pub fn pending_count(&self) -> usize {
+        self.edits.iter().filter(|e| e.accepted && !e.applied).count()
+    }
 }
 
 /// A provider/model pair chosen for one AI task.
@@ -174,6 +234,9 @@ pub enum Dialog {
     ReviewGate,
     /// Failing local CI checks, with the option to proceed anyway.
     ChecksGate,
+    /// Changes the conflict harness proposed, each awaiting confirmation
+    /// before anything is written to the worktree.
+    AgentChanges,
 }
 
 /// A destructive action awaiting user confirmation.
@@ -223,6 +286,8 @@ impl ConfirmAction {
             Self::OverwriteAiText(worker::AiTarget::PullRequest) => {
                 "Overwrite PR title and description?"
             }
+            // Only the text-generating tasks can overwrite a field.
+            Self::OverwriteAiText(_) => "Overwrite generated text?",
         }
     }
 
@@ -280,6 +345,9 @@ impl ConfirmAction {
                  replaces both with the AI's suggestion, and anything you \
                  typed is lost."
                     .into()
+            }
+            Self::OverwriteAiText(_) => {
+                "The field already has text. Generating replaces it.".into()
             }
         }
     }
@@ -596,6 +664,8 @@ pub struct App {
     pub local_ci: LocalCiState,
     pub review: ReviewState,
     pub conflicts: ConflictState,
+    /// The conflict-resolution harness and the changes it proposes.
+    pub agent: AgentState,
     /// AI CI-config generation: busy flag and the editable proposal text
     /// shown in the review dialog. Nothing is written until confirmed.
     pub ci_ai_busy: bool,
@@ -674,6 +744,7 @@ impl App {
             local_ci: Default::default(),
             review: Default::default(),
             conflicts: Default::default(),
+            agent: Default::default(),
             ollama_models: Vec::new(),
             toast: None,
             busy: false,
@@ -917,6 +988,8 @@ impl App {
         let explicit = match target {
             worker::AiTarget::Commit => self.config.commit_ai.clone(),
             worker::AiTarget::PullRequest => self.config.pr_ai.clone(),
+            worker::AiTarget::Conflict => self.config.conflict_ai.clone(),
+            worker::AiTarget::Review => self.config.review_ai.clone(),
         };
         explicit.or_else(|| {
             let provider = self.config.ai_provider.clone().unwrap_or_else(|| "ollama".into());
@@ -934,6 +1007,8 @@ impl App {
         match target {
             worker::AiTarget::Commit => self.config.commit_ai = Some(sel),
             worker::AiTarget::PullRequest => self.config.pr_ai = Some(sel),
+            worker::AiTarget::Conflict => self.config.conflict_ai = Some(sel),
+            worker::AiTarget::Review => self.config.review_ai = Some(sel),
         }
         self.config.save();
     }
@@ -984,6 +1059,10 @@ impl App {
         let (inline, file) = match target {
             worker::AiTarget::Commit => (&prompts.commit, &prompts.commit_file),
             worker::AiTarget::PullRequest => (&prompts.pull_request, &prompts.pull_request_file),
+            worker::AiTarget::Conflict => (&prompts.conflict, &prompts.conflict_file),
+            // Review guidance is per-repository and committed: it comes from
+            // `[review] instructions` in .git-manage-ci.toml, not from here.
+            worker::AiTarget::Review => return None,
         };
         let mut parts: Vec<String> = Vec::new();
         let inline = inline.trim();
@@ -1476,6 +1555,52 @@ impl App {
                     Err(e) => self.toast(e, true),
                 }
             }
+            Msg::AgentEvent(line) => {
+                self.agent.log.push(line);
+            }
+            Msg::AgentDone(result) => {
+                self.agent.running = false;
+                match result {
+                    Ok(report) => {
+                        let conflicted: Vec<String> =
+                            self.conflicts.files.iter().map(|f| f.path.clone()).collect();
+                        self.agent.summary = report.summary;
+                        self.agent.truncated = report.truncated;
+                        self.agent.edits = report
+                            .edits
+                            .into_iter()
+                            .map(|edit| {
+                                // A "resolution" that still has markers in it
+                                // is flagged, not silently offered as done.
+                                let unresolved = conflicted.contains(&edit.path)
+                                    && crate::agent::conflict::has_conflict_markers(
+                                        &edit.after,
+                                    );
+                                ProposedEdit {
+                                    edit,
+                                    accepted: false,
+                                    applied: false,
+                                    unresolved,
+                                }
+                            })
+                            .collect();
+                        self.agent.selected = (!self.agent.edits.is_empty()).then_some(0);
+                        if self.agent.edits.is_empty() {
+                            self.toast(
+                                "The AI proposed no changes. Its notes are in the \
+                                 conflict resolver.",
+                                true,
+                            );
+                        } else {
+                            self.dialog = Dialog::AgentChanges;
+                        }
+                    }
+                    Err(e) => {
+                        self.agent.error = Some(e.clone());
+                        self.toast(e, true);
+                    }
+                }
+            }
             Msg::AiSuggestion { target, result } => {
                 self.ai_busy = false;
                 match (target, result) {
@@ -1489,6 +1614,8 @@ impl App {
                         self.pr.body = s.description;
                         self.toast("PR title and description generated.", false);
                     }
+                    // The harness tasks report through Msg::AgentDone.
+                    (worker::AiTarget::Conflict | worker::AiTarget::Review, Ok(_)) => {}
                     (_, Err(e)) => self.toast(e, true),
                 }
             }
@@ -1675,12 +1802,24 @@ impl App {
                 if diff.trim().is_empty() {
                     return Err("Nothing to review: no outgoing changes found.".into());
                 }
-                if provider == "claude" {
-                    let client = claude::Client::from_store(model)
-                        .ok_or("Claude is not signed in. Open Settings.")?;
-                    strerr(client.review(&diff, &cfg))
-                } else {
-                    strerr(ollama::Client::new(url).review(&model, &diff, &cfg))
+                let sel = AiSelection { provider, model };
+                if !cfg.repo_context {
+                    return review_single_shot(&sel, &url, &diff, &cfg);
+                }
+                match review_with_repo_context(&repo, &sel, &url, &diff, &cfg) {
+                    Err(e) if lacks_tool_support(&e) => {
+                        // The model cannot call tools, so it cannot read the
+                        // repository. Review the diff alone rather than
+                        // failing: a diff-only review is the old behaviour,
+                        // and a gate that errors out gets switched off.
+                        let mut outcome = review_single_shot(&sel, &url, &diff, &cfg)?;
+                        outcome.context_log.push(format!("! {e}"));
+                        outcome
+                            .context_log
+                            .push("! reviewed the diff alone, without repository context".into());
+                        Ok(outcome)
+                    }
+                    other => other,
                 }
             })();
             Msg::ReviewDone(result)
@@ -1843,7 +1982,7 @@ impl App {
         else {
             return;
         };
-        let Some(sel) = self.ai_selection(worker::AiTarget::Commit) else {
+        let Some(sel) = self.ai_selection(worker::AiTarget::Conflict) else {
             self.toast("No AI model selected. Pick one next to the AI button.", true);
             return;
         };
@@ -1868,6 +2007,133 @@ impl App {
             };
             Msg::AiMergeProposal { path, result }
         });
+    }
+
+    /// Runs the conflict-resolution harness across every conflicted file.
+    ///
+    /// Unlike [`Self::ai_resolve_conflict`], which shows one file's three
+    /// versions to the model and takes back a merged file, this gives the
+    /// model the repository: it reads whatever it needs and may propose
+    /// changes to any file the merge requires touching. Every proposal comes
+    /// back for the user to accept or reject — see [`Self::apply_agent_edits`].
+    pub fn start_conflict_agent(&mut self) {
+        let Some(repo) = self.repo.clone() else { return };
+        if self.agent.running {
+            return;
+        }
+        if self.conflicts.files.is_empty() {
+            self.toast("No conflicted files to resolve.", true);
+            return;
+        }
+        let Some(sel) = self.ai_selection(worker::AiTarget::Conflict) else {
+            self.toast("No AI model selected. Pick one next to the AI button.", true);
+            return;
+        };
+        let files: Vec<crate::agent::conflict::Brief> = self
+            .conflicts
+            .files
+            .iter()
+            .map(|f| crate::agent::conflict::Brief {
+                path: f.path.clone(),
+                ours: f.ours.clone(),
+                theirs: f.theirs.clone(),
+            })
+            .collect();
+        let custom = self.conflict_prompt();
+        let url = self.effective_ollama_url();
+
+        self.agent = AgentState {
+            running: true,
+            log: vec![format!(
+                "· resolving {} file(s) with {}: {}",
+                files.len(),
+                sel.provider,
+                sel.model
+            )],
+            ..Default::default()
+        };
+        self.dialog = Dialog::Conflicts;
+
+        let progress = self.worker.progress();
+        self.worker.spawn(move || {
+            let result = (|| -> Result<AgentReport, String> {
+                let provider = agent_provider(&sel, &url)?;
+                let tracked = strerr(repo.tracked_files())?;
+                let mut workspace = crate::agent::Workspace::new(
+                    repo.path(),
+                    tracked,
+                    crate::agent::Access::ReadWrite,
+                )?;
+                let run = crate::agent::conflict::run(
+                    provider.as_ref(),
+                    &mut workspace,
+                    &files,
+                    custom.as_deref(),
+                    crate::agent::conflict::limits(),
+                    &mut |event| progress.send(Msg::AgentEvent(event.line())),
+                )?;
+                Ok(AgentReport {
+                    summary: run.text,
+                    edits: run.edits,
+                    truncated: run.truncated,
+                })
+            })();
+            Msg::AgentDone(result)
+        });
+    }
+
+    /// Writes the proposals the user ticked, and nothing else.
+    ///
+    /// A conflicted file goes through [`crate::git::Repo::resolve`], which
+    /// writes it and stages it as resolved. Any other file the model
+    /// proposed is written to the worktree and left unstaged, so it shows up
+    /// in Changes for a second look before it is committed.
+    pub fn apply_agent_edits(&mut self) {
+        let Some(repo) = self.repo.clone() else { return };
+        let conflicted: Vec<String> =
+            self.conflicts.files.iter().map(|f| f.path.clone()).collect();
+
+        let mut newly_resolved: Vec<String> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        let mut applied = 0usize;
+
+        for proposed in &mut self.agent.edits {
+            if !proposed.accepted || proposed.applied {
+                continue;
+            }
+            let path = proposed.edit.path.clone();
+            let is_conflicted = conflicted.contains(&path);
+            let outcome = if is_conflicted {
+                repo.resolve(&path, &crate::git::Resolution::Manual(proposed.edit.after.clone()))
+                    .map_err(|e| e.to_string())
+            } else {
+                write_worktree_file(repo.path(), &path, &proposed.edit.after)
+            };
+            match outcome {
+                Ok(()) => {
+                    proposed.applied = true;
+                    applied += 1;
+                    if is_conflicted {
+                        newly_resolved.push(path);
+                    }
+                }
+                Err(e) => errors.push(format!("{path}: {e}")),
+            }
+        }
+
+        for path in newly_resolved {
+            if !self.conflicts.resolved.contains(&path) {
+                self.conflicts.resolved.push(path);
+            }
+        }
+
+        if errors.is_empty() {
+            self.toast(format!("Applied {applied} change(s)."), false);
+        } else {
+            self.toast(format!("Applied {applied}; failed: {}", errors.join("; ")), true);
+        }
+        self.refresh();
+        self.load_conflicts();
     }
 
     /// Starts fixing a PR's merge conflicts locally: checks out the head
@@ -1914,6 +2180,9 @@ impl App {
             match target {
                 worker::AiTarget::Commit => self.generate_ai_message(),
                 worker::AiTarget::PullRequest => self.generate_pr_text(),
+                // The harness tasks write no text field, so nothing can be
+                // overwritten and this gate never fires for them.
+                worker::AiTarget::Conflict | worker::AiTarget::Review => {}
             }
             return;
         }
@@ -2171,4 +2440,79 @@ impl eframe::App for App {
         dialogs::show(self, ctx);
         views::toasts(self, ctx);
     }
+}
+
+/// Builds the harness provider for a task's provider/model selection, the
+/// same pair the model picker writes.
+pub fn agent_provider(
+    sel: &AiSelection,
+    ollama_url: &str,
+) -> Result<Box<dyn crate::agent::Provider>, String> {
+    if sel.provider == "claude" {
+        return claude::Client::from_store(sel.model.clone())
+            .map(|c| Box::new(c) as Box<dyn crate::agent::Provider>)
+            .ok_or_else(|| "Claude is not signed in. Open Settings.".to_string());
+    }
+    if sel.model.trim().is_empty() {
+        return Err("No Ollama model selected. Pick one in Settings.".into());
+    }
+    Ok(Box::new(ollama::Client::new(ollama_url).agent(sel.model.clone())))
+}
+
+/// Writes one accepted proposal into the worktree, creating parent
+/// directories for a file the model added.
+fn write_worktree_file(root: &std::path::Path, rel: &str, content: &str) -> Result<(), String> {
+    let full = root.join(rel);
+    if let Some(parent) = full.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&full, content).map_err(|e| e.to_string())
+}
+
+/// Reviews `diff` with the reviewer able to read the repository.
+///
+/// Read-only: the review gate inspects code, it never edits it. The
+/// reviewer's reading list comes back on the outcome, so a verdict can be
+/// weighed against the context it was reached from.
+fn review_with_repo_context(
+    repo: &crate::git::Repo,
+    sel: &AiSelection,
+    ollama_url: &str,
+    diff: &str,
+    cfg: &crate::review::ReviewConfig,
+) -> Result<crate::review::ReviewOutcome, String> {
+    let provider = agent_provider(sel, ollama_url)?;
+    let tracked = strerr(repo.tracked_files())?;
+    let mut workspace =
+        crate::agent::Workspace::new(repo.path(), tracked, crate::agent::Access::ReadOnly)?;
+    crate::review::run_with_context(
+        provider.as_ref(),
+        &mut workspace,
+        diff,
+        cfg,
+        &mut |_| {},
+    )
+}
+
+/// The diff-only review: one request, no tools. Used when `repo_context` is
+/// off and as the fallback for a model that cannot call tools.
+fn review_single_shot(
+    sel: &AiSelection,
+    ollama_url: &str,
+    diff: &str,
+    cfg: &crate::review::ReviewConfig,
+) -> Result<crate::review::ReviewOutcome, String> {
+    if sel.provider == "claude" {
+        let client = claude::Client::from_store(sel.model.clone())
+            .ok_or("Claude is not signed in. Open Settings.")?;
+        return strerr(client.review(diff, cfg));
+    }
+    strerr(ollama::Client::new(ollama_url).review(&sel.model, diff, cfg))
+}
+
+/// Whether a failure means "this model cannot call tools", which is worth
+/// falling back for, as opposed to a real error worth reporting.
+fn lacks_tool_support(error: &str) -> bool {
+    let e = error.to_lowercase();
+    e.contains("cannot call tools") || e.contains("does not support tools")
 }

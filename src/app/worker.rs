@@ -69,18 +69,59 @@ pub enum Msg {
     /// AI-drafted local CI config (TOML). Never written automatically:
     /// the user reviews and confirms in a dialog first.
     AiCiConfig { result: Result<String, String> },
+    /// One step of an agentic run (a file read, an edit proposed), for the
+    /// progress log the user watches while it works.
+    AgentEvent(String),
+    /// An agentic run finished. Its edits are proposals: the user accepts or
+    /// rejects each one before anything is written.
+    AgentDone(Result<crate::app::AgentReport, String>),
 
     /// Background task finished with nothing to report.
     Noop,
 }
 
-/// Where an AI suggestion should land.
+/// Which AI task a provider/model selection belongs to. Each task picks its
+/// own model, so a small local model can write commit messages while a
+/// stronger one reviews code or resolves conflicts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AiTarget {
     /// Commit summary/description fields.
     Commit,
     /// Pull request title/body fields.
     PullRequest,
+    /// The conflict-resolution harness, which edits files.
+    Conflict,
+    /// The code review gate, which reads them.
+    Review,
+}
+
+impl AiTarget {
+    /// Label for the model picker.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Commit => "commit messages",
+            Self::PullRequest => "pull request text",
+            Self::Conflict => "conflict resolution",
+            Self::Review => "code review",
+        }
+    }
+}
+
+/// A channel back to the UI for a job that reports progress as it runs,
+/// rather than only when it finishes. Cheap to clone and `Send`, so it can
+/// be handed to a long agentic run on a worker thread.
+#[derive(Clone)]
+pub struct Progress {
+    tx: Sender<Msg>,
+    ctx: egui::Context,
+}
+
+impl Progress {
+    /// Delivers one message to the UI thread and asks for a repaint.
+    pub fn send(&self, msg: Msg) {
+        let _ = self.tx.send(msg);
+        self.ctx.request_repaint();
+    }
 }
 
 /// Handle for spawning background tasks that report back as [`Msg`]s.
@@ -94,6 +135,11 @@ impl Worker {
     pub fn new(ctx: egui::Context) -> (Self, Receiver<Msg>) {
         let (tx, rx) = std::sync::mpsc::channel();
         (Self { tx, ctx }, rx)
+    }
+
+    /// A progress handle for jobs that report as they go.
+    pub fn progress(&self) -> Progress {
+        Progress { tx: self.tx.clone(), ctx: self.ctx.clone() }
     }
 
     /// Runs `job` on a new thread and delivers its message to the UI.

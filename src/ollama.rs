@@ -250,6 +250,182 @@ impl Client {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tool-use harness
+// ---------------------------------------------------------------------------
+
+/// Context window requested for agentic runs. Ollama defaults to a window
+/// far too small to hold a transcript of file reads, and silently drops the
+/// oldest messages when it overflows — which looks like a model that forgot
+/// what it just read.
+const AGENT_NUM_CTX: u32 = 16_384;
+
+/// One Ollama model bound to one server, driven through the tool-use loop
+/// in [`crate::agent`]. Created with [`Client::agent`].
+///
+/// Tool calling is a per-model capability: `qwen3`, `llama3.1`+, `mistral`,
+/// and the coder models support it, while many smaller or older tags do
+/// not. When the server says so, [`crate::agent::Provider::turn`] returns a
+/// message naming the fix rather than a raw API error.
+pub struct Agent {
+    client: Client,
+    model: String,
+}
+
+impl Client {
+    /// Binds this server to one model for an agentic run.
+    pub fn agent(&self, model: impl Into<String>) -> Agent {
+        Agent { client: self.clone(), model: model.into() }
+    }
+}
+
+impl crate::agent::Provider for Agent {
+    fn label(&self) -> String {
+        format!("Ollama ({})", self.model)
+    }
+
+    fn turn(
+        &self,
+        system: &str,
+        messages: &[crate::agent::Message],
+        tools: &[crate::agent::ToolSpec],
+        max_tokens: u32,
+    ) -> std::result::Result<crate::agent::Reply, String> {
+        let mut wire = vec![serde_json::json!({"role": "system", "content": system})];
+        wire.extend(wire_messages(messages));
+
+        let mut payload = serde_json::json!({
+            "model": self.model,
+            "messages": wire,
+            "stream": false,
+            "options": {
+                "temperature": 0.0,
+                "num_ctx": AGENT_NUM_CTX,
+                "num_predict": max_tokens,
+            },
+        });
+        if !tools.is_empty() {
+            payload["tools"] = serde_json::Value::Array(
+                tools
+                    .iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "type": "function",
+                            "function": {
+                                "name": t.name,
+                                "description": t.description,
+                                "parameters": t.schema,
+                            }
+                        })
+                    })
+                    .collect(),
+            );
+        }
+
+        let resp = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(600))
+            .build()
+            .post(&format!("{}/api/chat", self.client.base_url))
+            .send_json(payload);
+
+        let value: serde_json::Value = match resp {
+            Ok(r) => r.into_json().map_err(|e| format!("Bad response from Ollama: {e}"))?,
+            Err(ureq::Error::Status(code, r)) => {
+                let body = r.into_string().unwrap_or_default();
+                if body.contains("does not support tools") {
+                    return Err(format!(
+                        "{} cannot call tools, so it cannot read the repository. Pick a \
+                         tool-capable local model (qwen3, llama3.1 or newer, mistral, the \
+                         coder tags) or switch this task to Claude.",
+                        self.model
+                    ));
+                }
+                return Err(format!("Ollama error {code}: {body}"));
+            }
+            Err(e) => return Err(format!("Ollama request failed: {e}")),
+        };
+
+        Ok(parse_agent_reply(&value))
+    }
+}
+
+/// Rewrites the harness transcript into Ollama's chat format. Ollama has no
+/// tool-call ids, matching results to calls by position, so the ids the
+/// harness assigned are dropped here and restored by the caller.
+fn wire_messages(messages: &[crate::agent::Message]) -> Vec<serde_json::Value> {
+    use crate::agent::Message;
+    let mut out = Vec::new();
+    for message in messages {
+        match message {
+            Message::User(text) => {
+                out.push(serde_json::json!({"role": "user", "content": text}));
+            }
+            Message::Assistant { text, calls } => {
+                let tool_calls: Vec<serde_json::Value> = calls
+                    .iter()
+                    .map(|c| {
+                        serde_json::json!({
+                            "function": {"name": c.name, "arguments": c.input}
+                        })
+                    })
+                    .collect();
+                out.push(serde_json::json!({
+                    "role": "assistant",
+                    "content": text,
+                    "tool_calls": tool_calls,
+                }));
+            }
+            Message::ToolResults(results) => {
+                for r in results {
+                    let content = if r.is_error {
+                        format!("ERROR: {}", r.content)
+                    } else {
+                        r.content.clone()
+                    };
+                    out.push(serde_json::json!({
+                        "role": "tool",
+                        "tool_name": r.name,
+                        "content": content,
+                    }));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Pulls text and tool calls out of an `/api/chat` response.
+fn parse_agent_reply(value: &serde_json::Value) -> crate::agent::Reply {
+    use crate::agent::{Reply, ToolCall};
+    let mut reply = Reply::default();
+    let Some(message) = value.get("message") else { return reply };
+    if let Some(text) = message.get("content").and_then(|c| c.as_str()) {
+        reply.text = text.to_string();
+    }
+    let Some(calls) = message.get("tool_calls").and_then(|c| c.as_array()) else {
+        return reply;
+    };
+    for (i, call) in calls.iter().enumerate() {
+        let Some(function) = call.get("function") else { continue };
+        let Some(name) = function.get("name").and_then(|n| n.as_str()) else { continue };
+        // Arguments arrive as an object from most models and as a JSON
+        // string from a few; accept either rather than dropping the call.
+        let input = match function.get("arguments") {
+            Some(serde_json::Value::String(raw)) => {
+                serde_json::from_str(raw).unwrap_or(serde_json::json!({}))
+            }
+            Some(other) => other.clone(),
+            None => serde_json::json!({}),
+        };
+        reply.calls.push(ToolCall {
+            id: format!("{name}-{i}"),
+            name: name.to_string(),
+            input,
+        });
+    }
+    reply
+}
+
 /// The merge system prompt, with the user's custom instructions appended
 /// when configured. The built-in prompt always applies; custom text extends
 /// it rather than replacing it, so output-format rules stay intact.

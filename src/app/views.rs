@@ -1323,6 +1323,10 @@ pub fn ai_controls(
             match target {
                 crate::app::worker::AiTarget::Commit => app.request_ai_message(),
                 crate::app::worker::AiTarget::PullRequest => app.request_pr_text(),
+                // Conflict resolution and review are started from their own
+                // panels; these controls only drive text generation.
+                crate::app::worker::AiTarget::Conflict
+                | crate::app::worker::AiTarget::Review => {}
             }
         }
         ai_model_picker(app, ui, target);
@@ -1503,6 +1507,26 @@ fn held_action_banner(app: &mut App, ui: &mut egui::Ui) {
 
 /// The latest AI review, kept visible after the gate dialog is dismissed so
 /// the findings a user overrode are still there to come back to.
+/// The files the reviewer opened, listed under the findings.
+///
+/// Empty when the review saw only the diff, which is itself worth knowing:
+/// findings from a reviewer that could not read the code around a change
+/// deserve more scepticism than ones from a reviewer that did.
+fn review_context_log(ui: &mut egui::Ui, log: &[String]) {
+    if log.is_empty() {
+        return;
+    }
+    ui.add_space(4.0);
+    egui::CollapsingHeader::new(format!("What the reviewer read ({} steps)", log.len()))
+        .default_open(false)
+        .id_salt("checks-review-context")
+        .show(ui, |ui| {
+            for line in log {
+                ui.label(RichText::new(line).small().monospace().color(theme::FG_DIM));
+            }
+        });
+}
+
 fn review_section(app: &mut App, ui: &mut egui::Ui) {
     use crate::review::Severity;
 
@@ -1522,7 +1546,10 @@ fn review_section(app: &mut App, ui: &mut egui::Ui) {
         let held = if outcome.verdict_blocks { " — reviewer asked to hold" } else { "" };
         egui::CollapsingHeader::new(RichText::new(format!("AI review{held}")).strong())
             .default_open(true)
-            .show(ui, |ui| super::markdown::render(ui, &md));
+            .show(ui, |ui| {
+                super::markdown::render(ui, &md);
+                review_context_log(ui, &outcome.context_log);
+            });
         ui.add_space(4.0);
         return;
     }
@@ -1547,6 +1574,7 @@ fn review_section(app: &mut App, ui: &mut egui::Ui) {
                     },
                 );
             }
+            review_context_log(ui, &outcome.context_log);
             ui.add_space(6.0);
             for (i, finding) in outcome.findings.iter().enumerate() {
                 let color = match finding.severity {
@@ -1628,6 +1656,9 @@ fn checks_tab(app: &mut App, ui: &mut egui::Ui) {
         {
             app.review_now();
         }
+        // The reviewer picks its own model, like every other AI task.
+        // `[review] provider/model` in the repo config still wins when set.
+        ai_model_picker(app, ui, crate::app::worker::AiTarget::Review);
     });
 
     held_action_banner(app, ui);

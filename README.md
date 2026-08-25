@@ -17,6 +17,10 @@ macOS/Windows since egui is cross-platform).
 - **Sync**: fetch, pull, push (auto-publishes new branches).
 - **Merge & rebase** with a built-in **conflict resolver**
   (take ours / take theirs / manual editing), including rebase continue/abort.
+  **Resolve all with AI** hands the whole repository to a model: it reads the
+  files it needs, proposes a merge for each conflict plus any other file the
+  merge requires touching, and shows you every change as a diff. Nothing is
+  written until you tick it and apply.
 - **GitHub**: sign in via browser device flow or a personal access token,
   authenticated push/pull/fetch, list and **create pull requests**
   (with AI-generated PR title/body).
@@ -97,6 +101,11 @@ have an AI review the outgoing diff first — it reports findings with its
 reasoning, and you can always proceed anyway. The reviewer needs a model set
 up first (see [AI setup](#ai-setup)).
 
+The reviewer **reads your repository** while it reviews (tracked files only,
+read-only), so it judges a change against the code around it rather than
+against the diff alone, and it tells you what it opened. Turn that off with
+`repo_context = false` under `[review]`.
+
 See the full guide: [docs/local-ci.md](docs/local-ci.md)
 ([gating pushes](docs/local-ci.md#gating-pushes-and-pull-requests),
 [AI code review](docs/local-ci.md#ai-code-review))
@@ -118,6 +127,9 @@ src/
   git.rs       Typed wrapper around the git CLI (library, reusable)
   github.rs    Device-flow auth + PR REST API (library, reusable)
   ollama.rs    Commit-message generation client (library, reusable)
+  review.rs    The AI review gate: config, prompts, findings, thresholds
+  agent/       Tool-use harness: a model reads the repo (review) or
+               proposes edits across it (conflicts), never writing itself
   app/
     mod.rs     App state, config, background message pump
     theme.rs   Visual identity (indigo/ember/teal, not a GitHub clone)
@@ -126,6 +138,7 @@ src/
     worker.rs  Background thread runner
 tests/
   workflow.rs  End-to-end git workflow tests against throwaway repos
+  agent.rs     Harness tests: sandbox limits, proposals, applied merges
 ```
 
 The `git_manage` library (git/github/ollama modules) has no UI dependencies and

@@ -27,6 +27,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         Dialog::Confirm(_) => confirm_dialog(app, ctx, &mut open),
         Dialog::ReviewGate => review_gate(app, ctx, &mut open),
         Dialog::ChecksGate => checks_gate(app, ctx, &mut open),
+        Dialog::AgentChanges => agent_changes(app, ctx, &mut open),
     }
     // Dismissing a gate with the X is a deferred decision, not an approval:
     // the modal closes but the held action stays available behind the
@@ -34,6 +35,14 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     if !open && matches!(app.dialog, Dialog::ReviewGate | Dialog::ChecksGate) {
         app.toast("Still held — proceed or discard it from the Checks tab.", false);
         app.tab = crate::app::Tab::Checks;
+    }
+    // Closing the proposal list is not a decision: anything still unapplied
+    // stays reachable from the conflict resolver.
+    if !open
+        && app.dialog == Dialog::AgentChanges
+        && app.agent.edits.iter().any(|e| !e.applied)
+    {
+        app.toast("Proposals kept — reopen them from the conflict resolver.", false);
     }
     // The window's X button was clicked.
     if !open {
@@ -539,6 +548,7 @@ fn review_gate(app: &mut App, ctx: &egui::Context, open: &mut bool) {
             ui.add_space(6.0);
             ui.separator();
             super::markdown::render(ui, &md);
+            context_log(ui, &outcome.context_log);
             ui.separator();
             ui.add_space(6.0);
             review_gate_buttons(app, ui, noun, override_label);
@@ -570,6 +580,8 @@ fn review_gate(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                     ui.label(RichText::new(&outcome.reasoning).color(theme::FG_DIM));
                 });
         }
+
+        context_log(ui, &outcome.context_log);
 
         ui.add_space(8.0);
         ui.separator();
@@ -680,6 +692,34 @@ fn checks_gate(app: &mut App, ctx: &egui::Context, open: &mut bool) {
 }
 
 /// The gate's two choices, shared by both output styles.
+/// What the reviewer opened while it reviewed.
+///
+/// A verdict from a model that could read the repository is only as good as
+/// what it actually read, so the reading list travels with the findings
+/// rather than being thrown away — an override is a judgement about whether
+/// the reviewer looked at the right things.
+fn context_log(ui: &mut egui::Ui, log: &[String]) {
+    if log.is_empty() {
+        return;
+    }
+    ui.add_space(6.0);
+    egui::CollapsingHeader::new(format!("What the reviewer read ({} steps)", log.len()))
+        .default_open(false)
+        .id_salt("review-context-log")
+        .show(ui, |ui| {
+            ScrollArea::vertical().max_height(160.0).id_salt("review-context-body").show(
+                ui,
+                |ui| {
+                    for line in log {
+                        ui.label(
+                            RichText::new(line).small().monospace().color(theme::FG_DIM),
+                        );
+                    }
+                },
+            );
+        });
+}
+
 fn review_gate_buttons(app: &mut App, ui: &mut egui::Ui, noun: &str, override_label: &str) {
     ui.horizontal(|ui| {
         // Fixing is the default action, so it reads first and is plain.
@@ -735,6 +775,8 @@ fn conflict_resolver(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         if app.conflicts.files.is_empty() {
             ui.label(RichText::new("All conflicts resolved").color(theme::ADD));
         }
+
+        agent_panel(app, ui);
 
         // File list
         let files: Vec<(usize, String)> = app
@@ -1350,6 +1392,267 @@ fn finish_conflicts(app: &mut App) {
     app.worker.spawn(move || {
         let outcome = if rebasing { repo.rebase_continue() } else { repo.merge_continue() };
         Msg::MergeOutcome(outcome)
+    });
+}
+
+/// The whole-repository AI resolver, above the per-file controls.
+///
+/// The per-file "Resolve with AI" button below shows one file's two sides to
+/// the model. This one hands it the repository: it reads what it needs and
+/// may propose changes to any file the merge requires touching. Neither
+/// writes anything — both end in a proposal the user accepts.
+fn agent_panel(app: &mut App, ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        let busy = app.agent.running;
+        let enabled = !busy && !app.conflicts.files.is_empty();
+        if busy {
+            ui.add(egui::Spinner::new().size(14.0));
+            ui.label(RichText::new("AI is working through the repository…").italics().weak());
+        } else if ui
+            .add_enabled(
+                enabled,
+                egui::Button::new("Resolve all with AI").fill(theme::EMBER),
+            )
+            .on_hover_text(
+                "Gives the model read access to every tracked file and lets it \
+                 propose edits anywhere in the worktree. You confirm every change \
+                 before anything is written.",
+            )
+            .clicked()
+        {
+            app.start_conflict_agent();
+        }
+        crate::app::views::ai_model_picker(app, ui, crate::app::worker::AiTarget::Conflict);
+
+        let unapplied = app.agent.edits.iter().filter(|e| !e.applied).count();
+        if unapplied > 0
+            && ui
+                .button(format!("Review {unapplied} proposal(s)"))
+                .on_hover_text("Reopen the proposed changes")
+                .clicked()
+        {
+            app.dialog = Dialog::AgentChanges;
+        }
+    });
+
+    // Live progress: what the model is reading and proposing.
+    if app.agent.running || !app.agent.log.is_empty() {
+        let lines = app.agent.log.clone();
+        egui::CollapsingHeader::new(format!("AI activity ({} steps)", lines.len()))
+            .default_open(app.agent.running)
+            .id_salt("agent-log")
+            .show(ui, |ui| {
+                ScrollArea::vertical().max_height(120.0).stick_to_bottom(true).show(
+                    ui,
+                    |ui| {
+                        for line in &lines {
+                            ui.label(
+                                RichText::new(line).small().color(theme::FG_DIM).monospace(),
+                            );
+                        }
+                    },
+                );
+            });
+    }
+    if let Some(error) = app.agent.error.clone() {
+        ui.label(RichText::new(error).color(theme::DANGER).small());
+    }
+    ui.separator();
+}
+
+// ---------------------------------------------------------------------------
+// Proposed changes from the conflict harness
+// ---------------------------------------------------------------------------
+
+/// Every change the model proposed, one diff at a time, each waiting on the
+/// user. Nothing here has been written: the proposals live in memory until
+/// "Apply" writes the ticked ones.
+fn agent_changes(app: &mut App, ctx: &egui::Context, open: &mut bool) {
+    modal(ctx, "AI proposed changes", open, |ui| {
+        ui.set_min_width(760.0);
+
+        ui.label(
+            RichText::new(
+                "Nothing has been written yet. Tick the changes you want, then apply.",
+            )
+            .color(theme::WARN)
+            .small(),
+        );
+        if app.agent.truncated {
+            ui.label(
+                RichText::new(
+                    "The model ran out of budget and finished on partial context — \
+                     read these diffs with extra care.",
+                )
+                .color(theme::DANGER)
+                .small(),
+            );
+        }
+
+        if !app.agent.summary.trim().is_empty() {
+            egui::CollapsingHeader::new("What the AI says it did")
+                .default_open(true)
+                .id_salt("agent-summary")
+                .show(ui, |ui| {
+                    ScrollArea::vertical().max_height(160.0).id_salt("agent-summary-body").show(
+                        ui,
+                        |ui| {
+                            crate::app::markdown::render(ui, &app.agent.summary);
+                        },
+                    );
+                });
+        }
+
+        ui.separator();
+
+        // File list with per-file accept ticks.
+        let conflicted: Vec<String> =
+            app.conflicts.files.iter().map(|f| f.path.clone()).collect();
+        let mut select: Option<usize> = None;
+        for (i, proposed) in app.agent.edits.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                let applied = proposed.applied;
+                ui.add_enabled(
+                    !applied,
+                    egui::Checkbox::new(&mut proposed.accepted, ""),
+                );
+                let (added, removed) = proposed.edit.line_delta();
+                let label = format!(
+                    "{}{}  +{added} -{removed}",
+                    proposed.edit.path,
+                    if proposed.edit.is_new() { "  (new file)" } else { "" }
+                );
+                let color = if applied {
+                    theme::ADD
+                } else if proposed.unresolved {
+                    theme::DANGER
+                } else if conflicted.contains(&proposed.edit.path) {
+                    theme::WARN
+                } else {
+                    theme::FG
+                };
+                if ui
+                    .selectable_label(
+                        app.agent.selected == Some(i),
+                        RichText::new(label).color(color),
+                    )
+                    .clicked()
+                {
+                    select = Some(i);
+                }
+                if applied {
+                    ui.label(RichText::new("applied").color(theme::ADD).small());
+                } else if proposed.unresolved {
+                    ui.label(
+                        RichText::new("still has conflict markers")
+                            .color(theme::DANGER)
+                            .small(),
+                    );
+                } else if !conflicted.contains(&proposed.edit.path) {
+                    ui.label(
+                        RichText::new("not a conflicted file")
+                            .color(theme::FG_DIM)
+                            .small(),
+                    )
+                    .on_hover_text(
+                        "The model changed this file because the merge required it. \
+                         It is written unstaged, so you can inspect it in Changes.",
+                    );
+                }
+            });
+        }
+        if let Some(i) = select {
+            app.agent.selected = Some(i);
+        }
+
+        // Diff of the selected proposal.
+        if let Some(proposed) = app.agent.selected.and_then(|i| app.agent.edits.get(i)) {
+            ui.separator();
+            ui.label(RichText::new(&proposed.edit.path).color(theme::EMBER).strong());
+            let lines = crate::app::textdiff::diff(
+                proposed.edit.before.as_deref().unwrap_or(""),
+                &proposed.edit.after,
+            );
+            let lang = crate::app::syntax::Lang::from_path(&proposed.edit.path);
+            let font = egui::TextStyle::Small.resolve(ui.style());
+            ScrollArea::vertical().max_height(320.0).id_salt("agent-diff").show(ui, |ui| {
+                for line in &lines {
+                    use crate::app::textdiff::Line;
+                    match line {
+                        Line::Skipped(n) => {
+                            ui.label(
+                                RichText::new(format!("    … {n} unchanged line(s)"))
+                                    .small()
+                                    .color(theme::FG_DIM),
+                            );
+                        }
+                        Line::Context(text) => {
+                            ui.label(crate::app::syntax::diff_line_job(
+                                lang,
+                                &format!("  {text}"),
+                                theme::FG,
+                                font.clone(),
+                                true,
+                            ));
+                        }
+                        Line::Added(text) => {
+                            ui.label(
+                                RichText::new(format!("+ {text}"))
+                                    .color(theme::ADD)
+                                    .font(font.clone()),
+                            );
+                        }
+                        Line::Removed(text) => {
+                            ui.label(
+                                RichText::new(format!("- {text}"))
+                                    .color(theme::DEL)
+                                    .font(font.clone()),
+                            );
+                        }
+                    }
+                }
+            });
+        }
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            let pending = app.agent.pending_count();
+            if ui
+                .add_enabled(
+                    pending > 0,
+                    egui::Button::new(format!("Apply {pending} selected change(s)"))
+                        .fill(theme::EMBER),
+                )
+                .on_hover_text(
+                    "Writes only the ticked files. Conflicted files are staged as \
+                     resolved; other files are written unstaged.",
+                )
+                .clicked()
+            {
+                app.apply_agent_edits();
+            }
+            if ui.button("Select all").clicked() {
+                for proposed in &mut app.agent.edits {
+                    if !proposed.applied {
+                        proposed.accepted = true;
+                    }
+                }
+            }
+            if ui.button("Select none").clicked() {
+                for proposed in &mut app.agent.edits {
+                    proposed.accepted = false;
+                }
+            }
+            if ui
+                .button("Discard proposals")
+                .on_hover_text("Throws away every unapplied proposal")
+                .clicked()
+            {
+                app.agent.edits.retain(|e| e.applied);
+                app.agent.selected = None;
+                app.dialog = Dialog::Conflicts;
+            }
+        });
     });
 }
 

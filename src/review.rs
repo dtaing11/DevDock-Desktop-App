@@ -149,6 +149,11 @@ pub struct ReviewOutcome {
     /// Whether the reviewer itself asked to hold the action. Only meaningful
     /// in Markdown mode, where there are no severities to threshold.
     pub verdict_blocks: bool,
+    /// What the reviewer looked at: one line per file read or search run.
+    /// Empty for a diff-only review. Shown with the findings so a verdict
+    /// can be weighed against the context it was reached from.
+    #[serde(default)]
+    pub context_log: Vec<String>,
 }
 
 impl ReviewOutcome {
@@ -215,6 +220,20 @@ pub struct ReviewConfig {
     /// Cap on how much diff is sent to the model.
     #[serde(default = "default_max_diff")]
     pub max_diff_bytes: usize,
+    /// Whether the reviewer may read the repository while it reviews.
+    ///
+    /// On by default. A diff alone cannot show whether the caller three
+    /// files over still holds, so the reviewer gets read-only access to the
+    /// tracked files ([`crate::agent`]) and decides for itself what to open.
+    /// Set `repo_context = false` for a diff-only review.
+    #[serde(default = "default_true")]
+    pub repo_context: bool,
+    /// Cap on how many files the reviewer may open in one review.
+    #[serde(default = "default_context_calls")]
+    pub max_context_calls: usize,
+    /// Cap on how much it may read in total, in bytes.
+    #[serde(default = "default_context_bytes")]
+    pub max_context_bytes: usize,
     /// Extra project-specific guidance appended to the prompt.
     #[serde(default)]
     pub instructions: Option<String>,
@@ -254,6 +273,19 @@ fn default_fail_on() -> Severity {
 
 fn default_max_diff() -> usize {
     24_000
+}
+
+/// Enough tool calls to list a directory, search for a symbol, and read the
+/// handful of files a change actually touches — not enough to walk the
+/// repository. A reviewer that hits this still answers, on what it has.
+fn default_context_calls() -> usize {
+    24
+}
+
+/// Roughly a quarter of a million characters of source: generous for one
+/// change, and a hard stop on a model that decides to read everything.
+fn default_context_bytes() -> usize {
+    200_000
 }
 
 /// Cap on an instructions file. Guidance shares the prompt with the diff, so
@@ -354,6 +386,19 @@ impl ReviewConfig {
     pub fn runs_at_all(&self) -> bool {
         self.runs_on_push() || self.runs_on_pull_request()
     }
+
+    /// Budgets for a context-reading review, from the configured caps.
+    pub fn limits(&self) -> crate::agent::Limits {
+        let defaults = crate::agent::Limits::default();
+        crate::agent::Limits {
+            max_tool_calls: self.max_context_calls,
+            max_read_bytes: self.max_context_bytes,
+            // One turn per two calls covers a model that batches its reads,
+            // bounded so a loop cannot outlive the call budget.
+            max_turns: (self.max_context_calls / 2).clamp(4, 16),
+            ..defaults
+        }
+    }
 }
 
 impl Default for ReviewConfig {
@@ -365,6 +410,9 @@ impl Default for ReviewConfig {
             block_on_failure: true,
             fail_on: default_fail_on(),
             max_diff_bytes: default_max_diff(),
+            repo_context: true,
+            max_context_calls: default_context_calls(),
+            max_context_bytes: default_context_bytes(),
             provider: None,
             model: None,
             instructions: None,
@@ -466,6 +514,86 @@ pub fn markdown_system_prompt(style: Option<&str>, require_verdict: bool) -> Str
     p
 }
 
+/// Appended to whichever system prompt the output style selects, when the
+/// reviewer has read-only repository access.
+///
+/// The emphasis on *why* to read is deliberate. A model handed tools will
+/// otherwise either ignore them or spend its whole budget listing files; what
+/// makes a review better is opening the definition of the thing the diff
+/// calls and checking the assumption the diff is making about it.
+pub const CONTEXT_PROMPT: &str = r#"You can read this repository while you review. Use it.
+
+Tools: list_files, read_file, search. They see every file git tracks, and nothing else.
+
+A diff shows changed lines, not whether they are correct. Open what you need to decide:
+- The definition of anything the change calls, to check arguments, error cases, and contracts.
+- Other callers of anything the change alters, to see what a changed signature or behaviour breaks.
+- The tests covering the changed code, to see whether this change is tested at all.
+- The rest of the file each hunk sits in, when the surrounding code decides whether the hunk is right.
+
+Read deliberately, not exhaustively: a handful of targeted reads beats crawling the tree, and your budget is finite. When it runs out you must answer with what you have.
+
+Then judge the change against what you read, not against what the diff alone suggests. If a file you needed was unreadable, say so in your answer rather than guessing."#;
+
+/// Runs a review whose model can read the repository, and returns the
+/// parsed outcome with the reviewer's reading list attached.
+///
+/// This is the same review contract as the single-shot path in
+/// [`crate::claude`] and [`crate::ollama`] — same prompts, same parsing,
+/// same gate — with tools added. Callers fall back to the single-shot path
+/// when `repo_context` is off or the model cannot call tools.
+pub fn run_with_context(
+    provider: &dyn crate::agent::Provider,
+    workspace: &mut crate::agent::Workspace,
+    diff: &str,
+    config: &ReviewConfig,
+    on_event: &mut dyn FnMut(crate::agent::Event),
+) -> std::result::Result<ReviewOutcome, String> {
+    let base = match config.output {
+        OutputStyle::Findings => SYSTEM_PROMPT.to_string(),
+        OutputStyle::Markdown => markdown_system_prompt(
+            config.output_instructions.as_deref(),
+            config.block_on_failure,
+        ),
+    };
+    let system = format!("{base}\n\n{CONTEXT_PROMPT}");
+    let prompt = user_prompt(diff, config.instructions.as_deref(), config.max_diff_bytes);
+
+    let run = crate::agent::run(
+        provider,
+        workspace,
+        &system,
+        &prompt,
+        config.limits(),
+        on_event,
+    )?;
+
+    let mut outcome = match config.output {
+        OutputStyle::Findings => {
+            if !parsed_cleanly(&run.text) {
+                return Err(format!(
+                    "The reviewer did not return a usable review: {}",
+                    excerpt(&run.text)
+                ));
+            }
+            parse(&run.text)
+        }
+        OutputStyle::Markdown => {
+            if run.text.trim().is_empty() {
+                return Err("The reviewer returned nothing.".into());
+            }
+            parse_markdown(&run.text)
+        }
+    };
+    outcome.context_log = run.log;
+    if run.truncated {
+        outcome
+            .context_log
+            .push("! budget spent; the review was finished on partial context".into());
+    }
+    Ok(outcome)
+}
+
 /// Extracts a Markdown-mode review: strips an outer code fence and the
 /// verdict line, keeping the body for rendering.
 pub fn parse_markdown(text: &str) -> ReviewOutcome {
@@ -516,6 +644,7 @@ pub fn parse_markdown(text: &str) -> ReviewOutcome {
         findings: Vec::new(),
         markdown: Some(markdown),
         verdict_blocks,
+        context_log: Vec::new(),
     }
 }
 
@@ -617,6 +746,7 @@ pub fn parse(text: &str) -> ReviewOutcome {
         findings,
         markdown: None,
         verdict_blocks: false,
+        context_log: Vec::new(),
     }
 }
 

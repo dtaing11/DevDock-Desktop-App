@@ -18,6 +18,7 @@ Docker containers for reproducible environments.
   - [Project-specific instructions](#project-specific-instructions)
   - [Custom output format](#custom-output-format)
   - [What the reviewer sees](#what-the-reviewer-sees)
+  - [Repository context](#repository-context)
 - [Docker environments](#docker-environments)
 - [Secrets](#secrets)
 - [Recipes](#recipes)
@@ -282,6 +283,9 @@ fail_on = "high"          # low | medium | high
 # provider = "claude"                  # claude | ollama
 # model = "claude-opus-5"
 # max_diff_bytes = 24000               # cap on how much diff is sent
+# repo_context = true                  # let the reviewer read the repository
+# max_context_calls = 24               # files/searches it may make per review
+# max_context_bytes = 200000           # total it may read
 # instructions = "Flag any new blocking call on the UI thread."
 ```
 
@@ -322,6 +326,9 @@ this — asking for a review is its own consent.
 | `provider`         | app's    | `claude` or `ollama`; defaults to your selection in the app        |
 | `model`            | app's    | Model for that provider                                            |
 | `max_diff_bytes`   | `24000`  | Diff is truncated past this, with a marker so the model knows      |
+| `repo_context`     | `true`   | Reviewer may read tracked files for context — see [Repository context](#repository-context) |
+| `max_context_calls`| `24`     | How many reads/searches one review may make                        |
+| `max_context_bytes`| `200000` | Total bytes one review may read                                    |
 | `instructions`     | none     | Extra project-specific things to look for                          |
 | `instructions_file`| none     | A file holding that guidance, relative to the repo root; combines with `instructions` |
 | `output`           | `"findings"` | `"markdown"` to answer in your own format — see [Custom output format](#custom-output-format) |
@@ -539,6 +546,52 @@ Uncommitted edits are **not** reviewed, because a push does not publish them.
 This is the opposite of the jobs, which run against the working tree. If you
 want a review of work in progress, commit it first (or use the Checks tab
 button after committing).
+
+### Repository context
+
+The reviewer can **read your repository while it reviews**, and does so by
+default. A diff shows changed lines; it cannot show whether the function three
+files over still agrees with them. So the model gets read-only access to the
+files git tracks and decides for itself what to open — typically the definition
+of whatever the change calls, the other callers of anything whose signature
+moved, and the tests covering the changed code.
+
+It sees **tracked files only**. Ignored files — `.env`, credentials, build
+output — are invisible to it and never leave your machine (beyond the diff and
+what it reads, which go to the provider you configured).
+
+```toml
+[review]
+run = true
+repo_context = true       # default: the reviewer may read the repository
+max_context_calls = 24    # how many files/searches it may make per review
+max_context_bytes = 200000  # total it may read, in bytes
+```
+
+Set `repo_context = false` for the old diff-only behaviour: one request, no
+file reads, lowest token cost.
+
+The caps are a budget, not an error: a reviewer that runs out is told to answer
+with what it has, so a review always comes back. When that happens the reading
+list says so.
+
+Every review records **what it read**, shown under "What the reviewer read" in
+the gate dialog and the Checks tab:
+
+```
+· list src/*.rs
+· read src/git.rs
+· search "resolve_conflict"
+· read src/app/mod.rs
+```
+
+That list is part of the verdict. A finding from a reviewer that opened the
+right files deserves more weight than one from a reviewer that never looked.
+
+**Ollama models must support tool calling** for this to work (`qwen3`,
+`llama3.1` and newer, `mistral`, the coder tags). When the model cannot,
+the review falls back to diff-only automatically and says so in the reading
+list rather than failing. Claude models all support it.
 
 ## Docker environments
 

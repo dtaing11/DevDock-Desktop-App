@@ -866,6 +866,23 @@ impl Repo {
         self.git(&["rebase", "--abort"]).map(drop)
     }
 
+    // -- file inventory -----------------------------------------------------
+
+    /// Every file git tracks, as repo-relative paths.
+    ///
+    /// This is what the AI harness is allowed to read ([`crate::agent`]).
+    /// Tracked-only is the point: ignored files — `.env`, credentials,
+    /// build output — stay invisible and never reach a model provider.
+    pub fn tracked_files(&self) -> Result<Vec<String>> {
+        let out = self.git(&["ls-files", "-z"])?;
+        Ok(out
+            .split('\0')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(String::from)
+            .collect())
+    }
+
     // -- conflicts ----------------------------------------------------------
 
     /// All conflicted files with base/ours/theirs/working contents.

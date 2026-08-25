@@ -23,7 +23,7 @@ pub fn run(args: &[String]) -> Option<ExitCode> {
         "commit" => cmd_commit(rest),
         "pr" => cmd_pr(rest),
         "hook" => cmd_hook(rest),
-        "resolve" => cmd_resolve(),
+        "resolve" => cmd_resolve(rest),
         "help" | "--help" | "-h" => {
             print_help();
             ExitCode::SUCCESS
@@ -65,6 +65,7 @@ fn print_help() {
         ("pr -t TITLE [-b BODY]", "CI gate, push, open PR into main"),
         ("pr --ai", "AI-generated PR title and body"),
         ("resolve", "interactive conflict resolver with AI proposals"),
+        ("resolve --agent", "AI reads the repo and proposes every fix, you confirm each"),
         ("ci", "run all local CI jobs (.git-manage-ci.toml)"),
         ("ci init", "write a starter .git-manage-ci.toml"),
         ("ci init --ai", "AI drafts the CI config; review before saving"),
@@ -813,7 +814,7 @@ fn ai_message(repo: &Repo) -> Result<crate::ollama::CommitSuggestion, String> {
 /// picks ours/theirs, or asks the AI for a proposed merge. AI output is
 /// never applied silently: it is printed in full and must be explicitly
 /// accepted (or regenerated/skipped) before anything is written.
-fn cmd_resolve() -> ExitCode {
+fn cmd_resolve(rest: &[String]) -> ExitCode {
     use std::io::{BufRead, Write};
     let repo = match repo() {
         Ok(r) => r,
@@ -838,6 +839,192 @@ fn cmd_resolve() -> ExitCode {
     );
 
     let stdin = std::io::stdin();
+
+    // --agent: one repository-wide pass first. Whatever it does not resolve
+    // falls through to the per-file loop below.
+    if rest.iter().any(|a| a == "--agent" || a == "-a") {
+        if let Err(e) = agent_resolve(&repo, &conflicts, &stdin) {
+            eprintln!("devdock: {e}");
+        }
+        match repo.conflicts() {
+            Ok(remaining) if remaining.is_empty() => {
+                return finish_resolve(&repo, state, 0, 0, &stdin);
+            }
+            Ok(remaining) => {
+                println!(
+                    "\n{} {} file(s) still conflicted",
+                    style::header("resolve"),
+                    style::bold(&remaining.len().to_string())
+                );
+                return per_file_resolve(&repo, state, remaining, &stdin);
+            }
+            Err(e) => {
+                eprintln!("devdock: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    per_file_resolve(&repo, state, conflicts, &stdin)
+}
+
+/// The repository-wide AI pass: the model reads what it needs, proposes
+/// changes to any file the merge requires, and every proposal is printed as
+/// a diff and applied only when the user says so.
+fn agent_resolve(
+    repo: &Repo,
+    conflicts: &[crate::git::ConflictFile],
+    stdin: &std::io::Stdin,
+) -> Result<(), String> {
+    use std::io::{BufRead, Write};
+
+    let config = crate::app::Config::load();
+    let sel = config
+        .conflict_ai
+        .clone()
+        .or_else(|| config.commit_ai.clone())
+        .ok_or("no AI model selected (pick one in the GUI)")?;
+    let url = config.ollama_url.clone().unwrap_or_else(|| crate::ollama::DEFAULT_URL.into());
+    let provider = crate::app::agent_provider(&sel, &url)?;
+    let custom = conflict_instructions(&config, repo);
+
+    let briefs: Vec<crate::agent::conflict::Brief> = conflicts
+        .iter()
+        .map(|f| crate::agent::conflict::Brief {
+            path: f.path.clone(),
+            ours: f.ours.clone(),
+            theirs: f.theirs.clone(),
+        })
+        .collect();
+    let tracked = repo.tracked_files().map_err(|e| e.to_string())?;
+    let mut workspace = crate::agent::Workspace::new(
+        repo.path(),
+        tracked,
+        crate::agent::Access::ReadWrite,
+    )?;
+
+    println!(
+        "{} {} is reading the repository…",
+        style::header("agent"),
+        style::bold(&provider.label())
+    );
+    let run = crate::agent::conflict::run(
+        provider.as_ref(),
+        &mut workspace,
+        &briefs,
+        custom.as_deref(),
+        crate::agent::conflict::limits(),
+        // Progress prints as it happens: a run that reads twenty files
+        // should not look like a hang.
+        &mut |event| println!("  {}", style::dim(&event.line())),
+    )?;
+
+    if !run.text.trim().is_empty() {
+        println!("\n{}\n{}", style::header("summary"), run.text.trim());
+    }
+    if run.truncated {
+        println!(
+            "{}",
+            style::yellow("the model ran out of budget and finished on partial context")
+        );
+    }
+    if run.edits.is_empty() {
+        println!("{}", style::dim("the model proposed no changes"));
+        return Ok(());
+    }
+
+    let conflicted: Vec<&str> = conflicts.iter().map(|f| f.path.as_str()).collect();
+    for edit in &run.edits {
+        let (added, removed) = edit.line_delta();
+        println!(
+            "\n{} {} {}",
+            style::yellow("[proposed]"),
+            style::bold(&edit.path),
+            style::dim(&format!("+{added} -{removed}"))
+        );
+        if !conflicted.contains(&edit.path.as_str()) {
+            println!(
+                "{}",
+                style::dim("  not a conflicted file — the model says the merge needs it")
+            );
+        }
+        print_proposal_diff(edit);
+
+        let markers = crate::agent::conflict::has_conflict_markers(&edit.after);
+        if markers {
+            println!("{}", style::red("  still contains conflict markers"));
+        }
+        loop {
+            print!(
+                "{} {} {} ? ",
+                style::green("[a]pply"),
+                style::dim("[s]kip"),
+                style::red("[q]uit")
+            );
+            let _ = std::io::stdout().flush();
+            let mut line = String::new();
+            if stdin.lock().read_line(&mut line).is_err() {
+                return Err("could not read your answer".into());
+            }
+            match line.trim().to_lowercase().as_str() {
+                "a" => {
+                    let result = if conflicted.contains(&edit.path.as_str()) {
+                        repo.resolve(
+                            &edit.path,
+                            &crate::git::Resolution::Manual(edit.after.clone()),
+                        )
+                        .map_err(|e| e.to_string())
+                    } else {
+                        write_proposal(repo, &edit.path, &edit.after)
+                    };
+                    match result {
+                        Ok(()) => println!("{} {}", style::green("applied"), edit.path),
+                        Err(e) => eprintln!("devdock: {e}"),
+                    }
+                    break;
+                }
+                "s" | "" => {
+                    println!("{} skipped {}", style::dim("·"), edit.path);
+                    break;
+                }
+                "q" => return Ok(()),
+                other => println!("devdock: \"{other}\"? a / s / q"),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Prints one proposal as a colored unified diff.
+fn print_proposal_diff(edit: &crate::agent::PendingEdit) {
+    use crate::app::textdiff::Line;
+    for line in crate::app::textdiff::diff(edit.before.as_deref().unwrap_or(""), &edit.after) {
+        match line {
+            Line::Context(text) => println!("  {}", style::dim(&text)),
+            Line::Added(text) => println!("{}", style::green(&format!("+ {text}"))),
+            Line::Removed(text) => println!("{}", style::red(&format!("- {text}"))),
+            Line::Skipped(n) => println!("  {}", style::dim(&format!("… {n} unchanged line(s)"))),
+        }
+    }
+}
+
+/// Writes an accepted proposal for a file that was not itself conflicted.
+/// Left unstaged, so it shows up in `devdock status` for a second look.
+fn write_proposal(repo: &Repo, rel: &str, content: &str) -> Result<(), String> {
+    let full = repo.path().join(rel);
+    if let Some(parent) = full.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(full, content).map_err(|e| e.to_string())
+}
+
+/// The original per-file loop: ours / theirs / single-file AI merge.
+fn per_file_resolve(
+    repo: &Repo,
+    state: crate::git::RepoState,
+    conflicts: Vec<crate::git::ConflictFile>,
+    stdin: &std::io::Stdin,
+) -> ExitCode {
+    use std::io::{BufRead, Write};
     let mut resolved = 0usize;
     for file in &conflicts {
         let path = &file.path;
@@ -899,7 +1086,19 @@ fn cmd_resolve() -> ExitCode {
         }
     }
 
-    if resolved == conflicts.len() {
+    finish_resolve(repo, state, resolved, conflicts.len(), stdin)
+}
+
+/// Offers to continue the merge or rebase once everything is resolved.
+fn finish_resolve(
+    repo: &Repo,
+    state: crate::git::RepoState,
+    resolved: usize,
+    total: usize,
+    stdin: &std::io::Stdin,
+) -> ExitCode {
+    use std::io::{BufRead, Write};
+    if resolved == total {
         let verb = match state {
             crate::git::RepoState::Rebasing => "rebase",
             _ => "merge",
@@ -929,8 +1128,7 @@ fn cmd_resolve() -> ExitCode {
         }
     } else {
         println!(
-            "\ndevdock: {resolved}/{} resolved; run `devdock resolve` again for the rest",
-            conflicts.len()
+            "\ndevdock: {resolved}/{total} resolved; run `devdock resolve` again for the rest"
         );
     }
     ExitCode::SUCCESS

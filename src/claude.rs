@@ -412,6 +412,17 @@ impl Client {
         prompt: &str,
         max_tokens: u32,
     ) -> Result<String> {
+        self.with_retry(|model| self.request_once(model, system, prompt, max_tokens))
+    }
+
+    /// Runs one request with retry and model fallback, whatever its shape.
+    ///
+    /// `send` is handed the model id to use, which is not always the one the
+    /// user picked: see the fallback rules on [`Self::request_with_system`].
+    fn with_retry<T>(
+        &self,
+        send: impl Fn(&str) -> std::result::Result<T, RequestError>,
+    ) -> Result<T> {
         /// Backoff retries. Waits are short because model fallback (not
         /// waiting) is the real fix for persistent subscription limits.
         const MAX_RETRIES: u32 = 2;
@@ -421,7 +432,7 @@ impl Client {
         let mut fell_back = false;
         let mut attempt = 0;
         loop {
-            match self.request_once(&model, system, prompt, max_tokens) {
+            match send(&model) {
                 Err(RequestError::Transient { wait_hint, error }) => {
                     // First 429 on a non-Haiku model: switch to Haiku
                     // immediately. Opus/Sonnet caps are weekly, so backoff
@@ -444,7 +455,7 @@ impl Client {
                     std::thread::sleep(Duration::from_secs(wait));
                 }
                 Err(RequestError::Fatal(e)) => return Err(e),
-                Ok(text) => return Ok(text),
+                Ok(value) => return Ok(value),
             }
         }
     }
@@ -462,21 +473,58 @@ impl Client {
         prompt: &str,
         max_tokens: u32,
     ) -> std::result::Result<String, RequestError> {
-        #[derive(Deserialize)]
-        struct Content {
-            text: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct Response {
-            content: Vec<Content>,
-        }
+        let messages = serde_json::json!([{"role": "user", "content": prompt}]);
+        let value = self.send(model, system, messages, &[], max_tokens)?;
+        first_text(&value).ok_or_else(|| {
+            RequestError::Fatal(ClaudeError("Claude returned no text".into()))
+        })
+    }
 
-        let payload = serde_json::json!({
+    /// One turn of the tool-use loop: sends the transcript with the tools
+    /// currently on offer and parses the reply's text and tool calls.
+    fn turn_once(
+        &self,
+        model: &str,
+        system: &str,
+        messages: &[crate::agent::Message],
+        tools: &[crate::agent::ToolSpec],
+        max_tokens: u32,
+    ) -> std::result::Result<crate::agent::Reply, RequestError> {
+        let value = self.send(model, system, wire_messages(messages), tools, max_tokens)?;
+        Ok(parse_reply(&value))
+    }
+
+    /// One raw call to the Messages API, returning the parsed response body.
+    /// Transport, auth, and status handling live here so both the plain
+    /// request path and the tool-use loop classify failures the same way.
+    fn send(
+        &self,
+        model: &str,
+        system: &str,
+        messages: serde_json::Value,
+        tools: &[crate::agent::ToolSpec],
+        max_tokens: u32,
+    ) -> std::result::Result<serde_json::Value, RequestError> {
+        let mut payload = serde_json::json!({
             "model": model,
             "max_tokens": max_tokens,
             "system": system,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
         });
+        if !tools.is_empty() {
+            payload["tools"] = serde_json::Value::Array(
+                tools
+                    .iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "name": t.name,
+                            "description": t.description,
+                            "input_schema": t.schema,
+                        })
+                    })
+                    .collect(),
+            );
+        }
         let mut req = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(120))
             .build()
@@ -489,12 +537,11 @@ impl Client {
                 .set("Authorization", &format!("Bearer {}", tokens.access_token))
                 .set("anthropic-beta", "oauth-2025-04-20"),
         };
-        let resp = req.send_json(payload);
 
-        let value: serde_json::Value = match resp {
+        match req.send_json(payload) {
             Ok(r) => r
                 .into_json()
-                .map_err(|e| RequestError::Fatal(ClaudeError(e.to_string())))?,
+                .map_err(|e| RequestError::Fatal(ClaudeError(e.to_string()))),
             Err(ureq::Error::Status(code, r)) => {
                 let retry_after: Option<u64> =
                     r.header("retry-after").and_then(|v| v.parse().ok());
@@ -518,25 +565,129 @@ impl Client {
                     401 => " (sign in again in Settings)",
                     _ => "",
                 };
-                return Err(RequestError::Fatal(ClaudeError(format!(
+                Err(RequestError::Fatal(ClaudeError(format!(
                     "Claude API {code}: {detail}{hint}"
-                ))));
-            }
-            Err(e) => {
-                return Err(RequestError::Fatal(ClaudeError(format!(
-                    "Cannot reach Claude: {e}"
                 ))))
             }
-        };
-        let parsed: Response = serde_json::from_value(value)
-            .map_err(|e| RequestError::Fatal(ClaudeError(format!("Bad response: {e}"))))?;
-        parsed
-            .content
-            .into_iter()
-            .filter_map(|c| c.text)
-            .next()
-            .ok_or_else(|| RequestError::Fatal(ClaudeError("Claude returned no text".into())))
+            Err(e) => Err(RequestError::Fatal(ClaudeError(format!(
+                "Cannot reach Claude: {e}"
+            )))),
+        }
     }
+}
+
+/// Claude drives the harness the same way it answers a plain request: same
+/// retry and same Haiku fallback, so a rate-limited agentic run degrades
+/// instead of dying halfway through.
+impl crate::agent::Provider for Client {
+    fn label(&self) -> String {
+        format!("Claude ({})", self.model)
+    }
+
+    fn turn(
+        &self,
+        system: &str,
+        messages: &[crate::agent::Message],
+        tools: &[crate::agent::ToolSpec],
+        max_tokens: u32,
+    ) -> std::result::Result<crate::agent::Reply, String> {
+        self.with_retry(|model| self.turn_once(model, system, messages, tools, max_tokens))
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Rewrites the harness transcript into Anthropic's wire format.
+///
+/// Tool results go back as a user message of `tool_result` blocks, and the
+/// assistant's own `tool_use` blocks are echoed verbatim with their ids —
+/// the API rejects a result whose id it never issued.
+fn wire_messages(messages: &[crate::agent::Message]) -> serde_json::Value {
+    use crate::agent::Message;
+    let mut out = Vec::new();
+    for message in messages {
+        match message {
+            Message::User(text) => {
+                out.push(serde_json::json!({"role": "user", "content": text}));
+            }
+            Message::Assistant { text, calls } => {
+                let mut blocks = Vec::new();
+                // An empty text block is a 400, so only send prose that exists.
+                if !text.trim().is_empty() {
+                    blocks.push(serde_json::json!({"type": "text", "text": text}));
+                }
+                for call in calls {
+                    blocks.push(serde_json::json!({
+                        "type": "tool_use",
+                        "id": call.id,
+                        "name": call.name,
+                        "input": call.input,
+                    }));
+                }
+                out.push(serde_json::json!({"role": "assistant", "content": blocks}));
+            }
+            Message::ToolResults(results) => {
+                let blocks: Vec<serde_json::Value> = results
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "type": "tool_result",
+                            "tool_use_id": r.id,
+                            "content": r.content,
+                            "is_error": r.is_error,
+                        })
+                    })
+                    .collect();
+                out.push(serde_json::json!({"role": "user", "content": blocks}));
+            }
+        }
+    }
+    serde_json::Value::Array(out)
+}
+
+/// Pulls text and tool calls out of a Messages API response.
+fn parse_reply(value: &serde_json::Value) -> crate::agent::Reply {
+    use crate::agent::{Reply, ToolCall};
+    let mut reply = Reply::default();
+    let Some(blocks) = value.get("content").and_then(|c| c.as_array()) else {
+        return reply;
+    };
+    for block in blocks {
+        match block.get("type").and_then(|t| t.as_str()) {
+            Some("text") => {
+                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                    if !reply.text.is_empty() {
+                        reply.text.push('\n');
+                    }
+                    reply.text.push_str(text);
+                }
+            }
+            Some("tool_use") => {
+                let (Some(id), Some(name)) = (
+                    block.get("id").and_then(|v| v.as_str()),
+                    block.get("name").and_then(|v| v.as_str()),
+                ) else {
+                    continue;
+                };
+                reply.calls.push(ToolCall {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    input: block.get("input").cloned().unwrap_or(serde_json::json!({})),
+                });
+            }
+            _ => {}
+        }
+    }
+    reply
+}
+
+/// The first text block of a response, for the non-agentic paths.
+fn first_text(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter(|b| b.get("type").and_then(|t| t.as_str()) != Some("tool_use"))
+        .find_map(|b| b.get("text").and_then(|t| t.as_str()).map(String::from))
 }
 
 // ---------------------------------------------------------------------------

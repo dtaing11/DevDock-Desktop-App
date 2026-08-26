@@ -137,6 +137,43 @@ pub struct BranchList {
     pub remote: Vec<Branch>,
 }
 
+/// The ranges that address a branch's outgoing work.
+struct Outgoing {
+    /// Range for `git diff`; `None` means "against the empty tree".
+    diff_range: Option<String>,
+    /// Range for `git log`.
+    log_range: String,
+}
+
+/// Cap on how many commits a branch summary carries. A branch with more
+/// than this has a story the subject lines will tell just as well.
+const MAX_SUMMARY_COMMITS: u32 = 50;
+
+/// What a branch would publish: its commits and its diff.
+///
+/// Built by [`Repo::branch_summary`] and handed to the AI when it writes a
+/// pull request, so the description covers the whole branch rather than
+/// whatever happens to be staged.
+#[derive(Debug, Clone, Default)]
+pub struct BranchSummary {
+    /// The branch being summarized.
+    pub branch: String,
+    /// What it was compared against, empty when that was the upstream.
+    pub base: String,
+    /// Commits the base does not have, newest first.
+    pub commits: Vec<Commit>,
+    /// `git diff --stat` for the range.
+    pub stat: String,
+    pub diff: String,
+}
+
+impl BranchSummary {
+    /// Whether there is anything to describe.
+    pub fn is_empty(&self) -> bool {
+        self.commits.is_empty() && self.diff.trim().is_empty()
+    }
+}
+
 /// Outcome of a merge/rebase style operation that may hit conflicts.
 ///
 /// These operations "fail" routinely as part of normal workflows, so they
@@ -480,26 +517,80 @@ impl Repo {
     /// This is deliberately not the working-tree diff — a push publishes
     /// commits, so reviewing uncommitted edits would review the wrong code.
     pub fn diff_for_review(&self, base: Option<&str>) -> Result<String> {
+        let Some(outgoing) = self.outgoing(base)? else { return Ok(String::new()) };
+        self.diff_outgoing(&outgoing)
+    }
+
+    /// How to address the work this branch would publish.
+    ///
+    /// Three ranges, because there are three ways to ask: against an
+    /// explicit base (a pull request), against the upstream (a push), or —
+    /// with no upstream — against everything no remote has yet.
+    fn outgoing(&self, base: Option<&str>) -> Result<Option<Outgoing>> {
         if let Some(base) = base.map(str::trim).filter(|b| !b.is_empty()) {
-            let range = format!("{base}...HEAD");
-            return self.git(&["diff", &range]);
+            return Ok(Some(Outgoing {
+                // Three dots for the diff: what this branch added since it
+                // forked, not what the base did meanwhile.
+                diff_range: Some(format!("{base}...HEAD")),
+                log_range: format!("{base}..HEAD"),
+            }));
         }
         if self.git(&["rev-parse", "--verify", "--quiet", "@{upstream}"]).is_ok() {
-            return self.git(&["diff", "@{upstream}...HEAD"]);
+            return Ok(Some(Outgoing {
+                diff_range: Some("@{upstream}...HEAD".into()),
+                log_range: "@{upstream}..HEAD".into(),
+            }));
         }
         // No upstream: `rev-list` is newest-first, so the last entry is the
         // oldest commit missing from every remote.
         let unpushed = self.git(&["rev-list", "HEAD", "--not", "--remotes"])?;
         let Some(oldest) = unpushed.split_whitespace().last() else {
-            return Ok(String::new());
+            return Ok(None);
         };
-        let range = format!("{oldest}^..HEAD");
-        match self.git(&["diff", &range]) {
-            Ok(diff) => Ok(diff),
-            // The oldest commit is the root commit and has no parent, so
-            // there is nothing to diff against but the empty tree.
-            Err(_) => self.git(&["diff", EMPTY_TREE, "HEAD"]),
+        // The oldest commit may be the root commit, which has no parent to
+        // diff against — only the empty tree.
+        let parent = format!("{oldest}^");
+        if self.git(&["rev-parse", "--verify", "--quiet", &parent]).is_err() {
+            return Ok(Some(Outgoing { diff_range: None, log_range: "HEAD".into() }));
         }
+        Ok(Some(Outgoing {
+            diff_range: Some(format!("{parent}..HEAD")),
+            log_range: format!("{parent}..HEAD"),
+        }))
+    }
+
+    fn diff_outgoing(&self, outgoing: &Outgoing) -> Result<String> {
+        match &outgoing.diff_range {
+            Some(range) => self.git(&["diff", range]),
+            None => self.git(&["diff", EMPTY_TREE, "HEAD"]),
+        }
+    }
+
+    /// Everything a pull request from this branch would contain: its
+    /// commits, a diffstat, and the diff itself.
+    ///
+    /// This is deliberately **not** [`Self::diff_for_ai`]. That one describes
+    /// what is staged right now, which is the right context for a commit
+    /// message and the wrong context for a pull request — a PR is the whole
+    /// branch, most of which was committed long before the working tree
+    /// looked like it does now.
+    pub fn branch_summary(&self, base: Option<&str>) -> Result<BranchSummary> {
+        let branch = self.status().map(|s| s.branch).unwrap_or_default();
+        let Some(outgoing) = self.outgoing(base)? else {
+            return Ok(BranchSummary { branch, ..Default::default() });
+        };
+        let commits = self.log(MAX_SUMMARY_COMMITS, Some(&outgoing.log_range))?;
+        let stat = match &outgoing.diff_range {
+            Some(range) => self.git(&["diff", "--stat", range]).unwrap_or_default(),
+            None => self.git(&["diff", "--stat", EMPTY_TREE, "HEAD"]).unwrap_or_default(),
+        };
+        Ok(BranchSummary {
+            branch,
+            base: base.map(str::to_string).unwrap_or_default(),
+            commits,
+            stat: stat.trim().to_string(),
+            diff: self.diff_outgoing(&outgoing)?,
+        })
     }
 
     /// True when `path` exists in the `HEAD` commit.

@@ -84,6 +84,11 @@ pub struct Config {
     /// `.git-manage-ci.toml` overrides this when the repository sets it.
     #[serde(default)]
     pub review_ai: Option<AiSelection>,
+    /// Render Markdown files instead of showing their diff. Sticky, because
+    /// someone who wants prose rendered wants it rendered for the next file
+    /// too.
+    #[serde(default)]
+    pub md_preview: bool,
     /// Keyboard shortcuts; missing/invalid entries fall back to defaults.
     #[serde(default)]
     pub shortcuts: shortcuts::Shortcuts,
@@ -622,6 +627,12 @@ pub struct App {
     // diff view
     pub diff_title: String,
     pub diff_text: String,
+    /// Working-tree text of the selected file, rendered as Markdown when
+    /// the preview is on. Empty until it is needed.
+    pub preview_text: String,
+    /// Whether a preview read is in flight. Without this the render path
+    /// re-asks every frame, which at 60fps is a thread per frame.
+    pub preview_loading: bool,
     /// Hunks of the currently selected file (for partial staging).
     pub hunks: Vec<crate::git::Hunk>,
     /// Whether the hunk bar shows every hunk. Files with many hunks collapse
@@ -685,9 +696,29 @@ pub struct App {
 
 impl App {
     fn new(ctx: &egui::Context) -> Self {
+        let mut app = Self::bare(ctx);
+        app.startup();
+        app.claude.auth_label = claude::Client::auth_label();
+        app.load_claude_models();
+        app
+    }
+
+    /// An app that has done no startup work: no repository reopened, no
+    /// GitHub or Ollama probes in flight.
+    ///
+    /// Tests need this. [`Self::new`] reopens the last repository on a
+    /// worker, and that message lands mid-test and overwrites whatever state
+    /// the test just set up — which looks exactly like the bug under
+    /// investigation.
+    #[cfg(test)]
+    pub fn new_for_test(ctx: &egui::Context) -> Self {
+        Self::bare(ctx)
+    }
+
+    fn bare(ctx: &egui::Context) -> Self {
         let (worker, rx) = Worker::new(ctx.clone());
         let config = Config::load();
-        let mut app = Self {
+        Self {
             worker,
             rx,
             ollama_url_input: config
@@ -717,6 +748,8 @@ impl App {
             ci_ai_proposal: String::new(),
             diff_title: String::new(),
             diff_text: String::new(),
+            preview_text: String::new(),
+            preview_loading: false,
             hunks: Vec::new(),
             hunks_expanded: false,
             line_sel: Default::default(),
@@ -750,11 +783,7 @@ impl App {
             busy: false,
             sync_op: None,
             rebinding: None,
-        };
-        app.startup();
-        app.claude.auth_label = claude::Client::auth_label();
-        app.load_claude_models();
-        app
+        }
     }
 
     fn startup(&mut self) {
@@ -1159,6 +1188,13 @@ impl App {
 
     // -- message pump -------------------------------------------------------
 
+    /// Drains the worker channel, for tests that need to observe a
+    /// background result without running the whole event loop.
+    #[cfg(test)]
+    pub fn handle_messages_for_test(&mut self) {
+        self.handle_messages();
+    }
+
     fn handle_messages(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
             self.handle(msg);
@@ -1222,6 +1258,13 @@ impl App {
             Msg::Branches(Err(e)) => self.toast(e, true),
             Msg::Log(Ok(log)) => self.log = log,
             Msg::Log(Err(e)) => self.toast(e, true),
+            Msg::Preview { path, text } => {
+                // Ignore a preview for a file that is no longer selected.
+                if self.selected_file.as_deref() == Some(path.as_str()) {
+                    self.preview_text = text;
+                    self.preview_loading = false;
+                }
+            }
             Msg::Diff { title, text } => {
                 self.diff_title = title;
                 self.diff_text = text;

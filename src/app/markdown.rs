@@ -35,45 +35,81 @@ pub fn render(ui: &mut egui::Ui, md: &str) {
     for block in parse(md) {
         match block {
             Block::Heading { level, text } => {
+                // A real scale. With no bold face available, size is the
+                // only thing that separates a heading from a paragraph, so
+                // the steps have to be big enough to read as steps.
                 let size = match level {
-                    1 => 19.0,
-                    2 => 16.5,
-                    _ => 14.5,
+                    1 => 25.0,
+                    2 => 20.0,
+                    3 => 16.5,
+                    4 => 15.0,
+                    _ => 13.5,
                 };
-                ui.add_space(if level <= 2 { 8.0 } else { 6.0 });
+                // Space belongs above a heading, not below it: a heading
+                // groups with the text it introduces.
+                ui.add_space(match level {
+                    1 => 20.0,
+                    2 => 17.0,
+                    3 => 13.0,
+                    _ => 10.0,
+                });
                 let mut job = LayoutJob::default();
                 inline(&mut job, &text, theme::FG, size, true);
                 ui.label(job);
-                ui.add_space(2.0);
+                // Only the document title gets a hairline. Giving every
+                // H2 one turns a normal README into a stack of rules.
+                if level == 1 {
+                    ui.add_space(3.0);
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), 1.0),
+                        egui::Sense::hover(),
+                    );
+                    ui.painter().rect_filled(rect, 0.0, theme::BORDER);
+                }
+                ui.add_space(5.0);
             }
             Block::Paragraph(text) => {
                 let mut job = LayoutJob::default();
-                inline(&mut job, &text, theme::FG, 13.0, false);
+                inline(&mut job, &text, theme::FG, 13.5, false);
                 ui.label(job);
-                ui.add_space(5.0);
+                ui.add_space(9.0);
             }
             Block::Quote(text) => {
                 // A left rule plus dimmed text, rather than trying to draw a
-                // real blockquote frame.
-                ui.horizontal(|ui| {
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(3.0, 18.0), egui::Sense::hover());
-                    ui.painter().rect_filled(rect, 1.0, theme::EMBER_DEEP);
+                // real blockquote frame. The rule is laid out *after* the
+                // text is measured, so it spans a wrapped quote instead of
+                // stopping after one line.
+                ui.horizontal_top(|ui| {
+                    let bar = ui.allocate_exact_size(
+                        egui::vec2(3.0, 0.0),
+                        egui::Sense::hover(),
+                    );
+                    ui.add_space(8.0);
                     let mut job = LayoutJob::default();
-                    inline(&mut job, &text, theme::FG_DIM, 13.0, false);
-                    ui.label(job);
+                    inline(&mut job, &text, theme::FG_DIM, 13.5, false);
+                    // Explicit wrap: a horizontal layout does not wrap text
+                    // by default, so a long quote would run off the panel.
+                    let response = ui.add(egui::Label::new(job).wrap());
+                    let rule = egui::Rect::from_min_size(
+                        bar.0.min,
+                        egui::vec2(3.0, response.rect.height()),
+                    );
+                    ui.painter().rect_filled(rule, 1.0, theme::EMBER_DEEP);
                 });
-                ui.add_space(5.0);
+                ui.add_space(9.0);
             }
             Block::ListItem { marker, text, indent } => {
                 ui.horizontal_top(|ui| {
                     ui.add_space(10.0 + indent as f32 * 14.0);
                     ui.label(RichText::new(marker).color(theme::EMBER).monospace().size(13.0));
                     let mut job = LayoutJob::default();
-                    inline(&mut job, &text, theme::FG, 13.0, false);
-                    ui.label(job);
+                    inline(&mut job, &text, theme::FG, 13.5, false);
+                    // Explicit wrap, for the same reason as a quote: the
+                    // marker sits beside the text in a horizontal layout,
+                    // where egui extends rather than wraps by default.
+                    ui.add(egui::Label::new(job).wrap());
                 });
-                ui.add_space(2.0);
+                ui.add_space(4.0);
             }
             Block::Code { lang, lines } => {
                 let detected = detect_lang(&lang);
@@ -116,9 +152,9 @@ pub fn render(ui: &mut egui::Ui, md: &str) {
                 ui.add_space(6.0);
             }
             Block::Rule => {
-                ui.add_space(4.0);
+                ui.add_space(10.0);
                 ui.separator();
-                ui.add_space(4.0);
+                ui.add_space(10.0);
             }
         }
     }
@@ -213,6 +249,17 @@ fn parse(md: &str) -> Vec<Block> {
             continue;
         }
 
+        // A lazy continuation: an indented line under a list item belongs to
+        // that item. Without this, every wrapped bullet in a README breaks
+        // out to the left margin as its own paragraph.
+        if indent >= 2 && paragraph.is_empty() {
+            if let Some(Block::ListItem { text, .. }) = blocks.last_mut() {
+                text.push(' ');
+                text.push_str(lean);
+                continue;
+            }
+        }
+
         paragraph.push(lean.to_string());
     }
     flush!();
@@ -278,12 +325,19 @@ fn inline(job: &mut LayoutJob, text: &str, color: Color32, size: f32, strong: bo
             0.0,
             TextFormat {
                 font_id: if code {
-                    FontId::monospace(size - 0.5)
+                    FontId::monospace(size - 1.0)
                 } else {
                     FontId::proportional(size)
                 },
                 color,
                 italics,
+                // No bold face is loaded, so weight is faked with colour and
+                // a little tracking. It is not a real bold, but it is the
+                // difference between "I can see the emphasis" and not.
+                extra_letter_spacing: if bold || strong { 0.4 } else { 0.0 },
+                // Inline code reads as a chip, the way it does everywhere
+                // else Markdown is rendered.
+                background: if code { theme::PANEL2 } else { Color32::TRANSPARENT },
                 ..Default::default()
             },
         );
@@ -389,6 +443,22 @@ mod tests {
     }
 
     #[test]
+    fn a_wrapped_list_item_stays_one_item() {
+        // How every README writes a long bullet.
+        let md = "- A bullet whose text is long enough\n  that it wraps in the source\n- Second\n";
+        assert_eq!(kinds(md), ["item", "item"]);
+        let blocks = parse(md);
+        let Block::ListItem { text, .. } = &blocks[0] else { panic!("expected an item") };
+        assert_eq!(text, "A bullet whose text is long enough that it wraps in the source");
+    }
+
+    #[test]
+    fn an_indented_line_after_a_paragraph_is_still_that_paragraph() {
+        let md = "A paragraph\n  continued while indented\n";
+        assert_eq!(kinds(md), ["para"]);
+    }
+
+    #[test]
     fn parses_the_block_types_a_review_uses() {
         let md = "## Verdict\n\nLooks wrong.\n\n- one\n- two\n\n> careful\n\n---\n";
         assert_eq!(kinds(md), ["heading", "para", "item", "item", "quote", "rule"]);
@@ -477,5 +547,152 @@ mod tests {
         // Unknown languages fall back rather than panicking.
         let _ = detect_lang("brainfuck");
         let _ = detect_lang("");
+    }
+
+    /// The showcase fixture, which is the manual test for the renderer: if
+    /// it is in the repository claiming to cover every construct, a test
+    /// should be the thing that keeps that claim true.
+    fn showcase() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/markdown-showcase.md");
+        std::fs::read_to_string(path).expect("the showcase fixture must exist")
+    }
+
+    #[test]
+    fn the_showcase_exercises_every_block_type() {
+        let md = showcase();
+        let kinds = kinds(&md);
+        for expected in ["heading", "para", "code", "item", "quote", "rule"] {
+            assert!(kinds.contains(&expected), "the showcase has no {expected} block");
+        }
+        // Enough of each to be a real exercise rather than a token example.
+        let count = |kind: &str| kinds.iter().filter(|k| **k == kind).count();
+        assert!(count("heading") >= 12, "headings: {}", count("heading"));
+        assert!(count("code") >= 14, "code blocks: {}", count("code"));
+        assert!(count("item") >= 18, "list items: {}", count("item"));
+        assert!(count("quote") >= 4, "quotes: {}", count("quote"));
+        assert!(count("rule") >= 8, "rules: {}", count("rule"));
+    }
+
+    #[test]
+    fn the_showcase_covers_every_highlighted_language() {
+        let md = showcase();
+        let langs: Vec<String> = parse(&md)
+            .iter()
+            .filter_map(|b| match b {
+                Block::Code { lang, .. } => Some(lang.clone()),
+                _ => None,
+            })
+            .collect();
+        for expected in [
+            "rust", "python", "go", "c", "js", "ts", "java", "dart", "toml", "json",
+            "yaml", "sh", "markdown",
+        ] {
+            assert!(langs.iter().any(|l| l == expected), "no {expected} fence: {langs:?}");
+        }
+        // A fence with no info string and one with an unknown language both
+        // have to survive, since that is what real documents contain.
+        assert!(langs.iter().any(|l| l.is_empty()), "no bare fence: {langs:?}");
+        assert!(langs.iter().any(|l| l == "brainfuck"), "no unknown-language fence");
+    }
+
+    #[test]
+    fn the_showcases_unterminated_fence_does_not_swallow_the_document() {
+        let md = showcase();
+        let blocks = parse(&md);
+        // The file ends on an unterminated fence deliberately. Everything
+        // before it must still have parsed, and the fence itself becomes the
+        // last block rather than eating the rest of the file.
+        assert!(blocks.len() > 100, "only {} blocks parsed", blocks.len());
+        assert!(
+            matches!(blocks.last(), Some(Block::Code { .. })),
+            "the last block should be the unterminated fence"
+        );
+    }
+
+    #[test]
+    fn the_showcase_renders_without_panicking() {
+        let md = showcase();
+        egui::__run_test_ctx(|ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                render(ui, &md);
+            });
+        });
+    }
+
+    /// Renders `md` into a Ui of exactly `width` and reports the size the
+    /// content actually took.
+    ///
+    /// A real `Context` (not `__run_test_ctx`) because that one loads no
+    /// fonts, and text with no glyphs has no width to measure. Two passes,
+    /// since the first lays out before the font atlas is warm.
+    fn rendered_size(md: &str, width: f32) -> egui::Vec2 {
+        let ctx = egui::Context::default();
+        // Constrain the *window*, not the Ui: that is how a narrow panel
+        // reaches the renderer in the real app, and it leaves no doubt about
+        // whether the constraint was applied.
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(width, 2000.0),
+            )),
+            ..Default::default()
+        };
+        let mut size = egui::Vec2::ZERO;
+        for _ in 0..2 {
+            let _ = ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render(ui, md);
+                    size = ui.min_rect().size();
+                });
+            });
+        }
+        size
+    }
+
+    /// Long prose has to wrap inside the panel, whatever block it is in.
+    /// List items and quotes are laid out horizontally (marker beside text),
+    /// and egui does not wrap text in a horizontal layout unless it is told
+    /// to — so this is the test that keeps them from running off the edge.
+    #[test]
+    fn long_text_wraps_in_every_block_type() {
+        const WIDTH: f32 = 300.0;
+        let sentence = "This is a deliberately long line of prose that cannot possibly \
+                        fit inside three hundred points of width and therefore has to \
+                        wrap onto several lines to stay readable.";
+
+        for (label, md) in [
+            ("paragraph", sentence.to_string()),
+            ("list item", format!("- {sentence}")),
+            ("ordered item", format!("1. {sentence}")),
+            ("quote", format!("> {sentence}")),
+        ] {
+            let size = rendered_size(&md, WIDTH);
+            assert!(
+                size.x <= WIDTH + 1.0,
+                "{label} overflowed its panel: {}pt wide in a {WIDTH}pt ui",
+                size.x
+            );
+            assert!(
+                size.y > 40.0,
+                "{label} did not wrap: {}pt tall, so it is still one line",
+                size.y
+            );
+        }
+    }
+
+    /// A code block must not push the document wider than the panel. Code
+    /// is not wrapped — that would corrupt how it reads — so a long line has
+    /// to scroll inside its own block instead of overflowing the view.
+    #[test]
+    fn a_long_code_line_stays_inside_the_panel() {
+        const WIDTH: f32 = 300.0;
+        let md = format!("```rust\nlet x = \"{}\";\n```\n", "y".repeat(300));
+        let size = rendered_size(&md, WIDTH);
+        assert!(
+            size.x <= WIDTH + 1.0,
+            "the code block overflowed the panel: {}pt wide in a {WIDTH}pt ui",
+            size.x
+        );
     }
 }

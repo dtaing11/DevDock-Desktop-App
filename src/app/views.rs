@@ -1170,6 +1170,9 @@ fn changes_tab(app: &mut App, ui: &mut egui::Ui) {
 
 fn select_file(app: &mut App, path: &str, staged: bool) {
     app.selected_file = Some(path.to_string());
+    app.preview_text.clear();
+    // A read for the previous file must not land in this one's preview.
+    app.preview_loading = false;
     app.selected_commit = None;
     app.show_staged = staged;
     app.blame = None;
@@ -1177,6 +1180,77 @@ fn select_file(app: &mut App, path: &str, staged: bool) {
     app.hunks_expanded = false;
     app.commit_file_list.clear();
     load_file_diff(app);
+    if app.config.md_preview {
+        load_preview(app);
+    }
+}
+
+/// A button that shows which of two modes is active by being filled, not by
+/// a tint that only reads as "selected" once you know to look for it.
+fn mode_button(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
+    let button = if active {
+        egui::Button::new(RichText::new(label).color(theme::BG).strong())
+            .fill(theme::EMBER)
+    } else {
+        egui::Button::new(RichText::new(label).color(theme::FG))
+    };
+    ui.add(button)
+}
+
+/// Switches between the diff and the rendered document, and remembers it.
+fn set_md_preview(app: &mut App, on: bool) {
+    app.config.md_preview = on;
+    app.config.save();
+    app.blame = None;
+    if on {
+        load_preview(app);
+    }
+}
+
+/// Whether a path is Markdown, and so has something to render.
+///
+/// The extension has to be a real one: a file *named* `md`, or a dotfile
+/// like `.md`, has no extension at all and is not a document.
+pub fn is_markdown(path: &str) -> bool {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let Some((stem, ext)) = name.rsplit_once('.') else { return false };
+    !stem.is_empty()
+        && matches!(ext.to_lowercase().as_str(), "md" | "markdown" | "mdown" | "mkd")
+}
+
+/// Cap on a previewed document. Past this the renderer is doing more work
+/// than the reader wants, and the diff is the better view anyway.
+const MAX_PREVIEW_BYTES: usize = 1_000_000;
+
+/// Reads the selected file's working-tree text for the Markdown preview.
+///
+/// The working tree, not the index: the preview answers "what does this
+/// document look like right now", which is the question someone editing
+/// prose is asking. The diff beside it is where the staged/unstaged
+/// distinction lives.
+pub fn load_preview(app: &mut App) {
+    let Some(repo) = app.repo.clone() else { return };
+    let Some(path) = app.selected_file.clone() else { return };
+    if !is_markdown(&path) || app.preview_loading {
+        return;
+    }
+    app.preview_text.clear();
+    app.preview_loading = true;
+    app.worker.spawn(move || {
+        let full = repo.path().join(&path);
+        let text = match std::fs::metadata(&full).map(|m| m.len() as usize) {
+            Ok(size) if size > MAX_PREVIEW_BYTES => format!(
+                "*{path} is {size} bytes — too large to render. Use the diff view.*"
+            ),
+            Ok(_) => match std::fs::read_to_string(&full) {
+                Ok(text) => text,
+                Err(e) => format!("*Cannot read {path}: {e}*"),
+            },
+            // A deleted file has no working-tree version to render.
+            Err(_) => format!("*{path} is not in the working tree (deleted?).*"),
+        };
+        Msg::Preview { path, text }
+    });
 }
 
 /// Loads the diff (and hunks for the unstaged side) of the selected file.
@@ -1223,6 +1297,8 @@ pub fn clear_diff_view(app: &mut App) {
     app.selected_commit = None;
     app.diff_title.clear();
     app.diff_text.clear();
+    app.preview_text.clear();
+    app.preview_loading = false;
     app.hunks.clear();
     app.hunks_expanded = false;
     app.line_sel.clear();
@@ -1904,6 +1980,38 @@ pub fn diff_panel(app: &mut App, ctx: &egui::Context) {
                                             load_blame(app);
                                         }
                                     }
+                                    // Markdown files can be read instead of
+                                    // diffed; nothing else has a rendering.
+                                    //
+                                    // Two explicit buttons rather than one
+                                    // toggle: a selected `selectable_label`
+                                    // differs from an unselected one only by
+                                    // a dim tint, and "which mode am I in?"
+                                    // should never be a guess.
+                                    let markdown = app
+                                        .selected_file
+                                        .as_deref()
+                                        .is_some_and(is_markdown);
+                                    if markdown {
+                                        let rendered = app.config.md_preview;
+                                        if mode_button(ui, "Rendered", rendered)
+                                            .on_hover_text(
+                                                "Read this Markdown file as a \
+                                                 document",
+                                            )
+                                            .clicked()
+                                            && !rendered
+                                        {
+                                            set_md_preview(app, true);
+                                        }
+                                        if mode_button(ui, "Diff", !rendered)
+                                            .on_hover_text("Show what changed instead")
+                                            .clicked()
+                                            && rendered
+                                        {
+                                            set_md_preview(app, false);
+                                        }
+                                    }
                                     if ui
                                         .button("Ignore")
                                         .on_hover_text("Add this file to .gitignore")
@@ -1924,6 +2032,16 @@ pub fn diff_panel(app: &mut App, ctx: &egui::Context) {
 
             if let Some(blame) = app.blame.clone() {
                 blame_view(ui, &blame);
+                return;
+            }
+
+            // Rendered Markdown replaces the diff entirely: the point is to
+            // read the document, and half a document interleaved with diff
+            // markers is neither.
+            if app.config.md_preview
+                && app.selected_file.as_deref().is_some_and(is_markdown)
+            {
+                markdown_view(app, ui);
                 return;
             }
 
@@ -1977,6 +2095,41 @@ pub fn diff_panel(app: &mut App, ctx: &egui::Context) {
                 },
             );
         });
+}
+
+/// The selected Markdown file, rendered.
+fn markdown_view(app: &mut App, ui: &mut egui::Ui) {
+    if app.preview_text.is_empty() {
+        // Ask once, then wait. `preview_loading` is what stops this render
+        // path from spawning a fresh read on every frame.
+        load_preview(app);
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.add(egui::Spinner::new().size(14.0));
+            ui.label(RichText::new("rendering…").color(theme::FG_DIM).small());
+        });
+        return;
+    }
+
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("Working tree — this is the file as it is now, not a diff.")
+                .color(theme::FG_DIM)
+                .small(),
+        );
+    });
+    ui.separator();
+
+    let text = app.preview_text.clone();
+    ScrollArea::vertical().auto_shrink([false, false]).id_salt("md-preview").show(ui, |ui| {
+        // Prose is unreadable at full window width; cap the measure the way
+        // a document would. `set_max_width` is what the text actually wraps
+        // against, so the cap has to be set before anything is rendered.
+        let width = ui.available_width().min(900.0);
+        ui.set_max_width(width);
+        super::markdown::render(ui, &text);
+    });
 }
 
 /// Diff view with per-line checkboxes on changed lines for line staging.
@@ -2273,7 +2426,7 @@ pub fn toasts(app: &mut App, ctx: &egui::Context) {
 
 #[cfg(test)]
 mod tests {
-    use super::elide_path;
+    use super::{elide_path, is_markdown};
 
     #[test]
     fn short_paths_untouched() {
@@ -2306,5 +2459,277 @@ mod tests {
         let wide = elide_path(p, 28);
         assert!(narrow.chars().count() < wide.chars().count());
         assert!(wide.contains("four/five"), "{wide}");
+    }
+
+    #[test]
+    fn markdown_extensions_are_recognized() {
+        for path in ["README.md", "docs/guide.markdown", "a/b/NOTES.MD", "x.mkd"] {
+            assert!(is_markdown(path), "{path} should be Markdown");
+        }
+        for path in ["src/main.rs", "Makefile", "notes.txt", "md", "a.md.rs", ".md"] {
+            assert!(!is_markdown(path), "{path} should not be Markdown");
+        }
+    }
+
+    /// The diff panel renders in every state the Markdown preview can be in.
+    /// A panel that panics on an empty buffer or an unloaded preview is the
+    /// failure this catches.
+    #[test]
+    fn the_markdown_preview_renders_without_panicking() {
+        let tmp = tempfile::tempdir().unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "t@t.io"],
+            vec!["config", "user.name", "T"],
+        ] {
+            let out = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(tmp.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        }
+        std::fs::write(tmp.path().join("README.md"), "# Title\n\nSome *prose*.\n").unwrap();
+
+        let ctx = egui::Context::default();
+        let mut app = crate::app::App::new_for_test(&ctx);
+        app.repo = Some(crate::git::Repo::open(tmp.path()).unwrap());
+        app.selected_file = Some("README.md".into());
+        app.config.md_preview = true;
+
+        // Not loaded yet: the spinner path.
+        egui::__run_test_ctx(|ctx| super::diff_panel(&mut app, ctx));
+
+        // Loaded: the rendering path.
+        app.preview_text = "# Title\n\nSome *prose* and `code`.\n\n- a\n- b\n".into();
+        egui::__run_test_ctx(|ctx| super::diff_panel(&mut app, ctx));
+
+        // Toggled off: back to the diff, with the same file selected.
+        app.config.md_preview = false;
+        app.diff_text = "@@ -1 +1 @@\n-old\n+new\n".into();
+        egui::__run_test_ctx(|ctx| super::diff_panel(&mut app, ctx));
+    }
+
+    #[test]
+    fn clearing_the_view_drops_the_preview_text() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::App::new_for_test(&ctx);
+        app.selected_file = Some("README.md".into());
+        app.preview_text = "# stale".into();
+
+        super::clear_diff_view(&mut app);
+        assert!(app.preview_text.is_empty(), "a stale preview must not outlive the selection");
+        assert!(app.selected_file.is_none());
+    }
+
+    /// Clicks at `pos` in a window `width` wide and reports whether the
+    /// Markdown toggle flipped.
+    ///
+    /// Synthetic pointer input, because "the button does nothing" is a claim
+    /// about hit-testing, and hit-testing is exactly what reading the code
+    /// cannot tell you.
+    fn click_toggles(app: &mut crate::app::App, ctx: &egui::Context, width: f32, pos: egui::Pos2) -> bool {
+        let before = app.config.md_preview;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(width, 700.0),
+            )),
+            events: vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| super::diff_panel(app, ctx));
+        app.config.md_preview != before
+    }
+
+    /// The Diff/Rendered buttons must be clickable, including in a narrow
+    /// window where the header's controls are competing for width.
+    #[test]
+    fn the_rendered_toggle_responds_to_a_click() {
+        let tmp = tempfile::tempdir().unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "t@t.io"],
+            vec!["config", "user.name", "T"],
+        ] {
+            let out = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(tmp.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        }
+        std::fs::write(tmp.path().join("notes.md"), "# Title\n").unwrap();
+
+        let ctx = egui::Context::default();
+        let mut app = crate::app::App::new_for_test(&ctx);
+        let original = app.config.md_preview;
+        app.repo = Some(crate::git::Repo::open(tmp.path()).unwrap());
+        app.selected_file = Some("notes.md".into());
+        app.diff_title = "notes.md".into();
+        app.diff_text = "+# Title\n".into();
+        app.config.md_preview = false;
+
+        for width in [1400.0_f32, 900.0, 620.0] {
+            // Warm-up pass so the header is laid out before anything is clicked.
+            let warm = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(width, 700.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(warm, |ctx| super::diff_panel(&mut app, ctx));
+
+            // Sweep the header row for a position that hits the toggle.
+            let mut hit = None;
+            'sweep: for y in [14.0_f32, 20.0, 26.0, 32.0] {
+                let mut x = width - 6.0;
+                while x > 40.0 {
+                    if click_toggles(&mut app, &ctx, width, egui::pos2(x, y)) {
+                        hit = Some((x, y));
+                        break 'sweep;
+                    }
+                    x -= 6.0;
+                }
+            }
+            assert!(
+                hit.is_some(),
+                "at {width}pt wide, no click anywhere in the header switched to Rendered"
+            );
+            assert!(app.config.md_preview, "the Rendered button should have turned it on");
+
+            // The Diff button turns it back off. It is a different button, so
+            // the sweep runs again rather than reusing the same position.
+            let mut back = false;
+            'off: for y in [14.0_f32, 20.0, 26.0, 32.0] {
+                let mut x = width - 6.0;
+                while x > 40.0 {
+                    if click_toggles(&mut app, &ctx, width, egui::pos2(x, y)) {
+                        back = true;
+                        break 'off;
+                    }
+                    x -= 6.0;
+                }
+            }
+            assert!(back, "at {width}pt wide, nothing in the header switched back to Diff");
+            assert!(!app.config.md_preview, "the Diff button should have turned it off");
+        }
+
+        // Leave the user's saved preference as it was found.
+        app.config.md_preview = original;
+        app.config.save();
+    }
+
+    /// Every piece of text the frame actually painted.
+    ///
+    /// Asserting on state proves the toggle flipped a bool. Asserting on the
+    /// painted text proves the user's view changed, which is the thing being
+    /// reported.
+    fn painted_text(app: &mut crate::app::App, ctx: &egui::Context, width: f32) -> String {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(width, 700.0),
+            )),
+            ..Default::default()
+        };
+        let output = ctx.run(input, |ctx| super::diff_panel(app, ctx));
+        let mut text = String::new();
+        for clipped in &output.shapes {
+            collect_text(&clipped.shape, &mut text);
+        }
+        text
+    }
+
+    fn collect_text(shape: &egui::Shape, out: &mut String) {
+        match shape {
+            egui::Shape::Text(t) => {
+                out.push_str(t.galley.text());
+                out.push('\n');
+            }
+            egui::Shape::Vec(shapes) => {
+                for s in shapes {
+                    collect_text(s, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Turning the toggle on must actually replace the diff with the
+    /// rendered document, and turning it off must bring the diff back.
+    #[test]
+    fn the_toggle_changes_what_is_on_screen() {
+        let tmp = tempfile::tempdir().unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "t@t.io"],
+            vec!["config", "user.name", "T"],
+        ] {
+            let out = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(tmp.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        }
+        std::fs::write(tmp.path().join("notes.md"), "# Heading One\n\nBody prose.\n").unwrap();
+
+        let ctx = egui::Context::default();
+        let mut app = crate::app::App::new_for_test(&ctx);
+        let original = app.config.md_preview;
+        app.repo = Some(crate::git::Repo::open(tmp.path()).unwrap());
+        app.selected_file = Some("notes.md".into());
+        app.diff_title = "notes.md".into();
+        app.diff_text = "+# Heading One\n+\n+Body prose.\n".into();
+
+        // Off: the diff, with its markers.
+        app.config.md_preview = false;
+        let diff_view = painted_text(&mut app, &ctx, 1000.0);
+        assert!(diff_view.contains("+# Heading One"), "the diff should be on screen:\n{diff_view}");
+
+        // On: the document. The preview loads on a worker, so pump messages
+        // until it arrives, exactly as the running app does each frame.
+        app.config.md_preview = true;
+        app.preview_text.clear();
+        app.preview_loading = false;
+        let mut rendered = String::new();
+        for _ in 0..50 {
+            rendered = painted_text(&mut app, &ctx, 1000.0);
+            app.handle_messages_for_test();
+            if !app.preview_text.is_empty() {
+                rendered = painted_text(&mut app, &ctx, 1000.0);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            rendered.contains("Heading One") && !rendered.contains("+# Heading One"),
+            "the rendered document should have replaced the diff:\n{rendered}"
+        );
+        assert!(rendered.contains("Working tree"), "the preview banner is missing");
+
+        // Off again: back to the diff.
+        app.config.md_preview = false;
+        let back = painted_text(&mut app, &ctx, 1000.0);
+        assert!(back.contains("+# Heading One"), "the diff should be back:\n{back}");
+
+        app.config.md_preview = original;
+        app.config.save();
     }
 }

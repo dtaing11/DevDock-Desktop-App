@@ -1695,6 +1695,18 @@ fn review_section(app: &mut App, ui: &mut egui::Ui) {
                     }
                     if expanded {
                         ui.label(RichText::new(&finding.detail).color(theme::FG_DIM));
+                        // The line the reviewer quoted, checked against the file
+                        // before this was shown. It is what makes the finding
+                        // checkable rather than something to take on faith.
+                        if !finding.evidence.trim().is_empty() {
+                            ui.add_space(2.0);
+                            ui.label(
+                                RichText::new(finding.evidence.trim())
+                                    .monospace()
+                                    .small()
+                                    .color(theme::TEAL),
+                            );
+                        }
                     }
                 }
                 ui.add_space(4.0);

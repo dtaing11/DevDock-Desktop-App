@@ -846,6 +846,21 @@ fn ai_pr_text(repo: &Repo, base: &str) -> Result<crate::ollama::CommitSuggestion
 
     let config = crate::app::Config::load();
     let (provider, model) = ai_selection(&config, config.pr_ai.as_ref());
+    let url = config
+        .ollama_url
+        .clone()
+        .unwrap_or_else(|| crate::ollama::DEFAULT_URL.into());
+    let sel = crate::app::AiSelection { provider: provider.clone(), model: model.clone() };
+
+    // Let it read the repository first, so the description comes from an
+    // understanding of the change rather than from the diff's surface.
+    match pr_text_with_context(repo, &sel, &url, &summary) {
+        Err(e) if e.to_lowercase().contains("tools") => {
+            println!("{}", style::dim("model cannot read files; using the diff alone"));
+        }
+        other => return other,
+    }
+
     if provider == "claude" {
         let client = crate::claude::Client::from_store(model)
             .ok_or("Claude is not signed in (sign in from the GUI settings)")?;
@@ -854,10 +869,34 @@ fn ai_pr_text(repo: &Repo, base: &str) -> Result<crate::ollama::CommitSuggestion
     if model.is_empty() {
         return Err("no Ollama model configured (pick one in the GUI)".into());
     }
-    let url = config.ollama_url.unwrap_or_else(|| crate::ollama::DEFAULT_URL.into());
     crate::ollama::Client::new(url)
         .pull_request_text(&model, &summary, None)
         .map_err(|e| e.to_string())
+}
+
+/// Writes pull request text with the repository open to the model, printing
+/// what it reads as it goes.
+fn pr_text_with_context(
+    repo: &Repo,
+    sel: &crate::app::AiSelection,
+    url: &str,
+    summary: &crate::git::BranchSummary,
+) -> Result<crate::ollama::CommitSuggestion, String> {
+    let provider = crate::app::agent_provider(sel, url)?;
+    let tracked = repo.tracked_files().map_err(|e| e.to_string())?;
+    let mut workspace = crate::agent::Workspace::new(
+        repo.path(),
+        tracked,
+        crate::agent::pr::access(),
+    )?;
+    crate::agent::pr::run(
+        provider.as_ref(),
+        &mut workspace,
+        summary,
+        None,
+        crate::review::MAX_PR_DIFF_BYTES,
+        &mut |event| println!("  {}", style::dim(&event.line())),
+    )
 }
 
 /// Generates a commit message with the app's configured provider/model.

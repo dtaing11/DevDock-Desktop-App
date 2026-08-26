@@ -1343,6 +1343,27 @@ fn branch_summary_falls_back_to_the_upstream_and_reports_an_empty_branch() {
     assert!(summary.diff.contains("two"));
 }
 
+/// A cloned repository often has no local `main`, only `origin/main`.
+/// Naming the base the pull request targets must still work.
+#[test]
+fn branch_summary_resolves_a_base_that_only_exists_as_a_remote_branch() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "base.txt", "base\n", "chore: init");
+    repo.push(true, None).unwrap();
+
+    repo.create_branch("feature", true).unwrap();
+    commit_file(&repo, "f.txt", "work\n", "feat: the work");
+
+    // Delete the local main; only origin/main remains, as after a clone.
+    sh(repo.path(), "git", &["branch", "-D", "main"]);
+    assert!(repo.git(&["rev-parse", "--verify", "--quiet", "main"]).is_err());
+
+    let summary = repo.branch_summary(Some("main")).unwrap();
+    assert_eq!(summary.commits.len(), 1, "{:?}", summary.commits);
+    assert_eq!(summary.commits[0].subject, "feat: the work");
+    assert!(summary.diff.contains("work"));
+}
+
 #[test]
 fn branch_summary_handles_a_branch_with_no_parent_commit() {
     // A repository whose first commit has no parent still has to produce a
@@ -1399,7 +1420,22 @@ fn live_pr_text() {
         eprintln!("Claude is not signed in; skipping");
         return;
     };
-    let text = client.pull_request_text(&summary, None).expect("PR text");
+    // The harness path: the model can open the files the diff touches.
+    let mut workspace = git_manage::agent::Workspace::new(
+        repo.path(),
+        repo.tracked_files().unwrap(),
+        git_manage::agent::pr::access(),
+    )
+    .unwrap();
+    let text = git_manage::agent::pr::run(
+        &client,
+        &mut workspace,
+        &summary,
+        None,
+        60_000,
+        &mut |e| println!("  {}", e.line()),
+    )
+    .expect("PR text");
     println!("\nTITLE: {}\n\n{}\n", text.summary, text.description);
 
     let whole = format!("{} {}", text.summary, text.description).to_lowercase();

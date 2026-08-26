@@ -528,12 +528,25 @@ impl Repo {
     /// with no upstream — against everything no remote has yet.
     fn outgoing(&self, base: Option<&str>) -> Result<Option<Outgoing>> {
         if let Some(base) = base.map(str::trim).filter(|b| !b.is_empty()) {
-            return Ok(Some(Outgoing {
-                // Three dots for the diff: what this branch added since it
-                // forked, not what the base did meanwhile.
-                diff_range: Some(format!("{base}...HEAD")),
-                log_range: format!("{base}..HEAD"),
-            }));
+            // A cloned repository often has no local `main`, only
+            // `origin/main`. Naming a base that git cannot resolve would
+            // fail the whole summary, so try the remote-tracking form
+            // before giving up on it.
+            let resolved = [base.to_string(), format!("origin/{base}")]
+                .into_iter()
+                .find(|rev| {
+                    self.git(&["rev-parse", "--verify", "--quiet", rev]).is_ok()
+                });
+            if let Some(base) = resolved {
+                return Ok(Some(Outgoing {
+                    // Three dots for the diff: what this branch added since
+                    // it forked, not what the base did meanwhile.
+                    diff_range: Some(format!("{base}...HEAD")),
+                    log_range: format!("{base}..HEAD"),
+                }));
+            }
+            // Fall through: no such base, so describe what is unpushed
+            // rather than failing outright.
         }
         if self.git(&["rev-parse", "--verify", "--quiet", "@{upstream}"]).is_ok() {
             return Ok(Some(Outgoing {

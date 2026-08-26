@@ -34,6 +34,7 @@
 //! roughly the quality of the old single-shot path rather than to an error.
 
 pub mod conflict;
+pub mod pr;
 pub mod workspace;
 
 use serde::{Deserialize, Serialize};

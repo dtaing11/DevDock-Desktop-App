@@ -1174,6 +1174,20 @@ impl App {
                                 .into(),
                         );
                     }
+                    let sel = AiSelection {
+                        provider: provider.clone(),
+                        model: model.clone(),
+                    };
+                    // First choice: let it read the repository, so the
+                    // description comes from an understanding of the change
+                    // rather than from the diff's surface.
+                    match pull_request_with_context(&repo, &sel, &url, &summary, custom) {
+                        Err(e) if lacks_tool_support(&e) => {
+                            // The model cannot call tools; the commits and
+                            // the diff still describe the branch.
+                        }
+                        other => return other,
+                    }
                     return if provider == "claude" {
                         let client = claude::Client::from_store(model)
                             .ok_or("Claude is not signed in. Open Settings.")?;
@@ -2562,6 +2576,35 @@ fn review_with_repo_context(
         &mut workspace,
         diff,
         cfg,
+        &mut |_| {},
+    )
+}
+
+/// Writes pull request text with the repository open to the model.
+///
+/// The commits and diff are handed over up front; the tools let it check
+/// what they mean — open the file a hunk sits in, read the function a commit
+/// claims to fix, find the other callers of something whose signature moved.
+fn pull_request_with_context(
+    repo: &crate::git::Repo,
+    sel: &AiSelection,
+    ollama_url: &str,
+    summary: &crate::git::BranchSummary,
+    instructions: Option<&str>,
+) -> Result<ollama::CommitSuggestion, String> {
+    let provider = agent_provider(sel, ollama_url)?;
+    let tracked = strerr(repo.tracked_files())?;
+    let mut workspace = crate::agent::Workspace::new(
+        repo.path(),
+        tracked,
+        crate::agent::pr::access(),
+    )?;
+    crate::agent::pr::run(
+        provider.as_ref(),
+        &mut workspace,
+        summary,
+        instructions,
+        crate::review::MAX_PR_DIFF_BYTES,
         &mut |_| {},
     )
 }

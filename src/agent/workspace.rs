@@ -139,6 +139,13 @@ impl Workspace {
             .collect()
     }
 
+    /// The text of a tracked file, for code that needs to check something
+    /// against the repository without going through a tool call.
+    pub fn read_tracked(&self, path: &str) -> Option<String> {
+        let rel = self.resolve_readable(path).ok()?;
+        self.current_content(&rel).ok()
+    }
+
     /// The tools available at this access level.
     pub fn tools(&self) -> Vec<ToolSpec> {
         let mut tools = vec![

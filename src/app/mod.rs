@@ -1240,6 +1240,13 @@ impl App {
                     // CI state and history belong to the previous repo.
                     self.local_ci = Default::default();
                     self.load_local_ci();
+                    // So do any AI proposals and conflict resolutions still
+                    // waiting for confirmation. Their paths are
+                    // repo-relative, so applying them after a repository
+                    // switch would write one project's edits into another.
+                    self.agent = Default::default();
+                    self.conflicts = Default::default();
+                    self.review = Default::default();
                     // Graph belongs to the previous repo too.
                     self.graph.clear();
                     self.graph_open = false;
@@ -2605,5 +2612,130 @@ fn review_single_shot(
 /// falling back for, as opposed to a real error worth reporting.
 fn lacks_tool_support(error: &str) -> bool {
     let e = error.to_lowercase();
-    e.contains("cannot call tools") || e.contains("does not support tools")
+    // Only these mean "this model cannot do tools at all". Anything else —
+    // a timeout, a 500, a refused connection — must propagate: silently
+    // downgrading to a diff-only review on a transient failure would hide
+    // that the reviewer never got its context.
+    [
+        "cannot call tools",
+        "does not support tools",
+        "tools are not supported",
+        "tool use is not supported",
+        "does not support tool",
+    ]
+    .iter()
+    .any(|phrase| e.contains(phrase))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let out = Command::new("git").args(args).current_dir(dir).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// A repository with one file, and an app pointed at it.
+    fn app_with_repo() -> (tempfile::TempDir, App, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        git(tmp.path(), &["init", "-b", "main"]);
+        git(tmp.path(), &["config", "user.email", "t@t.io"]);
+        git(tmp.path(), &["config", "user.name", "T"]);
+        let file = tmp.path().join("notes.txt");
+        std::fs::write(&file, "one\ntwo\nthree\n").unwrap();
+
+        let ctx = egui::Context::default();
+        let mut app = App::new_for_test(&ctx);
+        app.repo = Some(crate::git::Repo::open(tmp.path()).unwrap());
+        (tmp, app, file)
+    }
+
+    /// Proposals belong to the repository they were made against.
+    ///
+    /// Their paths are repo-relative, so an unapplied proposal that survived
+    /// a repository switch would be written into the *new* project — one
+    /// repo's edits landing in another's files.
+    #[test]
+    fn switching_repositories_drops_proposals_from_the_old_one() {
+        let (_tmp, mut app, file) = app_with_repo();
+        app.agent.edits = vec![ProposedEdit {
+            edit: crate::agent::PendingEdit {
+                path: "notes.txt".into(),
+                before: Some("one\n".into()),
+                after: "REWRITTEN\n".into(),
+            },
+            accepted: true,
+            applied: false,
+            unresolved: false,
+        }];
+        app.agent.summary = "from the old repository".into();
+        app.conflicts.files = vec![crate::git::ConflictFile {
+            path: "notes.txt".into(),
+            base: None,
+            ours: None,
+            theirs: None,
+            working: None,
+        }];
+
+        let other = tempfile::tempdir().unwrap();
+        git(other.path(), &["init", "-b", "main"]);
+        git(other.path(), &["config", "user.email", "t@t.io"]);
+        git(other.path(), &["config", "user.name", "T"]);
+        std::fs::write(other.path().join("notes.txt"), "a different project\n").unwrap();
+
+        app.handle(Msg::RepoOpened(Ok(other.path().display().to_string())));
+
+        assert!(app.agent.edits.is_empty(), "proposals outlived the repository");
+        assert!(app.agent.summary.is_empty());
+        assert!(app.conflicts.files.is_empty(), "conflicts outlived the repository");
+        assert!(app.review.outcome.is_none(), "a review verdict outlived the repository");
+
+        // Neither repository was touched.
+        assert_eq!(
+            std::fs::read_to_string(other.path().join("notes.txt")).unwrap(),
+            "a different project\n"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\ntwo\nthree\n");
+    }
+
+    #[test]
+    fn only_a_missing_tool_capability_falls_back_to_a_diff_only_review() {
+        for tool_error in [
+            "qwen2 cannot call tools, so it cannot read the repository",
+            "Ollama error 400: registry.ollama.ai/library/x does not support tools",
+            "the server said tools are not supported for this model",
+        ] {
+            assert!(lacks_tool_support(tool_error), "{tool_error}");
+        }
+        // Everything else must propagate: a review that silently became
+        // diff-only after a timeout would hide that it lost its context.
+        for real_error in [
+            "Claude API 429 on claude-opus-5: rate limited",
+            "Cannot reach Claude: connection refused",
+            "The reviewer did not return a usable review: {",
+        ] {
+            assert!(!lacks_tool_support(real_error), "{real_error}");
+        }
+    }
+
+    /// The claim that `repo_context` "may not be initialized from config".
+    #[test]
+    fn repo_context_defaults_to_on_however_the_config_is_written() {
+        // No [review] section at all.
+        let config: crate::local_ci::Config = toml::from_str("[[job]]\nname = \"t\"\ncommands = []\n").unwrap();
+        assert!(config.review.repo_context);
+
+        // A [review] section that never mentions it.
+        let config: crate::local_ci::Config =
+            toml::from_str("[review]\nrun = true\nfail_on = \"high\"\n").unwrap();
+        assert!(config.review.repo_context);
+        assert_eq!(config.review.max_context_calls, 24);
+
+        // And an explicit opt-out is honoured.
+        let config: crate::local_ci::Config =
+            toml::from_str("[review]\nrun = true\nrepo_context = false\n").unwrap();
+        assert!(!config.review.repo_context);
+    }
 }

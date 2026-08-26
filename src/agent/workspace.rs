@@ -560,10 +560,15 @@ pub fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, String> {
 /// writing it follows the link and lands outside. So this walks up to the
 /// nearest ancestor that does exist and canonicalizes that instead.
 fn contained(root: &Path, joined: &Path) -> Result<(), ()> {
+    // The comparison is between two resolved paths, so the root has to be
+    // resolved too. A repository reached through a symlinked parent — a
+    // symlinked home directory, `/tmp` on macOS — would otherwise fail
+    // every containment check and refuse writes it should allow.
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let mut probe = joined.to_path_buf();
     loop {
         if let Ok(real) = probe.canonicalize() {
-            return if real.starts_with(root) { Ok(()) } else { Err(()) };
+            return if real.starts_with(&root) { Ok(()) } else { Err(()) };
         }
         match probe.parent() {
             Some(parent) => probe = parent.to_path_buf(),
@@ -783,6 +788,33 @@ mod tests {
         );
         assert!(out.is_error, "a read escaped the repository: {}", out.content);
         assert!(!out.content.contains("s3cret"));
+    }
+
+    /// A repository reached through a symlinked path is still that
+    /// repository. `/tmp` on macOS and a symlinked home directory are both
+    /// this case, and a containment check that compares a resolved path
+    /// against an unresolved root refuses every write in them.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_repository_root_still_accepts_its_own_files() {
+        let outer = tempfile::tempdir().unwrap();
+        let real = outer.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("a.txt"), "hello\n").unwrap();
+        let link = outer.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // Callers hand us whatever path they were given, symlink and all.
+        let resolved = safe_join(&link, "a.txt").expect("a file in the repository");
+        assert!(resolved.ends_with("a.txt"));
+        // A file that does not exist yet is fine too — that is how a new
+        // file gets written.
+        assert!(safe_join(&link, "sub/new.txt").is_ok());
+
+        // Escaping is still refused, symlinked root or not.
+        assert!(safe_relative(&link, "../outside.txt").is_err());
+        assert!(safe_relative(&link, "/etc/passwd").is_err());
+        assert!(safe_relative(&link, ".git/config").is_err());
     }
 
     #[test]

@@ -23,7 +23,9 @@ macOS/Windows since egui is cross-platform).
   written until you tick it and apply.
 - **GitHub**: sign in via browser device flow or a personal access token,
   authenticated push/pull/fetch, list and **create pull requests**
-  (with AI-generated PR title/body).
+  (with an AI-generated title and description written from **every commit on
+  the branch** — its subjects, bodies, and full diff against the base — not
+  from whatever happens to be staged).
 
 ## Install
 

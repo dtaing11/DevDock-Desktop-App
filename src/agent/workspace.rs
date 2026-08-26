@@ -463,39 +463,7 @@ impl Workspace {
     /// Normalizes a model-supplied path and refuses anything that leaves the
     /// repository or reaches into `.git`.
     fn normalize(&self, path: &str) -> Result<String, String> {
-        let trimmed = path.trim().trim_start_matches("./");
-        if trimmed.is_empty() {
-            return Err("path must not be empty.".into());
-        }
-        let candidate = Path::new(trimmed);
-        if candidate.is_absolute() {
-            return Err(format!(
-                "{path}: use a path relative to the repository root, not an absolute path."
-            ));
-        }
-        let mut parts: Vec<String> = Vec::new();
-        for component in candidate.components() {
-            match component {
-                Component::Normal(part) => {
-                    parts.push(part.to_string_lossy().to_string());
-                }
-                Component::CurDir => {}
-                _ => return Err(format!("{path}: resolves outside the repository.")),
-            }
-        }
-        let rel = parts.join("/");
-        if parts.first().is_some_and(|p| p == ".git") {
-            return Err(format!("{path}: the .git directory is off limits."));
-        }
-        // Existing paths get the symlink check too: a tracked symlink could
-        // otherwise point anywhere on the machine.
-        let joined = self.root.join(&rel);
-        if let Ok(canonical) = joined.canonicalize() {
-            if !canonical.starts_with(&self.root) {
-                return Err(format!("{path}: resolves outside the repository."));
-            }
-        }
-        Ok(rel)
+        safe_relative(&self.root, path)
     }
 
     /// A path the model may read: tracked, or one it has proposed itself.
@@ -540,6 +508,68 @@ impl Workspace {
         }
         let disk = std::fs::read_to_string(self.root.join(rel)).ok();
         self.originals.insert(rel.to_string(), disk);
+    }
+}
+
+/// Normalizes a repo-relative path, refusing anything that leaves the
+/// repository or reaches into `.git`.
+///
+/// Free-standing on purpose: the harness checks a path when the model names
+/// it, and the code that finally writes an accepted proposal checks it again
+/// on the way to disk. One of those is the sandbox; the other is the last
+/// line before a real write.
+pub fn safe_relative(root: &Path, path: &str) -> Result<String, String> {
+    let trimmed = path.trim().trim_start_matches("./");
+    if trimmed.is_empty() {
+        return Err("path must not be empty.".into());
+    }
+    let candidate = Path::new(trimmed);
+    if candidate.is_absolute() {
+        return Err(format!(
+            "{path}: use a path relative to the repository root, not an absolute path."
+        ));
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for component in candidate.components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_string_lossy().to_string()),
+            Component::CurDir => {}
+            _ => return Err(format!("{path}: resolves outside the repository.")),
+        }
+    }
+    if parts.first().is_some_and(|p| p == ".git") {
+        return Err(format!("{path}: the .git directory is off limits."));
+    }
+    let rel = parts.join("/");
+    contained(root, &root.join(&rel)).map_err(|_| {
+        format!("{path}: resolves outside the repository.")
+    })?;
+    Ok(rel)
+}
+
+/// The absolute path of `rel` under `root`, checked the same way.
+pub fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, String> {
+    Ok(root.join(safe_relative(root, rel)?))
+}
+
+/// Whether `joined` really lands inside `root` once symlinks are resolved.
+///
+/// Rejecting `..` is not enough: any component of the path can be a symlink
+/// pointing anywhere on the machine. Canonicalizing `joined` only works when
+/// it already exists, and the dangerous case is a file that does *not* —
+/// writing it follows the link and lands outside. So this walks up to the
+/// nearest ancestor that does exist and canonicalizes that instead.
+fn contained(root: &Path, joined: &Path) -> Result<(), ()> {
+    let mut probe = joined.to_path_buf();
+    loop {
+        if let Ok(real) = probe.canonicalize() {
+            return if real.starts_with(root) { Ok(()) } else { Err(()) };
+        }
+        match probe.parent() {
+            Some(parent) => probe = parent.to_path_buf(),
+            // Walked past the filesystem root without finding anything real.
+            None => return Err(()),
+        }
     }
 }
 
@@ -717,6 +747,42 @@ mod tests {
         let out = ws.dispatch(&c, 1);
         assert!(out.is_error);
         assert!(out.content.contains("budget"));
+    }
+
+    /// A symlink inside the repository must not be a way out of it.
+    ///
+    /// The dangerous case is a path that does not exist yet: canonicalize
+    /// fails on it, so a check that only looks at fully-resolved paths never
+    /// runs, and the write follows the link.
+    #[test]
+    fn a_symlink_is_not_a_way_out_of_the_repository() {
+        let outside = tempfile::tempdir().unwrap();
+        let (tmp, mut ws) = fixture(Access::ReadWrite);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), tmp.path().join("escape")).unwrap();
+
+        // Writing *through* the link to a file that does not exist yet.
+        let out = ws.dispatch(
+            &call(
+                "write_file",
+                serde_json::json!({"path": "escape/pwned.txt", "content": "owned"}),
+            ),
+            10,
+        );
+        assert!(out.is_error, "a write through a symlink escaped: {}", out.content);
+        assert!(
+            !outside.path().join("pwned.txt").exists(),
+            "the write landed outside the repository"
+        );
+
+        // And reading through it, for a file that does exist out there.
+        std::fs::write(outside.path().join("secret.txt"), "s3cret").unwrap();
+        let out = ws.dispatch(
+            &call("read_file", serde_json::json!({"path": "escape/secret.txt"})),
+            10,
+        );
+        assert!(out.is_error, "a read escaped the repository: {}", out.content);
+        assert!(!out.content.contains("s3cret"));
     }
 
     #[test]

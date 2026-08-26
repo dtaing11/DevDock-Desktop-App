@@ -669,6 +669,24 @@ pub fn user_prompt(diff: &str, instructions: Option<&str>, max_diff_bytes: usize
     }
 }
 
+/// How much of the diff the reviewer was actually shown, when it was not
+/// all of it.
+///
+/// A review of 8% of a change reads exactly like a review of all of it —
+/// same confident tone, same clean bill of health for everything it never
+/// saw. The only defence is to say so, next to the findings.
+pub fn coverage_note(diff: &str, max_diff_bytes: usize) -> Option<String> {
+    if diff.len() <= max_diff_bytes {
+        return None;
+    }
+    let percent = (max_diff_bytes as f64 / diff.len() as f64 * 100.0).round() as u32;
+    Some(format!(
+        "! the diff is {} bytes and only the first {max_diff_bytes} were reviewed \
+         ({percent}%) — raise max_diff_bytes under [review], or review a smaller change",
+        diff.len()
+    ))
+}
+
 /// Truncates to at most `max` bytes on a char boundary, marking the cut so
 /// the model knows it is seeing part of a change.
 fn truncate_utf8(s: &str, max: usize) -> String {
@@ -1058,5 +1076,19 @@ mod tests {
         assert!(!c.run, "review must be opt-in");
         assert!(c.block_on_failure);
         assert_eq!(c.fail_on, Severity::High);
+    }
+
+    #[test]
+    fn coverage_is_reported_only_when_the_diff_was_cut() {
+        assert!(coverage_note("small diff", 24_000).is_none());
+
+        let big = "x".repeat(300_000);
+        let note = coverage_note(&big, 24_000).expect("a cut diff must be reported");
+        assert!(note.contains("300000"), "{note}");
+        assert!(note.contains("24000"), "{note}");
+        // The percentage is what makes it land: "8%" is a different claim
+        // from "the diff was truncated".
+        assert!(note.contains("8%"), "{note}");
+        assert!(note.contains("max_diff_bytes"), "{note}");
     }
 }

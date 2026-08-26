@@ -131,8 +131,20 @@ pub fn limits() -> Limits {
 /// not resolved whatever the model said about it. Checked before an edit is
 /// offered to the user, so a half-done merge cannot be accepted by mistake.
 pub fn has_conflict_markers(content: &str) -> bool {
-    content.lines().any(|l| {
-        l.starts_with("<<<<<<< ") || l == "=======" || l.starts_with(">>>>>>> ")
+    /// Git writes exactly seven marker characters, optionally followed by a
+    /// space and a label. Requiring the count to be exact keeps a row of
+    /// eight `=` used as a text divider from reading as a conflict, and
+    /// requiring the start of the line keeps prose *about* markers out.
+    fn marker(line: &str, glyph: char) -> bool {
+        let run = line.chars().take_while(|c| *c == glyph).count();
+        run == 7 && line[run..].chars().next().is_none_or(|c| c == ' ')
+    }
+    content.lines().any(|line| {
+        marker(line, '<')
+            || marker(line, '=')
+            || marker(line, '>')
+            // The base section, present only under merge.conflictStyle=diff3.
+            || marker(line, '|')
     })
 }
 
@@ -197,6 +209,25 @@ mod tests {
         assert!(!has_conflict_markers("a\nb\nc\n"));
         // A line that merely mentions the marker text is not a marker.
         assert!(!has_conflict_markers("// the <<<<<<< marker means ours\n"));
+    }
+
+    #[test]
+    fn marker_detection_covers_the_shapes_git_actually_writes() {
+        // Labelled, which is the usual case.
+        assert!(has_conflict_markers("a\n<<<<<<< HEAD\nb\n=======\nc\n>>>>>>> other\n"));
+        // Bare, with no label after the marker.
+        assert!(has_conflict_markers("<<<<<<<\nours\n=======\ntheirs\n>>>>>>>\n"));
+        // diff3 style, which adds a base section.
+        assert!(has_conflict_markers("<<<<<<< ours\na\n||||||| base\nb\n=======\nc\n>>>>>>> theirs\n"));
+
+        assert!(!has_conflict_markers("a\nb\nc\n"));
+        // Prose about markers is not a marker.
+        assert!(!has_conflict_markers("// the <<<<<<< marker means ours\n"));
+        // A divider is not a marker: git writes exactly seven.
+        assert!(!has_conflict_markers("========\nA heading underline\n"));
+        assert!(!has_conflict_markers("<<<<<<<<<<\n"));
+        // Seven, but with something other than a space after them.
+        assert!(!has_conflict_markers("=======no\n"));
     }
 
     #[test]

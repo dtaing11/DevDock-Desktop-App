@@ -324,6 +324,27 @@ impl Client {
         Ok(crate::ollama::parse_suggestion_text(&text))
     }
 
+    /// Writes a pull request title and body from a branch summary.
+    ///
+    /// The context is the branch's commits and its diff against the base —
+    /// not the staged diff, which describes only whatever is uncommitted
+    /// right now and is nearly always the wrong thing for a pull request.
+    pub fn pull_request_text(
+        &self,
+        summary: &crate::git::BranchSummary,
+        extra_instructions: Option<&str>,
+    ) -> Result<CommitSuggestion> {
+        if summary.is_empty() {
+            return Err(ClaudeError(
+                "Nothing to describe: this branch has no commits the base does not.".into(),
+            ));
+        }
+        let system = crate::ollama::pr_system_prompt(extra_instructions);
+        let prompt = crate::ollama::pr_prompt(summary, MAX_DIFF_CHARS);
+        let text = self.request_with_system(&system, &prompt, 2048)?;
+        Ok(crate::ollama::parse_suggestion_text(&text))
+    }
+
     /// Asks Claude to merge a conflicted file from its three stages.
     /// Returns the full merged file content.
     pub fn resolve_conflict(

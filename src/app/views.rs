@@ -1391,10 +1391,19 @@ pub fn ai_controls(
         let enabled = !app.ai_busy && app.repo.is_some();
         let text = if app.ai_busy { "Generating…" } else { label };
         let button = egui::Button::new(text).fill(fill).min_size(egui::vec2(0.0, HEIGHT));
-        if ui
-            .add_enabled(enabled, button)
-            .on_hover_text("Generate with the selected model")
-            .clicked()
+        // Say which context it reads: the two targets look identical but
+        // describe entirely different things.
+        let hint = match target {
+            crate::app::worker::AiTarget::Commit => {
+                "Generate from the changes you have staged"
+            }
+            crate::app::worker::AiTarget::PullRequest => {
+                "Generate from every commit on this branch that the base does not have — \
+                 not from what is staged"
+            }
+            _ => "Generate with the selected model",
+        };
+        if ui.add_enabled(enabled, button).on_hover_text(hint).clicked()
         {
             match target {
                 crate::app::worker::AiTarget::Commit => app.request_ai_message(),

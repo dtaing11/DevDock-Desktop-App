@@ -27,6 +27,10 @@ block_on_failure = true   # high-severity findings stop to ask first
 fail_on = "high"          # set to "medium" to be asked about those too
 provider = "claude"
 model = "claude-opus-5"
+# A branch here is routinely 200 KB of diff. At the 24 KB default the
+# reviewer sees under a tenth of it and reports on the rest with the same
+# confidence, which is worse than not reviewing at all.
+max_diff_bytes = 200000
 instructions = """
 This is DevDock, a native egui git client that shells out to the git CLI. The
 failure modes that matter most here are the ones that quietly destroy or

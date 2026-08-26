@@ -1133,6 +1133,10 @@ impl App {
     /// Shared AI generation path for the commit box and the PR form. Each
     /// target has its own provider/model selection and optional per-repo
     /// custom instructions.
+    ///
+    /// The two targets read different things, because they describe
+    /// different things: a commit message describes what is staged, and a
+    /// pull request describes every commit on the branch.
     fn generate_ai(&mut self, target: worker::AiTarget, stage_files: Vec<String>) {
         let Some(repo) = self.repo.clone() else { return };
         let Some(sel) = self.ai_selection(target) else {
@@ -1140,27 +1144,18 @@ impl App {
             return;
         };
         let custom = self.repo_prompt(target);
+        // The base the pull request would target, so the branch is measured
+        // against what it will actually merge into.
+        let base = match target {
+            worker::AiTarget::PullRequest => {
+                Some(self.pr.base.clone()).filter(|b| !b.trim().is_empty())
+            }
+            _ => None,
+        };
         self.ai_busy = true;
 
-        if sel.provider == "claude" {
-            let model = sel.model;
-            self.worker.spawn(move || {
-                let result = (|| -> Result<ollama::CommitSuggestion, String> {
-                    if !stage_files.is_empty() {
-                        repo.unstage_all().ok();
-                        strerr(repo.stage(&stage_files))?;
-                    }
-                    let diff = strerr(repo.diff_for_ai())?;
-                    let client = claude::Client::from_store(model)
-                        .ok_or("Claude is not signed in. Open Settings.")?;
-                    strerr(client.commit_message(&diff, custom.as_deref()))
-                })();
-                Msg::AiSuggestion { target, result }
-            });
-            return;
-        }
-
         let url = self.effective_ollama_url();
+        let provider = sel.provider;
         let model = sel.model;
         self.worker.spawn(move || {
             let result = (|| -> Result<ollama::CommitSuggestion, String> {
@@ -1168,8 +1163,36 @@ impl App {
                     repo.unstage_all().ok();
                     strerr(repo.stage(&stage_files))?;
                 }
+                let custom = custom.as_deref();
+
+                if target == worker::AiTarget::PullRequest {
+                    let summary = strerr(repo.branch_summary(base.as_deref()))?;
+                    if summary.is_empty() {
+                        return Err(
+                            "Nothing to describe: this branch has no commits the base \
+                             does not. Commit your work first."
+                                .into(),
+                        );
+                    }
+                    return if provider == "claude" {
+                        let client = claude::Client::from_store(model)
+                            .ok_or("Claude is not signed in. Open Settings.")?;
+                        strerr(client.pull_request_text(&summary, custom))
+                    } else {
+                        strerr(ollama::Client::new(url).pull_request_text(
+                            &model, &summary, custom,
+                        ))
+                    };
+                }
+
                 let diff = strerr(repo.diff_for_ai())?;
-                strerr(ollama::Client::new(url).commit_message(&model, &diff, custom.as_deref()))
+                if provider == "claude" {
+                    let client = claude::Client::from_store(model)
+                        .ok_or("Claude is not signed in. Open Settings.")?;
+                    strerr(client.commit_message(&diff, custom))
+                } else {
+                    strerr(ollama::Client::new(url).commit_message(&model, &diff, custom))
+                }
             })();
             Msg::AiSuggestion { target, result }
         });
@@ -1846,24 +1869,18 @@ impl App {
                     return Err("Nothing to review: no outgoing changes found.".into());
                 }
                 let sel = AiSelection { provider, model };
-                if !cfg.repo_context {
-                    return review_single_shot(&sel, &url, &diff, &cfg);
+                // Whatever path runs, the user is told how much of the diff
+                // the verdict actually covers.
+                let coverage = crate::review::coverage_note(&diff, cfg.max_diff_bytes);
+                let mut outcome = if !cfg.repo_context {
+                    review_single_shot(&sel, &url, &diff, &cfg)?
+                } else {
+                    review_with_repo_context_or_fallback(&repo, &sel, &url, &diff, &cfg)?
+                };
+                if let Some(note) = coverage {
+                    outcome.context_log.push(note);
                 }
-                match review_with_repo_context(&repo, &sel, &url, &diff, &cfg) {
-                    Err(e) if lacks_tool_support(&e) => {
-                        // The model cannot call tools, so it cannot read the
-                        // repository. Review the diff alone rather than
-                        // failing: a diff-only review is the old behaviour,
-                        // and a gate that errors out gets switched off.
-                        let mut outcome = review_single_shot(&sel, &url, &diff, &cfg)?;
-                        outcome.context_log.push(format!("! {e}"));
-                        outcome
-                            .context_log
-                            .push("! reviewed the diff alone, without repository context".into());
-                        Ok(outcome)
-                    }
-                    other => other,
-                }
+                Ok(outcome)
             })();
             Msg::ReviewDone(result)
         });
@@ -2504,8 +2521,13 @@ pub fn agent_provider(
 
 /// Writes one accepted proposal into the worktree, creating parent
 /// directories for a file the model added.
+///
+/// The path is re-checked here even though the harness already refused
+/// anything outside the repository. This is the only place a proposal
+/// becomes a real write, and a containment check is cheap next to the cost
+/// of being wrong about it.
 fn write_worktree_file(root: &std::path::Path, rel: &str, content: &str) -> Result<(), String> {
-    let full = root.join(rel);
+    let full = crate::agent::workspace::safe_join(root, rel)?;
     if let Some(parent) = full.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -2535,6 +2557,32 @@ fn review_with_repo_context(
         cfg,
         &mut |_| {},
     )
+}
+
+/// Runs the context-reading review, falling back to a diff-only one when the
+/// model turns out not to be able to call tools.
+fn review_with_repo_context_or_fallback(
+    repo: &crate::git::Repo,
+    sel: &AiSelection,
+    url: &str,
+    diff: &str,
+    cfg: &crate::review::ReviewConfig,
+) -> Result<crate::review::ReviewOutcome, String> {
+    match review_with_repo_context(repo, sel, url, diff, cfg) {
+        Err(e) if lacks_tool_support(&e) => {
+            // The model cannot call tools, so it cannot read the repository.
+            // Review the diff alone rather than failing: a diff-only review
+            // is the old behaviour, and a gate that errors out gets switched
+            // off.
+            let mut outcome = review_single_shot(sel, url, diff, cfg)?;
+            outcome.context_log.push(format!("! {e}"));
+            outcome
+                .context_log
+                .push("! reviewed the diff alone, without repository context".into());
+            Ok(outcome)
+        }
+        other => other,
+    }
 }
 
 /// The diff-only review: one request, no tools. Used when `repo_context` is

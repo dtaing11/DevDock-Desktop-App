@@ -746,3 +746,84 @@ mod merge_tests {
         assert_eq!(extract_merged_content("a\nb\n"), "a\nb\n");
     }
 }
+
+#[cfg(test)]
+mod pr_tests {
+    use super::*;
+
+    fn summary_fixture() -> crate::git::BranchSummary {
+        let commit = |subject: &str, body: &str| crate::git::Commit {
+            sha: "0".repeat(40),
+            short_sha: "0000000".into(),
+            author: "Tester".into(),
+            email: "t@t.io".into(),
+            date: "2026-01-01T00:00:00Z".into(),
+            subject: subject.into(),
+            body: body.into(),
+            parents: Vec::new(),
+            refs: Vec::new(),
+        };
+        crate::git::BranchSummary {
+            branch: "feat/flags".into(),
+            base: "main".into(),
+            // Newest first, the way git log reports it.
+            commits: vec![
+                commit("feat: document the flag", ""),
+                commit("feat: add --json", "Scripts had to parse the human output."),
+            ],
+            stat: " src/cli.rs | 20 ++++++++\n 1 file changed".into(),
+            diff: "diff --git a/src/cli.rs b/src/cli.rs\n+let json = true;\n".into(),
+        }
+    }
+
+    #[test]
+    fn the_pr_prompt_leads_with_the_commits_oldest_first() {
+        let prompt = pr_prompt(&summary_fixture(), 10_000);
+        let older = prompt.find("feat: add --json").unwrap();
+        let newer = prompt.find("feat: document the flag").unwrap();
+        assert!(older < newer, "commits should read in the order the work happened");
+
+        // The branch, the base, the reasoning from a commit body, the stat,
+        // and the diff all have to reach the model.
+        assert!(prompt.contains("`feat/flags`") && prompt.contains("`main`"));
+        assert!(prompt.contains("Scripts had to parse the human output."));
+        assert!(prompt.contains("src/cli.rs | 20"));
+        assert!(prompt.contains("+let json = true;"));
+    }
+
+    #[test]
+    fn the_pr_prompt_keeps_every_commit_when_the_diff_is_truncated() {
+        let mut summary = summary_fixture();
+        summary.diff = "x".repeat(50_000);
+        let prompt = pr_prompt(&summary, 1_000);
+        assert!(prompt.contains("feat: add --json"), "commits must survive truncation");
+        assert!(prompt.contains("feat: document the flag"));
+        assert!(prompt.contains("[diff truncated]"));
+        assert!(prompt.len() < 5_000, "the diff should have been cut: {} chars", prompt.len());
+    }
+
+    #[test]
+    fn the_pr_prompt_says_so_when_there_is_nothing_to_go_on() {
+        let empty = crate::git::BranchSummary {
+            branch: "feat/x".into(),
+            base: String::new(),
+            ..Default::default()
+        };
+        let prompt = pr_prompt(&empty, 1_000);
+        assert!(prompt.contains("No commits"));
+        assert!(prompt.contains("The diff is empty."));
+        // With no base named, it says what it actually compared against.
+        assert!(prompt.contains("its upstream"));
+    }
+
+    #[test]
+    fn the_pr_system_prompt_extends_rather_than_replaces() {
+        let base = pr_system_prompt(None);
+        assert!(base.contains("pull request"));
+        assert!(base.contains("summary"));
+        let extended = pr_system_prompt(Some("Always link the Jira ticket."));
+        assert!(extended.starts_with(&base));
+        assert!(extended.contains("Always link the Jira ticket."));
+        assert_eq!(pr_system_prompt(Some("   ")), base);
+    }
+}

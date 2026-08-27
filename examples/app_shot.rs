@@ -14,6 +14,7 @@ struct Shot {
     /// Opened after the repository has finished loading: opening it sooner
     /// is undone, because a repository change clears the editor.
     open: Option<String>,
+    shoot_at: u32,
 }
 
 impl eframe::App for Shot {
@@ -29,12 +30,23 @@ impl eframe::App for Shot {
         views::sidebar(&mut self.app, ctx);
         views::diff_panel(&mut self.app, ctx);
 
+        // The sidebar must not grow frame over frame: egui stores a panel's
+        // width from its content, so a greedy child compounds.
+        if self.frame.is_multiple_of(40) {
+            if let Some(state) = egui::containers::panel::PanelState::load(
+                ctx,
+                egui::Id::new("sidebar"),
+            ) {
+                println!("frame {}: sidebar {:.0}pt", self.frame, state.rect.width());
+            }
+        }
+
         // Give background work (tracked files, language servers) a few
         // frames to land before the picture is taken.
-        if self.frame == 30 {
+        if self.frame == self.shoot_at {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
         }
-        if self.frame > 30 {
+        if self.frame > self.shoot_at {
             let shot = ctx.input(|i| {
                 i.events.iter().find_map(|e| match e {
                     egui::Event::Screenshot { image, .. } => Some(image.clone()),
@@ -83,7 +95,11 @@ fn main() -> eframe::Result<()> {
                 "agent" => Tab::Agent,
                 _ => Tab::Changes,
             };
-            Ok(Box::new(Shot { app, out, frame: 0, open: open.clone() }))
+            let shoot_at: u32 = std::env::var("SHOOT_AT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30);
+            Ok(Box::new(Shot { app, out, frame: 0, open: open.clone(), shoot_at }))
         }),
     )
 }

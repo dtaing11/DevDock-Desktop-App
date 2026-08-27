@@ -30,6 +30,8 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         Dialog::AgentChanges => agent_changes(app, ctx, &mut open),
         Dialog::Rename => rename_dialog(app, ctx, &mut open),
         Dialog::Reflog => reflog_dialog(app, ctx, &mut open),
+        Dialog::SplitCommits => split_dialog(app, ctx, &mut open),
+        Dialog::TidyHistory => tidy_dialog(app, ctx, &mut open),
     }
     // Dismissing a gate with the X is a deferred decision, not an approval:
     // the modal closes but the held action stays available behind the
@@ -1670,6 +1672,159 @@ pub fn proposal_diff(ui: &mut egui::Ui, edit: &crate::agent::PendingEdit, salt: 
                 }
             }
         }
+    });
+}
+
+/// The commits an AI proposes the working tree should become.
+///
+/// Editable before anything is committed: the grouping is the hard part and
+/// the model is usually right about it, while a message is one line the
+/// developer may well want to word themselves.
+fn split_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
+    modal(ctx, "Split into commits", open, |ui| {
+        ui.set_min_width(720.0);
+        if !app.split.notes.trim().is_empty() {
+            ui.label(RichText::new(&app.split.notes).color(theme::FG_DIM).small());
+        }
+        ui.label(
+            RichText::new(
+                "Nothing is committed until you apply. Each commit is staged and made in \
+                 order, from the top.",
+            )
+            .color(theme::WARN)
+            .small(),
+        );
+        ui.separator();
+
+        let mut remove: Option<usize> = None;
+        ScrollArea::vertical().max_height(430.0).id_salt("split-groups").show(ui, |ui| {
+            for (i, group) in app.split.groups.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("{}.", i + 1)).color(theme::EMBER).strong());
+                    ui.add(
+                        egui::TextEdit::singleline(&mut group.summary)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("summary"),
+                    );
+                });
+                ui.add(
+                    egui::TextEdit::multiline(&mut group.description)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(2)
+                        .hint_text("description (optional)"),
+                );
+                for file in &group.files {
+                    ui.label(RichText::new(format!("   {file}")).small().monospace());
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button("Drop this commit")
+                        .on_hover_text("Its files stay uncommitted in the working tree")
+                        .clicked()
+                    {
+                        remove = Some(i);
+                    }
+                });
+                ui.separator();
+            }
+        });
+        if let Some(i) = remove {
+            app.split.groups.remove(i);
+        }
+
+        ui.horizontal(|ui| {
+            let ready = !app.split.groups.is_empty()
+                && app.split.groups.iter().all(|g| !g.summary.trim().is_empty());
+            if ui
+                .add_enabled(
+                    ready,
+                    egui::Button::new(format!("Make {} commit(s)", app.split.groups.len()))
+                        .fill(theme::EMBER),
+                )
+                .clicked()
+            {
+                app.apply_split();
+            }
+            if ui.button("Cancel").clicked() {
+                app.split.groups.clear();
+                app.dialog = Dialog::None;
+            }
+            if !ready {
+                ui.label(RichText::new("every commit needs a summary").small().color(theme::WARN));
+            }
+        });
+    });
+}
+
+/// The history an AI proposes this branch should have.
+fn tidy_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
+    let Some(plan) = app.tidy.plan.clone() else {
+        app.dialog = Dialog::None;
+        return;
+    };
+    modal(ctx, "Tidy history", open, |ui| {
+        ui.set_min_width(720.0);
+        if !app.tidy.notes.trim().is_empty() {
+            ui.label(RichText::new(&app.tidy.notes).color(theme::FG_DIM).small());
+        }
+        ui.label(
+            RichText::new(
+                "The branch's commits are replayed onto the base. Your files do not \
+                 change; only the commits do, and the old ones stay in the reflog.",
+            )
+            .color(theme::WARN)
+            .small(),
+        );
+        ui.separator();
+
+        ScrollArea::vertical().max_height(430.0).id_salt("tidy-plan").show(ui, |ui| {
+            for (i, group) in plan.groups.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("{}.", i + 1)).color(theme::EMBER).strong());
+                    ui.label(RichText::new(&group.summary).strong());
+                });
+                if !group.description.trim().is_empty() {
+                    ui.label(RichText::new(&group.description).small().color(theme::FG_DIM));
+                }
+                // What folds into it, so a squash is visible as a squash.
+                for sha in &group.commits {
+                    let subject = app
+                        .tidy
+                        .originals
+                        .get(sha)
+                        .cloned()
+                        .unwrap_or_else(|| sha.clone());
+                    ui.label(
+                        RichText::new(format!("   {} {subject}", &sha[..sha.len().min(7)]))
+                            .small()
+                            .monospace()
+                            .color(theme::FG_DIM),
+                    );
+                }
+                ui.separator();
+            }
+        });
+
+        let folded = plan.commits().len();
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::Button::new(format!(
+                        "Rewrite {folded} commit(s) as {}",
+                        plan.groups.len()
+                    ))
+                    .fill(theme::EMBER),
+                )
+                .on_hover_text("Replays the commits; refuses if anything is uncommitted")
+                .clicked()
+            {
+                app.apply_tidy();
+            }
+            if ui.button("Cancel").clicked() {
+                app.tidy.plan = None;
+                app.dialog = Dialog::None;
+            }
+        });
     });
 }
 

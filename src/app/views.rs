@@ -966,7 +966,10 @@ pub fn sidebar(app: &mut App, ctx: &egui::Context) {
         .width_range(280.0..=460.0)
         .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(8.0))
         .show(ctx, |ui| {
-            ui.horizontal(|ui| {
+            // Wrapped: five tab buttons in one unwrapped row are wider than
+            // the panel's default width, and a panel grows to fit its
+            // content — so an unwrapped row silently widens the sidebar.
+            ui.horizontal_wrapped(|ui| {
                 let changes_label = format!(
                     "Changes ({})",
                     app.status.as_ref().map(|s| s.files.len()).unwrap_or(0)
@@ -1120,6 +1123,19 @@ fn changes_tab(app: &mut App, ui: &mut egui::Ui) {
                     .small(),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if app.split.running {
+                    ui.add(egui::Spinner::new().size(12.0));
+                } else if files.len() > 1
+                    && ui
+                        .small_button("Split…")
+                        .on_hover_text(
+                            "Ask the AI to group these changes into separate commits, \
+                             then review them before anything is committed",
+                        )
+                        .clicked()
+                {
+                    app.start_split();
+                }
                 if ui
                     .small_button("Discard all…")
                     .on_hover_text("Reset every change (asks first)")
@@ -1983,31 +1999,45 @@ fn history_search_bar(app: &mut App, ui: &mut egui::Ui) {
         let response = ui.add(
             egui::TextEdit::singleline(&mut app.history_query)
                 .hint_text(dim_hint(app.history_mode.hint()))
-                .desired_width(ui.available_width() - 90.0),
+                .desired_width(f32::INFINITY),
         );
         // Searching history is a git call per keystroke otherwise.
         if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
             app.load_history();
         }
+    });
+
+    // A second row: five controls abreast would widen the whole sidebar.
+    ui.horizontal(|ui| {
         if ui.small_button("Search").clicked() {
             app.load_history();
         }
-        if !app.history_query.is_empty() && ui.small_button("×").on_hover_text("Clear").clicked()
-        {
+        if !app.history_query.is_empty() && ui.small_button("Clear").clicked() {
             app.clear_history_filter();
         }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .small_button("Undo…")
-                .on_hover_text(
-                    "Where this branch has been — go back to before a bad merge, \
-                     rebase, or reset",
-                )
-                .clicked()
-            {
-                app.open_reflog();
-            }
-        });
+        if ui
+            .small_button("Tidy history…")
+            .on_hover_text(
+                "Ask the AI how this branch's commits should be folded and worded, \
+                 then review the plan before anything is rewritten",
+            )
+            .clicked()
+        {
+            app.start_tidy();
+        }
+        if ui
+            .small_button("Undo…")
+            .on_hover_text(
+                "Where this branch has been — go back to before a bad merge, rebase, \
+                 or reset",
+            )
+            .clicked()
+        {
+            app.open_reflog();
+        }
+        if app.tidy.running {
+            ui.add(egui::Spinner::new().size(12.0));
+        }
     });
 
     if !app.history_query.trim().is_empty() {

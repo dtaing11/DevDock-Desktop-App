@@ -126,6 +126,28 @@ pub struct RepoPrompts {
     pub conflict_file: Option<String>,
 }
 
+/// A proposed split of the working tree into several commits.
+#[derive(Default)]
+pub struct SplitState {
+    pub running: bool,
+    /// The proposed commits, editable before they are made.
+    pub groups: Vec<crate::agent::split::Group>,
+    pub notes: String,
+    pub error: Option<String>,
+}
+
+/// A proposed rewrite of the branch's commits.
+#[derive(Default)]
+pub struct TidyState {
+    pub running: bool,
+    pub plan: Option<crate::git::RebasePlan>,
+    pub notes: String,
+    pub error: Option<String>,
+    /// Subjects of the original commits, so the dialog can show what folds
+    /// into what.
+    pub originals: std::collections::HashMap<String, String>,
+}
+
 /// What one agentic run produced, on its way back to the UI thread.
 #[derive(Debug, Clone)]
 pub struct AgentReport {
@@ -256,6 +278,10 @@ pub enum Dialog {
     Rename,
     /// Recent `HEAD` movements, with the option to go back to one.
     Reflog,
+    /// An AI-proposed split of the working tree into commits.
+    SplitCommits,
+    /// An AI-proposed tidy-up of the branch's history.
+    TidyHistory,
 }
 
 /// A destructive action awaiting user confirmation.
@@ -712,6 +738,10 @@ pub struct App {
     pub editor: editor::EditorState,
     /// The coding agent's tab: task, transcript, and pending changes.
     pub coding: agent_tab::CodingState,
+    /// An AI-proposed split of the working tree into separate commits.
+    pub split: SplitState,
+    /// An AI-proposed tidy-up of the branch's commits.
+    pub tidy: TidyState,
     /// Language servers for the open repository, started on demand.
     pub lsp: std::sync::Arc<crate::lsp::Manager>,
     /// The egui context, kept so background work started from a message
@@ -831,6 +861,8 @@ impl App {
             agent: Default::default(),
             editor: Default::default(),
             coding: Default::default(),
+            split: Default::default(),
+            tidy: Default::default(),
             // Replaced when a repository opens; a manager with no servers
             // running costs nothing until a file needs one.
             lsp: std::sync::Arc::new(crate::lsp::Manager::new(
@@ -1783,6 +1815,38 @@ impl App {
                 self.editor.quick_open.files = files;
             }
             Msg::Lsp(reply) => self.handle_lsp(reply),
+            Msg::SplitProposal(result) => {
+                self.split.running = false;
+                match result {
+                    Ok(proposal) => {
+                        self.split.groups = proposal.groups;
+                        self.split.notes = proposal.notes;
+                        self.dialog = Dialog::SplitCommits;
+                    }
+                    Err(e) => {
+                        self.split.error = Some(e.clone());
+                        self.toast(e, true);
+                    }
+                }
+            }
+            Msg::TidyProposal(result) => {
+                self.tidy.running = false;
+                match result {
+                    Ok((proposal, commits)) => {
+                        self.tidy.originals = commits
+                            .into_iter()
+                            .map(|c| (c.sha, c.subject))
+                            .collect();
+                        self.tidy.plan = Some(proposal.plan);
+                        self.tidy.notes = proposal.notes;
+                        self.dialog = Dialog::TidyHistory;
+                    }
+                    Err(e) => {
+                        self.tidy.error = Some(e.clone());
+                        self.toast(e, true);
+                    }
+                }
+            }
             Msg::AgentPlan { kind, steps } => match kind {
                 AgentKind::Coding => self.coding.plan = steps,
                 // The conflict resolver's progress is its log, not a plan.
@@ -2790,6 +2854,145 @@ impl App {
                 }
             }
             Msg::Done { message: Ok("Language servers restarted.".into()), refresh: false }
+        });
+    }
+
+    // -- splitting and tidying -------------------------------------------------
+
+    /// Asks the AI how the working tree should be split into commits.
+    pub fn start_split(&mut self) {
+        let Some(repo) = self.repo.clone() else { return };
+        if self.split.running {
+            return;
+        }
+        let Some(sel) = self.ai_selection(worker::AiTarget::Coding) else {
+            self.toast("No AI model selected. Pick one in the Agent panel.", true);
+            return;
+        };
+        let changed: Vec<String> = self
+            .status
+            .as_ref()
+            .map(|s| s.files.iter().map(|f| f.path.clone()).collect())
+            .unwrap_or_default();
+        if changed.len() < 2 {
+            self.toast("Nothing to split: fewer than two files changed.", true);
+            return;
+        }
+
+        self.split = SplitState { running: true, ..Default::default() };
+        let url = self.effective_ollama_url();
+        let instructions = self.coding_instructions();
+        self.worker.spawn(move || {
+            let result = (|| -> Result<crate::agent::split::Proposal, String> {
+                let provider = agent_provider(&sel, &url)?;
+                let diff = strerr(repo.diff_for_ai())?;
+                let tracked = strerr(repo.tracked_files())?;
+                let mut workspace = crate::agent::Workspace::new(
+                    repo.path(),
+                    tracked,
+                    crate::agent::split::access(),
+                )?;
+                crate::agent::split::run(
+                    provider.as_ref(),
+                    &mut workspace,
+                    &changed,
+                    &diff,
+                    instructions.as_deref(),
+                    &mut |_| {},
+                )
+            })();
+            Msg::SplitProposal(result)
+        });
+    }
+
+    /// Makes the proposed commits, in order.
+    ///
+    /// Each group is staged on its own and committed, so a split that fails
+    /// halfway leaves the commits it already made and the rest of the work
+    /// still in the tree — nothing is lost either way.
+    pub fn apply_split(&mut self) {
+        let Some(repo) = self.repo.clone() else { return };
+        let groups = std::mem::take(&mut self.split.groups);
+        if groups.is_empty() {
+            return;
+        }
+        self.dialog = Dialog::None;
+        self.busy = true;
+        self.worker.spawn(move || {
+            let result = (|| -> Result<String, String> {
+                let mut made = 0usize;
+                for group in &groups {
+                    strerr(repo.unstage_all())?;
+                    strerr(repo.stage(&group.files))?;
+                    strerr(repo.commit(&group.summary, &group.description, false))?;
+                    made += 1;
+                }
+                Ok(format!("Made {made} commit(s)."))
+            })();
+            Msg::Done { message: result, refresh: true }
+        });
+    }
+
+    /// Asks the AI how this branch's commits should be tidied.
+    pub fn start_tidy(&mut self) {
+        let Some(repo) = self.repo.clone() else { return };
+        if self.tidy.running {
+            return;
+        }
+        let Some(sel) = self.ai_selection(worker::AiTarget::Coding) else {
+            self.toast("No AI model selected. Pick one in the Agent panel.", true);
+            return;
+        };
+        let base = self.default_branch();
+        self.tidy = TidyState { running: true, ..Default::default() };
+        let url = self.effective_ollama_url();
+        let instructions = self.coding_instructions();
+
+        self.worker.spawn(move || {
+            let result = (|| -> Result<(crate::agent::rebase::Proposal, Vec<crate::git::Commit>), String> {
+                let summary = strerr(repo.branch_summary(Some(&base)))?;
+                if summary.commits.len() < 2 {
+                    return Err(
+                        "Nothing to tidy: this branch has fewer than two commits the base \
+                         does not."
+                            .into(),
+                    );
+                }
+                // The base commit itself, which the rewrite replays onto.
+                let base_sha = strerr(repo.git(&["merge-base", &base, "HEAD"]))?
+                    .trim()
+                    .to_string();
+                let provider = agent_provider(&sel, &url)?;
+                let tracked = strerr(repo.tracked_files())?;
+                let mut workspace = crate::agent::Workspace::new(
+                    repo.path(),
+                    tracked,
+                    crate::agent::rebase::access(),
+                )?;
+                let proposal = crate::agent::rebase::run(
+                    provider.as_ref(),
+                    &mut workspace,
+                    &base_sha,
+                    &summary.commits,
+                    &summary.diff,
+                    instructions.as_deref(),
+                    &mut |_| {},
+                )?;
+                Ok((proposal, summary.commits))
+            })();
+            Msg::TidyProposal(result)
+        });
+    }
+
+    /// Runs the accepted plan.
+    pub fn apply_tidy(&mut self) {
+        let Some(repo) = self.repo.clone() else { return };
+        let Some(plan) = self.tidy.plan.take() else { return };
+        self.dialog = Dialog::None;
+        self.busy = true;
+        self.worker.spawn(move || Msg::Done {
+            message: strerr(repo.rewrite_history(&plan)),
+            refresh: true,
         });
     }
 
@@ -4031,6 +4234,76 @@ mod tests {
         assert!(app.history_file.is_none());
         assert!(app.history_query.is_empty());
         assert_eq!(app.log.len(), 2);
+    }
+
+    #[test]
+    fn the_split_and_tidy_dialogs_render() {
+        let (_tmp, mut app, _file) = app_with_repo();
+        app.split.groups = vec![crate::agent::split::Group {
+            files: vec!["notes.txt".into()],
+            summary: "docs: notes".into(),
+            description: "why".into(),
+        }];
+        app.split.notes = "one change".into();
+        egui::__run_test_ctx(|ctx| {
+            app.dialog = Dialog::SplitCommits;
+            dialogs::show(&mut app, ctx);
+        });
+
+        app.tidy.plan = Some(crate::git::RebasePlan {
+            base: "b".repeat(40),
+            groups: vec![crate::git::RebaseGroup {
+                commits: vec!["a".repeat(40)],
+                summary: "feat: the thing".into(),
+                description: String::new(),
+            }],
+        });
+        app.tidy.originals.insert("a".repeat(40), "wip".into());
+        egui::__run_test_ctx(|ctx| {
+            app.dialog = Dialog::TidyHistory;
+            dialogs::show(&mut app, ctx);
+        });
+    }
+
+    /// A split makes one commit per group, staging only that group's files.
+    #[test]
+    fn applying_a_split_makes_one_commit_per_group() {
+        let (tmp, mut app, _file) = app_with_repo();
+        git(tmp.path(), &["add", "-A"]);
+        git(tmp.path(), &["commit", "-m", "init"]);
+
+        std::fs::write(tmp.path().join("feature.rs"), "fn f() {}\n").unwrap();
+        std::fs::write(tmp.path().join("README.md"), "# docs\n").unwrap();
+        app.split.groups = vec![
+            crate::agent::split::Group {
+                files: vec!["feature.rs".into()],
+                summary: "feat: add f()".into(),
+                description: String::new(),
+            },
+            crate::agent::split::Group {
+                files: vec!["README.md".into()],
+                summary: "docs: add a readme".into(),
+                description: "Separate from the feature.".into(),
+            },
+        ];
+
+        app.apply_split();
+        for _ in 0..60 {
+            app.handle_messages_for_test();
+            if app.repo.as_ref().unwrap().log(5, None).unwrap().len() >= 3 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let log = app.repo.as_ref().unwrap().log(5, None).unwrap();
+        assert_eq!(log[0].subject, "docs: add a readme");
+        assert_eq!(log[0].body.trim(), "Separate from the feature.");
+        assert_eq!(log[1].subject, "feat: add f()");
+        // Each commit holds only its own group's file.
+        let files = app.repo.as_ref().unwrap().commit_files(&log[1].sha).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "feature.rs");
     }
 
     /// The reflog dialog renders while loading and once loaded.

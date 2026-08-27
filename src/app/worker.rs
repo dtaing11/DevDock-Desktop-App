@@ -75,6 +75,12 @@ pub enum Msg {
     TrackedFiles(Vec<String>),
     /// Recent `HEAD` movements, for the undo dialog.
     Reflog(Result<Vec<crate::git::ReflogEntry>, String>),
+    /// A proposed split of the working tree into commits.
+    SplitProposal(Result<crate::agent::split::Proposal, String>),
+    /// A proposed rewrite of the branch, with the commits it was built from.
+    TidyProposal(
+        Result<(crate::agent::rebase::Proposal, Vec<crate::git::Commit>), String>,
+    ),
     /// A language server answered, or failed to.
     Lsp(LspReply),
     /// One step of an agentic run (a file read, an edit proposed), for the

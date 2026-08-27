@@ -11,6 +11,8 @@ uses the same tools you do. This guide covers all three.
   - [Built-in table](#built-in-table)
   - [Configuring your own](#configuring-your-own)
   - [When something is wrong](#when-something-is-wrong)
+- [History, search, and undo](#history-search-and-undo)
+- [AI history tools](#ai-history-tools)
 - [The coding agent](#the-coding-agent)
   - [Two modes: propose, or let it iterate](#two-modes-propose-or-let-it-iterate)
   - [What it can and cannot do](#what-it-can-and-cannot-do)
@@ -28,12 +30,17 @@ contributes.
 
 ### Opening files
 
-Four ways, because you arrive from four directions:
+The sidebar is the **work tree**: directories expand, files open, and anything
+with unsaved changes is marked. The file itself, its problems and its outline
+are in the viewport — a 340pt column is no place to read code.
+
+Five ways in, because you arrive from five directions:
 
 | From | How |
 |------|-----|
+| The work tree | Click a file in the Editor sidebar |
 | The Changes tab | Double-click a file |
-| Anywhere | **Open file…**, or Cmd/Ctrl+O — filters every tracked file |
+| Anywhere | **Open…**, or Cmd/Ctrl+O — filters every tracked file |
 | A diagnostic | Click it in the Problems panel |
 | The code | F12 on a symbol, or Cmd/Ctrl+click |
 
@@ -143,6 +150,57 @@ committed, so everyone on the project gets the same setup.
 - **A wedged server**: **Restart servers** stops all of them; they start again
   on the next file and your open buffers are re-attached.
 
+## History, search, and undo
+
+**File history** — the **History** button on a selected file lists every
+commit that touched it, following it through renames. A file's history
+usually predates its current name, and stopping at the rename hides exactly
+the commits you were looking for.
+
+**Search** — the History tab searches four ways:
+
+| Mode | What it finds |
+|------|---------------|
+| Message | words in commit messages |
+| **Code** | commits that *added or removed* this text — git's pickaxe |
+| Author | commits by a person |
+| Path | commits touching a path |
+
+Code search is the one worth knowing. It answers "when did this string appear,
+and when did it go away?", which no amount of grepping the working tree can:
+the answer is in history, not in the files.
+
+**Undo** — the **Undo…** button lists where the branch has been, from the
+reflog: merges, rebases, resets, commits. Going back to one is a **soft**
+reset, so the changes from the undone commits stay staged in your working
+tree. Nothing is deleted, and the state you left is itself in the reflog.
+
+## AI history tools
+
+Two tools that use the harness to clean up before a pull request. Both
+propose; neither acts until you accept.
+
+**Split** (Changes tab, when more than one file has changed). Groups the
+working tree into the commits it should have been — a feature with its test
+in one, an unrelated fix in another — and writes each message. Every changed
+file must appear in exactly one group, which is checked before anything is
+staged; a split that quietly left a file out would leave it uncommitted with
+nobody the wiser. You can edit the messages and drop a group before applying.
+
+**Tidy history** (History tab). Proposes how the branch's commits should be
+folded and reworded: three commits called `wip`, `wip 2` and `fix typo` are
+one commit with a real message. Then:
+
+- Every sha must appear **exactly once**. A plan that drops a commit is lost
+  work and a plan that repeats one applies it twice; both are refused before
+  anything moves, and the model gets one retry with the reason.
+- The rewrite replays the commits onto the base on a detached `HEAD`, and
+  moves the branch only once every commit has landed. A conflict or a bad
+  message leaves the branch exactly where it was.
+- It refuses to run with uncommitted work, since replaying moves the working
+  tree between commits.
+- The old history stays in the reflog, so **Undo…** covers it.
+
 ## The coding agent
 
 The **Agent** tab takes an instruction and works on the repository until it
@@ -151,6 +209,13 @@ gate use, with a wider toolset.
 
 Pick the provider and model next to the task box, exactly like commit
 messages — this is the one worth pointing at your strongest model.
+
+### The plan
+
+The agent writes down what it intends to do before it starts, and ticks each
+step off as it finishes. That checklist is what the sidebar shows while it
+works — a far better answer to "what is it doing" than a scrolling log of
+tool calls, which is still there underneath if you want it.
 
 ### Two modes: propose, or let it iterate
 

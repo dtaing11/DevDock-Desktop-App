@@ -752,6 +752,13 @@ impl App {
     /// investigation.
     #[cfg(test)]
     pub fn new_for_test(ctx: &egui::Context) -> Self {
+        Self::new_bare(ctx)
+    }
+
+    /// An app with no startup work, for tests and the screenshot tool in
+    /// `examples/`. Looking at a layout beats reasoning about one.
+    #[doc(hidden)]
+    pub fn new_bare(ctx: &egui::Context) -> Self {
         Self::bare(ctx)
     }
 
@@ -1338,6 +1345,12 @@ impl App {
     /// background result without running the whole event loop.
     #[cfg(test)]
     pub fn handle_messages_for_test(&mut self) {
+        self.handle_messages();
+    }
+
+    /// Drains the worker channel, for the screenshot tool in `examples/`.
+    #[doc(hidden)]
+    pub fn pump_for_tools(&mut self) {
         self.handle_messages();
     }
 

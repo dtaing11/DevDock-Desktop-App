@@ -371,11 +371,8 @@ pub fn editor_sidebar(app: &mut App, ui: &mut egui::Ui) {
     }
 
     ui.horizontal(|ui| {
-        ui.add(
-            egui::TextEdit::singleline(&mut app.editor.tree_filter)
-                .hint_text(super::views::dim_hint("filter"))
-                .desired_width(ui.available_width() - 60.0),
-        );
+        // The button first: in a horizontal layout the text field then asks
+        // for what is left, rather than for a width that grows the panel.
         if ui
             .small_button("Open…")
             .on_hover_text("Filter every tracked file (Cmd/Ctrl+O)")
@@ -383,6 +380,11 @@ pub fn editor_sidebar(app: &mut App, ui: &mut egui::Ui) {
         {
             actions.push(Action::QuickOpen);
         }
+        ui.add(
+            egui::TextEdit::singleline(&mut app.editor.tree_filter)
+                .hint_text(super::views::dim_hint("filter the tree"))
+                .desired_width(f32::INFINITY),
+        );
     });
     quick_open(app, ui, &mut actions);
     ui.separator();

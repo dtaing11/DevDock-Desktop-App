@@ -960,7 +960,10 @@ fn state_banner(app: &mut App, ui: &mut egui::Ui) {
 pub fn sidebar(app: &mut App, ctx: &egui::Context) {
     egui::SidePanel::left("sidebar")
         .default_width(340.0)
-        .min_width(280.0)
+        // A hard ceiling: a greedy child — a text field asking for the
+        // available width, a scroll area told not to shrink — can otherwise
+        // grow the panel until the viewport is a sliver.
+        .width_range(280.0..=460.0)
         .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(8.0))
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -2204,12 +2207,16 @@ pub fn diff_panel(app: &mut App, ctx: &egui::Context) {
             // active tab: their content is a file and a set of diffs, and
             // neither belongs in a 340pt sidebar.
             match app.tab {
-                Tab::Editor => {
-                    super::editor::editor_viewport(app, ui);
-                    return;
-                }
-                Tab::Agent => {
-                    super::agent_tab::agent_viewport(app, ui);
+                Tab::Editor | Tab::Agent => {
+                    // The diff view draws its own margins; these two need
+                    // their own, or their right edge is flush with the
+                    // window and the buttons there are clipped.
+                    egui::Frame::new()
+                        .inner_margin(egui::Margin::symmetric(12, 8))
+                        .show(ui, |ui| match app.tab {
+                            Tab::Editor => super::editor::editor_viewport(app, ui),
+                            _ => super::agent_tab::agent_viewport(app, ui),
+                        });
                     return;
                 }
                 _ => {}

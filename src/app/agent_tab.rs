@@ -41,6 +41,8 @@ pub struct CodingState {
     pub running: bool,
     /// Live progress from the current run.
     pub log: Vec<String>,
+    /// The agent's own plan, ticked off as it works.
+    pub plan: Vec<crate::agent::PlanStep>,
     /// Completed exchanges, oldest first.
     pub history: Vec<Exchange>,
     /// The latest run's closing summary.
@@ -77,8 +79,9 @@ impl CodingState {
     }
 }
 
-/// Draws the agent tab.
-pub fn agent_tab(app: &mut App, ui: &mut egui::Ui) {
+/// The agent's half of the sidebar: the task, what it is doing, and which
+/// of its changes you are looking at. The diffs are in the viewport.
+pub fn agent_sidebar(app: &mut App, ui: &mut egui::Ui) {
     if app.repo.is_none() {
         ui.label(RichText::new("Open a repository to use the coding agent.").color(theme::FG_DIM));
         return;
@@ -87,24 +90,78 @@ pub fn agent_tab(app: &mut App, ui: &mut egui::Ui) {
     task_panel(app, ui);
     ui.separator();
 
-    ScrollArea::vertical().auto_shrink([false, false]).id_salt("agent-scroll").show(ui, |ui| {
-        transcript(app, ui);
-        if app.coding.running || !app.coding.log.is_empty() {
-            activity(app, ui);
+    ScrollArea::vertical().auto_shrink([false, false]).id_salt("agent-sidebar").show(
+        ui,
+        |ui| {
+            transcript(app, ui);
+            plan(app, ui);
+            if app.coding.running || !app.coding.log.is_empty() {
+                activity(app, ui);
+            }
+            if let Some(error) = app.coding.error.clone() {
+                ui.add_space(6.0);
+                ui.label(RichText::new(error).color(theme::DANGER));
+            }
+            if !app.coding.edits.is_empty() {
+                ui.add_space(8.0);
+                change_list(app, ui);
+            }
+        },
+    );
+}
+
+/// The agent's viewport: what it said, and the diff of whichever change is
+/// selected — at a size a diff can actually be read at.
+pub fn agent_viewport(app: &mut App, ui: &mut egui::Ui) {
+    if app.repo.is_none() {
+        return;
+    }
+    if app.coding.summary.trim().is_empty() && app.coding.edits.is_empty() {
+        ui.add_space(24.0);
+        ui.vertical_centered(|ui| {
+            ui.label(
+                RichText::new(if app.coding.running {
+                    "Working…"
+                } else {
+                    "Give the agent a task in the panel on the left"
+                })
+                .color(theme::FG_DIM),
+            );
+        });
+        return;
+    }
+
+    if !app.coding.summary.trim().is_empty() {
+        let summary = app.coding.summary.clone();
+        ScrollArea::vertical()
+            .max_height(if app.coding.edits.is_empty() {
+                ui.available_height()
+            } else {
+                (ui.available_height() * 0.3).clamp(80.0, 260.0)
+            })
+            .id_salt("agent-summary-view")
+            .show(ui, |ui| {
+                ui.set_max_width(ui.available_width().min(900.0));
+                super::markdown::render(ui, &summary);
+            });
+    }
+
+    if app.coding.edits.is_empty() {
+        return;
+    }
+    ui.separator();
+    apply_bar(app, ui);
+    ui.separator();
+
+    match app.coding.selected.and_then(|i| app.coding.edits.get(i)) {
+        Some(proposed) => {
+            let edit = proposed.edit.clone();
+            super::dialogs::proposal_diff(ui, &edit, "agent-viewport-diff");
         }
-        if !app.coding.summary.trim().is_empty() {
-            ui.add_space(6.0);
-            super::markdown::render(ui, &app.coding.summary.clone());
+        None => {
+            ui.label(RichText::new("Select a change on the left.").color(theme::FG_DIM));
         }
-        if let Some(error) = app.coding.error.clone() {
-            ui.add_space(6.0);
-            ui.label(RichText::new(error).color(theme::DANGER));
-        }
-        if !app.coding.edits.is_empty() {
-            ui.add_space(10.0);
-            changes(app, ui);
-        }
-    });
+    }
 }
 
 /// The task box and the controls that decide how the run behaves.
@@ -211,6 +268,50 @@ fn transcript(app: &mut App, ui: &mut egui::Ui) {
     ui.separator();
 }
 
+/// The agent's plan, ticked off as it goes.
+///
+/// This is the sidebar's main job while a run is going: a checklist the
+/// model keeps up to date is a far better answer to "what is it doing" than
+/// a scrolling log of tool calls.
+fn plan(app: &mut App, ui: &mut egui::Ui) {
+    let steps = app.coding.plan.clone();
+    if steps.is_empty() {
+        if app.coding.running {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(12.0));
+                ui.label(RichText::new("working out what to do…").small().color(theme::FG_DIM));
+            });
+        }
+        return;
+    }
+
+    let done = steps.iter().filter(|s| s.done).count();
+    ui.add_space(4.0);
+    ui.label(theme::overline(&format!("PLAN — {done}/{} DONE", steps.len())));
+    for step in &steps {
+        ui.horizontal_top(|ui| {
+            let (mark, color) = if step.done {
+                ("✔", theme::ADD)
+            } else if app.coding.running {
+                ("○", theme::WARN)
+            } else {
+                ("○", theme::FG_DIM)
+            };
+            ui.label(RichText::new(mark).color(color).monospace());
+            let text = RichText::new(&step.text).small();
+            ui.add(
+                egui::Label::new(if step.done {
+                    text.color(theme::FG_DIM).strikethrough()
+                } else {
+                    text.color(theme::FG)
+                })
+                .wrap(),
+            );
+        });
+    }
+    ui.add_space(4.0);
+}
+
 /// What the model is doing right now.
 fn activity(app: &mut App, ui: &mut egui::Ui) {
     let lines = app.coding.log.clone();
@@ -230,8 +331,8 @@ fn activity(app: &mut App, ui: &mut egui::Ui) {
         });
 }
 
-/// The changes waiting on the user, with a diff for the selected one.
-fn changes(app: &mut App, ui: &mut egui::Ui) {
+/// The changes waiting on the user: the list, in the sidebar.
+fn change_list(app: &mut App, ui: &mut egui::Ui) {
     let live = app.coding.live;
     ui.label(theme::overline(if live { "CHANGES ON DISK" } else { "PROPOSED CHANGES" }));
     ui.label(
@@ -284,12 +385,11 @@ fn changes(app: &mut App, ui: &mut egui::Ui) {
         app.coding.selected = Some(i);
     }
 
-    if let Some(proposed) = app.coding.selected.and_then(|i| app.coding.edits.get(i)) {
-        ui.separator();
-        super::dialogs::proposal_diff(ui, &proposed.edit, "agent-tab-diff");
-    }
+}
 
-    ui.separator();
+/// Accept, revert, and the rest — above the diff they act on.
+fn apply_bar(app: &mut App, ui: &mut egui::Ui) {
+    let live = app.coding.live;
     ui.horizontal(|ui| {
         let pending = app.coding.pending_count();
         if live {

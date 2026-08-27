@@ -1766,9 +1766,15 @@ impl App {
             }
             Msg::TrackedFiles(files) => {
                 self.editor.quick_open.loading = false;
+                self.editor.tree = editor::TreeNode::build(&files);
                 self.editor.quick_open.files = files;
             }
             Msg::Lsp(reply) => self.handle_lsp(reply),
+            Msg::AgentPlan { kind, steps } => match kind {
+                AgentKind::Coding => self.coding.plan = steps,
+                // The conflict resolver's progress is its log, not a plan.
+                AgentKind::Conflict => {}
+            },
             Msg::AgentEvent { kind, line } => match kind {
                 AgentKind::Conflict => self.agent.log.push(line),
                 AgentKind::Coding => self.coding.log.push(line),
@@ -2447,6 +2453,17 @@ impl App {
         self.lsp_open(path);
     }
 
+    /// Loads the tracked file list and builds the work tree from it.
+    pub fn editor_load_tree(&mut self) {
+        if self.editor.quick_open.loading {
+            return;
+        }
+        let Some(repo) = self.repo.clone() else { return };
+        self.editor.quick_open.loading = true;
+        self.worker
+            .spawn(move || Msg::TrackedFiles(repo.tracked_files().unwrap_or_default()));
+    }
+
     /// Opens the file finder, loading the tracked file list the first time.
     pub fn editor_quick_open(&mut self) {
         self.tab = Tab::Editor;
@@ -2797,6 +2814,7 @@ impl App {
 
         self.coding.running = true;
         self.coding.log.clear();
+        self.coding.plan.clear();
         self.coding.summary.clear();
         self.coding.error = None;
         self.coding.edits.clear();
@@ -2834,11 +2852,15 @@ impl App {
                         instructions: instructions.as_deref(),
                         limits: crate::agent::coding::limits(),
                     },
-                    &mut |event| {
-                        progress.send(Msg::AgentEvent {
+                    &mut |event| match event {
+                        crate::agent::Event::Plan(steps) => progress.send(Msg::AgentPlan {
                             kind: AgentKind::Coding,
-                            line: event.line(),
-                        })
+                            steps,
+                        }),
+                        other => progress.send(Msg::AgentEvent {
+                            kind: AgentKind::Coding,
+                            line: other.line(),
+                        }),
                     },
                 )?;
                 Ok(AgentReport {
@@ -3789,7 +3811,8 @@ mod tests {
 
         egui::__run_test_ctx(|ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                editor::editor_tab(&mut app, ui);
+                editor::editor_sidebar(&mut app, ui);
+                editor::editor_viewport(&mut app, ui);
             });
         });
     }
@@ -3822,7 +3845,8 @@ mod tests {
             app.coding.live = live;
             egui::__run_test_ctx(|ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    agent_tab::agent_tab(&mut app, ui);
+                    agent_tab::agent_sidebar(&mut app, ui);
+                    agent_tab::agent_viewport(&mut app, ui);
                 });
             });
         }
@@ -3933,14 +3957,16 @@ mod tests {
         let mut app = App::new_for_test(&ctx);
         egui::__run_test_ctx(|ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                editor::editor_tab(&mut app, ui);
+                editor::editor_sidebar(&mut app, ui);
+                editor::editor_viewport(&mut app, ui);
             });
         });
 
         let (_tmp, mut app, _file) = app_with_repo();
         egui::__run_test_ctx(|ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                editor::editor_tab(&mut app, ui);
+                editor::editor_sidebar(&mut app, ui);
+                editor::editor_viewport(&mut app, ui);
             });
         });
     }

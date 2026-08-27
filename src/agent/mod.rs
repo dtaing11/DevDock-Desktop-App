@@ -119,9 +119,18 @@ impl Default for Limits {
     }
 }
 
+/// One step of an agent's plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanStep {
+    pub text: String,
+    pub done: bool,
+}
+
 /// Progress from a run, for the UI to show while it happens.
 #[derive(Debug, Clone)]
 pub enum Event {
+    /// The model's plan changed: it wrote one, or ticked something off.
+    Plan(Vec<PlanStep>),
     /// A tool call, already summarized for display ("read src/git.rs").
     Tool { summary: String, is_error: bool },
     /// Prose the model emitted alongside its tool calls.
@@ -134,6 +143,10 @@ impl Event {
     /// One line for a progress log.
     pub fn line(&self) -> String {
         match self {
+            Self::Plan(steps) => {
+                let done = steps.iter().filter(|s| s.done).count();
+                format!("· plan: {done}/{} done", steps.len())
+            }
             Self::Tool { summary, is_error } => {
                 if *is_error {
                     format!("! {summary}")
@@ -221,14 +234,20 @@ pub fn run(
         let mut results = Vec::with_capacity(reply.calls.len());
         for call in &reply.calls {
             let result = workspace.dispatch(call, limits.max_tool_calls);
-            emit(
-                Event::Tool {
-                    summary: workspace::summarize(call),
-                    is_error: result.is_error,
-                },
-                &mut log,
-                on_event,
-            );
+            // A plan update is not a step to log; it *is* the progress, and
+            // the UI shows it as a checklist rather than another line.
+            if call.name == "update_plan" && !result.is_error {
+                emit(Event::Plan(workspace.plan()), &mut log, on_event);
+            } else {
+                emit(
+                    Event::Tool {
+                        summary: workspace::summarize(call),
+                        is_error: result.is_error,
+                    },
+                    &mut log,
+                    on_event,
+                );
+            }
             results.push(result);
         }
         messages.push(Message::Assistant { text: reply.text, calls: reply.calls });

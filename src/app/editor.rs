@@ -213,6 +213,71 @@ impl QuickOpen {
     }
 }
 
+/// One node of the work tree.
+#[derive(Debug, Clone, Default)]
+pub struct TreeNode {
+    /// The last path component, which is what is shown.
+    pub name: String,
+    /// Repo-relative path.
+    pub path: String,
+    pub children: Vec<TreeNode>,
+}
+
+impl TreeNode {
+    pub fn is_dir(&self) -> bool {
+        !self.children.is_empty()
+    }
+
+    /// Builds a tree from repo-relative paths.
+    ///
+    /// Directories are inferred from the paths themselves: git tracks files,
+    /// not directories, and an empty directory is not part of the work tree
+    /// in any sense that matters here.
+    pub fn build(paths: &[String]) -> Vec<TreeNode> {
+        let mut root: Vec<TreeNode> = Vec::new();
+        for path in paths {
+            let mut level = &mut root;
+            let mut walked = String::new();
+            let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+            for (i, part) in parts.iter().enumerate() {
+                if !walked.is_empty() {
+                    walked.push('/');
+                }
+                walked.push_str(part);
+                let existing = level.iter().position(|n| n.name == *part);
+                let index = match existing {
+                    Some(index) => index,
+                    None => {
+                        level.push(TreeNode {
+                            name: (*part).to_string(),
+                            path: walked.clone(),
+                            children: Vec::new(),
+                        });
+                        level.len() - 1
+                    }
+                };
+                if i + 1 == parts.len() {
+                    break;
+                }
+                level = &mut level[index].children;
+            }
+        }
+        sort(&mut root);
+        root
+    }
+}
+
+/// Directories first, then files, each alphabetically — the order every
+/// file browser uses, because it is the one people scan by.
+fn sort(nodes: &mut [TreeNode]) {
+    for node in nodes.iter_mut() {
+        sort(&mut node.children);
+    }
+    nodes.sort_by(|a, b| {
+        b.is_dir().cmp(&a.is_dir()).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+}
+
 /// Everything the editor tab owns.
 #[derive(Default)]
 pub struct EditorState {
@@ -233,6 +298,12 @@ pub struct EditorState {
     /// Requests in flight, so the UI can say so.
     pub busy: usize,
     pub quick_open: QuickOpen,
+    /// The work tree, built once from the tracked file list.
+    pub tree: Vec<TreeNode>,
+    /// Directories the user has opened.
+    pub expanded: std::collections::HashSet<String>,
+    /// Filter applied to the tree.
+    pub tree_filter: String,
 }
 
 impl EditorState {
@@ -279,28 +350,165 @@ pub enum Action {
     RestartServers,
     /// Open the file finder, loading the tracked file list if needed.
     QuickOpen,
+    /// Load the tracked file list, for the work tree.
+    LoadTree,
 }
 
-/// Draws the editor tab.
-pub fn editor_tab(app: &mut App, ui: &mut egui::Ui) {
+/// The editor's half of the sidebar: what to open, and what is wrong with
+/// it. The code itself lives in the viewport — a 340pt column is no place
+/// to read a file.
+pub fn editor_sidebar(app: &mut App, ui: &mut egui::Ui) {
     let mut actions: Vec<Action> = Vec::new();
 
     if app.repo.is_none() {
         ui.label(RichText::new("Open a repository to edit files.").color(theme::FG_DIM));
         return;
     }
+    // The tree is the tracked file list; ask for it the first time it is
+    // needed rather than at startup.
+    if app.editor.tree.is_empty() && !app.editor.quick_open.loading {
+        actions.push(Action::LoadTree);
+    }
 
-    toolbar(app, ui, &mut actions);
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut app.editor.tree_filter)
+                .hint_text(super::views::dim_hint("filter"))
+                .desired_width(ui.available_width() - 60.0),
+        );
+        if ui
+            .small_button("Open…")
+            .on_hover_text("Filter every tracked file (Cmd/Ctrl+O)")
+            .clicked()
+        {
+            actions.push(Action::QuickOpen);
+        }
+    });
     quick_open(app, ui, &mut actions);
+    ui.separator();
 
-    if app.editor.files.is_empty() {
-        empty_state(app, ui, &mut actions);
+    if app.editor.tree.is_empty() {
+        ui.horizontal(|ui| {
+            ui.add(egui::Spinner::new().size(12.0));
+            ui.label(RichText::new("reading the work tree…").small().color(theme::FG_DIM));
+        });
         run_actions(app, actions);
         return;
     }
 
-    tab_bar(app, ui, &mut actions);
-    ui.separator();
+    let filter = app.editor.tree_filter.trim().to_lowercase();
+    let tree = app.editor.tree.clone();
+    let open: Vec<String> = app.editor.files.iter().map(|f| f.rel.clone()).collect();
+    let active = app.editor.active_file().map(|f| f.rel.clone());
+    let dirty: Vec<String> = app
+        .editor
+        .files
+        .iter()
+        .filter(|f| f.is_dirty())
+        .map(|f| f.rel.clone())
+        .collect();
+
+    ScrollArea::vertical().auto_shrink([false, false]).id_salt("work-tree").show(ui, |ui| {
+        let context = TreeContext { filter: &filter, open: &open, active: &active, dirty: &dirty };
+        for node in &tree {
+            tree_node(app, ui, node, &context, &mut actions);
+        }
+    });
+
+    run_actions(app, actions);
+}
+
+/// What the tree needs to know about the editor while it draws.
+struct TreeContext<'a> {
+    filter: &'a str,
+    open: &'a [String],
+    active: &'a Option<String>,
+    dirty: &'a [String],
+}
+
+/// Whether a subtree contains anything matching the filter.
+fn matches(node: &TreeNode, filter: &str) -> bool {
+    if filter.is_empty() {
+        return true;
+    }
+    node.path.to_lowercase().contains(filter)
+        || node.children.iter().any(|child| matches(child, filter))
+}
+
+/// One directory or file in the work tree.
+fn tree_node(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    node: &TreeNode,
+    context: &TreeContext<'_>,
+    actions: &mut Vec<Action>,
+) {
+    if !matches(node, context.filter) {
+        return;
+    }
+
+    if node.is_dir() {
+        // A filter is a search: showing its hits collapsed would hide them.
+        let default_open = !context.filter.is_empty()
+            || app.editor.expanded.contains(&node.path);
+        let header = egui::CollapsingHeader::new(
+            RichText::new(&node.name).color(theme::TEAL),
+        )
+        .id_salt(("tree", &node.path))
+        .default_open(default_open);
+
+        let response = header.show(ui, |ui| {
+            for child in &node.children {
+                tree_node(app, ui, child, context, actions);
+            }
+        });
+        // Remember what the user opened, so it survives a rebuild.
+        if response.fully_open() {
+            app.editor.expanded.insert(node.path.clone());
+        } else {
+            app.editor.expanded.remove(&node.path);
+        }
+        return;
+    }
+
+    let is_open = context.open.contains(&node.path);
+    let is_dirty = context.dirty.contains(&node.path);
+    let label = format!("{}{}", node.name, if is_dirty { " •" } else { "" });
+    let color = if is_open { theme::FG } else { theme::FG_DIM };
+    let selected = context.active.as_deref() == Some(node.path.as_str());
+    if ui
+        .selectable_label(selected, RichText::new(label).color(color))
+        .on_hover_text(&node.path)
+        .clicked()
+    {
+        if let Some(repo) = app.repo.clone() {
+            actions.push(Action::Open { path: repo.path().join(&node.path), reveal: None });
+        }
+    }
+}
+
+/// The editor's viewport: the file, full size.
+pub fn editor_viewport(app: &mut App, ui: &mut egui::Ui) {
+    let mut actions: Vec<Action> = Vec::new();
+
+    if app.editor.active_file().is_none() {
+        ui.add_space(24.0);
+        ui.vertical_centered(|ui| {
+            ui.label(RichText::new("No file open").color(theme::FG_DIM));
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(
+                    "Open one from the Editor panel, double-click a file in Changes, \
+                     or press Cmd/Ctrl+O.",
+                )
+                .color(theme::FG_DIM)
+                .small(),
+            );
+        });
+        return;
+    }
+
+    viewport_header(app, ui, &mut actions);
 
     // Diagnostics come straight from the server's shared state; they change
     // without anything in the UI asking, so they are read fresh each frame.
@@ -311,80 +519,53 @@ pub fn editor_tab(app: &mut App, ui: &mut egui::Ui) {
         .unwrap_or_default();
 
     let available = ui.available_height();
-    let bottom_height = (available * 0.28).clamp(90.0, 260.0);
+    let bottom_height = (available * 0.26).clamp(80.0, 240.0);
 
     ui.horizontal_top(|ui| {
-        if app.editor.outline_open {
-            outline(app, ui, &mut actions);
-            ui.separator();
-        }
         ui.vertical(|ui| {
+            ui.set_width(ui.available_width() - if app.editor.outline_open { 190.0 } else { 0.0 });
             code_area(app, ui, available - bottom_height, &diagnostics, &mut actions);
             ui.separator();
             bottom_panel(app, ui, bottom_height, &diagnostics, &mut actions);
         });
+        if app.editor.outline_open {
+            ui.separator();
+            outline(app, ui, available, &mut actions);
+        }
     });
-
     run_actions(app, actions);
 }
 
-fn toolbar(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+/// File name, dirty marker, and the actions that act on the open file.
+fn viewport_header(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+    let Some(file) = app.editor.active_file() else { return };
+    let (rel, dirty) = (file.rel.clone(), file.is_dirty());
     ui.horizontal(|ui| {
-        if super::views::panel_button(ui, "Open file…", app.repo.is_some())
-            .on_hover_text("Filter every tracked file (Cmd/Ctrl+O)")
-            .clicked()
-        {
-            actions.push(Action::QuickOpen);
-        }
-        let dirty = app.editor.active_file().is_some_and(|f| f.is_dirty());
-        let save_label = if dirty { "Save*" } else { "Save" };
-        if super::views::panel_button(ui, save_label, dirty)
-            .on_hover_text("Ctrl+S — writes the buffer and tells the language server")
-            .clicked()
-        {
-            actions.push(Action::Save);
-        }
-        if super::views::panel_button(ui, "Format", app.editor.active_file().is_some())
-            .on_hover_text("Format with the language server")
-            .clicked()
-        {
-            actions.push(Action::Format);
-        }
-        ui.checkbox(&mut app.editor.format_on_save, "on save");
-        ui.checkbox(&mut app.editor.outline_open, "Outline");
-
-        ui.separator();
-        // Language server status: which one, and what it is doing.
-        match app.editor.active_file().and_then(|f| app.lsp.running_for(&f.path)) {
-            Some(client) => {
-                let (text, color) = match (client.alive(), client.status()) {
-                    (false, _) => ("stopped".to_string(), theme::DANGER),
-                    (true, Some(status)) => (status, theme::WARN),
-                    (true, None) => ("ready".to_string(), theme::ADD),
-                };
-                ui.label(
-                    RichText::new(format!("{}: {text}", client.spec().name)).small().color(color),
-                );
-            }
-            None => {
-                ui.label(RichText::new("no language server").small().color(theme::FG_DIM));
-            }
-        }
-        if app.editor.busy > 0 {
-            ui.add(egui::Spinner::new().size(12.0));
+        ui.label(RichText::new(&rel).strong().color(theme::EMBER));
+        if dirty {
+            ui.label(RichText::new("• unsaved").small().color(theme::WARN));
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if super::views::panel_button(ui, "Restart servers", true)
-                .on_hover_text("Stops every language server; they start again on the next file")
+            if super::views::panel_button(ui, "Save", dirty)
+                .on_hover_text("Ctrl+S")
                 .clicked()
             {
-                actions.push(Action::RestartServers);
+                actions.push(Action::Save);
             }
+            if super::views::panel_button(ui, "Format", true)
+                .on_hover_text("Format with the language server")
+                .clicked()
+            {
+                actions.push(Action::Format);
+            }
+            if app.editor.busy > 0 {
+                ui.add(egui::Spinner::new().size(12.0));
+            }
+            ui.checkbox(&mut app.editor.outline_open, "Outline");
+            ui.checkbox(&mut app.editor.format_on_save, "Format on save");
         });
     });
-    if let Some(error) = app.editor.error.clone() {
-        ui.label(RichText::new(error).color(theme::DANGER).small());
-    }
+    ui.separator();
 }
 
 /// The file finder, shown inline above the tabs while it is open.
@@ -461,79 +642,18 @@ fn quick_open(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
     });
 }
 
-fn empty_state(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-    ui.add_space(12.0);
-    ui.label(
-        RichText::new("No file open. Pick one from Changes, or from the list below.")
-            .color(theme::FG_DIM),
-    );
-    ui.add_space(8.0);
-
-    // The recently changed files are the ones you actually want to edit.
-    let Some(status) = app.status.clone() else { return };
-    let Some(repo) = app.repo.clone() else { return };
-    ScrollArea::vertical().max_height(260.0).id_salt("editor-empty").show(ui, |ui| {
-        for file in status.files.iter().take(40) {
-            if ui.selectable_label(false, &file.path).clicked() {
-                actions.push(Action::Open {
-                    path: repo.path().join(&file.path),
-                    reveal: None,
-                });
-            }
-        }
-    });
-}
-
-fn tab_bar(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-    ScrollArea::horizontal().id_salt("editor-tabs").show(ui, |ui| {
-        ui.horizontal(|ui| {
-            for (i, file) in app.editor.files.iter().enumerate() {
-                let errors = app
-                    .lsp
-                    .diagnostics(&file.path)
-                    .iter()
-                    .filter(|d| d.severity == Severity::Error)
-                    .count();
-                let name = file
-                    .path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| file.rel.clone());
-                let label = format!(
-                    "{name}{}{}",
-                    if file.is_dirty() { " •" } else { "" },
-                    if errors > 0 { format!(" ({errors})") } else { String::new() }
-                );
-                let color = if errors > 0 { theme::DANGER } else { theme::FG };
-                if ui
-                    .selectable_label(app.editor.active == Some(i), RichText::new(label).color(color))
-                    .on_hover_text(&file.rel)
-                    .clicked()
-                {
-                    app.editor.active = Some(i);
-                    app.editor.completion.close();
-                }
-                if ui.small_button("×").on_hover_text("Close").clicked() {
-                    actions.push(Action::Close(i));
-                }
-            }
-        });
-    });
-}
-
 /// The outline, from `textDocument/documentSymbol`.
-fn outline(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+fn outline(app: &mut App, ui: &mut egui::Ui, height: f32, actions: &mut Vec<Action>) {
     let Some(file) = app.editor.active_file() else { return };
     let path = file.path.clone();
     let symbols = file.symbols.clone();
     ui.vertical(|ui| {
-        ui.set_width(200.0);
         ui.label(theme::overline("OUTLINE"));
         if symbols.is_empty() {
             ui.label(RichText::new("no symbols").small().color(theme::FG_DIM));
             return;
         }
-        ScrollArea::vertical().id_salt("editor-outline").show(ui, |ui| {
+        ScrollArea::vertical().max_height(height).id_salt("editor-outline").show(ui, |ui| {
             for symbol in &symbols {
                 let indent = "  ".repeat(symbol.depth);
                 let label = format!("{indent}{}", symbol.name);
@@ -1241,6 +1361,7 @@ fn run_actions(app: &mut App, actions: Vec<Action>) {
             }
             Action::RestartServers => app.lsp_restart(),
             Action::QuickOpen => app.editor_quick_open(),
+            Action::LoadTree => app.editor_load_tree(),
         }
     }
 }

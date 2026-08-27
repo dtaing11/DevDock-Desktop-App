@@ -80,6 +80,8 @@ pub enum Msg {
     /// One step of an agentic run (a file read, an edit proposed), for the
     /// progress log the user watches while it works.
     AgentEvent { kind: AgentKind, line: String },
+    /// The agent wrote or updated its plan.
+    AgentPlan { kind: AgentKind, steps: Vec<crate::agent::PlanStep> },
     /// An agentic run finished. Its edits are proposals: the user accepts or
     /// rejects each one before anything is written.
     AgentDone { kind: AgentKind, result: Result<crate::app::AgentReport, String> },

@@ -1031,8 +1031,8 @@ pub fn sidebar(app: &mut App, ctx: &egui::Context) {
                 Tab::Changes => changes_tab(app, ui),
                 Tab::History => history_tab(app, ui),
                 Tab::Checks => checks_tab(app, ui),
-                Tab::Editor => super::editor::editor_tab(app, ui),
-                Tab::Agent => super::agent_tab::agent_tab(app, ui),
+                Tab::Editor => super::editor::editor_sidebar(app, ui),
+                Tab::Agent => super::agent_tab::agent_sidebar(app, ui),
             }
         });
 }
@@ -2105,14 +2105,18 @@ pub fn diff_panel(app: &mut App, ctx: &egui::Context) {
                 .inner_margin(egui::Margin::symmetric(12, 8))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        let title = if app.diff_title.is_empty() {
-                            "Select a file to view its diff"
-                        } else {
-                            &app.diff_title
+                        let title = match app.tab {
+                            Tab::Editor => "Editor",
+                            Tab::Agent => "Coding agent",
+                            _ if app.diff_title.is_empty() => "Select a file to view its diff",
+                            _ => &app.diff_title,
                         };
                         ui.label(RichText::new(title).strong());
-                        // File-level controls only when a working file is selected.
-                        if app.selected_file.is_some() {
+                        // File-level controls only when a working file is
+                        // selected and the viewport is showing its diff.
+                        if app.selected_file.is_some()
+                            && !matches!(app.tab, Tab::Editor | Tab::Agent)
+                        {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
@@ -2195,6 +2199,21 @@ pub fn diff_panel(app: &mut App, ctx: &egui::Context) {
                         }
                     });
                 });
+
+            // The editor and the agent own the viewport when they are the
+            // active tab: their content is a file and a set of diffs, and
+            // neither belongs in a 340pt sidebar.
+            match app.tab {
+                Tab::Editor => {
+                    super::editor::editor_viewport(app, ui);
+                    return;
+                }
+                Tab::Agent => {
+                    super::agent_tab::agent_viewport(app, ui);
+                    return;
+                }
+                _ => {}
+            }
 
             // History mode: show the commit's file list above the patch.
             if app.selected_commit.is_some() && !app.commit_file_list.is_empty() {

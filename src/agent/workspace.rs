@@ -113,6 +113,8 @@ pub struct Workspace {
     originals: BTreeMap<String, Option<String>>,
     calls: usize,
     bytes_read: usize,
+    /// The model's own plan, which it writes and ticks off as it works.
+    plan: Vec<super::PlanStep>,
     write_mode: WriteMode,
     /// Language servers, when the task is allowed to consult them.
     lsp: Option<Arc<crate::lsp::Manager>>,
@@ -145,6 +147,7 @@ impl Workspace {
             originals: BTreeMap::new(),
             calls: 0,
             bytes_read: 0,
+            plan: Vec::new(),
             write_mode: WriteMode::Overlay,
             lsp: None,
             epochs: BTreeMap::new(),
@@ -207,6 +210,11 @@ impl Workspace {
 
     pub fn bytes_read(&self) -> usize {
         self.bytes_read
+    }
+
+    /// The model's plan as it currently stands.
+    pub fn plan(&self) -> Vec<super::PlanStep> {
+        self.plan.clone()
     }
 
     /// Every proposed change, oldest path first. Unchanged files are
@@ -282,6 +290,33 @@ impl Workspace {
                 }),
             },
         ];
+
+        tools.push(ToolSpec {
+            name: "update_plan",
+            description: "Write down what you are going to do, and tick items off as you \
+                          finish them. Call this once at the start with the whole plan, \
+                          then again each time a step is done. The developer watches this \
+                          list while you work — it is how they know what you are doing and \
+                          how far along you are. Send the full list every time.",
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "description": "Every step, in order, including the finished ones.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "text": {"type": "string", "description": "One short line, in the imperative."},
+                                "done": {"type": "boolean", "description": "Whether it is finished."}
+                            },
+                            "required": ["text", "done"]
+                        }
+                    }
+                },
+                "required": ["steps"]
+            }),
+        });
 
         if self.lsp.is_some() {
             tools.push(ToolSpec {
@@ -409,6 +444,7 @@ impl Workspace {
             return self.error(call, "Tool budget exhausted. Answer with what you have.");
         }
         let outcome = match call.name.as_str() {
+            "update_plan" => self.update_plan(&call.input),
             "list_files" => self.list_files(&call.input),
             "read_file" => self.read_file(&call.input),
             "search" => self.search(&call.input),
@@ -674,6 +710,31 @@ impl Workspace {
             }
         }
         Ok(())
+    }
+
+    /// Records the model's plan.
+    fn update_plan(&mut self, input: &serde_json::Value) -> Result<String, String> {
+        let steps = input
+            .get("steps")
+            .and_then(|s| s.as_array())
+            .ok_or("Missing required array argument \"steps\".")?;
+        let plan: Vec<super::PlanStep> = steps
+            .iter()
+            .filter_map(|step| {
+                let text = step.get("text")?.as_str()?.trim();
+                (!text.is_empty()).then(|| super::PlanStep {
+                    text: text.to_string(),
+                    done: step.get("done").and_then(|d| d.as_bool()).unwrap_or(false),
+                })
+            })
+            .collect();
+        if plan.is_empty() {
+            return Err("A plan needs at least one step.".into());
+        }
+        let done = plan.iter().filter(|s| s.done).count();
+        let total = plan.len();
+        self.plan = plan;
+        Ok(format!("Plan noted: {done}/{total} done."))
     }
 
     // -- language server ----------------------------------------------------
@@ -1035,6 +1096,7 @@ fn contained(root: &Path, joined: &Path) -> Result<(), ()> {
 pub fn summarize(call: &ToolCall) -> String {
     let arg = |key: &str| call.input.get(key).and_then(|v| v.as_str()).unwrap_or("?");
     match call.name.as_str() {
+        "update_plan" => "update the plan".to_string(),
         "list_files" => match call.input.get("glob").and_then(|v| v.as_str()) {
             Some(glob) => format!("list {glob}"),
             None => "list files".into(),
@@ -1125,7 +1187,9 @@ mod tests {
     fn read_only_access_has_no_edit_tools() {
         let (_tmp, mut ws) = fixture(Access::ReadOnly);
         let names: Vec<&str> = ws.tools().iter().map(|t| t.name).collect();
-        assert_eq!(names, vec!["list_files", "read_file", "search"]);
+        // update_plan is always available: saying what you intend to do is
+        // not a write.
+        assert_eq!(names, vec!["list_files", "read_file", "search", "update_plan"]);
         let out = ws.dispatch(
             &call("write_file", serde_json::json!({"path": "src/lib.rs", "content": "x"})),
             10,
@@ -1366,6 +1430,48 @@ mod tests {
         for expected in ["diagnostics", "definition", "references", "find_symbol"] {
             assert!(names.contains(&expected), "{expected} missing from {names:?}");
         }
+    }
+
+    #[test]
+    fn the_plan_is_recorded_and_ticked_off() {
+        let (_tmp, mut ws) = fixture(Access::ReadOnly);
+        assert!(ws.plan().is_empty());
+
+        let out = ws.dispatch(
+            &call(
+                "update_plan",
+                serde_json::json!({"steps": [
+                    {"text": "read the parser", "done": true},
+                    {"text": "fix the off-by-one", "done": false}
+                ]}),
+            ),
+            10,
+        );
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("1/2"), "{}", out.content);
+
+        let plan = ws.plan();
+        assert_eq!(plan.len(), 2);
+        assert!(plan[0].done && !plan[1].done);
+        assert_eq!(plan[1].text, "fix the off-by-one");
+
+        // Sending the list again replaces it, so ticking a box is one call.
+        ws.dispatch(
+            &call(
+                "update_plan",
+                serde_json::json!({"steps": [
+                    {"text": "read the parser", "done": true},
+                    {"text": "fix the off-by-one", "done": true}
+                ]}),
+            ),
+            10,
+        );
+        assert!(ws.plan().iter().all(|s| s.done));
+
+        // An empty plan is a mistake, not a plan.
+        let out = ws.dispatch(&call("update_plan", serde_json::json!({"steps": []})), 10);
+        assert!(out.is_error);
+        assert_eq!(ws.plan().len(), 2, "the previous plan survives a bad update");
     }
 
     #[test]

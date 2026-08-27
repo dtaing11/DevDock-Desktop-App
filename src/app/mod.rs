@@ -90,6 +90,11 @@ pub struct Config {
     /// this is the one worth pointing at your strongest model.
     #[serde(default)]
     pub coding_ai: Option<AiSelection>,
+    /// Render Markdown files instead of showing their diff. Sticky, because
+    /// someone who wants prose rendered wants it rendered for the next file
+    /// too.
+    #[serde(default)]
+    pub md_preview: bool,
     /// Keyboard shortcuts; missing/invalid entries fall back to defaults.
     #[serde(default)]
     pub shortcuts: shortcuts::Shortcuts,
@@ -634,6 +639,12 @@ pub struct App {
     // diff view
     pub diff_title: String,
     pub diff_text: String,
+    /// Working-tree text of the selected file, rendered as Markdown when
+    /// the preview is on. Empty until it is needed.
+    pub preview_text: String,
+    /// Whether a preview read is in flight. Without this the render path
+    /// re-asks every frame, which at 60fps is a thread per frame.
+    pub preview_loading: bool,
     /// Hunks of the currently selected file (for partial staging).
     pub hunks: Vec<crate::git::Hunk>,
     /// Whether the hunk bar shows every hunk. Files with many hunks collapse
@@ -706,9 +717,29 @@ pub struct App {
 
 impl App {
     fn new(ctx: &egui::Context) -> Self {
+        let mut app = Self::bare(ctx);
+        app.startup();
+        app.claude.auth_label = claude::Client::auth_label();
+        app.load_claude_models();
+        app
+    }
+
+    /// An app that has done no startup work: no repository reopened, no
+    /// GitHub or Ollama probes in flight.
+    ///
+    /// Tests need this. [`Self::new`] reopens the last repository on a
+    /// worker, and that message lands mid-test and overwrites whatever state
+    /// the test just set up — which looks exactly like the bug under
+    /// investigation.
+    #[cfg(test)]
+    pub fn new_for_test(ctx: &egui::Context) -> Self {
+        Self::bare(ctx)
+    }
+
+    fn bare(ctx: &egui::Context) -> Self {
         let (worker, rx) = Worker::new(ctx.clone());
         let config = Config::load();
-        let mut app = Self {
+        Self {
             worker,
             rx,
             ollama_url_input: config
@@ -738,6 +769,8 @@ impl App {
             ci_ai_proposal: String::new(),
             diff_title: String::new(),
             diff_text: String::new(),
+            preview_text: String::new(),
+            preview_loading: false,
             hunks: Vec::new(),
             hunks_expanded: false,
             line_sel: Default::default(),
@@ -780,11 +813,7 @@ impl App {
             busy: false,
             sync_op: None,
             rebinding: None,
-        };
-        app.startup();
-        app.claude.auth_label = claude::Client::auth_label();
-        app.load_claude_models();
-        app
+        }
     }
 
     fn startup(&mut self) {
@@ -1140,6 +1169,10 @@ impl App {
     /// Shared AI generation path for the commit box and the PR form. Each
     /// target has its own provider/model selection and optional per-repo
     /// custom instructions.
+    ///
+    /// The two targets read different things, because they describe
+    /// different things: a commit message describes what is staged, and a
+    /// pull request describes every commit on the branch.
     fn generate_ai(&mut self, target: worker::AiTarget, stage_files: Vec<String>) {
         let Some(repo) = self.repo.clone() else { return };
         let Some(sel) = self.ai_selection(target) else {
@@ -1147,27 +1180,18 @@ impl App {
             return;
         };
         let custom = self.repo_prompt(target);
+        // The base the pull request would target, so the branch is measured
+        // against what it will actually merge into.
+        let base = match target {
+            worker::AiTarget::PullRequest => {
+                Some(self.pr.base.clone()).filter(|b| !b.trim().is_empty())
+            }
+            _ => None,
+        };
         self.ai_busy = true;
 
-        if sel.provider == "claude" {
-            let model = sel.model;
-            self.worker.spawn(move || {
-                let result = (|| -> Result<ollama::CommitSuggestion, String> {
-                    if !stage_files.is_empty() {
-                        repo.unstage_all().ok();
-                        strerr(repo.stage(&stage_files))?;
-                    }
-                    let diff = strerr(repo.diff_for_ai())?;
-                    let client = claude::Client::from_store(model)
-                        .ok_or("Claude is not signed in. Open Settings.")?;
-                    strerr(client.commit_message(&diff, custom.as_deref()))
-                })();
-                Msg::AiSuggestion { target, result }
-            });
-            return;
-        }
-
         let url = self.effective_ollama_url();
+        let provider = sel.provider;
         let model = sel.model;
         self.worker.spawn(move || {
             let result = (|| -> Result<ollama::CommitSuggestion, String> {
@@ -1175,8 +1199,50 @@ impl App {
                     repo.unstage_all().ok();
                     strerr(repo.stage(&stage_files))?;
                 }
+                let custom = custom.as_deref();
+
+                if target == worker::AiTarget::PullRequest {
+                    let summary = strerr(repo.branch_summary(base.as_deref()))?;
+                    if summary.is_empty() {
+                        return Err(
+                            "Nothing to describe: this branch has no commits the base \
+                             does not. Commit your work first."
+                                .into(),
+                        );
+                    }
+                    let sel = AiSelection {
+                        provider: provider.clone(),
+                        model: model.clone(),
+                    };
+                    // First choice: let it read the repository, so the
+                    // description comes from an understanding of the change
+                    // rather than from the diff's surface.
+                    match pull_request_with_context(&repo, &sel, &url, &summary, custom) {
+                        Err(e) if lacks_tool_support(&e) => {
+                            // The model cannot call tools; the commits and
+                            // the diff still describe the branch.
+                        }
+                        other => return other,
+                    }
+                    return if provider == "claude" {
+                        let client = claude::Client::from_store(model)
+                            .ok_or("Claude is not signed in. Open Settings.")?;
+                        strerr(client.pull_request_text(&summary, custom))
+                    } else {
+                        strerr(ollama::Client::new(url).pull_request_text(
+                            &model, &summary, custom,
+                        ))
+                    };
+                }
+
                 let diff = strerr(repo.diff_for_ai())?;
-                strerr(ollama::Client::new(url).commit_message(&model, &diff, custom.as_deref()))
+                if provider == "claude" {
+                    let client = claude::Client::from_store(model)
+                        .ok_or("Claude is not signed in. Open Settings.")?;
+                    strerr(client.commit_message(&diff, custom))
+                } else {
+                    strerr(ollama::Client::new(url).commit_message(&model, &diff, custom))
+                }
             })();
             Msg::AiSuggestion { target, result }
         });
@@ -1194,6 +1260,13 @@ impl App {
     }
 
     // -- message pump -------------------------------------------------------
+
+    /// Drains the worker channel, for tests that need to observe a
+    /// background result without running the whole event loop.
+    #[cfg(test)]
+    pub fn handle_messages_for_test(&mut self) {
+        self.handle_messages();
+    }
 
     fn handle_messages(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
@@ -1217,6 +1290,13 @@ impl App {
                     // CI state and history belong to the previous repo.
                     self.local_ci = Default::default();
                     self.load_local_ci();
+                    // So do any AI proposals and conflict resolutions still
+                    // waiting for confirmation. Their paths are
+                    // repo-relative, so applying them after a repository
+                    // switch would write one project's edits into another.
+                    self.agent = Default::default();
+                    self.conflicts = Default::default();
+                    self.review = Default::default();
                     // Graph belongs to the previous repo too.
                     self.graph.clear();
                     self.graph_open = false;
@@ -1266,6 +1346,13 @@ impl App {
             Msg::Branches(Err(e)) => self.toast(e, true),
             Msg::Log(Ok(log)) => self.log = log,
             Msg::Log(Err(e)) => self.toast(e, true),
+            Msg::Preview { path, text } => {
+                // Ignore a preview for a file that is no longer selected.
+                if self.selected_file.as_deref() == Some(path.as_str()) {
+                    self.preview_text = text;
+                    self.preview_loading = false;
+                }
+            }
             Msg::Diff { title, text } => {
                 self.diff_title = title;
                 self.diff_text = text;
@@ -2013,24 +2100,18 @@ impl App {
                     return Err("Nothing to review: no outgoing changes found.".into());
                 }
                 let sel = AiSelection { provider, model };
-                if !cfg.repo_context {
-                    return review_single_shot(&sel, &url, &diff, &cfg);
+                // Whatever path runs, the user is told how much of the diff
+                // the verdict actually covers.
+                let coverage = crate::review::coverage_note(&diff, cfg.max_diff_bytes);
+                let mut outcome = if !cfg.repo_context {
+                    review_single_shot(&sel, &url, &diff, &cfg)?
+                } else {
+                    review_with_repo_context_or_fallback(&repo, &sel, &url, &diff, &cfg)?
+                };
+                if let Some(note) = coverage {
+                    outcome.context_log.push(note);
                 }
-                match review_with_repo_context(&repo, &sel, &url, &diff, &cfg) {
-                    Err(e) if lacks_tool_support(&e) => {
-                        // The model cannot call tools, so it cannot read the
-                        // repository. Review the diff alone rather than
-                        // failing: a diff-only review is the old behaviour,
-                        // and a gate that errors out gets switched off.
-                        let mut outcome = review_single_shot(&sel, &url, &diff, &cfg)?;
-                        outcome.context_log.push(format!("! {e}"));
-                        outcome
-                            .context_log
-                            .push("! reviewed the diff alone, without repository context".into());
-                        Ok(outcome)
-                    }
-                    other => other,
-                }
+                Ok(outcome)
             })();
             Msg::ReviewDone(result)
         });
@@ -3337,8 +3418,13 @@ pub fn agent_provider(
 
 /// Writes one accepted proposal into the worktree, creating parent
 /// directories for a file the model added.
+///
+/// The path is re-checked here even though the harness already refused
+/// anything outside the repository. This is the only place a proposal
+/// becomes a real write, and a containment check is cheap next to the cost
+/// of being wrong about it.
 fn write_worktree_file(root: &std::path::Path, rel: &str, content: &str) -> Result<(), String> {
-    let full = root.join(rel);
+    let full = crate::agent::workspace::safe_join(root, rel)?;
     if let Some(parent) = full.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -3370,6 +3456,61 @@ fn review_with_repo_context(
     )
 }
 
+/// Writes pull request text with the repository open to the model.
+///
+/// The commits and diff are handed over up front; the tools let it check
+/// what they mean — open the file a hunk sits in, read the function a commit
+/// claims to fix, find the other callers of something whose signature moved.
+fn pull_request_with_context(
+    repo: &crate::git::Repo,
+    sel: &AiSelection,
+    ollama_url: &str,
+    summary: &crate::git::BranchSummary,
+    instructions: Option<&str>,
+) -> Result<ollama::CommitSuggestion, String> {
+    let provider = agent_provider(sel, ollama_url)?;
+    let tracked = strerr(repo.tracked_files())?;
+    let mut workspace = crate::agent::Workspace::new(
+        repo.path(),
+        tracked,
+        crate::agent::pr::access(),
+    )?;
+    crate::agent::pr::run(
+        provider.as_ref(),
+        &mut workspace,
+        summary,
+        instructions,
+        crate::review::MAX_PR_DIFF_BYTES,
+        &mut |_| {},
+    )
+}
+
+/// Runs the context-reading review, falling back to a diff-only one when the
+/// model turns out not to be able to call tools.
+fn review_with_repo_context_or_fallback(
+    repo: &crate::git::Repo,
+    sel: &AiSelection,
+    url: &str,
+    diff: &str,
+    cfg: &crate::review::ReviewConfig,
+) -> Result<crate::review::ReviewOutcome, String> {
+    match review_with_repo_context(repo, sel, url, diff, cfg) {
+        Err(e) if lacks_tool_support(&e) => {
+            // The model cannot call tools, so it cannot read the repository.
+            // Review the diff alone rather than failing: a diff-only review
+            // is the old behaviour, and a gate that errors out gets switched
+            // off.
+            let mut outcome = review_single_shot(sel, url, diff, cfg)?;
+            outcome.context_log.push(format!("! {e}"));
+            outcome
+                .context_log
+                .push("! reviewed the diff alone, without repository context".into());
+            Ok(outcome)
+        }
+        other => other,
+    }
+}
+
 /// The diff-only review: one request, no tools. Used when `repo_context` is
 /// off and as the fallback for a model that cannot call tools.
 fn review_single_shot(
@@ -3390,13 +3531,30 @@ fn review_single_shot(
 /// falling back for, as opposed to a real error worth reporting.
 fn lacks_tool_support(error: &str) -> bool {
     let e = error.to_lowercase();
-    e.contains("cannot call tools") || e.contains("does not support tools")
+    // Only these mean "this model cannot do tools at all". Anything else —
+    // a timeout, a 500, a refused connection — must propagate: silently
+    // downgrading to a diff-only review on a transient failure would hide
+    // that the reviewer never got its context.
+    [
+        "cannot call tools",
+        "does not support tools",
+        "tools are not supported",
+        "tool use is not supported",
+        "does not support tool",
+    ]
+    .iter()
+    .any(|phrase| e.contains(phrase))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::process::Command;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let out = Command::new("git").args(args).current_dir(dir).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
 
     /// A repository with one file, and an app pointed at it.
     fn app_with_repo() -> (tempfile::TempDir, App, std::path::PathBuf) {
@@ -3414,7 +3572,7 @@ mod tests {
         std::fs::write(&file, "one\ntwo\nthree\n").unwrap();
 
         let ctx = egui::Context::default();
-        let mut app = App::new(&ctx);
+        let mut app = App::new_for_test(&ctx);
         app.repo = Some(crate::git::Repo::open(tmp.path()).unwrap());
         (tmp, app, file)
     }
@@ -3693,7 +3851,7 @@ mod tests {
     #[test]
     fn the_editor_tab_renders_when_there_is_nothing_to_show() {
         let ctx = egui::Context::default();
-        let mut app = App::new(&ctx);
+        let mut app = App::new_for_test(&ctx);
         egui::__run_test_ctx(|ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 editor::editor_tab(&mut app, ui);
@@ -3706,5 +3864,92 @@ mod tests {
                 editor::editor_tab(&mut app, ui);
             });
         });
+    }
+
+    /// Proposals belong to the repository they were made against.
+    ///
+    /// Their paths are repo-relative, so an unapplied proposal that survived
+    /// a repository switch would be written into the *new* project — one
+    /// repo's edits landing in another's files.
+    #[test]
+    fn switching_repositories_drops_proposals_from_the_old_one() {
+        let (_tmp, mut app, file) = app_with_repo();
+        app.agent.edits = vec![ProposedEdit {
+            edit: crate::agent::PendingEdit {
+                path: "notes.txt".into(),
+                before: Some("one\n".into()),
+                after: "REWRITTEN\n".into(),
+            },
+            accepted: true,
+            applied: false,
+            unresolved: false,
+        }];
+        app.agent.summary = "from the old repository".into();
+        app.conflicts.files = vec![crate::git::ConflictFile {
+            path: "notes.txt".into(),
+            base: None,
+            ours: None,
+            theirs: None,
+            working: None,
+        }];
+
+        let other = tempfile::tempdir().unwrap();
+        git(other.path(), &["init", "-b", "main"]);
+        git(other.path(), &["config", "user.email", "t@t.io"]);
+        git(other.path(), &["config", "user.name", "T"]);
+        std::fs::write(other.path().join("notes.txt"), "a different project\n").unwrap();
+
+        app.handle(Msg::RepoOpened(Ok(other.path().display().to_string())));
+
+        assert!(app.agent.edits.is_empty(), "proposals outlived the repository");
+        assert!(app.agent.summary.is_empty());
+        assert!(app.conflicts.files.is_empty(), "conflicts outlived the repository");
+        assert!(app.review.outcome.is_none(), "a review verdict outlived the repository");
+
+        // Neither repository was touched.
+        assert_eq!(
+            std::fs::read_to_string(other.path().join("notes.txt")).unwrap(),
+            "a different project\n"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\ntwo\nthree\n");
+    }
+
+    #[test]
+    fn only_a_missing_tool_capability_falls_back_to_a_diff_only_review() {
+        for tool_error in [
+            "qwen2 cannot call tools, so it cannot read the repository",
+            "Ollama error 400: registry.ollama.ai/library/x does not support tools",
+            "the server said tools are not supported for this model",
+        ] {
+            assert!(lacks_tool_support(tool_error), "{tool_error}");
+        }
+        // Everything else must propagate: a review that silently became
+        // diff-only after a timeout would hide that it lost its context.
+        for real_error in [
+            "Claude API 429 on claude-opus-5: rate limited",
+            "Cannot reach Claude: connection refused",
+            "The reviewer did not return a usable review: {",
+        ] {
+            assert!(!lacks_tool_support(real_error), "{real_error}");
+        }
+    }
+
+    /// The claim that `repo_context` "may not be initialized from config".
+    #[test]
+    fn repo_context_defaults_to_on_however_the_config_is_written() {
+        // No [review] section at all.
+        let config: crate::local_ci::Config = toml::from_str("[[job]]\nname = \"t\"\ncommands = []\n").unwrap();
+        assert!(config.review.repo_context);
+
+        // A [review] section that never mentions it.
+        let config: crate::local_ci::Config =
+            toml::from_str("[review]\nrun = true\nfail_on = \"high\"\n").unwrap();
+        assert!(config.review.repo_context);
+        assert_eq!(config.review.max_context_calls, 24);
+
+        // And an explicit opt-out is honoured.
+        let config: crate::local_ci::Config =
+            toml::from_str("[review]\nrun = true\nrepo_context = false\n").unwrap();
+        assert!(!config.review.repo_context);
     }
 }

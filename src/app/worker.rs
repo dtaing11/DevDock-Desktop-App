@@ -19,6 +19,8 @@ pub enum Msg {
     Branches(Result<BranchList, String>),
     Log(Result<Vec<Commit>, String>),
     Diff { title: String, text: String },
+    /// The working-tree text of a file, for the Markdown preview.
+    Preview { path: String, text: String },
     /// A git operation finished; message shown as a toast. `refresh` reloads state.
     Done { message: Result<String, String>, refresh: bool },
     MergeOutcome(OpOutcome),

@@ -216,10 +216,13 @@ fn a_review_reads_the_repository_and_reports_what_it_read() {
       "reasoning": "read caller.txt to check the contract",
       "findings": [{"file": "conflict.txt", "line": 1, "severity": "high",
                     "title": "drops the incoming change",
-                    "detail": "caller.txt still expects the other side"}]}"#;
+                    "detail": "caller.txt still expects the other side",
+                    "evidence": "ours"}]}"#;
     let provider = Scripted::new(vec![
         calls("", vec![call("1", "read_file", serde_json::json!({"path": "caller.txt"}))]),
         calls(findings, vec![]),
+        // Findings are verified before they are shown; this one holds up.
+        calls(r#"{"verdicts": [{"index": 0, "keep": true, "why": "confirmed"}]}"#, vec![]),
     ]);
 
     let mut ws = workspace(&repo, Access::ReadOnly);
@@ -508,4 +511,237 @@ fn live_coding_agent() {
     println!("--- VERIFY ---\n{}", result.output);
     assert!(result.ok, "the agent reported done but the code still does not build");
     assert!(!run.edits.is_empty(), "it cannot have fixed anything without editing");
+}
+
+// ---------------------------------------------------------------------------
+// Review verification
+// ---------------------------------------------------------------------------
+
+/// The reviewer's findings are checked against the code before anyone sees
+/// them: a misquoted citation is dropped mechanically, and what survives is
+/// judged again with the repository open.
+#[test]
+fn findings_that_do_not_survive_verification_are_dropped() {
+    let (_tmp, repo) = conflicted_repo();
+    // Finish the merge so there is a clean tree with a real file to cite.
+    repo.resolve("conflict.txt", &Resolution::Ours).unwrap();
+    assert!(repo.merge_continue().ok);
+
+    let findings = r#"{"summary": "three findings", "reasoning": "read caller.txt",
+      "findings": [
+        {"file": "caller.txt", "line": 1, "severity": "high",
+         "title": "real problem", "detail": "the call is wrong",
+         "evidence": "calls base"},
+        {"file": "caller.txt", "line": 1, "severity": "high",
+         "title": "misquoted problem", "detail": "this line is not there",
+         "evidence": "let never_written_in_this_file = 1;"},
+        {"file": "no/such/file.rs", "line": 9, "severity": "medium",
+         "title": "wrong file", "detail": "cites a file that does not exist",
+         "evidence": "anything"},
+        {"file": "caller.txt", "line": 999, "severity": "low",
+         "title": "line past the end", "detail": "the citation is out of range",
+         "evidence": "calls base"}
+      ]}"#;
+
+    // The verifier drops the first finding and keeps the survivor of the
+    // citation check.
+    let verdicts = r#"{"verdicts": [
+        {"index": 0, "keep": false, "why": "caller.txt documents this as intended"},
+        {"index": 1, "keep": true, "why": "confirmed"}
+    ]}"#;
+
+    let provider = Scripted::new(vec![
+        calls(findings, vec![]),
+        calls(verdicts, vec![]),
+    ]);
+
+    let mut ws = workspace(&repo, Access::ReadOnly);
+    let outcome = git_manage::review::run_with_context(
+        &provider,
+        &mut ws,
+        "a diff",
+        &git_manage::review::ReviewConfig::default(),
+        &mut |_| {},
+    )
+    .unwrap();
+
+    let titles: Vec<&str> = outcome.findings.iter().map(|f| f.title.as_str()).collect();
+    // Two dropped mechanically (bad quote, missing file), one dropped by the
+    // verifier, one kept.
+    assert_eq!(titles, vec!["line past the end"], "{:?}", outcome.context_log);
+
+    let log = outcome.context_log.join("\n");
+    assert!(log.contains("misquoted problem"), "{log}");
+    assert!(log.contains("wrong file"), "{log}");
+    assert!(log.contains("caller.txt documents this as intended"), "{log}");
+    assert!(log.contains("did not survive verification"), "{log}");
+
+    // The out-of-range line number is repaired rather than shown as-is.
+    assert_ne!(outcome.findings[0].line, Some(999));
+}
+
+#[test]
+fn verification_that_cannot_run_keeps_the_findings() {
+    let (_tmp, repo) = conflicted_repo();
+    repo.resolve("conflict.txt", &Resolution::Ours).unwrap();
+    assert!(repo.merge_continue().ok);
+
+    let findings = r#"{"summary": "one", "reasoning": "",
+      "findings": [{"file": "caller.txt", "line": 1, "severity": "high",
+                    "title": "kept", "detail": "d", "evidence": "calls base"}]}"#;
+    // The verifier answers with something unparseable.
+    let provider = Scripted::new(vec![
+        calls(findings, vec![]),
+        calls("I could not check these.", vec![]),
+    ]);
+
+    let mut ws = workspace(&repo, Access::ReadOnly);
+    let outcome = git_manage::review::run_with_context(
+        &provider,
+        &mut ws,
+        "a diff",
+        &git_manage::review::ReviewConfig::default(),
+        &mut |_| {},
+    )
+    .unwrap();
+
+    assert_eq!(outcome.findings.len(), 1, "a failed check must not discard findings");
+    assert!(outcome.context_log.join("\n").contains("findings kept"));
+}
+
+#[test]
+fn verification_is_skipped_when_it_is_turned_off_or_there_is_nothing_to_check() {
+    let (_tmp, repo) = conflicted_repo();
+    repo.resolve("conflict.txt", &Resolution::Ours).unwrap();
+    assert!(repo.merge_continue().ok);
+
+    // A clean review never pays for a second request.
+    let provider = Scripted::new(vec![calls(
+        r#"{"summary": "clean", "reasoning": "", "findings": []}"#,
+        vec![],
+    )]);
+    let mut ws = workspace(&repo, Access::ReadOnly);
+    let outcome = git_manage::review::run_with_context(
+        &provider,
+        &mut ws,
+        "a diff",
+        &git_manage::review::ReviewConfig::default(),
+        &mut |_| {},
+    )
+    .unwrap();
+    assert!(outcome.findings.is_empty());
+
+    // And the switch is honoured.
+    let findings = r#"{"summary": "one", "reasoning": "",
+      "findings": [{"file": "caller.txt", "line": 1, "severity": "high",
+                    "title": "unchecked", "detail": "d", "evidence": "calls base"}]}"#;
+    let provider = Scripted::new(vec![calls(findings, vec![])]);
+    let config = git_manage::review::ReviewConfig {
+        verify_findings: false,
+        ..Default::default()
+    };
+    let mut ws = workspace(&repo, Access::ReadOnly);
+    let outcome =
+        git_manage::review::run_with_context(&provider, &mut ws, "a diff", &config, &mut |_| {})
+            .unwrap();
+    assert_eq!(outcome.findings.len(), 1);
+}
+
+/// The verifier against the findings that started this: three real false
+/// positives from a review of this repository, plus one real defect.
+///
+/// It has to drop the three and keep the one. Ignored by default — needs
+/// Claude credentials and costs tokens.
+/// `cargo test --test agent -- --ignored --nocapture live_verifier`
+#[test]
+#[ignore]
+fn live_verifier_drops_the_false_positives() {
+    use git_manage::review::{Finding, ReviewConfig, ReviewOutcome, Severity};
+
+    let Some(client) = git_manage::claude::Client::from_store("claude-opus-5") else {
+        eprintln!("Claude is not signed in; skipping");
+        return;
+    };
+    let repo = Repo::open(env!("CARGO_MANIFEST_DIR")).unwrap();
+    let mut ws = Workspace::new(repo.path(), repo.tracked_files().unwrap(), Access::ReadOnly)
+        .unwrap();
+
+    let finding = |file: &str, line: u32, title: &str, detail: &str, evidence: &str| Finding {
+        file: file.into(),
+        line: Some(line),
+        severity: Severity::High,
+        title: title.into(),
+        detail: detail.into(),
+        evidence: evidence.into(),
+    };
+
+    let mut outcome = ReviewOutcome {
+        summary: "four findings".into(),
+        findings: vec![
+            // 1. False: there is nothing to validate client-side.
+            finding(
+                "src/claude.rs",
+                558,
+                "OAuth token passed directly in Authorization header without validation",
+                "The access token is interpolated into the header with no validation, \
+                 which could send a malformed or expired credential.",
+                ".set(\"Authorization\", &format!(\"Bearer {}\", tokens.access_token))",
+            ),
+            // 2. False: the built-in prompt always applies.
+            finding(
+                "src/app/mod.rs",
+                1,
+                "Conflict prompt source is unchecked; missing prompt means no guidance",
+                "conflict_prompt() returns Option<String> and a None means the model is \
+                 given no instructions at all.",
+                "let custom = self.conflict_prompt();",
+            ),
+            // 3. False: serde default plus a Default impl.
+            finding(
+                "src/review.rs",
+                1,
+                "repo_context may not be initialized from config",
+                "The reviewer depends on cfg.repo_context, which may be uninitialised when \
+                 the config file omits it.",
+                "pub repo_context: bool,",
+            ),
+            // 4. Real: this one has to survive.
+            finding(
+                "src/agent/workspace.rs",
+                1,
+                "search reads every tracked file on each call",
+                "Each search opens every tracked file in turn, so a search in a large \
+                 repository reads the whole tree before returning.",
+                "for rel in self.visible_paths() {",
+            ),
+        ],
+        ..Default::default()
+    };
+
+    let config = ReviewConfig::default();
+    git_manage::review::verify(&client, &mut ws, &mut outcome, &config, &mut |e| {
+        println!("  {}", e.line())
+    });
+
+    println!("\n--- SURVIVED ---");
+    for f in &outcome.findings {
+        println!("  [{}] {}", f.severity.label(), f.title);
+    }
+    println!("--- LOG ---");
+    for line in &outcome.context_log {
+        println!("  {line}");
+    }
+
+    let kept: Vec<&str> = outcome.findings.iter().map(|f| f.title.as_str()).collect();
+    for false_positive in [
+        "OAuth token passed directly in Authorization header without validation",
+        "Conflict prompt source is unchecked; missing prompt means no guidance",
+        "repo_context may not be initialized from config",
+    ] {
+        assert!(!kept.contains(&false_positive), "kept a false positive: {false_positive}");
+    }
+    assert!(
+        kept.contains(&"search reads every tracked file on each call"),
+        "the real finding was dropped: {kept:?}"
+    );
 }

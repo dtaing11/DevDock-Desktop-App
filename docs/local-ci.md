@@ -19,6 +19,7 @@ Docker containers for reproducible environments.
   - [Custom output format](#custom-output-format)
   - [What the reviewer sees](#what-the-reviewer-sees)
   - [Repository context](#repository-context)
+  - [Findings are verified before you see them](#findings-are-verified-before-you-see-them)
 - [Docker environments](#docker-environments)
 - [Secrets](#secrets)
 - [Recipes](#recipes)
@@ -286,6 +287,7 @@ fail_on = "high"          # low | medium | high
 # repo_context = true                  # let the reviewer read the repository
 # max_context_calls = 24               # files/searches it may make per review
 # max_context_bytes = 200000           # total it may read
+# verify_findings = true               # check each finding before showing it
 # instructions = "Flag any new blocking call on the UI thread."
 ```
 
@@ -329,6 +331,7 @@ this — asking for a review is its own consent.
 | `repo_context`     | `true`   | Reviewer may read tracked files for context — see [Repository context](#repository-context) |
 | `max_context_calls`| `24`     | How many reads/searches one review may make                        |
 | `max_context_bytes`| `200000` | Total bytes one review may read                                    |
+| `verify_findings`  | `true`   | Check each finding against the code before showing it — see [Findings are verified](#findings-are-verified-before-you-see-them) |
 | `instructions`     | none     | Extra project-specific things to look for                          |
 | `instructions_file`| none     | A file holding that guidance, relative to the repo root; combines with `instructions` |
 | `output`           | `"findings"` | `"markdown"` to answer in your own format — see [Custom output format](#custom-output-format) |
@@ -603,6 +606,52 @@ have not already written down.
 
 A repository with no `[[job]]` blocks gives the agent no way to execute
 anything at all.
+### Findings are verified before you see them
+
+A reviewer that reports things which are not true costs more than one that
+reports nothing: you read it, you check it, you find it was already handled
+three lines away, and next time you skim. So every finding is checked against
+the code before it reaches you.
+
+**First, the citation.** Each finding must quote a line, verbatim, from the
+file it accuses. That quote is checked against the file mechanically. A
+finding whose evidence is not in the file it names is dropped — as is one
+citing a file that does not exist. A line number past the end of the file is
+repaired rather than shown.
+
+**Then, the code.** What survives goes back to the model with the repository
+still open and one question: *is this actually true of this code?* It is told
+to drop a finding when
+
+- the thing said to be missing is already provided somewhere the reviewer did
+  not look — a `#[serde(default)]`, a `Default` impl, an earlier guard, a
+  check in the only caller, the match arm above the cited line;
+- it describes the deliberate, documented design rather than a mistake;
+- its failing case cannot happen, because the input is rejected earlier;
+- it is about code the diff did not change.
+
+Dropped findings are not hidden. The reading list shows each one and why:
+
+```
+! dropped "repo_context may not be initialized from config" — repo_context has
+  #[serde(default = "default_true")] on line 234 of src/review.rs
+· 3 of 4 findings did not survive verification
+```
+
+That is a real example. Three findings from a review of this repository, all
+confidently reported as high severity, all wrong for reasons a second look
+found in seconds.
+
+```toml
+[review]
+verify_findings = true    # default
+```
+
+It costs one extra request per review that found something, and nothing at all
+for a clean review. Two failure modes are deliberate: if verification cannot
+run, or answers with something unparseable, **the findings are kept** and the
+log says so — a gate that quietly discarded findings because a second request
+failed would be worse than one that reports too many.
 
 ## Docker environments
 

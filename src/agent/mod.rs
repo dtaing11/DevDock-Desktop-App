@@ -35,6 +35,7 @@
 
 pub mod coding;
 pub mod conflict;
+pub mod pr;
 pub mod workspace;
 
 use serde::{Deserialize, Serialize};

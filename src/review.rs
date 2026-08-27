@@ -130,6 +130,11 @@ pub struct Finding {
     pub title: String,
     /// Explanation, and a fix where the model offered one.
     pub detail: String,
+    /// A verbatim line the reviewer read that shows the problem, and which
+    /// is checked against the file before the finding is shown. Empty when
+    /// the reviewer offered none.
+    #[serde(default)]
+    pub evidence: String,
 }
 
 /// The result of one review pass.
@@ -234,6 +239,12 @@ pub struct ReviewConfig {
     /// Cap on how much it may read in total, in bytes.
     #[serde(default = "default_context_bytes")]
     pub max_context_bytes: usize,
+    /// Check every finding against the code before showing it.
+    ///
+    /// Costs one extra request per review with findings, and is the
+    /// difference between a gate you trust and one you learn to click past.
+    #[serde(default = "default_true")]
+    pub verify_findings: bool,
     /// Extra project-specific guidance appended to the prompt.
     #[serde(default)]
     pub instructions: Option<String>,
@@ -287,6 +298,13 @@ fn default_context_calls() -> usize {
 fn default_context_bytes() -> usize {
     200_000
 }
+
+/// How much diff a pull request description is written from.
+///
+/// Larger than a review's default: a description that misses half the branch
+/// is wrong in a way nobody notices, where a review that misses half at least
+/// reports fewer findings.
+pub const MAX_PR_DIFF_BYTES: usize = 60_000;
 
 /// Cap on an instructions file. Guidance shares the prompt with the diff, so
 /// a runaway document would crowd out the code under review.
@@ -413,6 +431,7 @@ impl Default for ReviewConfig {
             repo_context: true,
             max_context_calls: default_context_calls(),
             max_context_bytes: default_context_bytes(),
+            verify_findings: true,
             provider: None,
             model: None,
             instructions: None,
@@ -434,7 +453,8 @@ Output ONLY a JSON object, no markdown fences and no prose around it:
  "findings": [
    {"file": "src/foo.rs", "line": 42, "severity": "high",
     "title": "one-line statement of the defect",
-    "detail": "why it is wrong, the input or state that triggers it, and the fix"}
+    "detail": "why it is wrong, the input or state that triggers it, and the fix",
+    "evidence": "the exact line of code, copied verbatim from the file, that shows it"}
  ]}
 
 Severity means:
@@ -447,6 +467,9 @@ Rules:
 - Judge only the changed lines and code they directly affect. Do not report pre-existing issues in untouched code.
 - Set "file" to the repo-relative path from the diff, and "line" to the line in the new file when you can identify it; use null when you cannot.
 - Every finding needs a concrete failing case in "detail": the input, state, or sequence that produces the bad outcome. If you cannot name one, the finding is speculation — either lower its severity or drop it.
+- Every finding needs "evidence": one line copied **verbatim** from the file you are accusing. It is checked against the file, and a finding whose evidence is not there is dropped. Copy, do not paraphrase or reconstruct from memory.
+- Before reporting that something is missing, unchecked, or uninitialised, go and look for the thing that would provide it: a `#[serde(default)]`, a `Default` impl, a guard earlier in the function, a check in the only caller, a fallback in the match arm above. Read it. A diff hunk cannot tell you what the rest of the file already guarantees, and "X may not be initialised" is not a finding when three lines away X has a default.
+- If you cannot open a file you would need to judge a finding, say so in "reasoning" and lower the severity. An unverified guess reported as high is worse than no review.
 - Do not restate what the diff does, praise it, or suggest unrelated refactors.
 - An empty "findings" array is the correct answer for a clean change. Do not invent findings to appear thorough."#;
 
@@ -535,6 +558,226 @@ Read deliberately, not exhaustively: a handful of targeted reads beats crawling 
 
 Then judge the change against what you read, not against what the diff alone suggests. If a file you needed was unreadable, say so in your answer rather than guessing."#;
 
+// ---------------------------------------------------------------------------
+// Verification
+// ---------------------------------------------------------------------------
+
+/// Checks every finding against the code and drops the ones that do not
+/// survive, recording why in the reading list.
+///
+/// Two gates, cheapest first. The citation check is mechanical: a quoted
+/// line is either in the file or it is not. What survives that goes back to
+/// the model with the repository still open, asked the one question the
+/// first pass never asks itself — *is this actually true of this code?*
+///
+/// A verification that cannot run leaves the findings alone. A gate that
+/// silently discarded findings because a second request failed would be
+/// worse than one that reports too many.
+pub fn verify(
+    provider: &dyn crate::agent::Provider,
+    workspace: &mut crate::agent::Workspace,
+    outcome: &mut ReviewOutcome,
+    config: &ReviewConfig,
+    on_event: &mut dyn FnMut(crate::agent::Event),
+) {
+    if outcome.findings.is_empty() {
+        return;
+    }
+    let before = outcome.findings.len();
+    let read = |path: &str| workspace.read_tracked(path);
+
+    // 1. Mechanical: does the quoted line exist in the file it names?
+    let mut kept: Vec<Finding> = Vec::new();
+    for mut finding in std::mem::take(&mut outcome.findings) {
+        match check_citation(&finding, &read) {
+            Ok(line) => {
+                finding.line = line;
+                kept.push(finding);
+            }
+            Err(why) => outcome
+                .context_log
+                .push(format!("! dropped \"{}\" — {why}", finding.title)),
+        }
+    }
+
+    // 2. The model, with the whole repository, judging its own findings.
+    if !kept.is_empty() {
+        let limits = crate::agent::Limits {
+            // Verification reads more than finding does: it has to check
+            // each finding independently, and the cheap way to be wrong is
+            // to run out of budget halfway and keep the rest unexamined.
+            max_tool_calls: config.max_context_calls.saturating_mul(2).max(24),
+            max_turns: (config.max_context_calls / 2).clamp(6, 24),
+            ..config.limits()
+        };
+        match crate::agent::run(
+            provider,
+            workspace,
+            VERIFY_SYSTEM_PROMPT,
+            &verify_prompt(&kept),
+            limits,
+            on_event,
+        ) {
+            Ok(run) => {
+                outcome.context_log.extend(run.log);
+                let verdicts = parse_verdicts(&run.text);
+                if verdicts.is_empty() {
+                    outcome
+                        .context_log
+                        .push("! verification returned nothing usable; findings kept".into());
+                } else {
+                    let mut survivors = Vec::new();
+                    for (i, finding) in kept.into_iter().enumerate() {
+                        match verdicts.iter().find(|(index, ..)| *index == i) {
+                            Some((_, false, why)) => outcome.context_log.push(format!(
+                                "! dropped \"{}\" — {why}",
+                                finding.title
+                            )),
+                            // Unjudged findings are kept: silence is not a
+                            // verdict.
+                            _ => survivors.push(finding),
+                        }
+                    }
+                    kept = survivors;
+                }
+            }
+            Err(e) => outcome
+                .context_log
+                .push(format!("! verification could not run ({e}); findings kept")),
+        }
+    }
+
+    let dropped = before - kept.len();
+    if dropped > 0 {
+        outcome
+            .context_log
+            .push(format!("· {dropped} of {before} findings did not survive verification"));
+    }
+    outcome.findings = kept;
+}
+
+/// How a finding fared when it was checked against the code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// The evidence is in the file and the finding survived a second look.
+    Confirmed,
+    /// Dropped, with the reason.
+    Dropped(String),
+}
+
+/// Checks a finding's citation against the file it accuses.
+///
+/// Purely mechanical, and it catches the most common way a review wastes
+/// somebody's afternoon: a confident finding about code that does not say
+/// what the reviewer thinks it says. A quote either appears in the file or
+/// it does not.
+fn check_citation(
+    finding: &Finding,
+    read: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<u32>, String> {
+    if finding.file.trim().is_empty() {
+        // A finding about the change as a whole cites nothing; there is
+        // nothing to check.
+        return Ok(finding.line);
+    }
+    let Some(content) = read(&finding.file) else {
+        return Err(format!("{} is not a file in this repository", finding.file));
+    };
+
+    // A line number past the end is a citation of nothing.
+    let total = content.lines().count() as u32;
+    let line = finding.line.filter(|l| *l >= 1 && *l <= total);
+
+    if finding.evidence.trim().is_empty() {
+        return Ok(line);
+    }
+    // Whitespace is not evidence: models re-indent when they quote.
+    let squash = |text: &str| {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+    let haystack = squash(&content);
+    let needle = squash(&finding.evidence);
+    if needle.is_empty() || haystack.contains(&needle) {
+        // Point the finding at where the evidence actually is, when the
+        // reported line was wrong.
+        let found = content
+            .lines()
+            .position(|l| squash(l).contains(&needle) || needle.contains(&squash(l)) && !l.trim().is_empty())
+            .map(|i| i as u32 + 1);
+        return Ok(line.or(found));
+    }
+    Err(format!(
+        "the quoted line is not in {}: {}",
+        finding.file,
+        excerpt(&finding.evidence)
+    ))
+}
+
+const VERIFY_SYSTEM_PROMPT: &str = r#"You are checking a code review before it is shown to the developer. For each finding, decide whether it is a real defect in this code.
+
+You have the same tools as the reviewer: read the file, read what it calls, read its callers. Use them. The reviewer worked partly from a diff; you have the whole repository.
+
+Drop a finding when:
+- The thing it says is missing is already provided somewhere it did not look — a serde default, a Default impl, an earlier guard, a check in the only caller, the match arm above the cited line.
+- It describes the deliberate, documented design of the code, rather than a mistake. Read the doc comment before deciding.
+- Its failing case cannot actually happen: the input it needs is rejected earlier, the state it needs is unreachable.
+- It is about code the diff did not change.
+- It restates what the code does without saying what goes wrong.
+
+Keep a finding when the defect is real, even if it is small, and even if fixing it is easy.
+
+Answer with JSON only:
+{"verdicts": [{"index": 0, "keep": true, "why": "confirmed: the caller does not check this"},
+              {"index": 1, "keep": false, "why": "repo_context has #[serde(default = "default_true")] on line 231"}]}
+
+"why" is one sentence, and for a dropped finding it must name the specific code that makes it wrong. Judge every finding you were given, by index."#;
+
+/// One finding as the verifier sees it.
+fn verify_prompt(findings: &[Finding]) -> String {
+    let mut prompt = String::from(
+        "Check these findings against the code. Read whatever you need.\n",
+    );
+    for (i, finding) in findings.iter().enumerate() {
+        prompt.push_str(&format!(
+            "\n[{i}] {} ({}){}\n{}\n",
+            finding.title,
+            finding.severity.label(),
+            match (finding.file.is_empty(), finding.line) {
+                (true, _) => String::new(),
+                (false, Some(line)) => format!(" — {}:{line}", finding.file),
+                (false, None) => format!(" — {}", finding.file),
+            },
+            finding.detail
+        ));
+        if !finding.evidence.trim().is_empty() {
+            prompt.push_str(&format!("quoted: {}\n", finding.evidence.trim()));
+        }
+    }
+    prompt
+}
+
+/// Parses the verifier's answer into `(index, keep, why)`.
+fn parse_verdicts(text: &str) -> Vec<(usize, bool, String)> {
+    let Some(start) = text.find('{') else { return Vec::new() };
+    let Some(end) = text.rfind('}') else { return Vec::new() };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text[start..=end]) else {
+        return Vec::new();
+    };
+    let Some(items) = value.get("verdicts").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            Some((
+                item.get("index")?.as_u64()? as usize,
+                item.get("keep").and_then(|k| k.as_bool()).unwrap_or(true),
+                item.get("why").and_then(|w| w.as_str()).unwrap_or("").to_string(),
+            ))
+        })
+        .collect()
+}
+
 /// Runs a review whose model can read the repository, and returns the
 /// parsed outcome with the reviewer's reading list attached.
 ///
@@ -586,6 +829,12 @@ pub fn run_with_context(
         }
     };
     outcome.context_log = run.log;
+
+    // Findings are checked against the code before anyone is asked to act
+    // on them. Markdown mode has no findings to check.
+    if config.output == OutputStyle::Findings && config.verify_findings {
+        verify(provider, workspace, &mut outcome, config, on_event);
+    }
     if run.truncated {
         outcome
             .context_log
@@ -669,6 +918,24 @@ pub fn user_prompt(diff: &str, instructions: Option<&str>, max_diff_bytes: usize
     }
 }
 
+/// How much of the diff the reviewer was actually shown, when it was not
+/// all of it.
+///
+/// A review of 8% of a change reads exactly like a review of all of it —
+/// same confident tone, same clean bill of health for everything it never
+/// saw. The only defence is to say so, next to the findings.
+pub fn coverage_note(diff: &str, max_diff_bytes: usize) -> Option<String> {
+    if diff.len() <= max_diff_bytes {
+        return None;
+    }
+    let percent = (max_diff_bytes as f64 / diff.len() as f64 * 100.0).round() as u32;
+    Some(format!(
+        "! the diff is {} bytes and only the first {max_diff_bytes} were reviewed \
+         ({percent}%) — raise max_diff_bytes under [review], or review a smaller change",
+        diff.len()
+    ))
+}
+
 /// Truncates to at most `max` bytes on a char boundary, marking the cut so
 /// the model knows it is seeing part of a change.
 fn truncate_utf8(s: &str, max: usize) -> String {
@@ -706,6 +973,8 @@ struct RawFinding {
     title: String,
     #[serde(default)]
     detail: String,
+    #[serde(default)]
+    evidence: String,
 }
 
 /// Extracts a [`ReviewOutcome`] from model output, tolerating markdown fences
@@ -737,6 +1006,7 @@ pub fn parse(text: &str) -> ReviewOutcome {
                 f.title.trim().to_string()
             },
             detail: f.detail.trim().to_string(),
+            evidence: f.evidence.trim().to_string(),
         })
         .collect();
 
@@ -1058,5 +1328,19 @@ mod tests {
         assert!(!c.run, "review must be opt-in");
         assert!(c.block_on_failure);
         assert_eq!(c.fail_on, Severity::High);
+    }
+
+    #[test]
+    fn coverage_is_reported_only_when_the_diff_was_cut() {
+        assert!(coverage_note("small diff", 24_000).is_none());
+
+        let big = "x".repeat(300_000);
+        let note = coverage_note(&big, 24_000).expect("a cut diff must be reported");
+        assert!(note.contains("300000"), "{note}");
+        assert!(note.contains("24000"), "{note}");
+        // The percentage is what makes it land: "8%" is a different claim
+        // from "the diff was truncated".
+        assert!(note.contains("8%"), "{note}");
+        assert!(note.contains("max_diff_bytes"), "{note}");
     }
 }

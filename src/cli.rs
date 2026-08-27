@@ -670,7 +670,7 @@ fn cmd_commit(rest: &[String]) -> ExitCode {
     }
 
     let message = if rest.first().map(String::as_str) == Some("--ai") {
-        match review_ai_text(&repo, "commit message") {
+        match review_ai_text(&repo, &AiText::Commit) {
             Some(msg) => msg,
             None => {
                 println!("devdock: commit aborted");
@@ -704,13 +704,35 @@ fn cmd_commit(rest: &[String]) -> ExitCode {
 /// manually, or abort. Returns None when the user aborts.
 ///
 /// `label` names what is being generated ("commit message" / "PR").
-fn review_ai_text(
-    repo: &Repo,
-    label: &str,
-) -> Option<(String, String)> {
+/// Which text the AI is being asked for, and the context it needs.
+enum AiText {
+    /// A commit message, from what is staged.
+    Commit,
+    /// A pull request title and body, from every commit on the branch.
+    PullRequest { base: String },
+}
+
+impl AiText {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Commit => "commit message",
+            Self::PullRequest { .. } => "PR title and description",
+        }
+    }
+
+    fn generate(&self, repo: &Repo) -> Result<crate::ollama::CommitSuggestion, String> {
+        match self {
+            Self::Commit => ai_message(repo),
+            Self::PullRequest { base } => ai_pr_text(repo, base),
+        }
+    }
+}
+
+fn review_ai_text(repo: &Repo, kind: &AiText) -> Option<(String, String)> {
     use std::io::{BufRead, Write};
+    let label = kind.label();
     let stdin = std::io::stdin();
-    let mut suggestion = match ai_message(repo) {
+    let mut suggestion = match kind.generate(repo) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("devdock: {e}");
@@ -773,6 +795,110 @@ fn review_ai_text(
     }
 }
 
+/// The branch a pull request from here would target.
+fn default_base(repo: &Repo) -> String {
+    repo.branches()
+        .ok()
+        .and_then(|b| {
+            b.local
+                .iter()
+                .find(|br| br.name == "main" || br.name == "master")
+                .map(|br| br.name.clone())
+        })
+        .unwrap_or_else(|| "main".into())
+}
+
+/// The provider/model for one AI task, honouring the per-task selections the
+/// GUI writes and falling back to the legacy global settings.
+fn ai_selection(
+    config: &crate::app::Config,
+    explicit: Option<&crate::app::AiSelection>,
+) -> (String, String) {
+    if let Some(sel) = explicit {
+        return (sel.provider.clone(), sel.model.clone());
+    }
+    let provider = config.ai_provider.clone().unwrap_or_else(|| "ollama".into());
+    let model = if provider == "claude" {
+        config.claude_model.clone().unwrap_or_default()
+    } else {
+        config.ollama_model.clone().unwrap_or_default()
+    };
+    (provider, model)
+}
+
+/// Generates pull request text from every commit on the branch.
+///
+/// Deliberately not the staged diff: a pull request describes work that was
+/// committed, often over days, and the working tree usually has nothing to
+/// do with it.
+fn ai_pr_text(repo: &Repo, base: &str) -> Result<crate::ollama::CommitSuggestion, String> {
+    let summary = repo.branch_summary(Some(base)).map_err(|e| e.to_string())?;
+    if summary.is_empty() {
+        return Err(format!("nothing to describe: no commits that {base} does not have"));
+    }
+    println!(
+        "{}",
+        style::dim(&format!(
+            "reading {} commit(s) against {base}…",
+            summary.commits.len()
+        ))
+    );
+
+    let config = crate::app::Config::load();
+    let (provider, model) = ai_selection(&config, config.pr_ai.as_ref());
+    let url = config
+        .ollama_url
+        .clone()
+        .unwrap_or_else(|| crate::ollama::DEFAULT_URL.into());
+    let sel = crate::app::AiSelection { provider: provider.clone(), model: model.clone() };
+
+    // Let it read the repository first, so the description comes from an
+    // understanding of the change rather than from the diff's surface.
+    match pr_text_with_context(repo, &sel, &url, &summary) {
+        Err(e) if e.to_lowercase().contains("tools") => {
+            println!("{}", style::dim("model cannot read files; using the diff alone"));
+        }
+        other => return other,
+    }
+
+    if provider == "claude" {
+        let client = crate::claude::Client::from_store(model)
+            .ok_or("Claude is not signed in (sign in from the GUI settings)")?;
+        return client.pull_request_text(&summary, None).map_err(|e| e.to_string());
+    }
+    if model.is_empty() {
+        return Err("no Ollama model configured (pick one in the GUI)".into());
+    }
+    crate::ollama::Client::new(url)
+        .pull_request_text(&model, &summary, None)
+        .map_err(|e| e.to_string())
+}
+
+/// Writes pull request text with the repository open to the model, printing
+/// what it reads as it goes.
+fn pr_text_with_context(
+    repo: &Repo,
+    sel: &crate::app::AiSelection,
+    url: &str,
+    summary: &crate::git::BranchSummary,
+) -> Result<crate::ollama::CommitSuggestion, String> {
+    let provider = crate::app::agent_provider(sel, url)?;
+    let tracked = repo.tracked_files().map_err(|e| e.to_string())?;
+    let mut workspace = crate::agent::Workspace::new(
+        repo.path(),
+        tracked,
+        crate::agent::pr::access(),
+    )?;
+    crate::agent::pr::run(
+        provider.as_ref(),
+        &mut workspace,
+        summary,
+        None,
+        crate::review::MAX_PR_DIFF_BYTES,
+        &mut |event| println!("  {}", style::dim(&event.line())),
+    )
+}
+
 /// Generates a commit message with the app's configured provider/model.
 fn ai_message(repo: &Repo) -> Result<crate::ollama::CommitSuggestion, String> {
     let diff = repo.diff_for_ai().map_err(|e| e.to_string())?;
@@ -782,18 +908,7 @@ fn ai_message(repo: &Repo) -> Result<crate::ollama::CommitSuggestion, String> {
     let config = crate::app::Config::load();
 
     // Prefer the commit-task selection, then legacy fields, then defaults.
-    let (provider, model) = match &config.commit_ai {
-        Some(sel) => (sel.provider.clone(), sel.model.clone()),
-        None => {
-            let provider = config.ai_provider.clone().unwrap_or_else(|| "ollama".into());
-            let model = if provider == "claude" {
-                config.claude_model.clone().unwrap_or_default()
-            } else {
-                config.ollama_model.clone().unwrap_or_default()
-            };
-            (provider, model)
-        }
-    };
+    let (provider, model) = ai_selection(&config, config.commit_ai.as_ref());
 
     if provider == "claude" {
         let client = crate::claude::Client::from_store(model)
@@ -1345,7 +1460,7 @@ fn cmd_pr(rest: &[String]) -> ExitCode {
 
     // 2. Resolve title/body.
     let (title, body) = if rest.iter().any(|a| a == "--ai") {
-        match review_ai_text(&repo, "PR title and description") {
+        match review_ai_text(&repo, &AiText::PullRequest { base: default_base(&repo) }) {
             Some(text) => text,
             None => {
                 println!("devdock: PR aborted");
@@ -1399,16 +1514,7 @@ fn cmd_pr(rest: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
     let head = repo.current_branch();
-    let base = repo
-        .branches()
-        .ok()
-        .and_then(|b| {
-            b.local
-                .iter()
-                .find(|br| br.name == "main" || br.name == "master")
-                .map(|br| br.name.clone())
-        })
-        .unwrap_or_else(|| "main".into());
+    let base = default_base(&repo);
     if head == base {
         eprintln!("devdock pr: already on {base}; switch to a feature branch first");
         return ExitCode::from(2);

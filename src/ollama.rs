@@ -213,6 +213,48 @@ impl Client {
         Ok(review::parse(text))
     }
 
+    /// Writes a pull request title and body from a branch summary.
+    pub fn pull_request_text(
+        &self,
+        model: &str,
+        summary: &crate::git::BranchSummary,
+        extra_instructions: Option<&str>,
+    ) -> Result<CommitSuggestion> {
+        if summary.is_empty() {
+            return Err(OllamaError(
+                "Nothing to describe: this branch has no commits the base does not.".into(),
+            ));
+        }
+        let payload = serde_json::json!({
+            "model": model,
+            "prompt": pr_prompt(summary, MAX_DIFF_CHARS),
+            "system": pr_system_prompt(extra_instructions),
+            "stream": false,
+            "format": {
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string"},
+                    "description": {"type": "string"}
+                },
+                "required": ["summary", "description"]
+            },
+            "options": {"temperature": 0.2}
+        });
+        let resp = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(300))
+            .build()
+            .post(&format!("{}/api/generate", self.base_url))
+            .send_json(payload)
+            .map_err(|e| OllamaError(format!("Ollama request failed: {e}")))?;
+        let value: serde_json::Value =
+            resp.into_json().map_err(|e| OllamaError(format!("Bad response from Ollama: {e}")))?;
+        let text = value
+            .get("response")
+            .and_then(|r| r.as_str())
+            .ok_or_else(|| OllamaError("Ollama returned no response text".into()))?;
+        Ok(parse_suggestion(text))
+    }
+
     /// Asks the model to merge a conflicted file from its three stages.
     /// Returns the full merged file content.
     pub fn resolve_conflict(
@@ -426,6 +468,92 @@ fn parse_agent_reply(value: &serde_json::Value) -> crate::agent::Reply {
     reply
 }
 
+// ---------------------------------------------------------------------------
+// Pull request text
+// ---------------------------------------------------------------------------
+
+const PR_SYSTEM_PROMPT: &str = "You are writing the title and description of a pull request, \
+from the commits on a branch and the diff they add up to.\n\n\
+Title: one line, under 72 characters, imperative mood, describing the branch as a whole. If the \
+branch does one thing, name that thing rather than listing every commit.\n\n\
+Description: GitHub-flavoured Markdown, written for the person who has to review it. Say what \
+changed and why, grouping related commits into themes instead of transcribing the log — the \
+reviewer can read the log. Lead with the part that matters. Call out anything that needs \
+attention: a behaviour change, a migration, a deliberate omission, something you cannot tell \
+from the diff alone.\n\n\
+Do not invent issue numbers, ticket links, reviewers, or test results. Do not add empty \
+headings for sections you have nothing to say for. Do not describe the change as \
+\"comprehensive\" or \"robust\"; describe what it does.\n\n\
+Respond only with JSON: {\"summary\": \"the title\", \"description\": \"the body\"}";
+
+/// The pull request system prompt, with the repository's own instructions
+/// appended. Custom text extends the built-in rules rather than replacing
+/// them, so the JSON contract stays intact.
+pub fn pr_system_prompt(extra_instructions: Option<&str>) -> String {
+    match extra_instructions.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(extra) => format!("{PR_SYSTEM_PROMPT}\n\nAdditional instructions:\n{extra}"),
+        None => PR_SYSTEM_PROMPT.to_string(),
+    }
+}
+
+/// How much of a commit body to carry into the prompt. The "why" is usually
+/// in the first paragraph; a long body is a document of its own.
+const MAX_BODY_CHARS: usize = 400;
+
+/// Builds the user turn for pull request text: the branch, its commits, the
+/// diffstat, and as much of the diff as the budget allows.
+///
+/// The commits come first and are never truncated. A branch's log is the
+/// cheapest, densest description of its intent that exists — losing it to
+/// make room for more diff would be exactly the wrong trade.
+pub fn pr_prompt(summary: &crate::git::BranchSummary, max_diff_chars: usize) -> String {
+    let mut prompt = String::new();
+
+    let target = if summary.base.trim().is_empty() {
+        "its upstream".to_string()
+    } else {
+        format!("`{}`", summary.base.trim())
+    };
+    prompt.push_str(&format!(
+        "Pull request from `{}` into {target}.\n\n",
+        if summary.branch.is_empty() { "this branch" } else { &summary.branch }
+    ));
+
+    match summary.commits.len() {
+        0 => prompt.push_str("No commits were found on this branch.\n\n"),
+        // Oldest first: that is the order the work happened in, and the
+        // order the description should follow.
+        n => {
+            prompt.push_str(&format!("{n} commit(s), oldest first:\n"));
+            for commit in summary.commits.iter().rev() {
+                prompt.push_str(&format!("\n- {}", commit.subject));
+                let body = commit.body.trim();
+                if !body.is_empty() {
+                    let body = truncate_utf8(body, MAX_BODY_CHARS);
+                    for line in body.lines() {
+                        prompt.push_str(&format!("\n  {line}"));
+                    }
+                }
+            }
+            prompt.push_str("\n\n");
+        }
+    }
+
+    if !summary.stat.trim().is_empty() {
+        prompt.push_str(&format!("Files changed:\n{}\n\n", summary.stat.trim()));
+    }
+
+    if summary.diff.trim().is_empty() {
+        prompt.push_str("The diff is empty.");
+    } else {
+        prompt.push_str(&format!(
+            "The branch's full diff:\n\n```diff\n{}\n```",
+            truncate_utf8(&summary.diff, max_diff_chars)
+        ));
+    }
+    prompt
+}
+
 /// The merge system prompt, with the user's custom instructions appended
 /// when configured. The built-in prompt always applies; custom text extends
 /// it rather than replacing it, so output-format rules stay intact.
@@ -616,5 +744,86 @@ mod merge_tests {
         assert_eq!(extract_merged_content("plain text"), "plain text\n");
         // Inner fences survive when there is no wrapping fence pair.
         assert_eq!(extract_merged_content("a\nb\n"), "a\nb\n");
+    }
+}
+
+#[cfg(test)]
+mod pr_tests {
+    use super::*;
+
+    fn summary_fixture() -> crate::git::BranchSummary {
+        let commit = |subject: &str, body: &str| crate::git::Commit {
+            sha: "0".repeat(40),
+            short_sha: "0000000".into(),
+            author: "Tester".into(),
+            email: "t@t.io".into(),
+            date: "2026-01-01T00:00:00Z".into(),
+            subject: subject.into(),
+            body: body.into(),
+            parents: Vec::new(),
+            refs: Vec::new(),
+        };
+        crate::git::BranchSummary {
+            branch: "feat/flags".into(),
+            base: "main".into(),
+            // Newest first, the way git log reports it.
+            commits: vec![
+                commit("feat: document the flag", ""),
+                commit("feat: add --json", "Scripts had to parse the human output."),
+            ],
+            stat: " src/cli.rs | 20 ++++++++\n 1 file changed".into(),
+            diff: "diff --git a/src/cli.rs b/src/cli.rs\n+let json = true;\n".into(),
+        }
+    }
+
+    #[test]
+    fn the_pr_prompt_leads_with_the_commits_oldest_first() {
+        let prompt = pr_prompt(&summary_fixture(), 10_000);
+        let older = prompt.find("feat: add --json").unwrap();
+        let newer = prompt.find("feat: document the flag").unwrap();
+        assert!(older < newer, "commits should read in the order the work happened");
+
+        // The branch, the base, the reasoning from a commit body, the stat,
+        // and the diff all have to reach the model.
+        assert!(prompt.contains("`feat/flags`") && prompt.contains("`main`"));
+        assert!(prompt.contains("Scripts had to parse the human output."));
+        assert!(prompt.contains("src/cli.rs | 20"));
+        assert!(prompt.contains("+let json = true;"));
+    }
+
+    #[test]
+    fn the_pr_prompt_keeps_every_commit_when_the_diff_is_truncated() {
+        let mut summary = summary_fixture();
+        summary.diff = "x".repeat(50_000);
+        let prompt = pr_prompt(&summary, 1_000);
+        assert!(prompt.contains("feat: add --json"), "commits must survive truncation");
+        assert!(prompt.contains("feat: document the flag"));
+        assert!(prompt.contains("[diff truncated]"));
+        assert!(prompt.len() < 5_000, "the diff should have been cut: {} chars", prompt.len());
+    }
+
+    #[test]
+    fn the_pr_prompt_says_so_when_there_is_nothing_to_go_on() {
+        let empty = crate::git::BranchSummary {
+            branch: "feat/x".into(),
+            base: String::new(),
+            ..Default::default()
+        };
+        let prompt = pr_prompt(&empty, 1_000);
+        assert!(prompt.contains("No commits"));
+        assert!(prompt.contains("The diff is empty."));
+        // With no base named, it says what it actually compared against.
+        assert!(prompt.contains("its upstream"));
+    }
+
+    #[test]
+    fn the_pr_system_prompt_extends_rather_than_replaces() {
+        let base = pr_system_prompt(None);
+        assert!(base.contains("pull request"));
+        assert!(base.contains("summary"));
+        let extended = pr_system_prompt(Some("Always link the Jira ticket."));
+        assert!(extended.starts_with(&base));
+        assert!(extended.contains("Always link the Jira ticket."));
+        assert_eq!(pr_system_prompt(Some("   ")), base);
     }
 }

@@ -1290,3 +1290,158 @@ fn no_instructions_configured_resolves_to_none() {
     assert!(resolved.instructions.is_none());
     assert!(resolved.output_instructions.is_none());
 }
+
+/// A pull request describes the branch, not the working tree.
+///
+/// The bug this pins down: PR text was generated from the staged diff, so a
+/// branch with ten commits and a stray staged edit was described entirely by
+/// the stray edit.
+#[test]
+fn branch_summary_covers_committed_work_not_the_index() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "base.txt", "base\n", "chore: initial commit");
+
+    repo.create_branch("feature", true).unwrap();
+    commit_file(&repo, "feature.rs", "pub fn one() {}\n", "feat: add one()");
+    commit_file(&repo, "feature.rs", "pub fn one() {}\npub fn two() {}\n", "feat: add two()");
+
+    // Something staged that has nothing to do with the branch's story.
+    write(&repo, "scratch.txt", "an unrelated staged edit\n");
+    repo.stage(&["scratch.txt".into()]).unwrap();
+
+    let summary = repo.branch_summary(Some("main")).unwrap();
+
+    assert_eq!(summary.branch, "feature");
+    assert_eq!(summary.base, "main");
+    let subjects: Vec<&str> = summary.commits.iter().map(|c| c.subject.as_str()).collect();
+    assert_eq!(subjects, vec!["feat: add two()", "feat: add one()"], "newest first");
+    assert!(!subjects.contains(&"chore: initial commit"), "the base's own commits are not ours");
+
+    // The diff is the branch's, so it has the committed work and not the
+    // staged scratch file.
+    assert!(summary.diff.contains("pub fn two()"), "{}", summary.diff);
+    assert!(!summary.diff.contains("unrelated staged edit"), "{}", summary.diff);
+    assert!(summary.stat.contains("feature.rs"), "{}", summary.stat);
+    assert!(!summary.is_empty());
+}
+
+#[test]
+fn branch_summary_falls_back_to_the_upstream_and_reports_an_empty_branch() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "one\n", "feat: a");
+    repo.push(true, None).unwrap();
+
+    // Everything is pushed, so there is nothing outgoing to describe.
+    let summary = repo.branch_summary(None).unwrap();
+    assert!(summary.is_empty(), "{:?}", summary.commits);
+
+    // One new commit, and it alone is the outgoing work.
+    commit_file(&repo, "b.txt", "two\n", "feat: b");
+    let summary = repo.branch_summary(None).unwrap();
+    assert_eq!(summary.commits.len(), 1);
+    assert_eq!(summary.commits[0].subject, "feat: b");
+    assert!(summary.diff.contains("two"));
+}
+
+/// A cloned repository often has no local `main`, only `origin/main`.
+/// Naming the base the pull request targets must still work.
+#[test]
+fn branch_summary_resolves_a_base_that_only_exists_as_a_remote_branch() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "base.txt", "base\n", "chore: init");
+    repo.push(true, None).unwrap();
+
+    repo.create_branch("feature", true).unwrap();
+    commit_file(&repo, "f.txt", "work\n", "feat: the work");
+
+    // Delete the local main; only origin/main remains, as after a clone.
+    sh(repo.path(), "git", &["branch", "-D", "main"]);
+    assert!(repo.git(&["rev-parse", "--verify", "--quiet", "main"]).is_err());
+
+    let summary = repo.branch_summary(Some("main")).unwrap();
+    assert_eq!(summary.commits.len(), 1, "{:?}", summary.commits);
+    assert_eq!(summary.commits[0].subject, "feat: the work");
+    assert!(summary.diff.contains("work"));
+}
+
+#[test]
+fn branch_summary_handles_a_branch_with_no_parent_commit() {
+    // A repository whose first commit has no parent still has to produce a
+    // usable summary: `X^` does not exist to diff against.
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("solo");
+    fs::create_dir_all(&work).unwrap();
+    sh(&work, "git", &["init", "-b", "main"]);
+    sh(&work, "git", &["config", "user.email", "test@test.io"]);
+    sh(&work, "git", &["config", "user.name", "Tester"]);
+    let repo = Repo::open(&work).unwrap();
+    commit_file(&repo, "first.txt", "hello\n", "feat: the very first commit");
+
+    let summary = repo.branch_summary(None).unwrap();
+    assert_eq!(summary.commits.len(), 1);
+    assert!(summary.diff.contains("hello"), "{}", summary.diff);
+}
+
+/// Generates real pull request text for a branch, to prove what reaches the
+/// model is the branch and not the index.
+///
+/// Ignored: needs Claude credentials and costs tokens.
+/// `cargo test --test workflow -- --ignored --nocapture live_pr_text`
+#[test]
+#[ignore]
+fn live_pr_text() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "README.md", "# Tool\n", "docs: initial README");
+    repo.create_branch("feat/json-output", true).unwrap();
+
+    commit_file(
+        &repo,
+        "cli.rs",
+        "pub fn print_status(json: bool) {\n    if json { println!(\"{{}}\"); }\n}\n",
+        "feat: add a --json flag to status\n\nScripts had to parse the human-readable output, which changes between releases.",
+    );
+    commit_file(
+        &repo,
+        "cli.rs",
+        "pub fn print_status(json: bool) {\n    if json { println!(\"{{\\\"branch\\\": \\\"main\\\"}}\"); }\n}\n",
+        "feat: include the branch name in the JSON payload",
+    );
+    commit_file(&repo, "cli-guide.md", "## status --json\n", "docs: document --json");
+
+    // A staged edit that has nothing to do with the branch's story. Under
+    // the old behaviour this was the *only* thing the model saw.
+    write(&repo, "scratch.txt", "TODO: delete me before pushing\n");
+    repo.stage(&["scratch.txt".into()]).unwrap();
+
+    let summary = repo.branch_summary(Some("main")).unwrap();
+    println!("--- CONTEXT: {} commits, {} bytes of diff ---", summary.commits.len(), summary.diff.len());
+
+    let Some(client) = git_manage::claude::Client::from_store("claude-opus-5") else {
+        eprintln!("Claude is not signed in; skipping");
+        return;
+    };
+    // The harness path: the model can open the files the diff touches.
+    let mut workspace = git_manage::agent::Workspace::new(
+        repo.path(),
+        repo.tracked_files().unwrap(),
+        git_manage::agent::pr::access(),
+    )
+    .unwrap();
+    let text = git_manage::agent::pr::run(
+        &client,
+        &mut workspace,
+        &summary,
+        None,
+        60_000,
+        &mut |e| println!("  {}", e.line()),
+    )
+    .expect("PR text");
+    println!("\nTITLE: {}\n\n{}\n", text.summary, text.description);
+
+    let whole = format!("{} {}", text.summary, text.description).to_lowercase();
+    assert!(whole.contains("json"), "the branch's actual subject is missing");
+    assert!(
+        !whole.contains("scratch") && !whole.contains("todo: delete"),
+        "the staged scratch file leaked into the description"
+    );
+}

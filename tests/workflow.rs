@@ -1445,3 +1445,265 @@ fn live_pr_text() {
         "the staged scratch file leaked into the description"
     );
 }
+
+// ---------------------------------------------------------------------------
+// History, search, and the reflog
+// ---------------------------------------------------------------------------
+
+#[test]
+fn file_history_follows_a_file_through_a_rename() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "old.rs", "fn one() {}\n", "feat: add one()");
+    commit_file(&repo, "old.rs", "fn one() {}\nfn two() {}\n", "feat: add two()");
+    commit_file(&repo, "other.rs", "// unrelated\n", "chore: something else");
+
+    sh(repo.path(), "git", &["mv", "old.rs", "new.rs"]);
+    sh(repo.path(), "git", &["commit", "-m", "refactor: rename to new.rs"]);
+
+    let history = repo.file_history("new.rs", 20).unwrap();
+    let subjects: Vec<&str> = history.iter().map(|c| c.subject.as_str()).collect();
+
+    // The rename, and everything before it under the old name.
+    assert_eq!(
+        subjects,
+        vec!["refactor: rename to new.rs", "feat: add two()", "feat: add one()"]
+    );
+    assert!(!subjects.contains(&"chore: something else"), "other files are not this history");
+}
+
+#[test]
+fn line_history_shows_how_a_line_got_that_way() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.rs", "let x = 1;\nlet y = 2;\n", "feat: two values");
+    commit_file(&repo, "a.rs", "let x = 99;\nlet y = 2;\n", "fix: correct x");
+
+    let patch = repo.line_history("a.rs", 1, 1, 10).unwrap();
+    assert!(patch.contains("fix: correct x"), "{patch}");
+    assert!(patch.contains("let x = 99;"), "{patch}");
+    // Line 2 never changed, so its history is only the commit that made it.
+    let other = repo.line_history("a.rs", 2, 2, 10).unwrap();
+    assert!(other.contains("feat: two values"));
+    assert!(!other.contains("fix: correct x"), "{other}");
+}
+
+#[test]
+fn commit_search_covers_message_author_content_and_path() {
+    use git_manage::git::SearchMode;
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "auth.rs", "let token = \"placeholder\";\n", "feat: add auth");
+    commit_file(&repo, "ui.rs", "// widgets\n", "feat: add the widget panel");
+    // The line is removed again, which is what the pickaxe finds.
+    commit_file(&repo, "auth.rs", "// token removed\n", "chore: drop the placeholder");
+
+    let by_message = repo.search_commits("widget", SearchMode::Message, 20).unwrap();
+    assert_eq!(by_message.len(), 1);
+    assert_eq!(by_message[0].subject, "feat: add the widget panel");
+
+    // Case-insensitive, because nobody remembers the capitalisation.
+    assert_eq!(repo.search_commits("WIDGET", SearchMode::Message, 20).unwrap().len(), 1);
+
+    // The pickaxe: both the commit that introduced the string and the one
+    // that removed it.
+    let by_content = repo.search_commits("placeholder", SearchMode::Content, 20).unwrap();
+    let subjects: Vec<&str> = by_content.iter().map(|c| c.subject.as_str()).collect();
+    assert!(subjects.contains(&"feat: add auth"), "{subjects:?}");
+    assert!(subjects.contains(&"chore: drop the placeholder"), "{subjects:?}");
+
+    let by_author = repo.search_commits("Tester", SearchMode::Author, 20).unwrap();
+    assert_eq!(by_author.len(), 3);
+
+    let by_path = repo.search_commits("ui.rs", SearchMode::Path, 20).unwrap();
+    assert_eq!(by_path.len(), 1);
+
+    // An empty query searches for nothing rather than everything.
+    assert!(repo.search_commits("   ", SearchMode::Message, 20).unwrap().is_empty());
+}
+
+#[test]
+fn the_reflog_records_what_moved_head_and_undo_goes_back_to_it() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "one\n", "feat: first");
+    commit_file(&repo, "a.txt", "two\n", "feat: second");
+
+    repo.create_branch("side", true).unwrap();
+    commit_file(&repo, "b.txt", "side work\n", "feat: on the side");
+    repo.checkout("main").unwrap();
+    let before_merge = repo.log(1, None).unwrap()[0].sha.clone();
+    assert!(repo.merge("side").ok);
+    assert_eq!(repo.log(1, None).unwrap()[0].subject, "feat: on the side");
+
+    let reflog = repo.reflog(20).unwrap();
+    assert!(reflog.len() >= 4, "{reflog:?}");
+    assert!(
+        reflog.iter().any(|e| e.action.contains("merge")),
+        "the merge is not in the reflog: {:?}",
+        reflog.iter().map(|e| &e.action).collect::<Vec<_>>()
+    );
+    assert!(reflog[0].selector.starts_with("HEAD@{"), "{}", reflog[0].selector);
+    // Checkouts are noise in an undo list.
+    assert!(reflog.iter().any(|e| !e.is_interesting()));
+
+    // Undo the merge. The work it brought in stays, staged, rather than
+    // being destroyed.
+    let message = repo.undo_to(&before_merge).unwrap();
+    assert!(message.contains(&before_merge[..7]));
+    assert_eq!(repo.log(1, None).unwrap()[0].sha, before_merge);
+    assert_eq!(read(&repo, "b.txt"), "side work\n", "the merged file is still there");
+    let status = repo.status().unwrap();
+    assert!(status.files.iter().any(|f| f.path == "b.txt" && f.staged));
+}
+
+#[test]
+fn undo_refuses_while_a_merge_is_in_progress() {
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "c.txt", "base\n", "init");
+    repo.create_branch("clash", true).unwrap();
+    commit_file(&repo, "c.txt", "theirs\n", "theirs");
+    repo.checkout("main").unwrap();
+    commit_file(&repo, "c.txt", "ours\n", "ours");
+    assert!(repo.merge("clash").conflict);
+
+    let head = repo.log(1, None).unwrap()[0].sha.clone();
+    let err = repo.undo_to(&head).unwrap_err().to_string();
+    assert!(err.contains("abort the merge"), "{err}");
+}
+
+// ---------------------------------------------------------------------------
+// Rewriting history
+// ---------------------------------------------------------------------------
+
+/// Three WIP commits become two clean ones, and the files end up identical.
+#[test]
+fn rewrite_history_squashes_commits_and_keeps_the_tree() {
+    use git_manage::git::{RebaseGroup, RebasePlan};
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "base.txt", "base\n", "chore: init");
+    let base = repo.log(1, None).unwrap()[0].sha.clone();
+
+    commit_file(&repo, "a.rs", "fn a() {}\n", "wip");
+    commit_file(&repo, "a.rs", "fn a() { work() }\n", "wip 2");
+    commit_file(&repo, "docs.md", "# Docs\n", "docs");
+
+    let before: Vec<String> =
+        repo.log(10, None).unwrap().iter().map(|c| c.sha.clone()).collect();
+    let (wip1, wip2, docs) = (before[2].clone(), before[1].clone(), before[0].clone());
+
+    let plan = RebasePlan {
+        base: base.clone(),
+        groups: vec![
+            RebaseGroup {
+                commits: vec![wip1, wip2],
+                summary: "feat: add a()".into(),
+                description: "Folded from two work-in-progress commits.".into(),
+            },
+            RebaseGroup {
+                commits: vec![docs],
+                summary: "docs: document a()".into(),
+                description: String::new(),
+            },
+        ],
+    };
+
+    let message = repo.rewrite_history(&plan).unwrap();
+    assert!(message.contains("3 commit(s) became 2"), "{message}");
+
+    let after = repo.log(10, None).unwrap();
+    assert_eq!(after.len(), 3, "two rewritten commits plus the base");
+    assert_eq!(after[0].subject, "docs: document a()");
+    assert_eq!(after[1].subject, "feat: add a()");
+    assert_eq!(after[1].body.trim(), "Folded from two work-in-progress commits.");
+
+    // The point of a rewrite: the history changed, the files did not.
+    assert_eq!(read(&repo, "a.rs"), "fn a() { work() }\n");
+    assert_eq!(read(&repo, "docs.md"), "# Docs\n");
+    assert!(repo.status().unwrap().files.is_empty(), "the tree is clean afterwards");
+
+    // And the old history is still reachable.
+    assert!(repo.reflog(20).unwrap().iter().any(|e| e.sha == before[0]));
+}
+
+#[test]
+fn a_plan_that_would_lose_a_commit_is_refused_before_anything_moves() {
+    use git_manage::git::{RebaseGroup, RebasePlan};
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "base.txt", "base\n", "chore: init");
+    let base = repo.log(1, None).unwrap()[0].sha.clone();
+    commit_file(&repo, "a.txt", "one\n", "feat: one");
+    commit_file(&repo, "b.txt", "two\n", "feat: two");
+
+    let head_before = repo.log(1, None).unwrap()[0].sha.clone();
+    let commits: Vec<String> =
+        repo.log(2, None).unwrap().iter().map(|c| c.sha.clone()).collect();
+
+    let expect_refusal = |plan: RebasePlan, because: &str| {
+        let err = repo.rewrite_history(&plan).unwrap_err().to_string();
+        assert!(err.contains(because), "expected {because:?}, got {err:?}");
+        // Nothing moved.
+        assert_eq!(repo.log(1, None).unwrap()[0].sha, head_before);
+        assert_eq!(repo.current_branch(), "main");
+    };
+
+    // Drops a commit.
+    expect_refusal(
+        RebasePlan {
+            base: base.clone(),
+            groups: vec![RebaseGroup {
+                commits: vec![commits[0].clone()],
+                summary: "only one".into(),
+                description: String::new(),
+            }],
+        },
+        "drops 1 commit",
+    );
+
+    // Uses one twice.
+    expect_refusal(
+        RebasePlan {
+            base: base.clone(),
+            groups: vec![RebaseGroup {
+                commits: vec![commits[0].clone(), commits[0].clone(), commits[1].clone()],
+                summary: "twice".into(),
+                description: String::new(),
+            }],
+        },
+        "twice",
+    );
+
+    // Names a commit that does not exist on the branch.
+    expect_refusal(
+        RebasePlan {
+            base,
+            groups: vec![RebaseGroup {
+                commits: vec![commits[0].clone(), commits[1].clone(), "f".repeat(40)],
+                summary: "invented".into(),
+                description: String::new(),
+            }],
+        },
+        "not a commit on this branch",
+    );
+}
+
+#[test]
+fn rewriting_refuses_to_run_with_uncommitted_work() {
+    use git_manage::git::{RebaseGroup, RebasePlan};
+    let (_tmp, repo) = setup();
+    commit_file(&repo, "base.txt", "base\n", "chore: init");
+    let base = repo.log(1, None).unwrap()[0].sha.clone();
+    commit_file(&repo, "a.txt", "one\n", "feat: one");
+    let sha = repo.log(1, None).unwrap()[0].sha.clone();
+
+    write(&repo, "scratch.txt", "uncommitted\n");
+    repo.stage(&["scratch.txt".into()]).unwrap();
+
+    let plan = RebasePlan {
+        base,
+        groups: vec![RebaseGroup {
+            commits: vec![sha],
+            summary: "feat: one".into(),
+            description: String::new(),
+        }],
+    };
+    let err = repo.rewrite_history(&plan).unwrap_err().to_string();
+    assert!(err.contains("commit or stash"), "{err}");
+    assert_eq!(read(&repo, "scratch.txt"), "uncommitted\n");
+}

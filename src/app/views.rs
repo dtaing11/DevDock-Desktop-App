@@ -1929,7 +1929,99 @@ fn format_age(elapsed: std::time::Duration) -> String {
     }
 }
 
+/// Search across history, and the banner for a file-history view.
+///
+/// The mode is what makes this worth having. "Code" is git's pickaxe: it
+/// finds the commits where a piece of text appeared or disappeared, which is
+/// the question you actually have when something is gone and you want to
+/// know who took it out.
+fn history_search_bar(app: &mut App, ui: &mut egui::Ui) {
+    use crate::git::SearchMode;
+
+    // A file-history view says so, and offers the way back.
+    if let Some(path) = app.history_file.clone() {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("History of").small().color(theme::FG_DIM));
+            ui.label(RichText::new(&path).small().monospace().color(theme::EMBER));
+            ui.label(
+                RichText::new(format!("· {} commit(s), renames followed", app.log.len()))
+                    .small()
+                    .color(theme::FG_DIM),
+            );
+            if ui.small_button("Show all history").clicked() {
+                app.clear_history_filter();
+            }
+        });
+        ui.separator();
+        return;
+    }
+
+    ui.horizontal(|ui| {
+        let mode = app.history_mode;
+        egui::ComboBox::from_id_salt("history-mode")
+            .selected_text(mode.label())
+            .width(90.0)
+            .show_ui(ui, |ui| {
+                for option in SearchMode::ALL {
+                    if ui
+                        .selectable_label(mode == *option, option.label())
+                        .on_hover_text(option.hint())
+                        .clicked()
+                        && mode != *option
+                    {
+                        app.history_mode = *option;
+                        if !app.history_query.trim().is_empty() {
+                            app.load_history();
+                        }
+                    }
+                }
+            });
+
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut app.history_query)
+                .hint_text(dim_hint(app.history_mode.hint()))
+                .desired_width(ui.available_width() - 90.0),
+        );
+        // Searching history is a git call per keystroke otherwise.
+        if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            app.load_history();
+        }
+        if ui.small_button("Search").clicked() {
+            app.load_history();
+        }
+        if !app.history_query.is_empty() && ui.small_button("×").on_hover_text("Clear").clicked()
+        {
+            app.clear_history_filter();
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .small_button("Undo…")
+                .on_hover_text(
+                    "Where this branch has been — go back to before a bad merge, \
+                     rebase, or reset",
+                )
+                .clicked()
+            {
+                app.open_reflog();
+            }
+        });
+    });
+
+    if !app.history_query.trim().is_empty() {
+        ui.label(
+            RichText::new(format!(
+                "{} commit(s) across all branches",
+                app.log.len()
+            ))
+            .small()
+            .color(theme::FG_DIM),
+        );
+    }
+    ui.separator();
+}
+
 fn history_tab(app: &mut App, ui: &mut egui::Ui) {
+    history_search_bar(app, ui);
     let commits = app.log.clone();
     ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         if commits.is_empty() {
@@ -2086,6 +2178,18 @@ pub fn diff_panel(app: &mut App, ctx: &egui::Context) {
                                     {
                                         ignore_selected(app);
                                     }
+                                    if ui
+                                        .button("History")
+                                        .on_hover_text(
+                                            "Every commit that touched this file, \
+                                             following it through renames",
+                                        )
+                                        .clicked()
+                                    {
+                                        if let Some(path) = app.selected_file.clone() {
+                                            app.show_file_history(&path);
+                                        }
+                                    }
                                 },
                             );
                         }
@@ -2133,6 +2237,11 @@ pub fn diff_panel(app: &mut App, ctx: &egui::Context) {
             let lines: Vec<&str> = app.diff_text.lines().collect();
             let line_langs = crate::app::syntax::langs_per_line(&lines, base_lang);
             let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+            // Which removed line each added line replaced, so the words that
+            // actually changed can be picked out of two near-identical lines.
+            let pairs = crate::app::textdiff::pair_changed_lines(&lines);
+            let partners: std::collections::HashMap<usize, usize> =
+                pairs.iter().map(|(removed, added)| (*added, *removed)).collect();
             ScrollArea::both().auto_shrink([false, false]).show_rows(
                 ui,
                 row_height,
@@ -2141,13 +2250,35 @@ pub fn diff_panel(app: &mut App, ctx: &egui::Context) {
                     for i in range {
                         let line = lines[i];
                         let (color, bg) = diff_line_style(line);
-                        let job = crate::app::syntax::diff_line_job(
-                            line_langs[i],
-                            line,
-                            color,
-                            font.clone(),
-                            true,
-                        );
+                        // A changed line is shown against the line it
+                        // replaced, with only the differing words tinted.
+                        let job = match paired_lines(&lines, &pairs, &partners, i) {
+                            Some((removed, added)) => {
+                                let (removed_spans, added_spans) =
+                                    crate::app::textdiff::changed_words(
+                                        &strip_marker(removed),
+                                        &strip_marker(added),
+                                    );
+                                let is_addition = line.starts_with('+');
+                                let spans =
+                                    if is_addition { added_spans } else { removed_spans };
+                                word_diff_job(
+                                    line_langs[i],
+                                    line,
+                                    color,
+                                    font.clone(),
+                                    &spans,
+                                    is_addition,
+                                )
+                            }
+                            None => crate::app::syntax::diff_line_job(
+                                line_langs[i],
+                                line,
+                                color,
+                                font.clone(),
+                                true,
+                            ),
+                        };
                         match bg {
                             Some(bg) => {
                                 egui::Frame::new().fill(bg).show(ui, |ui| {
@@ -2437,6 +2568,95 @@ fn ignore_selected(app: &mut App) {
         }
         Err(e) => app.toast(e.to_string(), true),
     }
+}
+
+/// The `(removed, added)` pair row `i` belongs to, if it is half of one.
+///
+/// `pairs` maps a removed line to the added line that replaced it;
+/// `partners` is the same relation the other way round, so a row can find
+/// its counterpart whichever side of the change it is on.
+fn paired_lines<'a>(
+    lines: &[&'a str],
+    pairs: &std::collections::HashMap<usize, usize>,
+    partners: &std::collections::HashMap<usize, usize>,
+    i: usize,
+) -> Option<(&'a str, &'a str)> {
+    if let Some(&added) = pairs.get(&i) {
+        return lines.get(added).map(|added| (lines[i], *added));
+    }
+    let &removed = partners.get(&i)?;
+    lines.get(removed).map(|removed| (*removed, lines[i]))
+}
+
+/// A diff line without its leading `+`/`-`/` ` marker.
+fn strip_marker(line: &str) -> String {
+    match line.chars().next() {
+        Some('+') | Some('-') | Some(' ') => line[1..].to_string(),
+        _ => line.to_string(),
+    }
+}
+
+/// A diff line with the words that actually changed tinted.
+///
+/// Syntax colours still apply; the word highlight is a background, so the
+/// two carry different information instead of competing for the same one.
+fn word_diff_job(
+    lang: crate::app::syntax::Lang,
+    line: &str,
+    color: Color32,
+    font: egui::FontId,
+    changed: &[(usize, usize)],
+    added: bool,
+) -> egui::text::LayoutJob {
+    use egui::text::LayoutJob;
+    use egui::TextFormat;
+
+    if changed.is_empty() {
+        return crate::app::syntax::diff_line_job(lang, line, color, font, true);
+    }
+    // The spans are offsets into the content; the rendered line still has
+    // its marker in front.
+    let shift = usize::from(matches!(line.chars().next(), Some('+') | Some('-') | Some(' ')));
+    let highlight = if added {
+        theme::ADD.linear_multiply(0.35)
+    } else {
+        theme::DEL.linear_multiply(0.35)
+    };
+
+    let mut job = LayoutJob::default();
+    let mut at = 0usize;
+    for span in crate::app::syntax::highlight_line(lang, line, color) {
+        let (start, end) = (at, at + span.text.len());
+        at = end;
+        // Split each syntax span at the boundaries of the changed words.
+        let mut cuts: Vec<usize> = vec![start, end];
+        for (a, b) in changed {
+            for edge in [a + shift, b + shift] {
+                if edge > start && edge < end {
+                    cuts.push(edge);
+                }
+            }
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+        for pair in cuts.windows(2) {
+            let (piece_start, piece_end) = (pair[0], pair[1]);
+            let inside = changed
+                .iter()
+                .any(|(a, b)| a + shift <= piece_start && b + shift >= piece_end);
+            job.append(
+                &span.text[piece_start - start..piece_end - start],
+                0.0,
+                TextFormat {
+                    font_id: font.clone(),
+                    color: span.color,
+                    background: if inside { highlight } else { Color32::TRANSPARENT },
+                    ..Default::default()
+                },
+            );
+        }
+    }
+    job
 }
 
 pub fn diff_line_style(line: &str) -> (Color32, Option<Color32>) {

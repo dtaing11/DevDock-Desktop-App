@@ -127,6 +127,136 @@ pub fn tally(lines: &[Line]) -> (usize, usize) {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Word-level diff
+// ---------------------------------------------------------------------------
+
+/// Byte ranges within one line, each covering text that changed.
+pub type Spans = Vec<(usize, usize)>;
+
+/// Byte ranges within a changed line that actually differ from its partner.
+///
+/// A unified diff marks a whole line as removed and another as added, even
+/// when one identifier changed. Reading it means scanning two nearly
+/// identical lines for the difference — which is work a machine should do.
+///
+/// Both arguments are line *content*: the caller strips the diff's own `+`
+/// or `-` marker first, or every pair looks like it changed from the first
+/// character.
+pub fn changed_words(before: &str, after: &str) -> (Spans, Spans) {
+    let a = tokenize(before);
+    let b = tokenize(after);
+
+    // Same trick as the line diff: trim the common head and tail, then align
+    // only what is left.
+    let head = a.iter().zip(b.iter()).take_while(|(x, y)| x.1 == y.1).count();
+    let tail = a[head..]
+        .iter()
+        .rev()
+        .zip(b[head..].iter().rev())
+        .take_while(|(x, y)| x.1 == y.1)
+        .count();
+
+    let mid_a = &a[head..a.len() - tail];
+    let mid_b = &b[head..b.len() - tail];
+
+    // A line that changed beyond recognition is not helped by highlighting
+    // nearly all of it; leave it plain.
+    let changed_share = |mid: &[(usize, &str)], all: &[(usize, &str)]| {
+        let changed: usize = mid.iter().map(|(_, t)| t.len()).sum();
+        let total: usize = all.iter().map(|(_, t)| t.len()).sum::<usize>().max(1);
+        changed as f32 / total as f32
+    };
+    if changed_share(mid_a, &a) > 0.8 && changed_share(mid_b, &b) > 0.8 {
+        return (Vec::new(), Vec::new());
+    }
+
+    (spans(mid_a, before), spans(mid_b, after))
+}
+
+/// Merges a token run into byte ranges, skipping pure whitespace at the
+/// edges so the highlight sits on the words and not the gaps.
+fn spans(tokens: &[(usize, &str)], line: &str) -> Spans {
+    let mut out: Spans = Vec::new();
+    for (start, text) in tokens {
+        if text.trim().is_empty() {
+            continue;
+        }
+        let range = (*start, start + text.len());
+        match out.last_mut() {
+            // Join runs separated only by whitespace, so `a  b` highlights
+            // as one span rather than two.
+            Some(last) if line[last.1..range.0].trim().is_empty() => last.1 = range.1,
+            _ => out.push(range),
+        }
+    }
+    out
+}
+
+/// Splits a line into words, keeping byte offsets. Identifier characters
+/// group together; everything else is its own token, so `foo(bar)` differs
+/// from `foo(baz)` by one token rather than by the whole call.
+fn tokenize(line: &str) -> Vec<(usize, &str)> {
+    let mut out = Vec::new();
+    let mut chars = line.char_indices().peekable();
+    while let Some((start, c)) = chars.next() {
+        let word = c.is_alphanumeric() || c == '_';
+        let mut end = start + c.len_utf8();
+        if word {
+            while let Some((i, next)) = chars.peek().copied() {
+                if next.is_alphanumeric() || next == '_' {
+                    end = i + next.len_utf8();
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+        }
+        out.push((start, &line[start..end]));
+    }
+    out
+}
+
+/// Pairs each removed line in a unified diff with the added line that
+/// replaced it, if any.
+///
+/// Only balanced runs are paired: three removed lines followed by three
+/// added ones line up one-to-one, while three removed followed by one added
+/// is a rewrite, not an edit, and pairing it would invent changes.
+pub fn pair_changed_lines(lines: &[&str]) -> std::collections::HashMap<usize, usize> {
+    let mut pairs = std::collections::HashMap::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if !is_removal(lines[i]) {
+            i += 1;
+            continue;
+        }
+        let removed_start = i;
+        while i < lines.len() && is_removal(lines[i]) {
+            i += 1;
+        }
+        let added_start = i;
+        while i < lines.len() && is_addition(lines[i]) {
+            i += 1;
+        }
+        let (removed, added) = (added_start - removed_start, i - added_start);
+        if removed == added {
+            for offset in 0..removed {
+                pairs.insert(removed_start + offset, added_start + offset);
+            }
+        }
+    }
+    pairs
+}
+
+fn is_removal(line: &str) -> bool {
+    line.starts_with('-') && !line.starts_with("---")
+}
+
+fn is_addition(line: &str) -> bool {
+    line.starts_with('+') && !line.starts_with("+++")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +311,86 @@ mod tests {
         let before: String = (0..MAX_ALIGNED_LINES + 1).map(|i| format!("{i}\n")).collect();
         let d = diff(&before, "x\n");
         assert_eq!(tally(&d), (1, MAX_ALIGNED_LINES + 1));
+    }
+
+    #[test]
+    fn word_diff_marks_only_what_changed() {
+        // Content, with the diff's own +/- marker already stripped.
+        let before = "    let total = compute(values, 3);";
+        let after = "    let total = compute(values, 4);";
+        let (removed, added) = changed_words(before, after);
+        fn text<'a>(line: &'a str, spans: &[(usize, usize)]) -> Vec<&'a str> {
+            spans.iter().map(|(a, b)| &line[*a..*b]).collect()
+        }
+        assert_eq!(text(before, &removed), vec!["3"]);
+        assert_eq!(text(after, &added), vec!["4"]);
+    }
+
+    #[test]
+    fn word_diff_groups_a_run_of_changes() {
+        let before = "let name = old_thing.value();";
+        let after = "let name = new_thing.other();";
+        let (removed, added) = changed_words(before, after);
+        fn text<'a>(line: &'a str, spans: &[(usize, usize)]) -> Vec<&'a str> {
+            spans.iter().map(|(a, b)| &line[*a..*b]).collect()
+        }
+        assert_eq!(text(before, &removed), vec!["old_thing.value"]);
+        assert_eq!(text(after, &added), vec!["new_thing.other"]);
+    }
+
+    #[test]
+    fn a_wholly_rewritten_line_is_not_highlighted() {
+        // Marking 90% of a line as changed helps nobody.
+        let (removed, added) = changed_words(
+            "let a = one();",
+            "completely different content here entirely",
+        );
+        assert!(removed.is_empty() && added.is_empty());
+    }
+
+    #[test]
+    fn identical_lines_have_nothing_marked() {
+        let (removed, added) = changed_words("same line", "same line");
+        assert!(removed.is_empty() && added.is_empty());
+    }
+
+    #[test]
+    fn word_offsets_survive_wide_characters() {
+        let before = "let s = \"🦀 old\";";
+        let after = "let s = \"🦀 new\";";
+        let (removed, added) = changed_words(before, after);
+        // Slicing at these offsets must not panic, and must be the change.
+        assert_eq!(removed.iter().map(|(a, b)| &before[*a..*b]).collect::<Vec<_>>(), vec!["old"]);
+        assert_eq!(added.iter().map(|(a, b)| &after[*a..*b]).collect::<Vec<_>>(), vec!["new"]);
+    }
+
+    #[test]
+    fn balanced_runs_pair_up_and_unbalanced_ones_do_not() {
+        let lines = vec![
+            "@@ -1,4 +1,4 @@",
+            " context",
+            "-old one",
+            "-old two",
+            "+new one",
+            "+new two",
+            " context",
+            "-rewritten",
+            "+a",
+            "+b",
+            "+c",
+        ];
+        let pairs = pair_changed_lines(&lines);
+        assert_eq!(pairs.get(&2), Some(&4));
+        assert_eq!(pairs.get(&3), Some(&5));
+        // 1 removed vs 3 added is a rewrite, not an edit.
+        assert_eq!(pairs.get(&7), None);
+    }
+
+    #[test]
+    fn file_headers_are_not_mistaken_for_changed_lines() {
+        let lines = vec!["--- a/x.rs", "+++ b/x.rs", "-real removal", "+real addition"];
+        let pairs = pair_changed_lines(&lines);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs.get(&2), Some(&3));
     }
 }

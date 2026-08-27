@@ -254,6 +254,8 @@ pub enum Dialog {
     AgentChanges,
     /// Name a symbol for a workspace-wide rename.
     Rename,
+    /// Recent `HEAD` movements, with the option to go back to one.
+    Reflog,
 }
 
 /// A destructive action awaiting user confirmation.
@@ -284,6 +286,8 @@ pub enum ConfirmAction {
     /// Regenerate AI text over existing user-visible text (commit message
     /// or PR title/description).
     OverwriteAiText(worker::AiTarget),
+    /// Move the branch back to a commit from the reflog.
+    UndoTo { sha: String, short: String, what: String },
 }
 
 impl ConfirmAction {
@@ -305,6 +309,7 @@ impl ConfirmAction {
             }
             // Only the text-generating tasks can overwrite a field.
             Self::OverwriteAiText(_) => "Overwrite generated text?",
+            Self::UndoTo { .. } => "Go back to this commit?",
         }
     }
 
@@ -366,6 +371,12 @@ impl ConfirmAction {
             Self::OverwriteAiText(_) => {
                 "The field already has text. Generating replaces it.".into()
             }
+            Self::UndoTo { short, what, .. } => format!(
+                "The branch moves back to {short} ({what}).\n\n\
+                 Nothing is deleted: the changes from the commits you are undoing stay \
+                 in your working tree, staged, so you can re-commit, inspect, or discard \
+                 them deliberately. Your uncommitted work is untouched."
+            ),
         }
     }
 
@@ -384,6 +395,7 @@ impl ConfirmAction {
                 if *protected { "Merge anyway (may not push)" } else { "Merge" }
             }
             Self::OverwriteAiText(_) => "Overwrite and generate",
+            Self::UndoTo { .. } => "Go back",
         }
     }
 }
@@ -664,6 +676,13 @@ pub struct App {
     // commit graph (all branches), shown when graph_open
     pub graph: Vec<graph::GraphNode>,
     pub graph_open: bool,
+    /// History filters: a search, or one file's history. Both change what
+    /// `log` holds, so the History tab renders one list either way.
+    pub history_query: String,
+    pub history_mode: crate::git::SearchMode,
+    pub history_file: Option<String>,
+    /// Recent `HEAD` movements, for the undo dialog.
+    pub reflog: Vec<crate::git::ReflogEntry>,
 
     // stash / tags / github repos
     pub stashes: Vec<crate::git::StashEntry>,
@@ -779,6 +798,10 @@ impl App {
             commit_file_list: Vec::new(),
             graph: Vec::new(),
             graph_open: false,
+            history_query: String::new(),
+            history_mode: Default::default(),
+            history_file: None,
+            reflog: Vec::new(),
             stashes: Vec::new(),
             tags: Vec::new(),
             gh_repos: Vec::new(),
@@ -871,6 +894,56 @@ impl App {
         });
     }
 
+    /// Loads whatever the History tab is currently showing: a search, one
+    /// file's history, or the branch log.
+    pub fn load_history(&mut self) {
+        let Some(repo) = self.repo.clone() else { return };
+        let query = self.history_query.trim().to_string();
+        let mode = self.history_mode;
+        let file = self.history_file.clone();
+        self.worker.spawn(move || {
+            let result = match (file, query.is_empty()) {
+                (Some(path), _) => repo.file_history(&path, 200),
+                (None, false) => repo.search_commits(&query, mode, 200),
+                (None, true) => repo.log(200, None),
+            };
+            Msg::Log(strerr(result))
+        });
+    }
+
+    /// Shows one file's history in the History tab.
+    pub fn show_file_history(&mut self, path: &str) {
+        self.history_file = Some(path.to_string());
+        self.history_query.clear();
+        self.tab = Tab::History;
+        self.load_history();
+    }
+
+    /// Clears any history filter and goes back to the branch log.
+    pub fn clear_history_filter(&mut self) {
+        self.history_file = None;
+        self.history_query.clear();
+        self.load_history();
+    }
+
+    /// Loads recent `HEAD` movements and opens the undo dialog.
+    pub fn open_reflog(&mut self) {
+        let Some(repo) = self.repo.clone() else { return };
+        self.dialog = Dialog::Reflog;
+        self.worker.spawn(move || Msg::Reflog(strerr(repo.reflog(60))));
+    }
+
+    /// Moves the branch back to `sha`, keeping the working tree.
+    pub fn undo_to(&mut self, sha: String) {
+        let Some(repo) = self.repo.clone() else { return };
+        self.dialog = Dialog::None;
+        self.busy = true;
+        self.worker.spawn(move || Msg::Done {
+            message: strerr(repo.undo_to(&sha)),
+            refresh: true,
+        });
+    }
+
     /// Reloads status and branches (and history when that tab is open).
     pub fn refresh(&mut self) {
         let Some(repo) = self.repo.clone() else { return };
@@ -885,7 +958,7 @@ impl App {
         }
         // Always load history: the Undo button needs the last commit's
         // subject even on the Changes tab.
-        self.worker.spawn(move || Msg::Log(strerr(repo.log(200, None))));
+        self.load_history();
         self.load_stashes();
         self.load_tags();
         self.refresh_branch_checks();
@@ -1685,6 +1758,11 @@ impl App {
                     }
                     Err(e) => self.toast(e, true),
                 }
+            }
+            Msg::Reflog(Ok(entries)) => self.reflog = entries,
+            Msg::Reflog(Err(e)) => {
+                self.reflog.clear();
+                self.toast(e, true);
             }
             Msg::TrackedFiles(files) => {
                 self.editor.quick_open.loading = false;
@@ -3139,6 +3217,7 @@ impl App {
         match action {
             // Handled above; kept for exhaustiveness.
             ConfirmAction::OverwriteAiText(_) => {}
+            ConfirmAction::UndoTo { sha, .. } => self.undo_to(sha),
             ConfirmAction::DiscardFile(path) => {
                 if self.selected_file.as_deref() == Some(path.as_str()) {
                     views::clear_diff_view(self);
@@ -3863,6 +3942,88 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| {
                 editor::editor_tab(&mut app, ui);
             });
+        });
+    }
+
+    #[test]
+    fn history_loads_the_log_a_search_or_one_file() {
+        let (tmp, mut app, _file) = app_with_repo();
+        git(tmp.path(), &["add", "-A"]);
+        git(tmp.path(), &["commit", "-m", "feat: the widget panel"]);
+        std::fs::write(tmp.path().join("other.txt"), "x\n").unwrap();
+        git(tmp.path(), &["add", "-A"]);
+        git(tmp.path(), &["commit", "-m", "chore: something else"]);
+
+        let drain = |app: &mut App| {
+            for _ in 0..40 {
+                app.handle_messages_for_test();
+                if !app.log.is_empty() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+
+        // No filter: the branch log.
+        app.load_history();
+        drain(&mut app);
+        assert_eq!(app.log.len(), 2);
+
+        // A message search narrows it.
+        app.log.clear();
+        app.history_query = "widget".into();
+        app.load_history();
+        drain(&mut app);
+        assert_eq!(app.log.len(), 1);
+        assert_eq!(app.log[0].subject, "feat: the widget panel");
+
+        // A file's history ignores the search box.
+        app.log.clear();
+        app.show_file_history("other.txt");
+        drain(&mut app);
+        assert_eq!(app.tab, Tab::History);
+        assert_eq!(app.log.len(), 1);
+        assert_eq!(app.log[0].subject, "chore: something else");
+
+        // And clearing puts everything back.
+        app.log.clear();
+        app.clear_history_filter();
+        drain(&mut app);
+        assert!(app.history_file.is_none());
+        assert!(app.history_query.is_empty());
+        assert_eq!(app.log.len(), 2);
+    }
+
+    /// The reflog dialog renders while loading and once loaded.
+    #[test]
+    fn the_reflog_dialog_renders() {
+        let (_tmp, mut app, _file) = app_with_repo();
+        egui::__run_test_ctx(|ctx| {
+            app.dialog = Dialog::Reflog;
+            dialogs::show(&mut app, ctx);
+        });
+
+        app.reflog = vec![
+            crate::git::ReflogEntry {
+                sha: "a".repeat(40),
+                short_sha: "aaaaaaa".into(),
+                selector: "HEAD@{0}".into(),
+                action: "merge feature: Merge made by the 'ort' strategy.".into(),
+                subject: "feat: the merge".into(),
+                date: "2026-01-01T00:00:00Z".into(),
+            },
+            crate::git::ReflogEntry {
+                sha: "b".repeat(40),
+                short_sha: "bbbbbbb".into(),
+                selector: "HEAD@{1}".into(),
+                action: "checkout: moving from main to side".into(),
+                subject: "noise".into(),
+                date: "2026-01-01T00:00:00Z".into(),
+            },
+        ];
+        egui::__run_test_ctx(|ctx| {
+            app.dialog = Dialog::Reflog;
+            dialogs::show(&mut app, ctx);
         });
     }
 

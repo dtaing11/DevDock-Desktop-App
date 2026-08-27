@@ -29,6 +29,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         Dialog::ChecksGate => checks_gate(app, ctx, &mut open),
         Dialog::AgentChanges => agent_changes(app, ctx, &mut open),
         Dialog::Rename => rename_dialog(app, ctx, &mut open),
+        Dialog::Reflog => reflog_dialog(app, ctx, &mut open),
     }
     // Dismissing a gate with the X is a deferred decision, not an approval:
     // the modal closes but the held action stays available behind the
@@ -1668,6 +1669,80 @@ pub fn proposal_diff(ui: &mut egui::Ui, edit: &crate::agent::PendingEdit, salt: 
                     );
                 }
             }
+        }
+    });
+}
+
+/// Recent `HEAD` movements, with the option to go back to one.
+///
+/// This is the app's undo of last resort: a bad merge, a rebase that went
+/// sideways, a reset to the wrong commit. The reflog remembers where `HEAD`
+/// was even when nothing else does.
+fn reflog_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
+    modal(ctx, "Undo — recent history", open, |ui| {
+        ui.set_min_width(700.0);
+        ui.label(
+            RichText::new(
+                "Where this branch has been. Going back keeps your files: the undone \
+                 commits' changes stay staged in the working tree.",
+            )
+            .color(theme::FG_DIM)
+            .small(),
+        );
+        ui.separator();
+
+        if app.reflog.is_empty() {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(14.0));
+                ui.label(RichText::new("reading the reflog…").small().color(theme::FG_DIM));
+            });
+            return;
+        }
+
+        let entries = app.reflog.clone();
+        let current = entries.first().map(|e| e.sha.clone()).unwrap_or_default();
+        let mut undo_to: Option<crate::git::ReflogEntry> = None;
+
+        ScrollArea::vertical().max_height(420.0).id_salt("reflog").show(ui, |ui| {
+            for entry in &entries {
+                // Checkouts crowd the list without being places to go back to.
+                if !entry.is_interesting() {
+                    continue;
+                }
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(&entry.short_sha)
+                            .monospace()
+                            .small()
+                            .color(theme::TEAL),
+                    );
+                    ui.label(RichText::new(&entry.action).small().color(theme::EMBER));
+                    ui.label(RichText::new(&entry.subject).small());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if entry.sha == current {
+                            ui.label(RichText::new("now").small().color(theme::ADD));
+                        } else if ui
+                            .small_button("Go back to here")
+                            .on_hover_text("Moves the branch here; asks first")
+                            .clicked()
+                        {
+                            undo_to = Some(entry.clone());
+                        }
+                    });
+                });
+            }
+        });
+
+        if let Some(entry) = undo_to {
+            app.confirm(crate::app::ConfirmAction::UndoTo {
+                sha: entry.sha.clone(),
+                short: entry.short_sha.clone(),
+                what: if entry.subject.trim().is_empty() {
+                    entry.action.clone()
+                } else {
+                    entry.subject.clone()
+                },
+            });
         }
     });
 }

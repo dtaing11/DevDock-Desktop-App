@@ -73,6 +73,8 @@ pub enum Msg {
     AiCiConfig { result: Result<String, String> },
     /// Every file git tracks, for the editor's file finder.
     TrackedFiles(Vec<String>),
+    /// Recent `HEAD` movements, for the undo dialog.
+    Reflog(Result<Vec<crate::git::ReflogEntry>, String>),
     /// A language server answered, or failed to.
     Lsp(LspReply),
     /// One step of an agentic run (a file read, an edit proposed), for the

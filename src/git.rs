@@ -137,6 +137,142 @@ pub struct BranchList {
     pub remote: Vec<Branch>,
 }
 
+/// What a commit search looks at.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchMode {
+    /// Commit messages (`--grep`).
+    #[default]
+    Message,
+    /// Added or removed occurrences of the text (`-S`, the "pickaxe"): when
+    /// a string entered or left the codebase.
+    Content,
+    Author,
+    /// Commits touching a path.
+    Path,
+}
+
+impl SearchMode {
+    pub const ALL: &'static [SearchMode] =
+        &[SearchMode::Message, SearchMode::Content, SearchMode::Author, SearchMode::Path];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Message => "Message",
+            Self::Content => "Code",
+            Self::Author => "Author",
+            Self::Path => "Path",
+        }
+    }
+
+    /// What the mode actually searches, for the UI's hint text.
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::Message => "words in commit messages",
+            Self::Content => "commits that added or removed this text",
+            Self::Author => "commits by this author",
+            Self::Path => "commits touching this path",
+        }
+    }
+}
+
+/// How a branch's commits should be rewritten.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct RebasePlan {
+    /// The commit the branch forks from; everything after it is rewritten.
+    pub base: String,
+    /// The commits that will exist afterwards, oldest first.
+    pub groups: Vec<RebaseGroup>,
+}
+
+/// One resulting commit: the originals that fold into it, and its message.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct RebaseGroup {
+    /// Shas to replay, oldest first.
+    pub commits: Vec<String>,
+    pub summary: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+impl RebaseGroup {
+    pub fn message(&self) -> String {
+        if self.description.trim().is_empty() {
+            self.summary.trim().to_string()
+        } else {
+            format!("{}\n\n{}", self.summary.trim(), self.description.trim())
+        }
+    }
+}
+
+impl RebasePlan {
+    /// Every commit the plan would produce, flattened.
+    pub fn commits(&self) -> Vec<&String> {
+        self.groups.iter().flat_map(|g| g.commits.iter()).collect()
+    }
+
+    /// Whether the plan accounts for exactly the commits on the branch.
+    ///
+    /// This is the check that makes an AI-proposed rewrite safe to run: a
+    /// dropped commit is lost work, a repeated one is applied twice, and an
+    /// unknown one is a hallucinated sha. All three are refused before
+    /// anything moves.
+    pub fn check_against(&self, branch_commits: &[String]) -> Result<()> {
+        let planned = self.commits();
+        let mut seen: HashSet<&str> = HashSet::new();
+        for sha in &planned {
+            if !seen.insert(sha.as_str()) {
+                return Err(GitError::Command(format!(
+                    "the plan uses {} twice",
+                    &sha[..sha.len().min(7)]
+                )));
+            }
+            if !branch_commits.iter().any(|c| c == *sha) {
+                return Err(GitError::Command(format!(
+                    "the plan names {}, which is not a commit on this branch",
+                    &sha[..sha.len().min(7)]
+                )));
+            }
+        }
+        let missing: Vec<&String> = branch_commits
+            .iter()
+            .filter(|sha| !seen.contains(sha.as_str()))
+            .collect();
+        if !missing.is_empty() {
+            return Err(GitError::Command(format!(
+                "the plan drops {} commit(s), including {}",
+                missing.len(),
+                &missing[0][..7]
+            )));
+        }
+        if self.groups.iter().any(|g| g.commits.is_empty()) {
+            return Err(GitError::Command("the plan has an empty commit".into()));
+        }
+        Ok(())
+    }
+}
+
+/// One entry from `git reflog`: where `HEAD` was, and what moved it.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ReflogEntry {
+    pub sha: String,
+    pub short_sha: String,
+    /// The `HEAD@{n}` selector.
+    pub selector: String,
+    /// What moved it: "commit", "merge feature", "rebase (finish)", ...
+    pub action: String,
+    /// Subject of the commit `HEAD` pointed at.
+    pub subject: String,
+    pub date: String,
+}
+
+impl ReflogEntry {
+    /// Whether this entry is one an undo would meaningfully go back to.
+    pub fn is_interesting(&self) -> bool {
+        // Checkouts and no-op moves are noise in an undo list.
+        !self.action.starts_with("checkout:") && !self.action.is_empty()
+    }
+}
+
 /// The ranges that address a branch's outgoing work.
 struct Outgoing {
     /// Range for `git diff`; `None` means "against the empty tree".
@@ -718,6 +854,16 @@ impl Repo {
 
     /// Commit history, newest first.
     pub fn log(&self, limit: u32, branch: Option<&str>) -> Result<Vec<Commit>> {
+        let extra: Vec<&str> = branch.into_iter().collect();
+        self.log_with(limit, &extra)
+    }
+
+    /// `git log` with extra arguments, parsed into commits.
+    ///
+    /// Every history view goes through here — plain log, one file's history,
+    /// a message search, a pickaxe search — so they all parse the same way
+    /// and a repository with no commits is empty rather than an error.
+    fn log_with(&self, limit: u32, extra: &[&str]) -> Result<Vec<Commit>> {
         // Unit/record separators cannot appear in commit metadata.
         const FIELD: char = '\u{1f}';
         const RECORD: char = '\u{1e}';
@@ -725,9 +871,7 @@ impl Repo {
             format!("--format=%H{FIELD}%h{FIELD}%an{FIELD}%ae{FIELD}%aI{FIELD}%s{FIELD}%b{FIELD}%P{RECORD}");
         let max_count = format!("--max-count={limit}");
         let mut args = vec!["log", max_count.as_str(), format.as_str()];
-        if let Some(branch) = branch {
-            args.push(branch);
-        }
+        args.extend_from_slice(extra);
         let Ok(out) = self.git(&args) else {
             return Ok(Vec::new()); // repository without commits
         };
@@ -736,6 +880,212 @@ impl Repo {
             .filter(|r| !r.trim().is_empty())
             .filter_map(|record| parse_commit(record.trim_start_matches('\n'), FIELD))
             .collect())
+    }
+
+    // -- history and search --------------------------------------------------
+
+    /// Commits that touched `path`, newest first, following it through
+    /// renames.
+    ///
+    /// `--follow` is what makes this worth having: a file's history usually
+    /// predates its current name, and stopping at the rename hides exactly
+    /// the commits someone is looking for.
+    pub fn file_history(&self, path: &str, limit: u32) -> Result<Vec<Commit>> {
+        self.log_with(limit, &["--follow", "--", path])
+    }
+
+    /// The history of one range of lines in a file, as a patch series.
+    ///
+    /// `git log -L` answers "how did these lines get this way", following
+    /// them as the surrounding code moves. Its output is a patch per commit,
+    /// not metadata, so it is returned as text for the diff view.
+    pub fn line_history(&self, path: &str, start: u32, end: u32, limit: u32) -> Result<String> {
+        let range = format!("-L{start},{end}:{path}");
+        let max_count = format!("--max-count={limit}");
+        self.git(&["log", &max_count, &range])
+    }
+
+    /// Commits matching a search, newest first.
+    pub fn search_commits(
+        &self,
+        query: &str,
+        mode: SearchMode,
+        limit: u32,
+    ) -> Result<Vec<Commit>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        match mode {
+            SearchMode::Message => {
+                let needle = format!("--grep={query}");
+                self.log_with(limit, &[&needle, "--regexp-ignore-case", "--all"])
+            }
+            SearchMode::Author => {
+                let needle = format!("--author={query}");
+                self.log_with(limit, &[&needle, "--regexp-ignore-case", "--all"])
+            }
+            // The pickaxe: commits where the number of occurrences of this
+            // text changed. This is how you find when a line was introduced
+            // or deleted, which no amount of grepping the worktree can.
+            SearchMode::Content => {
+                let needle = format!("-S{query}");
+                self.log_with(limit, &[&needle, "--all"])
+            }
+            SearchMode::Path => self.log_with(limit, &["--all", "--", query]),
+        }
+    }
+
+    // -- history rewriting -----------------------------------------------------
+
+    /// Rewrites the branch's commits according to `plan`.
+    ///
+    /// # How
+    ///
+    /// The commits are replayed onto a detached `HEAD` at the base and the
+    /// branch is only moved once every group has landed. Nothing points at
+    /// the new history until it is complete, so a failure anywhere — a
+    /// conflicting cherry-pick, a bad message — leaves the branch exactly
+    /// where it was. `git rebase -i` would mean scripting an editor and
+    /// leaving the repository mid-rebase when something goes wrong.
+    ///
+    /// # Safety
+    ///
+    /// The plan is checked first: every commit on the branch must appear
+    /// exactly once. A plan that drops a commit would destroy work that only
+    /// the reflog remembers, and a plan that repeats one would apply it
+    /// twice.
+    pub fn rewrite_history(&self, plan: &RebasePlan) -> Result<String> {
+        let branch = self.current_branch();
+        if branch.starts_with('(') {
+            return Err(GitError::Command(
+                "not on a branch; check one out before rewriting history".into(),
+            ));
+        }
+        if self.state()? != RepoState::Clean {
+            return Err(GitError::Command(
+                "finish or abort the operation in progress first".into(),
+            ));
+        }
+        if !self.status()?.files.iter().all(|f| !f.staged && !f.unstaged) {
+            return Err(GitError::Command(
+                "commit or stash your changes first: rewriting history moves the working                  tree between commits"
+                    .into(),
+            ));
+        }
+
+        let expected: Vec<String> = self
+            .log_with(1000, &[&format!("{}..HEAD", plan.base)])?
+            .into_iter()
+            .map(|c| c.sha)
+            .collect();
+        plan.check_against(&expected)?;
+
+        let original = self.git(&["rev-parse", "HEAD"])?.trim().to_string();
+        self.git(&["checkout", "--detach", &plan.base])?;
+
+        let result = self.replay(plan);
+        match result {
+            Ok(()) => {
+                let rewritten = self.git(&["rev-parse", "HEAD"])?.trim().to_string();
+                self.git(&["branch", "-f", &branch, &rewritten])?;
+                self.git(&["checkout", &branch])?;
+                Ok(format!(
+                    "{} commit(s) became {}. The previous history is in the reflog.",
+                    expected.len(),
+                    plan.groups.len()
+                ))
+            }
+            Err(e) => {
+                // Put everything back exactly as it was.
+                let _ = self.git(&["cherry-pick", "--abort"]);
+                let _ = self.git(&["reset", "--hard", &original]);
+                let _ = self.git(&["checkout", &branch]);
+                Err(e)
+            }
+        }
+    }
+
+    /// Cherry-picks each group onto the detached head and commits it.
+    fn replay(&self, plan: &RebasePlan) -> Result<()> {
+        for group in &plan.groups {
+            for sha in &group.commits {
+                // --no-commit so a group of commits becomes one.
+                self.git(&["cherry-pick", "--no-commit", "--allow-empty", sha])
+                    .map_err(|e| {
+                        GitError::Command(format!(
+                            "{} would not replay cleanly: {e}. Nothing was changed.",
+                            &sha[..sha.len().min(7)]
+                        ))
+                    })?;
+            }
+            let message = group.message();
+            if message.trim().is_empty() {
+                return Err(GitError::Command("a group has no commit message".into()));
+            }
+            self.git(&["commit", "--allow-empty", "-m", &message])?;
+        }
+        Ok(())
+    }
+
+    // -- reflog ---------------------------------------------------------------
+
+    /// Recent `HEAD` movements, newest first.
+    ///
+    /// The reflog is the only record of what a reset, a rebase, or a bad
+    /// merge replaced, and it is the difference between "that was
+    /// unrecoverable" and "that was undoable".
+    pub fn reflog(&self, limit: u32) -> Result<Vec<ReflogEntry>> {
+        const FIELD: char = '\u{1f}';
+        let format = format!("--format=%H{FIELD}%h{FIELD}%gd{FIELD}%gs{FIELD}%s{FIELD}%aI");
+        let max_count = format!("--max-count={limit}");
+        let out = self.git(&["reflog", &max_count, &format])?;
+        Ok(out
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|line| {
+                let mut parts = line.split(FIELD);
+                Some(ReflogEntry {
+                    sha: parts.next()?.to_string(),
+                    short_sha: parts.next()?.to_string(),
+                    selector: parts.next()?.to_string(),
+                    action: parts.next()?.to_string(),
+                    subject: parts.next().unwrap_or_default().to_string(),
+                    date: parts.next().unwrap_or_default().to_string(),
+                })
+            })
+            .collect())
+    }
+
+    /// Moves the branch back to `sha`, keeping the working tree.
+    ///
+    /// A **soft** reset on purpose: `--hard` would silently destroy whatever
+    /// is uncommitted, and undoing a bad merge is not a reason to lose the
+    /// work sitting next to it. The changes the undone commits contained are
+    /// left staged, so they can be re-committed, inspected, or discarded
+    /// deliberately.
+    pub fn undo_to(&self, sha: &str) -> Result<String> {
+        if sha.trim().is_empty() {
+            return Err(GitError::Command("no commit to undo to".into()));
+        }
+        // A merge or rebase in progress has its own abort; resetting out of
+        // one leaves the repository in a state git cannot explain.
+        match self.state()? {
+            RepoState::Clean => {}
+            other => {
+                return Err(GitError::Command(format!(
+                    "finish or abort the {} first",
+                    match other {
+                        RepoState::Merging => "merge",
+                        RepoState::Rebasing => "rebase",
+                        RepoState::CherryPicking => "cherry-pick",
+                        RepoState::Clean => unreachable!(),
+                    }
+                )))
+            }
+        }
+        self.git(&["reset", "--soft", sha])?;
+        Ok(format!("Moved to {}", &sha[..sha.len().min(7)]))
     }
 
     // -- diffs --------------------------------------------------------------

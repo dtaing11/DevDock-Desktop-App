@@ -30,6 +30,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         Dialog::AgentChanges => agent_changes(app, ctx, &mut open),
         Dialog::Rename => rename_dialog(app, ctx, &mut open),
         Dialog::Reflog => reflog_dialog(app, ctx, &mut open),
+        Dialog::CommandPalette => command_palette(app, ctx, &mut open),
         Dialog::SplitCommits => split_dialog(app, ctx, &mut open),
         Dialog::TidyHistory => tidy_dialog(app, ctx, &mut open),
     }
@@ -1671,6 +1672,74 @@ pub fn proposal_diff(ui: &mut egui::Ui, edit: &crate::agent::PendingEdit, salt: 
                     );
                 }
             }
+        }
+    });
+}
+
+/// Everything the app can do, by name.
+fn command_palette(app: &mut App, ctx: &egui::Context, open: &mut bool) {
+    modal(ctx, "Commands", open, |ui| {
+        ui.set_min_width(560.0);
+
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut app.palette_query)
+                .hint_text(super::views::dim_hint("type a command"))
+                .desired_width(f32::INFINITY),
+        );
+        response.request_focus();
+        if response.changed() {
+            app.palette_selected = 0;
+        }
+
+        let commands = crate::app::palette::commands();
+        let hits: Vec<&crate::app::palette::Command> =
+            crate::app::palette::matches(&commands, &app.palette_query);
+        if hits.is_empty() {
+            ui.label(RichText::new("Nothing matches.").small().color(theme::fg_dim()));
+            return;
+        }
+
+        let (up, down, accept) = ui.input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+            )
+        });
+        if down {
+            app.palette_selected = (app.palette_selected + 1) % hits.len();
+        }
+        if up {
+            app.palette_selected = (app.palette_selected + hits.len() - 1) % hits.len();
+        }
+        let selected = app.palette_selected.min(hits.len() - 1);
+
+        let mut chosen = accept.then(|| hits[selected].cmd);
+        ScrollArea::vertical().max_height(420.0).id_salt("palette").show(ui, |ui| {
+            for (i, command) in hits.iter().enumerate() {
+                let row = ui.selectable_label(
+                    i == selected,
+                    RichText::new(command.name).color(theme::fg()),
+                );
+                if row.clicked() {
+                    chosen = Some(command.cmd);
+                }
+                // The hint under the name is what makes an unfamiliar
+                // command findable; it is not decoration.
+                if i == selected {
+                    ui.label(
+                        RichText::new(format!("   {}", command.hint))
+                            .small()
+                            .color(theme::fg_dim()),
+                    );
+                }
+            }
+        });
+
+        if let Some(cmd) = chosen {
+            app.palette_query.clear();
+            app.palette_selected = 0;
+            crate::app::palette::run(app, cmd);
         }
     });
 }

@@ -342,6 +342,8 @@ pub struct EditorState {
     /// Selection in the active buffer, as byte offsets.
     pub selection: Range,
     pub wrap: bool,
+    /// The scaled-down overview beside the code.
+    pub minimap: bool,
 }
 
 impl EditorState {
@@ -677,21 +679,120 @@ pub fn editor_viewport(app: &mut App, ui: &mut egui::Ui) {
         .unwrap_or_default();
 
     let available = ui.available_height();
-    let bottom_height = (available * 0.26).clamp(80.0, 240.0);
+    // Never negative: a short viewport would otherwise ask for a child of
+    // negative height, which egui refuses outright.
+    let bottom_height = (available * 0.26).clamp(0.0, 240.0);
+    let code_height = (available - bottom_height).max(40.0);
 
+    let reserved = if app.editor.outline_open { 190.0 } else { 0.0 }
+        + if app.editor.minimap { 92.0 } else { 0.0 };
     ui.horizontal_top(|ui| {
         ui.vertical(|ui| {
-            ui.set_width(ui.available_width() - if app.editor.outline_open { 190.0 } else { 0.0 });
-            code_area(app, ui, available - bottom_height, &diagnostics, &mut actions);
+            ui.set_width((ui.available_width() - reserved).max(120.0));
+            code_area(app, ui, code_height, &diagnostics, &mut actions);
             ui.separator();
             bottom_panel(app, ui, bottom_height, &diagnostics, &mut actions);
         });
+        if app.editor.minimap {
+            minimap(app, ui, code_height, &diagnostics);
+        }
         if app.editor.outline_open {
             ui.separator();
-            outline(app, ui, available, &mut actions);
+            outline(app, ui, available.max(40.0), &mut actions);
         }
     });
     run_actions(app, actions);
+}
+
+/// Where you are: the path, then the symbol the cursor is inside.
+///
+/// The symbol half is the part worth having. Two hundred lines into a file
+/// the path tells you nothing you did not know, and the name of the
+/// function you are in tells you what you are looking at.
+fn breadcrumbs(app: &mut App, ui: &mut egui::Ui, rel: &str) {
+    let mut parts = rel.split('/').peekable();
+    while let Some(part) = parts.next() {
+        let last = parts.peek().is_none();
+        let text = RichText::new(part).color(if last { theme::ember() } else { theme::fg_dim() });
+        let text = if last { text.strong() } else { text };
+        ui.label(text);
+        if !last {
+            ui.label(RichText::new("›").color(theme::fg_dim()).small());
+        }
+    }
+
+    // The innermost symbol containing the cursor.
+    let Some(file) = app.editor.active_file() else { return };
+    let line = edits::line_col(&file.text, file.cursor).0.saturating_sub(1);
+    let symbol = file
+        .symbols
+        .iter()
+        .filter(|s| s.range.start.line <= line)
+        .max_by_key(|s| (s.range.start.line, s.depth));
+    if let Some(symbol) = symbol {
+        ui.label(RichText::new("›").color(theme::fg_dim()).small());
+        ui.label(RichText::new(&symbol.name).color(theme::teal()))
+            .on_hover_text(symbol.kind_label());
+    }
+}
+
+/// A scaled-down picture of the file, beside the code.
+///
+/// Not a screenshot: one thin bar per line, as wide as the line's content
+/// and coloured by what is on it. That is what a minimap is actually used
+/// for — the shape of the file, and where the errors are.
+fn minimap(app: &mut App, ui: &mut egui::Ui, height: f32, diagnostics: &[Diagnostic]) {
+    const WIDTH: f32 = 84.0;
+    let Some(index) = app.editor.active else { return };
+    let text = app.editor.files[index].text.clone();
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        return;
+    }
+
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(WIDTH, height), egui::Sense::click_and_drag());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0.0, theme::panel());
+
+    let row = (height / lines.len() as f32).clamp(0.6, 3.0);
+    let scale = (rect.width() - 8.0) / 110.0; // ~110 columns across
+    let error_lines: std::collections::HashSet<u32> =
+        diagnostics.iter().map(|d| d.range.start.line).collect();
+
+    for (i, line) in lines.iter().enumerate() {
+        let y = rect.top() + i as f32 * row;
+        if y > rect.bottom() {
+            break;
+        }
+        let indent = (line.len() - line.trim_start().len()) as f32;
+        let length = line.trim_end().len() as f32;
+        if length <= 0.0 {
+            continue;
+        }
+        let color = if error_lines.contains(&(i as u32)) {
+            theme::danger()
+        } else if line.trim_start().starts_with("//") || line.trim_start().starts_with('#') {
+            theme::fg_dim().gamma_multiply(0.7)
+        } else {
+            theme::fg_dim()
+        };
+        painter.rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(rect.left() + 4.0 + indent * scale, y),
+                egui::vec2(((length - indent) * scale).max(1.0), row.max(1.0)),
+            ),
+            0.0,
+            color,
+        );
+    }
+
+    // Clicking or dragging the map scrolls the file.
+    if let Some(pos) = response.interact_pointer_pos() {
+        let fraction = ((pos.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
+        let line = (fraction * lines.len() as f32) as u32;
+        app.editor.files[index].reveal = Some(line);
+    }
 }
 
 /// Find, and optionally replace, within the open file.
@@ -870,7 +971,7 @@ fn viewport_header(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) 
     let Some(file) = app.editor.active_file() else { return };
     let (rel, dirty) = (file.rel.clone(), file.is_dirty());
     ui.horizontal(|ui| {
-        ui.label(RichText::new(&rel).strong().color(theme::ember()));
+        breadcrumbs(app, ui, &rel);
         if dirty {
             ui.label(RichText::new("• unsaved").small().color(theme::warn()));
         }
@@ -891,6 +992,7 @@ fn viewport_header(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) 
                 ui.add(egui::Spinner::new().size(12.0));
             }
             ui.checkbox(&mut app.editor.outline_open, "Outline");
+            ui.checkbox(&mut app.editor.minimap, "Map");
             ui.checkbox(&mut app.editor.format_on_save, "Format on save");
 
             // The AI actions that act on what you are looking at. They
@@ -1047,12 +1149,24 @@ fn code_area(
     let read_only = app.editor.files[index].read_only;
     let reveal = app.editor.files[index].reveal.take();
 
+    // Auto-closing has to happen before the text area sees the character,
+    // since it replaces one keystroke with a pair and a cursor move.
+    let buffer_id = egui::Id::new(("editor-buffer", &path));
+    if !read_only && ui.memory(|m| m.has_focus(buffer_id)) {
+        auto_close(app, ui, index);
+    }
+
     // The layouter closes over the diagnostics so their ranges can be
     // underlined in place, which is the whole point of having them here.
     let lang = app.editor.files[index].lang;
     let diagnostics = diagnostics.to_vec();
+    // The bracket under the cursor and its partner, so both can be marked.
+    let brackets = edits::matching_bracket(
+        &app.editor.files[index].text,
+        app.editor.files[index].cursor,
+    );
     let mut layouter = move |ui: &egui::Ui, buffer: &dyn egui::TextBuffer, wrap: f32| {
-        let mut job = highlight(buffer.as_str(), lang, &diagnostics, font.clone());
+        let mut job = highlight(buffer.as_str(), lang, &diagnostics, brackets, font.clone());
         job.wrap.max_width = wrap;
         ui.fonts(|f| f.layout_job(job))
     };
@@ -1557,6 +1671,51 @@ fn bottom_panel(
     });
 }
 
+/// Turns a typed bracket or quote into a pair, and a typed closing
+/// character into a step over the one already there.
+///
+/// The character is taken out of the event queue so the text area never
+/// sees it; letting both act would insert it twice.
+fn auto_close(app: &mut App, ui: &mut egui::Ui, index: usize) {
+    let (text, cursor) = {
+        let file = &app.editor.files[index];
+        (file.text.clone(), file.cursor.min(file.text.len()))
+    };
+    // Only when there is no selection: typing a quote over selected text
+    // means something else, and guessing wrong there destroys the
+    // selection.
+    let (start, end) = app.editor.selection;
+    if start != end {
+        return;
+    }
+
+    let handled = ui.input_mut(|input| {
+        let mut handled = None;
+        input.events.retain(|event| {
+            if handled.is_some() {
+                return true;
+            }
+            let egui::Event::Text(typed) = event else { return true };
+            let mut chars = typed.chars();
+            let (Some(ch), None) = (chars.next(), chars.next()) else { return true };
+            match edits::auto_close(&text, cursor, ch) {
+                Some(action) => {
+                    handled = Some(action);
+                    false
+                }
+                None => true,
+            }
+        });
+        handled
+    });
+
+    let Some((insert, caret_offset)) = handled else { return };
+    let mut updated = text;
+    updated.insert_str(cursor, &insert);
+    let caret = cursor + caret_offset;
+    apply_edit(app, index, updated, (caret, caret), ui.ctx());
+}
+
 /// Writes an edit into a buffer and puts the selection where it belongs.
 fn apply_edit(app: &mut App, index: usize, text: String, selection: Range, ctx: &egui::Context) {
     let file = &mut app.editor.files[index];
@@ -1675,12 +1834,17 @@ pub fn highlight(
     text: &str,
     lang: super::syntax::Lang,
     diagnostics: &[Diagnostic],
+    brackets: Option<(usize, usize)>,
     font: FontId,
 ) -> LayoutJob {
     let mut job = LayoutJob::default();
     let lines: Vec<&str> = text.split('\n').collect();
     let langs = super::syntax::langs_per_line(&lines, lang);
+    // Offsets of the two brackets, so the layouter can mark them as it
+    // walks the file.
+    let mark = |offset: usize| brackets.is_some_and(|(a, b)| offset == a || offset == b);
 
+    let mut line_offset = 0usize;
     for (number, line) in lines.iter().enumerate() {
         let line_lang = langs.get(number).copied().unwrap_or(lang);
         let underlines = underline_ranges(diagnostics, number as u32, line);
@@ -1704,12 +1868,18 @@ pub fn highlight(
                         },
                     );
                 }
+                // A matched bracket gets a background rather than a
+                // colour: the syntax colour still has to read.
+                if mark(line_offset + start) {
+                    format.background = theme::ember().gamma_multiply(0.35);
+                }
                 job.append(&span.text[start - span_start..end - span_start], 0.0, format);
             }
         }
         if number + 1 < lines.len() {
             job.append("\n", 0.0, TextFormat::simple(font.clone(), theme::fg()));
         }
+        line_offset += line.len() + 1;
     }
     job
 }
@@ -1983,7 +2153,8 @@ mod tests {
         // for the rest of the session.
         let text = "fn main() {\n    let x = broken(); // 🦀\n}\n";
         let d = vec![diagnostic(1, 12, 18, Severity::Error)];
-        let job = highlight(text, super::super::syntax::Lang::Rust, &d, FontId::monospace(13.0));
+        let job =
+            highlight(text, super::super::syntax::Lang::Rust, &d, None, FontId::monospace(13.0));
         assert_eq!(job.text, text);
     }
 

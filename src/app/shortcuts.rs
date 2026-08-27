@@ -18,6 +18,8 @@ pub enum Action {
     QuickOpen,
     /// Show or hide the terminal panel.
     Terminal,
+    /// Everything the app can do, by name.
+    CommandPalette,
 }
 
 impl Action {
@@ -31,6 +33,7 @@ impl Action {
         Action::ToggleHistory,
         Action::QuickOpen,
         Action::Terminal,
+        Action::CommandPalette,
     ];
 
     /// Human-readable label for Settings.
@@ -44,6 +47,7 @@ impl Action {
             Action::ToggleHistory => "Toggle Changes/History tab",
             Action::QuickOpen => "Open a file in the editor",
             Action::Terminal => "Show or hide the terminal",
+            Action::CommandPalette => "Command palette",
         }
     }
 }
@@ -115,6 +119,15 @@ pub struct Shortcuts {
     pub quick_open: Binding,
     #[serde(default = "default_terminal")]
     pub terminal: Binding,
+    #[serde(default = "default_palette")]
+    pub command_palette: Binding,
+}
+
+fn default_palette() -> Binding {
+    // Not Cmd+Shift+P, which every editor uses but which is Pull here —
+    // and a git client's pull is not a shortcut to move. Cmd+Shift+A is
+    // "find action" in JetBrains and is free.
+    Binding::new(true, true, false, egui::Key::A)
 }
 
 fn default_terminal() -> Binding {
@@ -137,6 +150,7 @@ impl Default for Shortcuts {
             toggle_history: Binding::new(true, false, false, egui::Key::H),
             quick_open: default_quick_open(),
             terminal: default_terminal(),
+            command_palette: default_palette(),
         }
     }
 }
@@ -152,6 +166,7 @@ impl Shortcuts {
             Action::ToggleHistory => self.toggle_history,
             Action::QuickOpen => self.quick_open,
             Action::Terminal => self.terminal,
+            Action::CommandPalette => self.command_palette,
         }
     }
 
@@ -165,6 +180,7 @@ impl Shortcuts {
             Action::ToggleHistory => self.toggle_history = binding,
             Action::QuickOpen => self.quick_open = binding,
             Action::Terminal => self.terminal = binding,
+            Action::CommandPalette => self.command_palette = binding,
         }
     }
 

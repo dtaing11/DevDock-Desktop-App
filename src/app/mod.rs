@@ -15,6 +15,7 @@ pub mod edits;
 pub mod editor;
 pub mod graph;
 pub mod markdown;
+pub mod palette;
 pub mod shortcuts;
 pub mod syntax;
 #[cfg(unix)]
@@ -289,6 +290,8 @@ pub enum Dialog {
     AgentChanges,
     /// Name a symbol for a workspace-wide rename.
     Rename,
+    /// Everything the app can do, by name.
+    CommandPalette,
     /// Recent `HEAD` movements, with the option to go back to one.
     Reflog,
     /// An AI-proposed split of the working tree into commits.
@@ -717,6 +720,9 @@ pub struct App {
     pub graph_open: bool,
     /// History filters: a search, or one file's history. Both change what
     /// `log` holds, so the History tab renders one list either way.
+    /// The command palette's filter.
+    pub palette_query: String,
+    pub palette_selected: usize,
     pub history_query: String,
     pub history_mode: crate::git::SearchMode,
     pub history_file: Option<String>,
@@ -855,6 +861,8 @@ impl App {
             commit_file_list: Vec::new(),
             graph: Vec::new(),
             graph_open: false,
+            palette_query: String::new(),
+            palette_selected: 0,
             history_query: String::new(),
             history_mode: Default::default(),
             history_file: None,
@@ -3844,6 +3852,11 @@ impl App {
                     self.refresh();
                 }
                 Action::QuickOpen => self.editor_quick_open(),
+                Action::CommandPalette => {
+                    self.palette_query.clear();
+                    self.palette_selected = 0;
+                    self.dialog = Dialog::CommandPalette;
+                }
                 Action::Terminal => {
                     #[cfg(unix)]
                     self.terminal_toggle();
@@ -4496,6 +4509,42 @@ mod tests {
         assert_eq!(app.log.len(), 2);
     }
 
+    /// The command palette renders and its selection moves.
+    #[test]
+    fn the_command_palette_renders_and_runs_a_command() {
+        let (_tmp, mut app, _file) = app_with_repo();
+        app.palette_query = "theme".into();
+        egui::__run_test_ctx(|ctx| {
+            app.dialog = Dialog::CommandPalette;
+            dialogs::show(&mut app, ctx);
+        });
+
+        // Running one does what it says, without going through the UI.
+        let before = app.config.light_theme;
+        palette::run(&mut app, palette::Cmd::ToggleTheme);
+        assert_eq!(app.config.light_theme, !before);
+        assert_eq!(app.dialog, Dialog::None, "running a command closes the palette");
+        palette::run(&mut app, palette::Cmd::ToggleTheme);
+        assert_eq!(app.config.light_theme, before, "left as it was found");
+    }
+
+    #[test]
+    fn zoom_is_clamped_to_something_usable() {
+        let (_tmp, mut app, _file) = app_with_repo();
+        let original = app.config.zoom;
+
+        app.set_zoom(10.0);
+        assert!(app.config.zoom <= 2.0, "{}", app.config.zoom);
+        app.set_zoom(0.01);
+        assert!(app.config.zoom >= 0.7, "{}", app.config.zoom);
+
+        app.set_zoom(1.0);
+        app.zoom_by(0.1);
+        assert!((app.config.zoom - 1.1).abs() < 0.001);
+
+        app.set_zoom(original);
+    }
+
     /// The editor renders with every bar and panel it can show open.
     #[test]
     fn the_editor_renders_with_its_bars_open() {
@@ -4507,6 +4556,8 @@ mod tests {
         app.editor.find.matches =
             crate::app::edits::find_all(&app.editor.files[0].text, "two", Default::default());
         app.editor.goto_line = Some("2".into());
+        app.editor.minimap = true;
+        app.editor.outline_open = true;
         app.editor.search.open = true;
         app.editor.search.searched = true;
         app.editor.search.hits = vec![crate::git::GrepHit {

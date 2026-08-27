@@ -1707,3 +1707,39 @@ fn rewriting_refuses_to_run_with_uncommitted_work() {
     assert!(err.contains("commit or stash"), "{err}");
     assert_eq!(read(&repo, "scratch.txt"), "uncommitted\n");
 }
+
+#[test]
+fn grep_searches_tracked_files_and_honours_its_options() {
+    use git_manage::git::GrepOptions;
+    let (_tmp, repo) = setup();
+    write(&repo, "a.rs", "let value = 1;\nlet VALUE = 2;\nlet valueOf = 3;\n");
+    write(&repo, "b.rs", "// no match here\n");
+    write(&repo, "ignored.log", "value in an ignored file\n");
+    write(&repo, ".gitignore", "*.log\n");
+    repo.stage_all().unwrap();
+    repo.commit("init", "", false).unwrap();
+
+    let hits = repo.grep("value", GrepOptions::default()).unwrap();
+    // Case-insensitive by default: three lines in a.rs, and nothing from
+    // the ignored file.
+    assert_eq!(hits.len(), 3, "{hits:?}");
+    assert!(hits.iter().all(|h| h.path == "a.rs"));
+    assert_eq!(hits[0].line, 1);
+    assert!(hits[0].text.contains("let value = 1;"));
+    assert!(!hits.iter().any(|h| h.path.ends_with(".log")), "ignored files are not searched");
+
+    let strict = GrepOptions { case_sensitive: true, ..Default::default() };
+    assert_eq!(repo.grep("VALUE", strict).unwrap().len(), 1);
+
+    let words = GrepOptions { whole_word: true, ..Default::default() };
+    let hits = repo.grep("value", words).unwrap();
+    assert_eq!(hits.len(), 2, "valueOf is not the word value: {hits:?}");
+
+    // A query that matches nothing is empty, not an error.
+    assert!(repo.grep("nothing-here", GrepOptions::default()).unwrap().is_empty());
+    assert!(repo.grep("   ", GrepOptions::default()).unwrap().is_empty());
+
+    // Regex, when asked for.
+    let regex = GrepOptions { regex: true, ..Default::default() };
+    assert_eq!(repo.grep("let [A-Za-z]+ = 3", regex).unwrap().len(), 1);
+}

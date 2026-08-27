@@ -33,6 +33,7 @@
 //! asked for its final answer with what it already has, which degrades to
 //! roughly the quality of the old single-shot path rather than to an error.
 
+pub mod assist;
 pub mod coding;
 pub mod conflict;
 pub mod pr;

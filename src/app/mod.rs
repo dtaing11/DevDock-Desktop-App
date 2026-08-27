@@ -11,6 +11,7 @@
 
 pub mod agent_tab;
 pub mod dialogs;
+pub mod edits;
 pub mod editor;
 pub mod graph;
 pub mod markdown;
@@ -1809,6 +1810,11 @@ impl App {
                 self.reflog.clear();
                 self.toast(e, true);
             }
+            Msg::SearchHits(hits) => {
+                self.editor.search.running = false;
+                self.editor.search.searched = true;
+                self.editor.search.hits = hits;
+            }
             Msg::TrackedFiles(files) => {
                 self.editor.quick_open.loading = false;
                 self.editor.tree = editor::TreeNode::build(&files);
@@ -2541,6 +2547,19 @@ impl App {
             .spawn(move || Msg::TrackedFiles(repo.tracked_files().unwrap_or_default()));
     }
 
+    /// Runs the project-wide content search in the editor sidebar.
+    pub fn editor_search(&mut self) {
+        let Some(repo) = self.repo.clone() else { return };
+        let query = self.editor.search.query.trim().to_string();
+        if query.is_empty() || self.editor.search.running {
+            return;
+        }
+        let options = self.editor.search.options;
+        self.editor.search.running = true;
+        self.worker
+            .spawn(move || Msg::SearchHits(repo.grep(&query, options).unwrap_or_default()));
+    }
+
     /// Opens the file finder, loading the tracked file list the first time.
     pub fn editor_quick_open(&mut self) {
         self.tab = Tab::Editor;
@@ -2854,6 +2873,112 @@ impl App {
                 }
             }
             Msg::Done { message: Ok("Language servers restarted.".into()), refresh: false }
+        });
+    }
+
+    // -- editor AI actions -----------------------------------------------------
+
+    /// Runs an AI action on the selection in the open file.
+    ///
+    /// The result lands in the Agent tab: an explanation as its summary,
+    /// and anything it proposes as changes to review there. One review
+    /// surface for everything the AI wants to change is worth more than a
+    /// second one that behaves almost the same.
+    pub fn editor_assist(&mut self, kind: crate::agent::assist::Kind) {
+        let Some(repo) = self.repo.clone() else { return };
+        if self.coding.running {
+            self.toast("The agent is already working.", true);
+            return;
+        }
+        let Some(file) = self.editor.active_file() else {
+            self.toast("Open a file first.", true);
+            return;
+        };
+        let Some(sel) = self.ai_selection(worker::AiTarget::Coding) else {
+            self.toast("No AI model selected. Pick one in the Agent panel.", true);
+            return;
+        };
+
+        let (rel, path, text) = (file.rel.clone(), file.path.clone(), file.text.clone());
+        // The selection, or the whole file when there is none.
+        let (start, end) = self.editor.selection;
+        let (start, end) = (start.min(end), start.max(end));
+        let (selection, lines) = if start != end && end <= text.len() {
+            let span = edits::line_span(&text, (start, end));
+            (
+                text[span.0..span.1].to_string(),
+                Some((edits::line_col(&text, span.0).0, edits::line_col(&text, span.1).0)),
+            )
+        } else {
+            (text.clone(), None)
+        };
+
+        // Only the diagnostics that overlap what was selected.
+        let diagnostics: Vec<crate::lsp::protocol::Diagnostic> = self
+            .lsp
+            .diagnostics(&path)
+            .into_iter()
+            .filter(|d| match lines {
+                // Diagnostic lines are 0-based; the selection's are not.
+                Some((first, last)) => {
+                    let line = d.range.start.line + 1;
+                    line >= first && line <= last
+                }
+                None => true,
+            })
+            .collect();
+
+        let instructions = self.coding_instructions();
+        let url = self.effective_ollama_url();
+        let task = format!("{} — {rel}", kind.label());
+
+        self.tab = Tab::Agent;
+        self.coding.running = true;
+        self.coding.log.clear();
+        self.coding.plan.clear();
+        self.coding.summary.clear();
+        self.coding.error = None;
+        self.coding.edits.clear();
+        self.coding.selected = None;
+        self.coding.live = false;
+        self.coding.task = task;
+
+        let progress = self.worker.progress();
+        self.worker.spawn(move || {
+            let result = (|| -> Result<AgentReport, String> {
+                let provider = agent_provider(&sel, &url)?;
+                let tracked = strerr(repo.tracked_files())?;
+                let mut workspace =
+                    crate::agent::Workspace::new(repo.path(), tracked, kind.access())?;
+                let run = crate::agent::assist::run(
+                    provider.as_ref(),
+                    &mut workspace,
+                    kind,
+                    crate::agent::assist::Target {
+                        rel: &rel,
+                        selection: &selection,
+                        lines,
+                        diagnostics: &diagnostics,
+                        instructions: instructions.as_deref(),
+                    },
+                    &mut |event| match event {
+                        crate::agent::Event::Plan(steps) => progress.send(Msg::AgentPlan {
+                            kind: AgentKind::Coding,
+                            steps,
+                        }),
+                        other => progress.send(Msg::AgentEvent {
+                            kind: AgentKind::Coding,
+                            line: other.line(),
+                        }),
+                    },
+                )?;
+                Ok(AgentReport {
+                    summary: run.text,
+                    edits: run.edits,
+                    truncated: run.truncated,
+                })
+            })();
+            Msg::AgentDone { kind: AgentKind::Coding, result }
         });
     }
 
@@ -4234,6 +4359,52 @@ mod tests {
         assert!(app.history_file.is_none());
         assert!(app.history_query.is_empty());
         assert_eq!(app.log.len(), 2);
+    }
+
+    /// The editor renders with every bar and panel it can show open.
+    #[test]
+    fn the_editor_renders_with_its_bars_open() {
+        let (_tmp, mut app, file) = app_with_repo();
+        app.editor_open(&file, None);
+        app.editor.find.open = true;
+        app.editor.find.replacing = true;
+        app.editor.find.query = "two".into();
+        app.editor.find.matches =
+            crate::app::edits::find_all(&app.editor.files[0].text, "two", Default::default());
+        app.editor.goto_line = Some("2".into());
+        app.editor.search.open = true;
+        app.editor.search.searched = true;
+        app.editor.search.hits = vec![crate::git::GrepHit {
+            path: "notes.txt".into(),
+            line: 2,
+            text: "two".into(),
+        }];
+
+        egui::__run_test_ctx(|ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                editor::editor_sidebar(&mut app, ui);
+                editor::editor_viewport(&mut app, ui);
+            });
+        });
+    }
+
+    /// Editing commands act on the buffer through the editor's own state.
+    #[test]
+    fn editor_commands_change_the_buffer() {
+        use crate::app::edits;
+        let (_tmp, mut app, file) = app_with_repo();
+        app.editor_open(&file, None);
+
+        // Comment the second line.
+        let text = app.editor.files[0].text.clone();
+        let at = text.find("two").unwrap();
+        let (out, _) = edits::toggle_comment(&text, (at, at), "#");
+        assert_eq!(out, "one\n# two\nthree\n");
+
+        // Go to line 3 puts the caret at the start of "three".
+        let offset = edits::line_start(&text, 3);
+        assert_eq!(&text[offset..offset + 5], "three");
+        assert_eq!(edits::line_col(&text, offset), (3, 1));
     }
 
     #[test]

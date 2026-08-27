@@ -24,6 +24,7 @@
 //! - **byte offset** — what Rust string slicing uses.
 //! - **line + UTF-16 column** — what LSP uses ([`Position`]).
 
+use super::edits::{self, Range};
 use super::worker::AiTarget;
 use super::{theme, App};
 use crate::lsp::protocol::{
@@ -278,6 +279,35 @@ fn sort(nodes: &mut [TreeNode]) {
     });
 }
 
+/// The find-and-replace bar.
+#[derive(Default)]
+pub struct Find {
+    pub open: bool,
+    pub replacing: bool,
+    pub query: String,
+    pub replacement: String,
+    pub options: super::edits::MatchOptions,
+    /// Matches in the active buffer, recomputed as the query changes.
+    pub matches: Vec<super::edits::Range>,
+    pub current: usize,
+    /// Set when the bar has just opened, so it can take focus once.
+    pub focus: bool,
+}
+
+/// Searching the contents of every tracked file.
+#[derive(Default)]
+pub struct ProjectSearch {
+    /// Whether the sidebar is showing search instead of the tree.
+    pub open: bool,
+    pub query: String,
+    pub options: crate::git::GrepOptions,
+    pub hits: Vec<crate::git::GrepHit>,
+    pub running: bool,
+    /// Set when the query returned nothing, to say so rather than showing
+    /// an empty panel that looks like it is still loading.
+    pub searched: bool,
+}
+
 /// Everything the editor tab owns.
 #[derive(Default)]
 pub struct EditorState {
@@ -304,6 +334,14 @@ pub struct EditorState {
     pub expanded: std::collections::HashSet<String>,
     /// Filter applied to the tree.
     pub tree_filter: String,
+    pub find: Find,
+    /// Project-wide content search, in the sidebar beside the tree.
+    pub search: ProjectSearch,
+    /// The go-to-line box, when it is open.
+    pub goto_line: Option<String>,
+    /// Selection in the active buffer, as byte offsets.
+    pub selection: Range,
+    pub wrap: bool,
 }
 
 impl EditorState {
@@ -352,6 +390,10 @@ pub enum Action {
     QuickOpen,
     /// Load the tracked file list, for the work tree.
     LoadTree,
+    /// Run the project-wide content search.
+    Search,
+    /// Ask the AI about the selection.
+    Assist(crate::agent::assist::Kind),
 }
 
 /// The editor's half of the sidebar: what to open, and what is wrong with
@@ -371,22 +413,45 @@ pub fn editor_sidebar(app: &mut App, ui: &mut egui::Ui) {
     }
 
     ui.horizontal(|ui| {
-        // The button first: in a horizontal layout the text field then asks
-        // for what is left, rather than for a width that grows the panel.
         if ui
-            .small_button("Open…")
-            .on_hover_text("Filter every tracked file (Cmd/Ctrl+O)")
+            .selectable_label(!app.editor.search.open, "Files")
+            .on_hover_text("The work tree")
             .clicked()
         {
-            actions.push(Action::QuickOpen);
+            app.editor.search.open = false;
         }
+        if ui
+            .selectable_label(app.editor.search.open, "Search")
+            .on_hover_text("Search the contents of every tracked file")
+            .clicked()
+        {
+            app.editor.search.open = true;
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .small_button("Open…")
+                .on_hover_text("Filter every tracked file (Cmd/Ctrl+O)")
+                .clicked()
+            {
+                actions.push(Action::QuickOpen);
+            }
+        });
+    });
+    quick_open(app, ui, &mut actions);
+
+    if app.editor.search.open {
+        search_panel(app, ui, &mut actions);
+        run_actions(app, actions);
+        return;
+    }
+
+    ui.horizontal(|ui| {
         ui.add(
             egui::TextEdit::singleline(&mut app.editor.tree_filter)
                 .hint_text(super::views::dim_hint("filter the tree"))
                 .desired_width(f32::INFINITY),
         );
     });
-    quick_open(app, ui, &mut actions);
     ui.separator();
 
     if app.editor.tree.is_empty() {
@@ -418,6 +483,95 @@ pub fn editor_sidebar(app: &mut App, ui: &mut egui::Ui) {
     });
 
     run_actions(app, actions);
+}
+
+/// Search across the contents of every tracked file.
+fn search_panel(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+    let mut run = false;
+    ui.horizontal(|ui| {
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut app.editor.search.query)
+                .hint_text(super::views::dim_hint("search files"))
+                .desired_width(f32::INFINITY),
+        );
+        // On Enter, not on every keystroke: each search is a git process.
+        if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            run = true;
+        }
+    });
+    ui.horizontal(|ui| {
+        let options = &mut app.editor.search.options;
+        if ui
+            .selectable_label(options.case_sensitive, "Aa")
+            .on_hover_text("Match case")
+            .clicked()
+        {
+            options.case_sensitive = !options.case_sensitive;
+            run = true;
+        }
+        if ui.selectable_label(options.whole_word, "W").on_hover_text("Whole word").clicked() {
+            options.whole_word = !options.whole_word;
+            run = true;
+        }
+        if ui
+            .selectable_label(options.regex, ".*")
+            .on_hover_text("Regular expression")
+            .clicked()
+        {
+            options.regex = !options.regex;
+            run = true;
+        }
+        if ui.small_button("Search").clicked() {
+            run = true;
+        }
+        if app.editor.search.running {
+            ui.add(egui::Spinner::new().size(12.0));
+        }
+    });
+    ui.separator();
+
+    if run && !app.editor.search.query.trim().is_empty() {
+        actions.push(Action::Search);
+    }
+
+    let hits = app.editor.search.hits.clone();
+    if hits.is_empty() {
+        if app.editor.search.searched && !app.editor.search.running {
+            ui.label(RichText::new("No matches.").small().color(theme::FG_DIM));
+        }
+        return;
+    }
+
+    let files = hits.iter().map(|h| &h.path).collect::<std::collections::HashSet<_>>().len();
+    ui.label(
+        RichText::new(format!("{} hit(s) in {files} file(s)", hits.len()))
+            .small()
+            .color(theme::FG_DIM),
+    );
+
+    let Some(repo) = app.repo.clone() else { return };
+    ScrollArea::vertical().auto_shrink([false, false]).id_salt("search-hits").show(ui, |ui| {
+        let mut last_path: Option<&str> = None;
+        for hit in &hits {
+            // Grouped by file, with the path shown once.
+            if last_path != Some(hit.path.as_str()) {
+                ui.add_space(4.0);
+                ui.label(RichText::new(&hit.path).small().color(theme::TEAL));
+                last_path = Some(hit.path.as_str());
+            }
+            let line = format!("{:>5}  {}", hit.line, hit.text.trim());
+            if ui
+                .selectable_label(false, RichText::new(line).small().monospace())
+                .on_hover_text("Open here")
+                .clicked()
+            {
+                actions.push(Action::Open {
+                    path: repo.path().join(&hit.path),
+                    reveal: Some(hit.line.saturating_sub(1)),
+                });
+            }
+        }
+    });
 }
 
 /// What the tree needs to know about the editor while it draws.
@@ -511,6 +665,8 @@ pub fn editor_viewport(app: &mut App, ui: &mut egui::Ui) {
     }
 
     viewport_header(app, ui, &mut actions);
+    find_bar(app, ui);
+    goto_line_bar(app, ui);
 
     // Diagnostics come straight from the server's shared state; they change
     // without anything in the UI asking, so they are read fresh each frame.
@@ -536,6 +692,177 @@ pub fn editor_viewport(app: &mut App, ui: &mut egui::Ui) {
         }
     });
     run_actions(app, actions);
+}
+
+/// Find, and optionally replace, within the open file.
+fn find_bar(app: &mut App, ui: &mut egui::Ui) {
+    if !app.editor.find.open {
+        return;
+    }
+    let Some(index) = app.editor.active else { return };
+
+    let mut changed = false;
+    let mut step = 0isize;
+    let mut replace_one = false;
+    let mut replace_all = false;
+
+    egui::Frame::new().fill(theme::PANEL2).inner_margin(6.0).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut app.editor.find.query)
+                    .hint_text(super::views::dim_hint("find"))
+                    .desired_width(240.0),
+            );
+            if app.editor.find.focus {
+                response.request_focus();
+                app.editor.find.focus = false;
+            }
+            if response.changed() {
+                changed = true;
+            }
+            // Enter steps through matches, which is what the key means in
+            // every editor's find bar.
+            if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                step = 1;
+                app.editor.find.focus = true;
+            }
+
+            let count = app.editor.find.matches.len();
+            let label = if count == 0 {
+                if app.editor.find.query.is_empty() {
+                    String::new()
+                } else {
+                    "no matches".into()
+                }
+            } else {
+                format!("{} of {count}", app.editor.find.current + 1)
+            };
+            ui.label(RichText::new(label).small().color(theme::FG_DIM));
+            if ui.small_button("‹").on_hover_text("Previous").clicked() {
+                step = -1;
+            }
+            if ui.small_button("›").on_hover_text("Next (Cmd/Ctrl+G)").clicked() {
+                step = 1;
+            }
+            if ui
+                .selectable_label(app.editor.find.options.case_sensitive, "Aa")
+                .on_hover_text("Match case")
+                .clicked()
+            {
+                app.editor.find.options.case_sensitive =
+                    !app.editor.find.options.case_sensitive;
+                changed = true;
+            }
+            if ui
+                .selectable_label(app.editor.find.options.whole_word, "W")
+                .on_hover_text("Whole word")
+                .clicked()
+            {
+                app.editor.find.options.whole_word = !app.editor.find.options.whole_word;
+                changed = true;
+            }
+            if ui
+                .selectable_label(app.editor.find.replacing, "Replace")
+                .on_hover_text("Cmd/Ctrl+Alt+F")
+                .clicked()
+            {
+                app.editor.find.replacing = !app.editor.find.replacing;
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("×").on_hover_text("Close (Esc)").clicked() {
+                    app.editor.find.open = false;
+                }
+            });
+        });
+
+        if app.editor.find.replacing {
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut app.editor.find.replacement)
+                        .hint_text(super::views::dim_hint("replace with"))
+                        .desired_width(240.0),
+                );
+                let any = !app.editor.find.matches.is_empty();
+                if ui.add_enabled(any, egui::Button::new("Replace")).clicked() {
+                    replace_one = true;
+                }
+                if ui
+                    .add_enabled(any, egui::Button::new("Replace all"))
+                    .on_hover_text("Every match in this file")
+                    .clicked()
+                {
+                    replace_all = true;
+                }
+            });
+        }
+    });
+
+    if changed {
+        refresh_matches(app, index);
+    }
+    if step != 0 {
+        step_match(app, index, step);
+    }
+    if replace_one {
+        let current = app.editor.find.current;
+        if let Some(range) = app.editor.find.matches.get(current).copied() {
+            let replacement = app.editor.find.replacement.clone();
+            let text = edits::replace_at(&app.editor.files[index].text, range, &replacement);
+            let end = range.0 + replacement.len();
+            apply_edit(app, index, text, (range.0, end), ui.ctx());
+            refresh_matches(app, index);
+        }
+    }
+    if replace_all {
+        let (query, replacement, options) = (
+            app.editor.find.query.clone(),
+            app.editor.find.replacement.clone(),
+            app.editor.find.options,
+        );
+        let (text, count) =
+            edits::replace_all(&app.editor.files[index].text, &query, &replacement, options);
+        let cursor = app.editor.files[index].cursor.min(text.len());
+        apply_edit(app, index, text, (cursor, cursor), ui.ctx());
+        refresh_matches(app, index);
+        app.toast(format!("Replaced {count} occurrence(s)."), false);
+    }
+}
+
+/// Jump to a line number.
+fn goto_line_bar(app: &mut App, ui: &mut egui::Ui) {
+    let Some(mut input) = app.editor.goto_line.clone() else { return };
+    let Some(index) = app.editor.active else { return };
+
+    let mut go = false;
+    egui::Frame::new().fill(theme::PANEL2).inner_margin(6.0).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Go to line").small());
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut input).desired_width(80.0).hint_text("1"),
+            );
+            response.request_focus();
+            if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                go = true;
+            }
+            let lines = app.editor.files[index].text.lines().count();
+            ui.label(RichText::new(format!("of {lines}")).small().color(theme::FG_DIM));
+            if ui.small_button("Go").clicked() {
+                go = true;
+            }
+        });
+    });
+
+    if go {
+        if let Ok(line) = input.trim().parse::<u32>() {
+            let offset = edits::line_start(&app.editor.files[index].text, line);
+            app.editor.selection = (offset, offset);
+            app.editor.files[index].cursor = offset;
+            app.editor.files[index].reveal = Some(line.saturating_sub(1));
+        }
+        app.editor.goto_line = None;
+    } else {
+        app.editor.goto_line = Some(input);
+    }
 }
 
 /// File name, dirty marker, and the actions that act on the open file.
@@ -565,6 +892,31 @@ fn viewport_header(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) 
             }
             ui.checkbox(&mut app.editor.outline_open, "Outline");
             ui.checkbox(&mut app.editor.format_on_save, "Format on save");
+
+            // The AI actions that act on what you are looking at. They
+            // report into the Agent tab, where changes are reviewed.
+            ui.menu_button("AI ▾", |ui| {
+                use crate::agent::assist::Kind;
+                let selected = {
+                    let (a, b) = app.editor.selection;
+                    a != b
+                };
+                ui.label(
+                    RichText::new(if selected {
+                        "on the selection"
+                    } else {
+                        "on the whole file"
+                    })
+                    .small()
+                    .color(theme::FG_DIM),
+                );
+                for kind in [Kind::Explain, Kind::Fix, Kind::Tests, Kind::Document] {
+                    if ui.button(kind.label()).clicked() {
+                        actions.push(Action::Assist(kind));
+                        ui.close();
+                    }
+                }
+            });
         });
     });
     ui.separator();
@@ -731,11 +1083,16 @@ fn code_area(
     });
     let output = response.inner;
 
+    // Scoped: the keyboard handling below needs `app` whole, and this
+    // borrow would otherwise still be alive there.
+    {
     let file = &mut app.editor.files[index];
 
-    // Cursor, as a byte offset.
+    // Cursor and selection, as byte offsets.
     if let Some(range) = output.cursor_range {
         file.cursor = char_to_byte(&file.text, range.primary.index);
+        let secondary = char_to_byte(&file.text, range.secondary.index);
+        app.editor.selection = (secondary, file.cursor);
     }
 
     // Typing: mark for a debounced didChange, and keep the completion filter
@@ -765,7 +1122,9 @@ fn code_area(
         ui.ctx().request_repaint_after(SYNC_DEBOUNCE);
     }
 
-    let position = file.cursor_position();
+    }
+
+    let position = app.editor.files[index].cursor_position();
     let cursor_screen = output
         .cursor_range
         .map(|r| output.galley.pos_from_cursor(r.primary))
@@ -785,6 +1144,7 @@ fn code_area(
         actions.push(Action::References { path: path.clone(), position });
     }
     if keys.rename {
+        let file = &app.editor.files[index];
         let (start, end) = file.word_at(file.cursor);
         actions.push(Action::StartRename {
             path: path.clone(),
@@ -793,25 +1153,71 @@ fn code_area(
         });
     }
     if keys.completion && !app.editor.completion.requesting {
-        let (start, _) = file.word_at(file.cursor);
+        let file = &app.editor.files[index];
+        let (start, cursor) = (file.word_at(file.cursor).0, file.cursor);
+        let filter = file.text[start..cursor].to_string();
         app.editor.completion.anchor = start;
-        app.editor.completion.filter = file.text[start..file.cursor].to_string();
+        app.editor.completion.filter = filter;
         app.editor.completion.screen_pos = cursor_screen;
         actions.push(Action::Completion { path: path.clone(), position, anchor: start });
     }
     if keys.escape {
         app.editor.completion.close();
         app.editor.hover.text = None;
+        app.editor.find.open = false;
+        app.editor.goto_line = None;
+    }
+    if keys.find || keys.replace {
+        app.editor.find.open = true;
+        app.editor.find.replacing = keys.replace;
+        app.editor.find.focus = true;
+        // Seed the box with the selection, the way every editor does.
+        let file = &app.editor.files[index];
+        let (start, end) = app.editor.selection;
+        if start != end && end <= file.text.len() {
+            let (a, b) = (start.min(end), start.max(end));
+            if !file.text[a..b].contains('\n') {
+                app.editor.find.query = file.text[a..b].to_string();
+            }
+        }
+        refresh_matches(app, index);
+    }
+    if keys.find_next {
+        step_match(app, index, 1);
+    }
+    if keys.goto_line {
+        app.editor.goto_line = Some(String::new());
+    }
+    if keys.comment {
+        let lang = app.editor.files[index].lang;
+        if let Some(marker) = edits::line_comment(lang) {
+            let file = &mut app.editor.files[index];
+            let (text, selection) =
+                edits::toggle_comment(&file.text, app.editor.selection, marker);
+            apply_edit(app, index, text, selection, ui.ctx());
+        }
+    }
+    if keys.duplicate {
+        let file = &app.editor.files[index];
+        let (text, selection) = edits::duplicate_lines(&file.text, app.editor.selection);
+        apply_edit(app, index, text, selection, ui.ctx());
+    }
+    if keys.move_up || keys.move_down {
+        let file = &app.editor.files[index];
+        let (text, selection) =
+            edits::move_lines(&file.text, app.editor.selection, keys.move_up);
+        apply_edit(app, index, text, selection, ui.ctx());
     }
 
     // Ctrl/Cmd-click is go-to-definition, the way every editor does it.
     if output.response.clicked() && (keys.command_down) {
         if let Some(pos) = ui.ctx().pointer_interact_pos() {
+            let text = &app.editor.files[index].text;
             let cursor = output.galley.cursor_from_pos(pos - output.galley_pos);
-            let offset = char_to_byte(&file.text, cursor.index);
+            let offset = char_to_byte(text, cursor.index);
             actions.push(Action::Definition {
                 path: path.clone(),
-                position: protocol::offset_to_position(&file.text, offset),
+                position: protocol::offset_to_position(text, offset),
             });
         }
     }
@@ -1151,6 +1557,56 @@ fn bottom_panel(
     });
 }
 
+/// Writes an edit into a buffer and puts the selection where it belongs.
+fn apply_edit(app: &mut App, index: usize, text: String, selection: Range, ctx: &egui::Context) {
+    let file = &mut app.editor.files[index];
+    if file.read_only || file.text == text {
+        return;
+    }
+    file.text = text;
+    file.cursor = selection.1.min(file.text.len());
+    file.dirty_since = Some(Instant::now());
+    app.editor.selection = selection;
+
+    // egui keeps its own cursor; without this the caret jumps to the top
+    // after any programmatic edit.
+    let id = egui::Id::new(("editor-buffer", &file.path));
+    if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
+        let range = CCursorRange::two(
+            CCursor::new(byte_to_char(&file.text, selection.0)),
+            CCursor::new(byte_to_char(&file.text, selection.1)),
+        );
+        state.cursor.set_char_range(Some(range));
+        state.store(ctx, id);
+    }
+}
+
+/// Recomputes the matches for the current query.
+fn refresh_matches(app: &mut App, index: usize) {
+    let query = app.editor.find.query.clone();
+    let options = app.editor.find.options;
+    let text = &app.editor.files[index].text;
+    app.editor.find.matches = edits::find_all(text, &query, options);
+    let from = app.editor.selection.1;
+    app.editor.find.current =
+        edits::next_match(&app.editor.find.matches, from).unwrap_or(0);
+}
+
+/// Moves to the next or previous match and selects it.
+fn step_match(app: &mut App, index: usize, delta: isize) {
+    if app.editor.find.matches.is_empty() {
+        return;
+    }
+    let count = app.editor.find.matches.len();
+    let current = app.editor.find.current;
+    let next = if delta >= 0 { (current + 1) % count } else { (current + count - 1) % count };
+    app.editor.find.current = next;
+    let found = app.editor.find.matches[next];
+    let line = edits::line_col(&app.editor.files[index].text, found.0).0;
+    app.editor.files[index].reveal = Some(line.saturating_sub(1));
+    app.editor.selection = found;
+}
+
 // ---------------------------------------------------------------------------
 // Keyboard
 // ---------------------------------------------------------------------------
@@ -1161,6 +1617,14 @@ fn bottom_panel(
 pub struct Keys {
     pub save: bool,
     pub format: bool,
+    pub find: bool,
+    pub replace: bool,
+    pub find_next: bool,
+    pub goto_line: bool,
+    pub comment: bool,
+    pub duplicate: bool,
+    pub move_up: bool,
+    pub move_down: bool,
     pub definition: bool,
     pub references: bool,
     pub rename: bool,
@@ -1178,6 +1642,14 @@ fn read_keys(ui: &egui::Ui, completion_open: bool) -> Keys {
     ui.input_mut(|i| Keys {
         save: i.consume_key(command, Key::S),
         format: i.consume_key(command | Modifiers::SHIFT, Key::F),
+        find: i.consume_key(command, Key::F),
+        replace: i.consume_key(command | Modifiers::ALT, Key::F),
+        find_next: i.consume_key(command, Key::G),
+        goto_line: i.consume_key(command | Modifiers::SHIFT, Key::G),
+        comment: i.consume_key(command, Key::Slash),
+        duplicate: i.consume_key(command | Modifiers::SHIFT, Key::D),
+        move_up: i.consume_key(Modifiers::ALT, Key::ArrowUp),
+        move_down: i.consume_key(Modifiers::ALT, Key::ArrowDown),
         definition: i.consume_key(Modifiers::NONE, Key::F12),
         references: i.consume_key(Modifiers::SHIFT, Key::F12),
         rename: i.consume_key(Modifiers::NONE, Key::F2),
@@ -1364,6 +1836,8 @@ fn run_actions(app: &mut App, actions: Vec<Action>) {
             Action::RestartServers => app.lsp_restart(),
             Action::QuickOpen => app.editor_quick_open(),
             Action::LoadTree => app.editor_load_tree(),
+            Action::Search => app.editor_search(),
+            Action::Assist(kind) => app.editor_assist(kind),
         }
     }
 }

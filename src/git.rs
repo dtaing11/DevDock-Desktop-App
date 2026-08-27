@@ -251,6 +251,32 @@ impl RebasePlan {
     }
 }
 
+/// How a content search matches.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GrepOptions {
+    pub case_sensitive: bool,
+    pub whole_word: bool,
+    /// Treat the query as a regular expression rather than literal text.
+    pub regex: bool,
+    /// Cap on hits returned, so a search for `e` cannot fill memory.
+    pub max_hits: usize,
+}
+
+impl Default for GrepOptions {
+    fn default() -> Self {
+        Self { case_sensitive: false, whole_word: false, regex: false, max_hits: 500 }
+    }
+}
+
+/// One matching line from a content search.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GrepHit {
+    pub path: String,
+    /// 1-based.
+    pub line: u32,
+    pub text: String,
+}
+
 /// One entry from `git reflog`: where `HEAD` was, and what moved it.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ReflogEntry {
@@ -1026,6 +1052,58 @@ impl Repo {
             self.git(&["commit", "--allow-empty", "-m", &message])?;
         }
         Ok(())
+    }
+
+    /// Searches the contents of tracked files.
+    ///
+    /// `git grep` rather than walking the tree: it honours `.gitignore` by
+    /// construction, skips binary files, and is fast on a large repository
+    /// because git already has the index.
+    pub fn grep(&self, query: &str, options: GrepOptions) -> Result<Vec<GrepHit>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let max = format!("{}", options.max_hits.max(1));
+        let mut args = vec!["grep", "--line-number", "--no-color", "-I", "--max-count", &max];
+        if !options.case_sensitive {
+            args.push("--ignore-case");
+        }
+        if options.whole_word {
+            args.push("--word-regexp");
+        }
+        if options.regex {
+            // Extended, not git's default basic regex: `+` and `|` meaning
+            // what everyone expects them to mean is the whole point of
+            // asking for a regex.
+            args.push("--extended-regexp");
+        } else {
+            args.push("--fixed-strings");
+        }
+        args.push("-e");
+        args.push(query);
+
+        let out = match self.git(&args) {
+            Ok(out) => out,
+            // git grep exits non-zero when nothing matched, which is not an
+            // error worth showing anyone.
+            Err(_) => return Ok(Vec::new()),
+        };
+        Ok(out
+            .lines()
+            .filter_map(|line| {
+                // path:line:text — a path can contain a colon, so split from
+                // the left twice and keep the rest verbatim.
+                let (path, rest) = line.split_once(':')?;
+                let (number, text) = rest.split_once(':')?;
+                Some(GrepHit {
+                    path: path.to_string(),
+                    line: number.parse().ok()?,
+                    text: text.trim_end().to_string(),
+                })
+            })
+            .take(options.max_hits)
+            .collect())
     }
 
     // -- reflog ---------------------------------------------------------------

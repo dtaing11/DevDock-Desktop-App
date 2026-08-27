@@ -73,6 +73,8 @@ pub enum Msg {
     AiCiConfig { result: Result<String, String> },
     /// Every file git tracks, for the editor's file finder.
     TrackedFiles(Vec<String>),
+    /// Matching lines from a project-wide content search.
+    SearchHits(Vec<crate::git::GrepHit>),
     /// Recent `HEAD` movements, for the undo dialog.
     Reflog(Result<Vec<crate::git::ReflogEntry>, String>),
     /// A proposed split of the working tree into commits.

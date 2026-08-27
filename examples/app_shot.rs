@@ -25,20 +25,36 @@ impl eframe::App for Shot {
             if let Some(file) = self.open.take() {
                 self.app.editor_open(std::path::Path::new(&file), None);
             }
+            if std::env::var("TERMINAL").is_ok() {
+                self.app.terminal_open(false);
+                if let Some(command) = std::env::var("TERMINAL_CMD").ok() {
+                    self.app.terminal_run(&command);
+                }
+            }
         }
 
         views::sidebar(&mut self.app, ctx);
+        // Bottom panel before the central one, as the app does it.
+        #[cfg(unix)]
+        git_manage::app::terminal_panel::panel(&mut self.app, ctx);
         views::diff_panel(&mut self.app, ctx);
 
         // The sidebar must not grow frame over frame: egui stores a panel's
         // width from its content, so a greedy child compounds.
-        if self.frame.is_multiple_of(40) {
+        if self.frame < 12 || self.frame.is_multiple_of(40) {
             if let Some(state) = egui::containers::panel::PanelState::load(
                 ctx,
                 egui::Id::new("sidebar"),
             ) {
-                println!("frame {}: sidebar {:.0}pt", self.frame, state.rect.width());
+                print!("frame {}: sidebar {:.0}pt", self.frame, state.rect.width());
             }
+            if let Some(state) = egui::containers::panel::PanelState::load(
+                ctx,
+                egui::Id::new("terminal"),
+            ) {
+                print!("  terminal {:.0}pt", state.rect.height());
+            }
+            println!();
         }
 
         // Give background work (tracked files, language servers) a few

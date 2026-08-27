@@ -17,6 +17,8 @@ pub mod graph;
 pub mod markdown;
 pub mod shortcuts;
 pub mod syntax;
+#[cfg(unix)]
+pub mod terminal_panel;
 pub mod textdiff;
 pub mod theme;
 pub mod views;
@@ -743,6 +745,9 @@ pub struct App {
     pub split: SplitState,
     /// An AI-proposed tidy-up of the branch's commits.
     pub tidy: TidyState,
+    /// Shells running in the bottom panel.
+    #[cfg(unix)]
+    pub terminal: terminal_panel::TerminalState,
     /// Language servers for the open repository, started on demand.
     pub lsp: std::sync::Arc<crate::lsp::Manager>,
     /// The egui context, kept so background work started from a message
@@ -864,6 +869,8 @@ impl App {
             coding: Default::default(),
             split: Default::default(),
             tidy: Default::default(),
+            #[cfg(unix)]
+            terminal: Default::default(),
             // Replaced when a repository opens; a manager with no servers
             // running costs nothing until a file needs one.
             lsp: std::sync::Arc::new(crate::lsp::Manager::new(
@@ -2876,6 +2883,63 @@ impl App {
         });
     }
 
+    // -- terminal --------------------------------------------------------------
+
+    /// Opens the terminal panel, starting a shell when asked for a new one
+    /// or when there is none yet.
+    #[cfg(unix)]
+    pub fn terminal_open(&mut self, new_session: bool) {
+        self.terminal.open = true;
+        if !new_session && !self.terminal.sessions.is_empty() {
+            return;
+        }
+        let cwd = self
+            .repo
+            .as_ref()
+            .map(|r| r.path().to_path_buf())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let shell = crate::terminal::pty::default_shell();
+        let repaint = repaint_handle(&self.ctx);
+
+        match crate::terminal::pty::Pty::spawn(&shell, &cwd, 80, 24, Some(repaint)) {
+            Ok(pty) => {
+                let title = format!(
+                    "{} {}",
+                    std::path::Path::new(&shell)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "shell".into()),
+                    self.terminal.sessions.len() + 1
+                );
+                self.terminal.sessions.push(terminal_panel::Session {
+                    pty,
+                    title,
+                    finished: false,
+                });
+                self.terminal.active = self.terminal.sessions.len() - 1;
+            }
+            Err(e) => self.toast(e, true),
+        }
+    }
+
+    /// Hides the panel, leaving the shells running.
+    #[cfg(unix)]
+    pub fn terminal_toggle(&mut self) {
+        if self.terminal.open {
+            self.terminal.open = false;
+        } else {
+            self.terminal_open(false);
+        }
+    }
+
+    /// Sends a command to the active shell, starting one if needed.
+    #[cfg(unix)]
+    pub fn terminal_run(&mut self, command: &str) {
+        self.terminal_open(false);
+        let Some(session) = self.terminal.sessions.get(self.terminal.active) else { return };
+        session.pty.write(format!("{command}\n").as_bytes());
+    }
+
     // -- editor AI actions -----------------------------------------------------
 
     /// Runs an AI action on the selection in the open file.
@@ -3741,6 +3805,10 @@ impl App {
                     self.refresh();
                 }
                 Action::QuickOpen => self.editor_quick_open(),
+                Action::Terminal => {
+                    #[cfg(unix)]
+                    self.terminal_toggle();
+                }
             }
         }
         if escape && self.dialog != Dialog::None {
@@ -3827,6 +3895,10 @@ impl eframe::App for App {
         if self.graph_open {
             graph::draw_side_panel(self, ctx);
         }
+        // Before the central panel, so the terminal takes its height from
+        // the bottom rather than overlapping the diff.
+        #[cfg(unix)]
+        terminal_panel::panel(self, ctx);
         views::diff_panel(self, ctx);
         dialogs::show(self, ctx);
         views::toasts(self, ctx);

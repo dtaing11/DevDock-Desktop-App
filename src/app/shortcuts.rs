@@ -16,6 +16,8 @@ pub enum Action {
     ToggleHistory,
     /// Open the editor's file finder.
     QuickOpen,
+    /// Show or hide the terminal panel.
+    Terminal,
 }
 
 impl Action {
@@ -28,6 +30,7 @@ impl Action {
         Action::RepoPicker,
         Action::ToggleHistory,
         Action::QuickOpen,
+        Action::Terminal,
     ];
 
     /// Human-readable label for Settings.
@@ -40,6 +43,7 @@ impl Action {
             Action::RepoPicker => "Open repository picker",
             Action::ToggleHistory => "Toggle Changes/History tab",
             Action::QuickOpen => "Open a file in the editor",
+            Action::Terminal => "Show or hide the terminal",
         }
     }
 }
@@ -109,6 +113,13 @@ pub struct Shortcuts {
     /// it, and a missing field must not invalidate the whole config.
     #[serde(default = "default_quick_open")]
     pub quick_open: Binding,
+    #[serde(default = "default_terminal")]
+    pub terminal: Binding,
+}
+
+fn default_terminal() -> Binding {
+    // Ctrl+` — what every editor uses, and not taken here.
+    Binding::new(true, false, false, egui::Key::Backtick)
 }
 
 fn default_quick_open() -> Binding {
@@ -125,6 +136,7 @@ impl Default for Shortcuts {
             repo_picker: Binding::new(true, false, false, egui::Key::K),
             toggle_history: Binding::new(true, false, false, egui::Key::H),
             quick_open: default_quick_open(),
+            terminal: default_terminal(),
         }
     }
 }
@@ -139,6 +151,7 @@ impl Shortcuts {
             Action::RepoPicker => self.repo_picker,
             Action::ToggleHistory => self.toggle_history,
             Action::QuickOpen => self.quick_open,
+            Action::Terminal => self.terminal,
         }
     }
 
@@ -151,6 +164,7 @@ impl Shortcuts {
             Action::RepoPicker => self.repo_picker = binding,
             Action::ToggleHistory => self.toggle_history = binding,
             Action::QuickOpen => self.quick_open = binding,
+            Action::Terminal => self.terminal = binding,
         }
     }
 

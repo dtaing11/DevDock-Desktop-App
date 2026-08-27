@@ -1008,6 +1008,17 @@ pub fn sidebar(app: &mut App, ctx: &egui::Context) {
                 if ui.selectable_label(app.tab == Tab::Editor, editor_label).clicked() {
                     app.tab = Tab::Editor;
                 }
+                #[cfg(unix)]
+                {
+                    let running = app.terminal.running();
+                    let label = match running {
+                        0 => "Terminal".to_string(),
+                        n => format!("Terminal ({n})"),
+                    };
+                    if ui.selectable_label(app.terminal.open, label).clicked() {
+                        app.terminal_toggle();
+                    }
+                }
                 let agent_label = if app.coding.running {
                     "Agent (working)".to_string()
                 } else {

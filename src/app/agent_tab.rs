@@ -83,7 +83,7 @@ impl CodingState {
 /// of its changes you are looking at. The diffs are in the viewport.
 pub fn agent_sidebar(app: &mut App, ui: &mut egui::Ui) {
     if app.repo.is_none() {
-        ui.label(RichText::new("Open a repository to use the coding agent.").color(theme::FG_DIM));
+        ui.label(RichText::new("Open a repository to use the coding agent.").color(theme::fg_dim()));
         return;
     }
 
@@ -100,7 +100,7 @@ pub fn agent_sidebar(app: &mut App, ui: &mut egui::Ui) {
             }
             if let Some(error) = app.coding.error.clone() {
                 ui.add_space(6.0);
-                ui.label(RichText::new(error).color(theme::DANGER));
+                ui.label(RichText::new(error).color(theme::danger()));
             }
             if !app.coding.edits.is_empty() {
                 ui.add_space(8.0);
@@ -125,7 +125,7 @@ pub fn agent_viewport(app: &mut App, ui: &mut egui::Ui) {
                 } else {
                     "Give the agent a task in the panel on the left"
                 })
-                .color(theme::FG_DIM),
+                .color(theme::fg_dim()),
             );
         });
         return;
@@ -159,7 +159,7 @@ pub fn agent_viewport(app: &mut App, ui: &mut egui::Ui) {
             super::dialogs::proposal_diff(ui, &edit, "agent-viewport-diff");
         }
         None => {
-            ui.label(RichText::new("Select a change on the left.").color(theme::FG_DIM));
+            ui.label(RichText::new("Select a change on the left.").color(theme::fg_dim()));
         }
     }
 }
@@ -191,7 +191,7 @@ fn task_panel(app: &mut App, ui: &mut egui::Ui) {
             } else {
                 format!("{checks} check(s) available")
             };
-            ui.label(RichText::new(note).small().color(theme::FG_DIM));
+            ui.label(RichText::new(note).small().color(theme::fg_dim()));
         }
     });
 
@@ -212,7 +212,7 @@ fn task_panel(app: &mut App, ui: &mut egui::Ui) {
             ui.add(egui::Spinner::new().size(14.0));
             ui.label(RichText::new("working…").italics().weak());
         } else if ui
-            .add_enabled(ready, egui::Button::new("Run").fill(theme::EMBER))
+            .add_enabled(ready, egui::Button::new("Run").fill(theme::ember()))
             .on_hover_text("Send the task to the selected model")
             .clicked()
         {
@@ -225,7 +225,7 @@ fn task_panel(app: &mut App, ui: &mut egui::Ui) {
             ui.label(
                 RichText::new("review the changes below first")
                     .small()
-                    .color(theme::WARN),
+                    .color(theme::warn()),
             );
         }
         if !app.coding.history.is_empty()
@@ -260,7 +260,7 @@ fn transcript(app: &mut App, ui: &mut egui::Ui) {
         .id_salt(("agent-exchange", i))
         .default_open(false)
         .show(ui, |ui| {
-            ui.label(RichText::new(&exchange.task).small().color(theme::FG_DIM));
+            ui.label(RichText::new(&exchange.task).small().color(theme::fg_dim()));
             ui.separator();
             super::markdown::render(ui, &exchange.summary);
         });
@@ -279,7 +279,7 @@ fn plan(app: &mut App, ui: &mut egui::Ui) {
         if app.coding.running {
             ui.horizontal(|ui| {
                 ui.add(egui::Spinner::new().size(12.0));
-                ui.label(RichText::new("working out what to do…").small().color(theme::FG_DIM));
+                ui.label(RichText::new("working out what to do…").small().color(theme::fg_dim()));
             });
         }
         return;
@@ -291,19 +291,19 @@ fn plan(app: &mut App, ui: &mut egui::Ui) {
     for step in &steps {
         ui.horizontal_top(|ui| {
             let (mark, color) = if step.done {
-                ("✔", theme::ADD)
+                ("✔", theme::add())
             } else if app.coding.running {
-                ("○", theme::WARN)
+                ("○", theme::warn())
             } else {
-                ("○", theme::FG_DIM)
+                ("○", theme::fg_dim())
             };
             ui.label(RichText::new(mark).color(color).monospace());
             let text = RichText::new(&step.text).small();
             ui.add(
                 egui::Label::new(if step.done {
-                    text.color(theme::FG_DIM).strikethrough()
+                    text.color(theme::fg_dim()).strikethrough()
                 } else {
-                    text.color(theme::FG)
+                    text.color(theme::fg())
                 })
                 .wrap(),
             );
@@ -325,7 +325,7 @@ fn activity(app: &mut App, ui: &mut egui::Ui) {
                 .id_salt("agent-activity-log")
                 .show(ui, |ui| {
                     for line in &lines {
-                        ui.label(RichText::new(line).small().monospace().color(theme::FG_DIM));
+                        ui.label(RichText::new(line).small().monospace().color(theme::fg_dim()));
                     }
                 });
         });
@@ -343,7 +343,7 @@ fn change_list(app: &mut App, ui: &mut egui::Ui) {
             "Nothing has been written. Tick what you want and apply it."
         })
         .small()
-        .color(if live { theme::WARN } else { theme::FG_DIM }),
+        .color(if live { theme::warn() } else { theme::fg_dim() }),
     );
     if app.coding.truncated {
         ui.label(
@@ -351,7 +351,7 @@ fn change_list(app: &mut App, ui: &mut egui::Ui) {
                 "The model ran out of budget and stopped early — read these with extra care.",
             )
             .small()
-            .color(theme::DANGER),
+            .color(theme::danger()),
         );
     }
 
@@ -365,7 +365,7 @@ fn change_list(app: &mut App, ui: &mut egui::Ui) {
                 proposed.edit.path,
                 if proposed.edit.is_new() { "  (new file)" } else { "" }
             );
-            let color = if proposed.applied { theme::ADD } else { theme::FG };
+            let color = if proposed.applied { theme::add() } else { theme::fg() };
             if ui
                 .selectable_label(app.coding.selected == Some(i), RichText::new(label).color(color))
                 .clicked()
@@ -376,7 +376,7 @@ fn change_list(app: &mut App, ui: &mut egui::Ui) {
                 ui.label(
                     RichText::new(if live { "kept" } else { "applied" })
                         .small()
-                        .color(theme::ADD),
+                        .color(theme::add()),
                 );
             }
         });
@@ -396,7 +396,7 @@ fn apply_bar(app: &mut App, ui: &mut egui::Ui) {
             if ui
                 .add_enabled(
                     pending > 0,
-                    egui::Button::new(format!("Revert {pending} selected")).fill(theme::DANGER),
+                    egui::Button::new(format!("Revert {pending} selected")).fill(theme::danger()),
                 )
                 .on_hover_text("Restores the file exactly as it was before this run")
                 .clicked()
@@ -406,7 +406,7 @@ fn apply_bar(app: &mut App, ui: &mut egui::Ui) {
             if ui
                 .add_enabled(
                     app.coding.awaiting_review(),
-                    egui::Button::new("Keep everything").fill(theme::EMBER),
+                    egui::Button::new("Keep everything").fill(theme::ember()),
                 )
                 .on_hover_text("Leaves every change in place and clears this list")
                 .clicked()
@@ -416,7 +416,7 @@ fn apply_bar(app: &mut App, ui: &mut egui::Ui) {
         } else if ui
             .add_enabled(
                 pending > 0,
-                egui::Button::new(format!("Apply {pending} selected")).fill(theme::EMBER),
+                egui::Button::new(format!("Apply {pending} selected")).fill(theme::ember()),
             )
             .on_hover_text("Writes only the ticked files")
             .clicked()

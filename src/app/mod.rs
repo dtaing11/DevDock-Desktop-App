@@ -93,6 +93,12 @@ pub struct Config {
     /// this is the one worth pointing at your strongest model.
     #[serde(default)]
     pub coding_ai: Option<AiSelection>,
+    /// Use the light palette.
+    #[serde(default)]
+    pub light_theme: bool,
+    /// Interface scale, as egui's zoom factor. 1.0 is the design size.
+    #[serde(default = "default_zoom")]
+    pub zoom: f32,
     /// Render Markdown files instead of showing their diff. Sticky, because
     /// someone who wants prose rendered wants it rendered for the next file
     /// too.
@@ -104,6 +110,10 @@ pub struct Config {
     /// Per-repository custom AI instructions, keyed by worktree root path.
     #[serde(default)]
     pub repo_prompts: std::collections::HashMap<String, RepoPrompts>,
+}
+
+fn default_zoom() -> f32 {
+    1.0
 }
 
 /// Custom AI prompt additions for one repository.
@@ -773,6 +783,10 @@ pub struct App {
 impl App {
     fn new(ctx: &egui::Context) -> Self {
         let mut app = Self::bare(ctx);
+        // The stored appearance, before the first frame is drawn.
+        theme::set_light(app.config.light_theme);
+        theme::apply(ctx);
+        ctx.set_zoom_factor(app.config.zoom.clamp(MIN_ZOOM, MAX_ZOOM));
         app.startup();
         app.claude.auth_label = claude::Client::auth_label();
         app.load_claude_models();
@@ -2883,6 +2897,31 @@ impl App {
         });
     }
 
+    // -- appearance ------------------------------------------------------------
+
+    /// Switches palette and restyles everything.
+    pub fn set_light_theme(&mut self, light: bool) {
+        self.config.light_theme = light;
+        self.config.save();
+        theme::set_light(light);
+        theme::apply(&self.ctx);
+    }
+
+    /// Scales the whole interface. egui's zoom factor rather than a font
+    /// size: it scales spacing and controls too, so nothing overlaps at the
+    /// extremes.
+    pub fn set_zoom(&mut self, zoom: f32) {
+        let zoom = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+        self.config.zoom = zoom;
+        self.config.save();
+        self.ctx.set_zoom_factor(zoom);
+    }
+
+    /// Steps the zoom by one notch.
+    pub fn zoom_by(&mut self, delta: f32) {
+        self.set_zoom(self.config.zoom + delta);
+    }
+
     // -- terminal --------------------------------------------------------------
 
     /// Opens the terminal panel, starting a shell when asked for a new one
@@ -3811,6 +3850,25 @@ impl App {
                 }
             }
         }
+        let (zoom_in, zoom_out, zoom_reset) = ctx.input_mut(|i| {
+            let command = egui::Modifiers::COMMAND;
+            (
+                i.consume_key(command, egui::Key::Plus)
+                    || i.consume_key(command, egui::Key::Equals),
+                i.consume_key(command, egui::Key::Minus),
+                i.consume_key(command, egui::Key::Num0),
+            )
+        });
+        if zoom_in {
+            self.zoom_by(0.1);
+        }
+        if zoom_out {
+            self.zoom_by(-0.1);
+        }
+        if zoom_reset {
+            self.set_zoom(1.0);
+        }
+
         if escape && self.dialog != Dialog::None {
             if self.dialog == Dialog::GitHub {
                 self.gh.device = None;
@@ -3904,6 +3962,11 @@ impl eframe::App for App {
         views::toasts(self, ctx);
     }
 }
+
+/// Interface scale limits: below this the controls stop being clickable,
+/// above it a laptop screen holds nothing.
+const MIN_ZOOM: f32 = 0.7;
+const MAX_ZOOM: f32 = 2.0;
 
 /// A repaint callback for background threads that change state nobody
 /// asked for — diagnostics arriving, indexing progress — so the UI wakes up

@@ -18,12 +18,12 @@ fn segment_text(caption: &str, value: &str) -> LayoutJob {
     job.append(
         &caption.to_uppercase(),
         0.0,
-        TextFormat { font_id: FontId::proportional(9.5), color: theme::FG_DIM, ..Default::default() },
+        TextFormat { font_id: FontId::proportional(9.5), color: theme::fg_dim(), ..Default::default() },
     );
     job.append(
         &format!("\n{value}"),
         0.0,
-        TextFormat { font_id: FontId::proportional(14.5), color: theme::FG, ..Default::default() },
+        TextFormat { font_id: FontId::proportional(14.5), color: theme::fg(), ..Default::default() },
     );
     job
 }
@@ -64,8 +64,8 @@ fn segment_menu<R>(
 fn segment(ui: &mut egui::Ui, caption: &str, value: &str, min_width: f32) -> egui::Response {
     let button = egui::Button::new(segment_text(caption, value))
         .min_size(egui::vec2(min_width, theme::SEGMENT_H))
-        .fill(theme::PANEL)
-        .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+        .fill(theme::panel())
+        .stroke(egui::Stroke::new(1.0_f32, theme::border()))
         .corner_radius(theme::RADIUS_MD as f32);
     ui.add(button)
 }
@@ -74,7 +74,7 @@ fn segment(ui: &mut egui::Ui, caption: &str, value: &str, min_width: f32) -> egu
 /// plus pull request / GitHub / settings on the right.
 pub fn toolbar(app: &mut App, ctx: &egui::Context) {
     egui::TopBottomPanel::top("toolbar")
-        .frame(egui::Frame::new().fill(theme::BG).inner_margin(8.0))
+        .frame(egui::Frame::new().fill(theme::bg()).inner_margin(8.0))
         .show(ctx, |ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             ui.horizontal(|ui| {
@@ -134,8 +134,8 @@ fn stash_banner(app: &mut App, ui: &mut egui::Ui) {
     }
     ui.add_space(6.0);
     egui::Frame::new()
-        .fill(theme::TEAL.linear_multiply(0.10))
-        .stroke(egui::Stroke::new(1.0_f32, theme::TEAL.linear_multiply(0.5)))
+        .fill(theme::teal().linear_multiply(0.10))
+        .stroke(egui::Stroke::new(1.0_f32, theme::teal().linear_multiply(0.5)))
         .corner_radius(theme::RADIUS_MD as f32)
         .inner_margin(egui::Margin::symmetric(12, 6))
         .show(ui, |ui| {
@@ -150,7 +150,7 @@ fn stash_banner(app: &mut App, ui: &mut egui::Ui) {
                 } else {
                     format!("{count} stashes, newest: {newest}")
                 };
-                ui.label(RichText::new(text).color(theme::TEAL).small());
+                ui.label(RichText::new(text).color(theme::teal()).small());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .small_button("Apply newest")
@@ -171,7 +171,7 @@ fn stash_banner(app: &mut App, ui: &mut egui::Ui) {
                     }
                     ui.label(
                         RichText::new("more in the branch menu · ")
-                            .color(theme::FG_DIM)
+                            .color(theme::fg_dim())
                             .small(),
                     );
                 });
@@ -181,7 +181,7 @@ fn stash_banner(app: &mut App, ui: &mut egui::Ui) {
 
 /// Dim, italic hint text for input fields, clearly distinct from content.
 pub fn dim_hint(text: &str) -> RichText {
-    RichText::new(text).color(theme::FG_DIM.linear_multiply(0.5)).italics()
+    RichText::new(text).color(theme::fg_dim().linear_multiply(0.5)).italics()
 }
 
 /// Repository dropdown: recent repositories saved in the local config, with
@@ -223,7 +223,7 @@ fn repo_menu(app: &mut App, ui: &mut egui::Ui) {
                 } else {
                     // Missing on disk: offer repair or removal.
                     ui.label(
-                        RichText::new(format!("    {name} (missing)")).color(theme::FG_DIM),
+                        RichText::new(format!("    {name} (missing)")).color(theme::fg_dim()),
                     )
                     .on_hover_text(path);
                     if ui.small_button("Change path…").clicked() {
@@ -243,7 +243,7 @@ fn repo_menu(app: &mut App, ui: &mut egui::Ui) {
             });
         }
         if recents.is_empty() {
-            ui.label(RichText::new("No recent repositories").color(theme::FG_DIM));
+            ui.label(RichText::new("No recent repositories").color(theme::fg_dim()));
         }
 
         if let Some(path) = remove {
@@ -270,9 +270,9 @@ fn checks_badge(app: &mut App, ui: &mut egui::Ui) {
         return;
     }
     let (symbol, color) = match summary.state {
-        CheckState::Passing => ("OK", theme::ADD),
-        CheckState::Failing => ("FAIL", theme::DANGER),
-        CheckState::Pending => ("RUNNING", theme::WARN),
+        CheckState::Passing => ("OK", theme::add()),
+        CheckState::Failing => ("FAIL", theme::danger()),
+        CheckState::Pending => ("RUNNING", theme::warn()),
         CheckState::None => unreachable!(),
     };
     // Compose "OK (4/4) · main OK" with the main part colored.
@@ -298,10 +298,10 @@ fn checks_badge(app: &mut App, ui: &mut egui::Ui) {
         // Default-branch summary row, green when healthy.
         if let Some((name, _, state)) = &main_part {
             let (label, mcolor) = match state {
-                CheckState::Passing => (format!("{name}: all checks passing"), theme::ADD),
-                CheckState::Failing => (format!("{name}: checks failing"), theme::DANGER),
-                CheckState::Pending => (format!("{name}: checks running"), theme::WARN),
-                CheckState::None => (format!("{name}: no checks"), theme::FG_DIM),
+                CheckState::Passing => (format!("{name}: all checks passing"), theme::add()),
+                CheckState::Failing => (format!("{name}: checks failing"), theme::danger()),
+                CheckState::Pending => (format!("{name}: checks running"), theme::warn()),
+                CheckState::None => (format!("{name}: no checks"), theme::fg_dim()),
             };
             ui.label(RichText::new(label).color(mcolor).strong());
             ui.separator();
@@ -312,15 +312,15 @@ fn checks_badge(app: &mut App, ui: &mut egui::Ui) {
                 "{} passed, {} failed, {} running",
                 summary.passed, summary.failed, summary.pending
             ))
-            .color(theme::FG_DIM)
+            .color(theme::fg_dim())
             .small(),
         );
         ui.separator();
         for run in &summary.runs {
             let (glyph, run_color) = match (run.status.as_str(), run.conclusion.as_str()) {
-                ("completed", "success" | "neutral" | "skipped") => ("[pass]", theme::ADD),
-                ("completed", _) => ("[fail]", theme::DANGER),
-                _ => ("[running]", theme::WARN),
+                ("completed", "success" | "neutral" | "skipped") => ("[pass]", theme::add()),
+                ("completed", _) => ("[fail]", theme::danger()),
+                _ => ("[running]", theme::warn()),
             };
             let detail = if run.status == "completed" {
                 run.conclusion.clone()
@@ -412,7 +412,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
                 .filter(|b| b.name.to_lowercase().contains(&filter))
                 .collect();
             egui::Frame::new()
-                .fill(theme::PANEL2)
+                .fill(theme::panel2())
                 .corner_radius(6.0)
                 .inner_margin(egui::Margin::symmetric(8, 4))
                 .show(ui, |ui| {
@@ -421,7 +421,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
                     );
                 });
             if local_matches.is_empty() {
-                ui.label(RichText::new("  none").color(theme::FG_DIM).small());
+                ui.label(RichText::new("  none").color(theme::fg_dim()).small());
             }
             for branch in local_matches {
                 let marker = if branch.current { "» " } else { "    " };
@@ -444,23 +444,23 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
             ui.add_space(6.0);
             ui.separator();
             egui::Frame::new()
-                .fill(theme::PANEL2)
+                .fill(theme::panel2())
                 .corner_radius(6.0)
                 .inner_margin(egui::Margin::symmetric(8, 4))
                 .show(ui, |ui| {
                     ui.label(
-                        theme::overline(&format!("Remote branches ({})", remote_matches.len())).color(theme::TEAL),
+                        theme::overline(&format!("Remote branches ({})", remote_matches.len())).color(theme::teal()),
                     );
                 });
             if remote_matches.is_empty() {
                 ui.label(
                     RichText::new("  none (all remotes have local branches)")
-                        .color(theme::FG_DIM)
+                        .color(theme::fg_dim())
                         .small(),
                 );
             }
             for branch in remote_matches {
-                let label = RichText::new(format!("    {}", branch.name)).color(theme::TEAL);
+                let label = RichText::new(format!("    {}", branch.name)).color(theme::teal());
                 if ui
                     .button(label)
                     .on_hover_text("Creates a local tracking branch and switches to it")
@@ -483,7 +483,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
                 RichText::new(format!(
                     "Puts {current}'s commits onto the branch you pick"
                 ))
-                .color(theme::FG_DIM)
+                .color(theme::fg_dim())
                 .small(),
             );
             let locals_only: Vec<_> =
@@ -499,7 +499,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
             ui.set_min_width(260.0);
             ui.label(
                 RichText::new(format!("Brings the picked branch's commits into {current}"))
-                    .color(theme::FG_DIM)
+                    .color(theme::fg_dim())
                     .small(),
             );
             for branch in &others {
@@ -546,7 +546,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
         ui.menu_button(format!("Stashes ({})", stashes.len()), |ui| {
             ui.set_min_width(260.0);
             if stashes.is_empty() {
-                ui.label(RichText::new("No stashes").color(theme::FG_DIM));
+                ui.label(RichText::new("No stashes").color(theme::fg_dim()));
             }
             let current_branch =
                 app.status.as_ref().map(|s| s.branch.clone()).unwrap_or_default();
@@ -561,7 +561,7 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
                             truncate(&stash.message, 20),
                             stash.branch.as_deref().unwrap_or("?")
                         ))
-                        .color(theme::FG_DIM)
+                        .color(theme::fg_dim())
                     };
                     ui.label(label).on_hover_text(&stash.message);
                     if ui.small_button("Apply").clicked() {
@@ -692,14 +692,14 @@ fn checkout(app: &mut App, name: &str) {
 /// a sync operation runs so the click visibly "took".
 fn segment_spinner(ui: &mut egui::Ui, caption: &str, value: &str) {
     egui::Frame::new()
-        .fill(theme::PANEL2)
-        .stroke(egui::Stroke::new(1.0_f32, theme::TEAL))
+        .fill(theme::panel2())
+        .stroke(egui::Stroke::new(1.0_f32, theme::teal()))
         .corner_radius(theme::RADIUS_MD as f32)
         .show(ui, |ui| {
             ui.set_min_size(egui::vec2(SEGMENT_W, theme::SEGMENT_H));
             ui.horizontal_centered(|ui| {
                 ui.add_space(12.0);
-                ui.add(egui::Spinner::new().size(16.0).color(theme::TEAL));
+                ui.add(egui::Spinner::new().size(16.0).color(theme::teal()));
                 ui.add_space(6.0);
                 ui.label(segment_text(caption, value));
             });
@@ -911,8 +911,8 @@ fn state_banner(app: &mut App, ui: &mut egui::Ui) {
     }
     ui.add_space(6.0);
     egui::Frame::new()
-        .fill(theme::EMBER_DEEP.linear_multiply(0.25))
-        .stroke(egui::Stroke::new(1.0_f32, theme::EMBER_DEEP))
+        .fill(theme::ember_deep().linear_multiply(0.25))
+        .stroke(egui::Stroke::new(1.0_f32, theme::ember_deep()))
         .corner_radius(8.0)
         .inner_margin(8.0)
         .show(ui, |ui| {
@@ -964,7 +964,7 @@ pub fn sidebar(app: &mut App, ctx: &egui::Context) {
         // available width, a scroll area told not to shrink — can otherwise
         // grow the panel until the viewport is a sliver.
         .width_range(280.0..=460.0)
-        .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(8.0))
+        .frame(egui::Frame::new().fill(theme::panel()).inner_margin(8.0))
         .show(ctx, |ui| {
             // Wrapped: five tab buttons in one unwrapped row are wider than
             // the panel's default width, and a panel grows to fit its
@@ -1056,16 +1056,16 @@ pub fn sidebar(app: &mut App, ctx: &egui::Context) {
 
 fn status_glyph(status: Option<FileStatus>, conflicted: bool) -> (&'static str, Color32) {
     if conflicted {
-        return ("!", theme::DANGER);
+        return ("!", theme::danger());
     }
     match status {
-        Some(FileStatus::Modified) => ("M", theme::WARN),
-        Some(FileStatus::Added) | Some(FileStatus::Untracked) => ("A", theme::ADD),
-        Some(FileStatus::Deleted) => ("D", theme::DEL),
-        Some(FileStatus::Renamed) => ("R", theme::TEAL),
-        Some(FileStatus::Copied) => ("C", theme::TEAL),
-        Some(FileStatus::Typechange) => ("T", theme::WARN),
-        _ => ("·", theme::FG_DIM),
+        Some(FileStatus::Modified) => ("M", theme::warn()),
+        Some(FileStatus::Added) | Some(FileStatus::Untracked) => ("A", theme::add()),
+        Some(FileStatus::Deleted) => ("D", theme::del()),
+        Some(FileStatus::Renamed) => ("R", theme::teal()),
+        Some(FileStatus::Copied) => ("C", theme::teal()),
+        Some(FileStatus::Typechange) => ("T", theme::warn()),
+        _ => ("·", theme::fg_dim()),
     }
 }
 
@@ -1130,7 +1130,7 @@ fn changes_tab(app: &mut App, ui: &mut egui::Ui) {
             let selected = files.iter().filter(|f| !app.unchecked.contains(&f.path)).count();
             ui.label(
                 RichText::new(format!("{selected} of {} selected", files.len()))
-                    .color(theme::FG_DIM)
+                    .color(theme::fg_dim())
                     .small(),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1168,11 +1168,11 @@ fn changes_tab(app: &mut App, ui: &mut egui::Ui) {
             if files.is_empty() {
                 ui.add_space(16.0);
                 ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("No local changes").color(theme::FG_DIM));
+                    ui.label(RichText::new("No local changes").color(theme::fg_dim()));
                     ui.add_space(6.0);
                     ui.label(
                         RichText::new("Edit files in this repository and they will appear here.\nCtrl+Enter commits, Ctrl+R refreshes.")
-                            .color(theme::FG_DIM)
+                            .color(theme::fg_dim())
                             .small(),
                     );
                 });
@@ -1264,10 +1264,10 @@ fn select_file(app: &mut App, path: &str, staged: bool) {
 /// a tint that only reads as "selected" once you know to look for it.
 fn mode_button(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
     let button = if active {
-        egui::Button::new(RichText::new(label).color(theme::BG).strong())
-            .fill(theme::EMBER)
+        egui::Button::new(RichText::new(label).color(theme::bg()).strong())
+            .fill(theme::ember())
     } else {
-        egui::Button::new(RichText::new(label).color(theme::FG))
+        egui::Button::new(RichText::new(label).color(theme::fg()))
     };
     ui.add(button)
 }
@@ -1414,7 +1414,7 @@ fn commit_box(app: &mut App, ui: &mut egui::Ui) {
         format!("Commit to {branch}")
     };
     let commit_btn = egui::Button::new(RichText::new(label).strong().color(Color32::BLACK))
-        .fill(theme::EMBER)
+        .fill(theme::ember())
         .min_size(egui::vec2(ui.available_width(), 32.0));
     if ui.add_enabled(can_commit, commit_btn).clicked() {
         app.do_commit();
@@ -1450,8 +1450,8 @@ pub fn ai_controls(
     label: &str,
 ) {
     const HEIGHT: f32 = 28.0;
-    let fill = theme::TEAL.linear_multiply(0.25);
-    let fill_hover = theme::TEAL.linear_multiply(0.35);
+    let fill = theme::teal().linear_multiply(0.25);
+    let fill_hover = theme::teal().linear_multiply(0.35);
 
     ui.scope(|ui| {
         // One interact height and one fill for both widgets.
@@ -1512,7 +1512,7 @@ pub fn ai_model_picker(app: &mut App, ui: &mut egui::Ui, target: crate::app::wor
         ui.label(theme::overline("OLLAMA (LOCAL)"));
         if app.ollama_models.is_empty() {
             ui.label(
-                RichText::new("No models. Is Ollama running? (Settings)").color(theme::FG_DIM),
+                RichText::new("No models. Is Ollama running? (Settings)").color(theme::fg_dim()),
             );
         }
         let names: Vec<String> = app.ollama_models.iter().map(|m| m.name.clone()).collect();
@@ -1532,7 +1532,7 @@ pub fn ai_model_picker(app: &mut App, ui: &mut egui::Ui, target: crate::app::wor
         ui.separator();
         ui.label(theme::overline("CLAUDE"));
         if app.claude.auth_label.is_none() {
-            ui.label(RichText::new("Not signed in (Settings)").color(theme::FG_DIM));
+            ui.label(RichText::new("Not signed in (Settings)").color(theme::fg_dim()));
         } else {
             let models: Vec<String> = if app.claude.models.is_empty() {
                 crate::claude::FALLBACK_MODELS.iter().map(|s| s.to_string()).collect()
@@ -1619,17 +1619,17 @@ fn held_action_banner(app: &mut App, ui: &mut egui::Ui) {
 
     ui.add_space(8.0);
     egui::Frame::new()
-        .fill(theme::PANEL2)
-        .stroke(egui::Stroke::new(1.0_f32, theme::DANGER))
+        .fill(theme::panel2())
+        .stroke(egui::Stroke::new(1.0_f32, theme::danger()))
         .corner_radius(theme::RADIUS_MD as f32)
         .inner_margin(egui::Margin::symmetric(12, 10))
         .show(ui, |ui| {
             ui.label(
                 RichText::new(format!("{} held", action.noun()))
-                    .color(theme::DANGER)
+                    .color(theme::danger())
                     .strong(),
             );
-            ui.label(RichText::new(reason).color(theme::FG_DIM));
+            ui.label(RichText::new(reason).color(theme::fg_dim()));
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 if ui
@@ -1683,7 +1683,7 @@ fn review_context_log(ui: &mut egui::Ui, log: &[String]) {
         .id_salt("checks-review-context")
         .show(ui, |ui| {
             for line in log {
-                ui.label(RichText::new(line).small().monospace().color(theme::FG_DIM));
+                ui.label(RichText::new(line).small().monospace().color(theme::fg_dim()));
             }
         });
 }
@@ -1693,7 +1693,7 @@ fn review_section(app: &mut App, ui: &mut egui::Ui) {
 
     if let Some(err) = app.review.error.clone() {
         ui.add_space(8.0);
-        ui.label(RichText::new(format!("AI review failed: {err}")).color(theme::DANGER));
+        ui.label(RichText::new(format!("AI review failed: {err}")).color(theme::danger()));
     }
 
     let Some(outcome) = app.review.outcome.clone() else { return };
@@ -1731,7 +1731,7 @@ fn review_section(app: &mut App, ui: &mut egui::Ui) {
                 egui::CollapsingHeader::new("Reviewer's reasoning").default_open(false).show(
                     ui,
                     |ui| {
-                        ui.label(RichText::new(&outcome.reasoning).color(theme::FG_DIM));
+                        ui.label(RichText::new(&outcome.reasoning).color(theme::fg_dim()));
                     },
                 );
             }
@@ -1739,9 +1739,9 @@ fn review_section(app: &mut App, ui: &mut egui::Ui) {
             ui.add_space(6.0);
             for (i, finding) in outcome.findings.iter().enumerate() {
                 let color = match finding.severity {
-                    Severity::High => theme::DANGER,
-                    Severity::Medium => theme::EMBER,
-                    Severity::Low => theme::FG_DIM,
+                    Severity::High => theme::danger(),
+                    Severity::Medium => theme::ember(),
+                    Severity::Low => theme::fg_dim(),
                 };
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
@@ -1755,11 +1755,11 @@ fn review_section(app: &mut App, ui: &mut egui::Ui) {
                             Some(l) => format!("{}:{l}", finding.file),
                             None => finding.file.clone(),
                         };
-                        ui.label(RichText::new(loc).color(theme::FG_DIM).small().monospace());
+                        ui.label(RichText::new(loc).color(theme::fg_dim()).small().monospace());
                     }
                     if finding.severity >= fail_on {
                         ui.label(
-                            RichText::new("blocks").color(theme::DANGER).small().italics(),
+                            RichText::new("blocks").color(theme::danger()).small().italics(),
                         );
                     }
                     ui.label(&finding.title);
@@ -1770,7 +1770,7 @@ fn review_section(app: &mut App, ui: &mut egui::Ui) {
                         app.review.expanded = if expanded { None } else { Some(i) };
                     }
                     if expanded {
-                        ui.label(RichText::new(&finding.detail).color(theme::FG_DIM));
+                        ui.label(RichText::new(&finding.detail).color(theme::fg_dim()));
                         // The line the reviewer quoted, checked against the file
                         // before this was shown. It is what makes the finding
                         // checkable rather than something to take on faith.
@@ -1780,7 +1780,7 @@ fn review_section(app: &mut App, ui: &mut egui::Ui) {
                                 RichText::new(finding.evidence.trim())
                                     .monospace()
                                     .small()
-                                    .color(theme::TEAL),
+                                    .color(theme::teal()),
                             );
                         }
                     }
@@ -1844,7 +1844,7 @@ fn checks_tab(app: &mut App, ui: &mut egui::Ui) {
                 "No checks configured.\nCreate {} in the repository root\n(see the Pull Request dialog or docs/local-ci.md).",
                 crate::local_ci::CONFIG_FILE
             ))
-            .color(theme::FG_DIM),
+            .color(theme::fg_dim()),
         );
         return;
     }
@@ -1858,10 +1858,10 @@ fn checks_tab(app: &mut App, ui: &mut egui::Ui) {
             ui.horizontal(|ui| {
                 let (status, color) =
                     match app.local_ci.results.get(i).and_then(|r| r.as_ref()) {
-                        Some(r) if r.ok => (format!("[pass {:.1}s]", r.duration_secs), theme::ADD),
-                        Some(r) => (format!("[fail {:.1}s]", r.duration_secs), theme::DANGER),
-                        None if app.local_ci.running => ("[running]".into(), theme::WARN),
-                        None => ("[pending]".into(), theme::FG_DIM),
+                        Some(r) if r.ok => (format!("[pass {:.1}s]", r.duration_secs), theme::add()),
+                        Some(r) => (format!("[fail {:.1}s]", r.duration_secs), theme::danger()),
+                        None if app.local_ci.running => ("[running]".into(), theme::warn()),
+                        None => ("[pending]".into(), theme::fg_dim()),
                     };
                 ui.label(RichText::new(status).color(color).small().monospace());
                 let expanded = app.local_ci.expanded == Some(i);
@@ -1881,7 +1881,7 @@ fn checks_tab(app: &mut App, ui: &mut egui::Ui) {
     ui.separator();
     ui.label(theme::overline("RUN HISTORY"));
     if app.local_ci.history.is_empty() {
-        ui.label(RichText::new("No runs yet in this session.").color(theme::FG_DIM).small());
+        ui.label(RichText::new("No runs yet in this session.").color(theme::fg_dim()).small());
         return;
     }
     let history_len = app.local_ci.history.len();
@@ -1892,9 +1892,9 @@ fn checks_tab(app: &mut App, ui: &mut egui::Ui) {
                 (run.passed, run.total_secs, run.trigger, run.when, run.results.clone())
             };
             let (badge, color) = if passed {
-                ("PASS", theme::ADD)
+                ("PASS", theme::add())
             } else {
-                ("FAIL", theme::DANGER)
+                ("FAIL", theme::danger())
             };
             let age = when.elapsed().map(format_age).unwrap_or_else(|_| "?".into());
             egui::CollapsingHeader::new(
@@ -1910,9 +1910,9 @@ fn checks_tab(app: &mut App, ui: &mut egui::Ui) {
             .show(ui, |ui| {
                 for (j, result) in results.iter().enumerate() {
                     let (glyph, jcolor) = if result.ok {
-                        ("[pass]", theme::ADD)
+                        ("[pass]", theme::add())
                     } else {
-                        ("[fail]", theme::DANGER)
+                        ("[fail]", theme::danger())
                     };
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(glyph).color(jcolor).small().monospace());
@@ -1935,7 +1935,7 @@ fn checks_tab(app: &mut App, ui: &mut egui::Ui) {
 fn ci_log_box(ui: &mut egui::Ui, salt: usize, output: &str) {
     ScrollArea::vertical().max_height(140.0).id_salt(("ci-log", salt)).show(ui, |ui| {
         egui::Frame::new()
-            .fill(theme::BG)
+            .fill(theme::bg())
             .inner_margin(egui::Margin::symmetric(8, 6))
             .show(ui, |ui| {
                 for line in output.lines() {
@@ -1971,12 +1971,12 @@ fn history_search_bar(app: &mut App, ui: &mut egui::Ui) {
     // A file-history view says so, and offers the way back.
     if let Some(path) = app.history_file.clone() {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("History of").small().color(theme::FG_DIM));
-            ui.label(RichText::new(&path).small().monospace().color(theme::EMBER));
+            ui.label(RichText::new("History of").small().color(theme::fg_dim()));
+            ui.label(RichText::new(&path).small().monospace().color(theme::ember()));
             ui.label(
                 RichText::new(format!("· {} commit(s), renames followed", app.log.len()))
                     .small()
-                    .color(theme::FG_DIM),
+                    .color(theme::fg_dim()),
             );
             if ui.small_button("Show all history").clicked() {
                 app.clear_history_filter();
@@ -2058,7 +2058,7 @@ fn history_search_bar(app: &mut App, ui: &mut egui::Ui) {
                 app.log.len()
             ))
             .small()
-            .color(theme::FG_DIM),
+            .color(theme::fg_dim()),
         );
     }
     ui.separator();
@@ -2071,11 +2071,11 @@ fn history_tab(app: &mut App, ui: &mut egui::Ui) {
         if commits.is_empty() {
             ui.add_space(16.0);
             ui.vertical_centered(|ui| {
-                ui.label(RichText::new("No commits yet").color(theme::FG_DIM));
+                ui.label(RichText::new("No commits yet").color(theme::fg_dim()));
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new("Make your first commit from the Changes tab.")
-                        .color(theme::FG_DIM)
+                        .color(theme::fg_dim())
                         .small(),
                 );
             });
@@ -2089,7 +2089,7 @@ fn history_tab(app: &mut App, ui: &mut egui::Ui) {
                 commit.author,
                 commit.date.get(..10).unwrap_or(&commit.date)
             ))
-            .color(theme::FG_DIM)
+            .color(theme::fg_dim())
             .small();
             let response = ui.selectable_label(selected, heading);
             ui.label(meta);
@@ -2142,10 +2142,10 @@ fn history_tab(app: &mut App, ui: &mut egui::Ui) {
 /// plus per-hunk staging, staged/unstaged toggle, and blame view.
 pub fn diff_panel(app: &mut App, ctx: &egui::Context) {
     egui::CentralPanel::default()
-        .frame(egui::Frame::new().fill(theme::BG).inner_margin(0.0))
+        .frame(egui::Frame::new().fill(theme::bg()).inner_margin(0.0))
         .show(ctx, |ui| {
             egui::Frame::new()
-                .fill(theme::PANEL2)
+                .fill(theme::panel2())
                 .inner_margin(egui::Margin::symmetric(12, 8))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -2371,7 +2371,7 @@ fn markdown_view(app: &mut App, ui: &mut egui::Ui) {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.add(egui::Spinner::new().size(14.0));
-            ui.label(RichText::new("rendering…").color(theme::FG_DIM).small());
+            ui.label(RichText::new("rendering…").color(theme::fg_dim()).small());
         });
         return;
     }
@@ -2380,7 +2380,7 @@ fn markdown_view(app: &mut App, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.label(
             RichText::new("Working tree — this is the file as it is now, not a diff.")
-                .color(theme::FG_DIM)
+                .color(theme::fg_dim())
                 .small(),
         );
     });
@@ -2463,13 +2463,13 @@ fn interactive_diff(app: &mut App, ui: &mut egui::Ui) {
 /// diff itself off screen.
 fn hunk_bar(app: &mut App, ui: &mut egui::Ui) {
     egui::Frame::new()
-        .fill(theme::PANEL)
+        .fill(theme::panel())
         .inner_margin(egui::Margin::symmetric(12, 6))
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 let total = app.hunks.len();
                 ui.label(
-                    RichText::new(format!("{total} hunk(s):")).color(theme::FG_DIM).small(),
+                    RichText::new(format!("{total} hunk(s):")).color(theme::fg_dim()).small(),
                 );
                 let collapsed = total > HUNK_BAR_LIMIT && !app.hunks_expanded;
                 let shown = if collapsed { HUNK_BAR_LIMIT } else { total };
@@ -2556,13 +2556,13 @@ fn stage_selected_lines(app: &mut App) {
 /// Horizontal strip listing files changed in the selected commit.
 fn commit_file_strip(app: &mut App, ui: &mut egui::Ui) {
     egui::Frame::new()
-        .fill(theme::PANEL)
+        .fill(theme::panel())
         .inner_margin(egui::Margin::symmetric(12, 6))
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(
                     RichText::new(format!("{} file(s):", app.commit_file_list.len()))
-                        .color(theme::FG_DIM)
+                        .color(theme::fg_dim())
                         .small(),
                 );
                 let files = app.commit_file_list.clone();
@@ -2594,11 +2594,11 @@ fn blame_view(ui: &mut egui::Ui, blame: &[crate::git::BlameLine]) {
         ui.add_space(4.0);
         for b in blame {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(&b.sha).monospace().color(theme::TEAL).small());
+                ui.label(RichText::new(&b.sha).monospace().color(theme::teal()).small());
                 ui.label(
                     RichText::new(format!("{:<12}", truncate(&b.author, 12)))
                         .monospace()
-                        .color(theme::FG_DIM)
+                        .color(theme::fg_dim())
                         .small(),
                 );
                 ui.label(RichText::new(&b.line).monospace());
@@ -2685,9 +2685,9 @@ fn word_diff_job(
     // its marker in front.
     let shift = usize::from(matches!(line.chars().next(), Some('+') | Some('-') | Some(' ')));
     let highlight = if added {
-        theme::ADD.linear_multiply(0.35)
+        theme::add().linear_multiply(0.35)
     } else {
-        theme::DEL.linear_multiply(0.35)
+        theme::del().linear_multiply(0.35)
     };
 
     let mut job = LayoutJob::default();
@@ -2728,22 +2728,22 @@ fn word_diff_job(
 
 pub fn diff_line_style(line: &str) -> (Color32, Option<Color32>) {
     if line.starts_with("+++") || line.starts_with("---") {
-        (theme::FG_DIM, None)
+        (theme::fg_dim(), None)
     } else if line.starts_with('+') {
-        (theme::ADD, Some(theme::ADD.linear_multiply(0.08)))
+        (theme::add(), Some(theme::add().linear_multiply(0.08)))
     } else if line.starts_with('-') {
-        (theme::DEL, Some(theme::DEL.linear_multiply(0.08)))
+        (theme::del(), Some(theme::del().linear_multiply(0.08)))
     } else if line.starts_with("@@") {
-        (theme::TEAL, Some(theme::TEAL.linear_multiply(0.08)))
+        (theme::teal(), Some(theme::teal().linear_multiply(0.08)))
     } else if line.starts_with("diff ")
         || line.starts_with("index ")
         || line.starts_with("commit ")
         || line.starts_with("Author")
         || line.starts_with("Date")
     {
-        (theme::FG_DIM, None)
+        (theme::fg_dim(), None)
     } else {
-        (theme::FG, None)
+        (theme::fg(), None)
     }
 }
 
@@ -2761,13 +2761,13 @@ pub fn toasts(app: &mut App, ctx: &egui::Context) {
         return;
     }
     let (border, color) =
-        if toast.error { (theme::DANGER, theme::DANGER) } else { (theme::TEAL, theme::FG) };
+        if toast.error { (theme::danger(), theme::danger()) } else { (theme::teal(), theme::fg()) };
     let max_width = (ctx.screen_rect().width() * 0.5).clamp(280.0, 560.0);
     egui::Area::new("toast".into())
         .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -24.0])
         .show(ctx, |ui| {
             egui::Frame::new()
-                .fill(theme::PANEL)
+                .fill(theme::panel())
                 .stroke(egui::Stroke::new(1.0_f32, border))
                 .corner_radius(12.0)
                 .inner_margin(egui::Margin::symmetric(18, 10))

@@ -174,6 +174,235 @@ pub fn line_col(text: &str, offset: usize) -> (u32, u32) {
     (line, col)
 }
 
+// ---------------------------------------------------------------------------
+// Brackets
+// ---------------------------------------------------------------------------
+
+/// The bracket pairs the editor knows about.
+const PAIRS: [(char, char); 4] = [('(', ')'), ('[', ']'), ('{', '}'), ('<', '>')];
+
+/// The quote characters that auto-close.
+const QUOTES: [char; 3] = ['"', '\'', '`'];
+
+/// Whether `ch` opens a pair, and what closes it.
+pub fn opening(ch: char) -> Option<char> {
+    PAIRS.iter().find(|(open, _)| *open == ch).map(|(_, close)| *close)
+}
+
+/// Whether `ch` closes a pair, and what opened it.
+pub fn closing(ch: char) -> Option<char> {
+    PAIRS.iter().find(|(_, close)| *close == ch).map(|(open, _)| *open)
+}
+
+/// The offset of the bracket matching the one at or just before `cursor`.
+///
+/// Scans with a depth counter rather than matching the first candidate, so
+/// nesting works, and skips brackets inside strings and comments — a `{` in
+/// a string literal is not a brace, and highlighting it as one is worse than
+/// highlighting nothing.
+pub fn matching_bracket(text: &str, cursor: usize) -> Option<(usize, usize)> {
+    let at = |offset: usize| text[offset..].chars().next();
+    // The bracket under the cursor, or the one just behind it — both are
+    // "the bracket you are on" as far as a person is concerned.
+    let candidates = [cursor, cursor.saturating_sub(1)];
+    let (start, ch) = candidates.into_iter().find_map(|offset| {
+        if offset >= text.len() || !text.is_char_boundary(offset) {
+            return None;
+        }
+        let ch = at(offset)?;
+        (opening(ch).is_some() || closing(ch).is_some()).then_some((offset, ch))
+    })?;
+    if in_string_or_comment(text, start) {
+        return None;
+    }
+
+    if let Some(close) = opening(ch) {
+        let mut depth = 0i32;
+        for (offset, c) in text[start..].char_indices() {
+            let offset = start + offset;
+            if in_string_or_comment(text, offset) {
+                continue;
+            }
+            if c == ch {
+                depth += 1;
+            } else if c == close {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((start, offset));
+                }
+            }
+        }
+        return None;
+    }
+
+    let open = closing(ch)?;
+    let mut depth = 0i32;
+    for (offset, c) in text[..=start].char_indices().rev() {
+        if in_string_or_comment(text, offset) {
+            continue;
+        }
+        if c == ch {
+            depth += 1;
+        } else if c == open {
+            depth -= 1;
+            if depth == 0 {
+                return Some((offset, start));
+            }
+        }
+    }
+    None
+}
+
+/// Whether an offset falls inside a string literal or a line comment.
+///
+/// A single pass from the start of the line: enough for the brace matching
+/// and auto-closing to behave, without pretending to be a parser.
+fn in_string_or_comment(text: &str, offset: usize) -> bool {
+    let line_start = text[..offset.min(text.len())]
+        .rfind('\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut previous = '\0';
+    for (i, ch) in text[line_start..offset.min(text.len())].char_indices() {
+        let _ = i;
+        if escaped {
+            escaped = false;
+            previous = ch;
+            continue;
+        }
+        match quote {
+            Some(q) => {
+                if ch == '\\' {
+                    escaped = true;
+                } else if ch == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if QUOTES.contains(&ch) {
+                    quote = Some(ch);
+                } else if (ch == '/' && previous == '/') || ch == '#' {
+                    return true;
+                }
+            }
+        }
+        previous = ch;
+    }
+    quote.is_some()
+}
+
+/// What typing `ch` should insert, given what follows the cursor.
+///
+/// Returns the text to insert and where the caret should end up within it.
+/// `None` means "nothing special": let the character be typed normally.
+pub fn auto_close(text: &str, cursor: usize, ch: char) -> Option<(String, usize)> {
+    let next = text[cursor.min(text.len())..].chars().next();
+
+    // Typing the closing character when it is already there just steps over
+    // it, which is what makes auto-closing bearable.
+    if next == Some(ch) && (closing(ch).is_some() || QUOTES.contains(&ch)) {
+        return Some((String::new(), 1));
+    }
+    // Only close before whitespace or a closing bracket; typing `(` in the
+    // middle of a word means wrapping, not opening a pair.
+    let closes_here = match next {
+        None => true,
+        Some(c) => c.is_whitespace() || closing(c).is_some() || c == ',' || c == ';',
+    };
+    if !closes_here {
+        return None;
+    }
+    if let Some(close) = opening(ch) {
+        // `<` is a pair in generics and a comparison everywhere else; not
+        // worth guessing wrong on.
+        if ch == '<' {
+            return None;
+        }
+        return Some((format!("{ch}{close}"), 1));
+    }
+    if QUOTES.contains(&ch) && !in_string_or_comment(text, cursor) {
+        return Some((format!("{ch}{ch}"), 1));
+    }
+    None
+}
+
+/// The indentation a new line should start with, given the line before it.
+pub fn auto_indent(text: &str, cursor: usize) -> String {
+    let line_start = text[..cursor.min(text.len())]
+        .rfind('\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let line = &text[line_start..cursor.min(text.len())];
+    let indent: String = line.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+    // One level deeper after an opening brace, which is the only heuristic
+    // that earns its keep across languages.
+    if line.trim_end().ends_with(['{', '(', '[', ':']) {
+        format!("{indent}    ")
+    } else {
+        indent
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Folding
+// ---------------------------------------------------------------------------
+
+/// A foldable region: the line that starts it, and the last line inside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fold {
+    /// 0-based line the fold starts on; it stays visible when folded.
+    pub start: u32,
+    /// 0-based last line hidden by the fold.
+    pub end: u32,
+}
+
+/// Foldable regions, from indentation.
+///
+/// Indentation rather than syntax: it works in every language the editor
+/// opens, including the ones with no language server, and it agrees with
+/// what a reader sees. A blank line does not end a region — code is full of
+/// them — but a line at or below the opening indentation does.
+pub fn folds(text: &str) -> Vec<Fold> {
+    let lines: Vec<&str> = text.lines().collect();
+    let indent_of = |line: &str| -> Option<usize> {
+        (!line.trim().is_empty()).then(|| line.len() - line.trim_start().len())
+    };
+
+    let mut folds = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let Some(indent) = indent_of(line) else { continue };
+        // Where does the block under this line end?
+        let mut last = i;
+        for (j, candidate) in lines.iter().enumerate().skip(i + 1) {
+            match indent_of(candidate) {
+                Some(other) if other > indent => last = j,
+                Some(_) => break,
+                // Blank lines belong to the block only if something deeper
+                // follows them.
+                None => continue,
+            }
+        }
+        if last > i {
+            folds.push(Fold { start: i as u32, end: last as u32 });
+        }
+    }
+    folds
+}
+
+/// The fold starting on `line`, if any.
+pub fn fold_at(folds: &[Fold], line: u32) -> Option<Fold> {
+    folds.iter().find(|f| f.start == line).copied()
+}
+
+/// Whether a line is hidden by any of the collapsed folds.
+pub fn is_hidden(folds: &[Fold], collapsed: &std::collections::HashSet<u32>, line: u32) -> bool {
+    folds
+        .iter()
+        .any(|f| collapsed.contains(&f.start) && line > f.start && line <= f.end)
+}
+
 /// How a search matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MatchOptions {
@@ -417,5 +646,89 @@ mod tests {
         }
         let (out, _) = duplicate_lines(text, (0, 0));
         assert!(out.starts_with("let s = \"🦀\";\nlet s = \"🦀\";\n"));
+    }
+
+    #[test]
+    fn brackets_match_across_nesting() {
+        let text = "fn a() { if b() { c(); } }";
+        let open = text.find('{').unwrap();
+        let (start, end) = matching_bracket(text, open).unwrap();
+        assert_eq!(start, open);
+        assert_eq!(end, text.rfind('}').unwrap());
+
+        // From the closing side too.
+        let (start, end) = matching_bracket(text, text.rfind('}').unwrap()).unwrap();
+        assert_eq!(start, open);
+        assert_eq!(end, text.rfind('}').unwrap());
+    }
+
+    #[test]
+    fn a_bracket_in_a_string_is_not_a_bracket() {
+        let text = "let s = \"{\"; let t = 1;";
+        assert!(matching_bracket(text, text.find('{').unwrap()).is_none());
+    }
+
+    #[test]
+    fn an_unmatched_bracket_matches_nothing() {
+        assert!(matching_bracket("fn a() {", 7).is_none());
+        assert!(matching_bracket("plain text", 3).is_none());
+    }
+
+    #[test]
+    fn auto_close_inserts_a_pair_only_where_it_makes_sense() {
+        // At the end of a line, or before whitespace.
+        assert_eq!(auto_close("let x = ", 8, '('), Some(("()".into(), 1)));
+        assert_eq!(auto_close("let x = ;", 8, '('), Some(("()".into(), 1)));
+        // In the middle of a word, typing `(` means wrapping.
+        assert_eq!(auto_close("value", 2, '('), None);
+        // `<` is a comparison as often as a generic.
+        assert_eq!(auto_close("a ", 2, '<'), None);
+    }
+
+    #[test]
+    fn typing_the_closing_character_steps_over_it() {
+        // The behaviour that makes auto-closing tolerable.
+        assert_eq!(auto_close("()", 1, ')'), Some((String::new(), 1)));
+        assert_eq!(auto_close("\"\"", 1, '"'), Some((String::new(), 1)));
+    }
+
+    #[test]
+    fn quotes_do_not_auto_close_inside_a_string() {
+        let text = "let s = \"already open";
+        assert_eq!(auto_close(text, text.len(), '"'), None);
+    }
+
+    #[test]
+    fn auto_indent_follows_the_line_and_opens_a_level() {
+        let text = "    let x = 1;";
+        assert_eq!(auto_indent(text, text.len()), "    ");
+        let text = "    fn a() {";
+        assert_eq!(auto_indent(text, text.len()), "        ");
+        assert_eq!(auto_indent("no indent", 9), "");
+    }
+
+    #[test]
+    fn folds_come_from_indentation_and_survive_blank_lines() {
+        let text = "fn a() {\n    one();\n\n    two();\n}\n\nfn b() {\n    three();\n}\n";
+        let folds = folds(text);
+        let first = fold_at(&folds, 0).expect("a fold on the first line");
+        // Lines 1..3 are inside it; the blank line does not end the block.
+        assert_eq!(first.end, 3);
+
+        let second = fold_at(&folds, 6).expect("a fold on fn b");
+        assert_eq!(second.end, 7);
+        assert!(fold_at(&folds, 4).is_none(), "a closing brace opens nothing");
+    }
+
+    #[test]
+    fn collapsing_a_fold_hides_its_body_and_nothing_else() {
+        let text = "fn a() {\n    one();\n}\nfn b() {}\n";
+        let folds = folds(text);
+        let mut collapsed = std::collections::HashSet::new();
+        collapsed.insert(0);
+        assert!(!is_hidden(&folds, &collapsed, 0), "the fold's own line stays visible");
+        assert!(is_hidden(&folds, &collapsed, 1));
+        assert!(!is_hidden(&folds, &collapsed, 2), "the closing brace is not inside");
+        assert!(!is_hidden(&folds, &collapsed, 3));
     }
 }

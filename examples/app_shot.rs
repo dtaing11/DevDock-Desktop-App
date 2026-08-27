@@ -27,7 +27,7 @@ impl eframe::App for Shot {
             }
             if std::env::var("TERMINAL").is_ok() {
                 self.app.terminal_open(false);
-                if let Some(command) = std::env::var("TERMINAL_CMD").ok() {
+                if let Ok(command) = std::env::var("TERMINAL_CMD") {
                     self.app.terminal_run(&command);
                 }
             }
@@ -101,6 +101,9 @@ fn main() -> eframe::Result<()> {
         "app_shot",
         options,
         Box::new(move |cc| {
+            if std::env::var("LIGHT").is_ok() {
+                git_manage::app::theme::set_light(true);
+            }
             git_manage::app::theme::apply(&cc.egui_ctx);
             let mut app = App::new_bare(&cc.egui_ctx);
             app.open_repo(&repo);

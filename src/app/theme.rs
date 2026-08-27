@@ -15,24 +15,131 @@ use egui::{Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId,
 // Color tokens
 // ---------------------------------------------------------------------------
 
-pub const BG: Color32 = Color32::from_rgb(0x0f, 0x12, 0x18);
-pub const PANEL: Color32 = Color32::from_rgb(0x17, 0x1c, 0x26);
-pub const PANEL2: Color32 = Color32::from_rgb(0x1e, 0x25, 0x32);
-pub const BORDER: Color32 = Color32::from_rgb(0x2c, 0x35, 0x47);
-pub const FG: Color32 = Color32::from_rgb(0xe8, 0xe3, 0xd8);
-pub const FG_DIM: Color32 = Color32::from_rgb(0x8a, 0x93, 0xa6);
-pub const EMBER: Color32 = Color32::from_rgb(0xff, 0x9d, 0x4d);
-pub const EMBER_DEEP: Color32 = Color32::from_rgb(0xe0, 0x7b, 0x2a);
-pub const TEAL: Color32 = Color32::from_rgb(0x3d, 0xdb, 0xd9);
-pub const DANGER: Color32 = Color32::from_rgb(0xff, 0x6b, 0x6b);
-pub const ADD: Color32 = Color32::from_rgb(0x7e, 0xe7, 0x87);
-pub const DEL: Color32 = Color32::from_rgb(0xff, 0x7b, 0x72);
-pub const WARN: Color32 = Color32::from_rgb(0xf0, 0xb4, 0x29);
+/// One palette. Two exist: the dock-at-night original, and a light one for
+/// people who work in daylight or need the contrast.
+#[derive(Clone, Copy)]
+pub struct Palette {
+    pub bg: Color32,
+    pub panel: Color32,
+    pub panel2: Color32,
+    pub border: Color32,
+    pub fg: Color32,
+    pub fg_dim: Color32,
+    pub ember: Color32,
+    pub ember_deep: Color32,
+    pub teal: Color32,
+    pub danger: Color32,
+    pub add: Color32,
+    pub del: Color32,
+    pub warn: Color32,
+    pub hover_wash: Color32,
+    pub select_wash: Color32,
+}
 
-/// Subtle hover wash (teal at low alpha) used by list rows.
-pub const HOVER_WASH: Color32 = Color32::from_rgba_premultiplied(10, 36, 36, 40);
-/// Selection wash (ember at low alpha) used by selected rows.
-pub const SELECT_WASH: Color32 = Color32::from_rgba_premultiplied(48, 30, 14, 60);
+/// The original: deep indigo base, a single ember accent.
+pub const DARK: Palette = Palette {
+    bg: Color32::from_rgb(0x0f, 0x12, 0x18),
+    panel: Color32::from_rgb(0x17, 0x1c, 0x26),
+    panel2: Color32::from_rgb(0x1e, 0x25, 0x32),
+    border: Color32::from_rgb(0x2c, 0x35, 0x47),
+    fg: Color32::from_rgb(0xe8, 0xe3, 0xd8),
+    fg_dim: Color32::from_rgb(0x8a, 0x93, 0xa6),
+    ember: Color32::from_rgb(0xff, 0x9d, 0x4d),
+    ember_deep: Color32::from_rgb(0xe0, 0x7b, 0x2a),
+    teal: Color32::from_rgb(0x3d, 0xdb, 0xd9),
+    danger: Color32::from_rgb(0xff, 0x6b, 0x6b),
+    add: Color32::from_rgb(0x7e, 0xe7, 0x87),
+    del: Color32::from_rgb(0xff, 0x7b, 0x72),
+    warn: Color32::from_rgb(0xf0, 0xb4, 0x29),
+    hover_wash: Color32::from_rgba_premultiplied(10, 36, 36, 40),
+    select_wash: Color32::from_rgba_premultiplied(48, 30, 14, 60),
+};
+
+/// The same identity in daylight: warm paper, the accents darkened enough
+/// to carry on white. A light theme that is the dark one inverted reads as
+/// washed out, so every accent is picked again rather than flipped.
+pub const LIGHT: Palette = Palette {
+    bg: Color32::from_rgb(0xfa, 0xf8, 0xf4),
+    panel: Color32::from_rgb(0xf1, 0xed, 0xe6),
+    panel2: Color32::from_rgb(0xe6, 0xe1, 0xd8),
+    border: Color32::from_rgb(0xd0, 0xc8, 0xba),
+    fg: Color32::from_rgb(0x24, 0x28, 0x30),
+    fg_dim: Color32::from_rgb(0x69, 0x70, 0x7e),
+    ember: Color32::from_rgb(0xc2, 0x5b, 0x0a),
+    ember_deep: Color32::from_rgb(0x9c, 0x45, 0x05),
+    teal: Color32::from_rgb(0x0d, 0x71, 0x74),
+    danger: Color32::from_rgb(0xc0, 0x2a, 0x2a),
+    add: Color32::from_rgb(0x1c, 0x7a, 0x33),
+    del: Color32::from_rgb(0xb3, 0x2c, 0x24),
+    warn: Color32::from_rgb(0x9a, 0x6b, 0x00),
+    hover_wash: Color32::from_rgba_premultiplied(10, 30, 30, 18),
+    select_wash: Color32::from_rgba_premultiplied(60, 36, 12, 30),
+};
+
+/// Which palette is in use. An atomic rather than a lock: it is read
+/// hundreds of times per frame and written when someone flips a switch.
+static LIGHT_MODE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Switches the palette. Call [`apply`] afterwards to restyle egui itself.
+pub fn set_light(light: bool) {
+    LIGHT_MODE.store(light, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn is_light() -> bool {
+    LIGHT_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The palette in force.
+pub fn palette() -> Palette {
+    if is_light() { LIGHT } else { DARK }
+}
+
+pub fn bg() -> Color32 {
+    palette().bg
+}
+pub fn panel() -> Color32 {
+    palette().panel
+}
+pub fn panel2() -> Color32 {
+    palette().panel2
+}
+pub fn border() -> Color32 {
+    palette().border
+}
+pub fn fg() -> Color32 {
+    palette().fg
+}
+pub fn fg_dim() -> Color32 {
+    palette().fg_dim
+}
+pub fn ember() -> Color32 {
+    palette().ember
+}
+pub fn ember_deep() -> Color32 {
+    palette().ember_deep
+}
+pub fn teal() -> Color32 {
+    palette().teal
+}
+pub fn danger() -> Color32 {
+    palette().danger
+}
+pub fn add() -> Color32 {
+    palette().add
+}
+pub fn del() -> Color32 {
+    palette().del
+}
+pub fn warn() -> Color32 {
+    palette().warn
+}
+pub fn hover_wash() -> Color32 {
+    palette().hover_wash
+}
+pub fn select_wash() -> Color32 {
+    palette().select_wash
+}
 
 // ---------------------------------------------------------------------------
 // Spacing grid (4px base) and component constants
@@ -59,7 +166,7 @@ pub const RADIUS_LG: u8 = 12;
 pub fn overline(text: &str) -> egui::RichText {
     egui::RichText::new(text.to_uppercase())
         .size(10.0)
-        .color(FG_DIM)
+        .color(fg_dim())
         .letter_spacing_note()
 }
 
@@ -77,48 +184,53 @@ impl OverlineExt for egui::RichText {
 /// Applies the DevDock theme to the egui context.
 pub fn apply(ctx: &egui::Context) {
     install_fonts(ctx);
-    let mut visuals = Visuals::dark();
+    // Start from egui's own light or dark base so the parts this file does
+    // not set — scrollbars, text selection, disabled widgets — are right
+    // for the palette rather than dark-on-light.
+    let mut visuals = if is_light() { Visuals::light() } else { Visuals::dark() };
 
-    visuals.panel_fill = BG;
-    visuals.window_fill = PANEL;
-    visuals.extreme_bg_color = BG;
-    visuals.faint_bg_color = PANEL2;
+    visuals.panel_fill = bg();
+    visuals.window_fill = panel();
+    visuals.extreme_bg_color = bg();
+    visuals.faint_bg_color = panel2();
 
-    visuals.override_text_color = Some(FG);
-    visuals.window_stroke = Stroke::new(1.0_f32, BORDER);
+    visuals.override_text_color = Some(fg());
+    visuals.window_stroke = Stroke::new(1.0_f32, border());
     visuals.window_corner_radius = CornerRadius::same(RADIUS_LG);
     visuals.menu_corner_radius = CornerRadius::same(RADIUS_MD);
+    // A shadow tuned for a dark ground is a smear on a light one.
+    let shadow_alpha = if is_light() { 40 } else { 120 };
     visuals.window_shadow = egui::epaint::Shadow {
         offset: [0, 8],
         blur: 24,
         spread: 0,
-        color: Color32::from_black_alpha(120),
+        color: Color32::from_black_alpha(shadow_alpha),
     };
     visuals.popup_shadow = egui::epaint::Shadow {
         offset: [0, 4],
         blur: 12,
         spread: 0,
-        color: Color32::from_black_alpha(100),
+        color: Color32::from_black_alpha(shadow_alpha.saturating_sub(20)),
     };
 
-    visuals.widgets.noninteractive.bg_fill = PANEL;
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
-    visuals.widgets.inactive.bg_fill = PANEL2;
+    visuals.widgets.noninteractive.bg_fill = panel();
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, border());
+    visuals.widgets.inactive.bg_fill = panel2();
     visuals.widgets.inactive.corner_radius = CornerRadius::same(RADIUS_MD);
-    visuals.widgets.hovered.bg_fill = PANEL2;
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, TEAL);
+    visuals.widgets.hovered.bg_fill = panel2();
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, teal());
     visuals.widgets.hovered.corner_radius = CornerRadius::same(RADIUS_MD);
     // Pressed state: clearly different from hover so clicks visibly land.
-    visuals.widgets.active.bg_fill = EMBER_DEEP.linear_multiply(0.45);
-    visuals.widgets.active.weak_bg_fill = EMBER_DEEP.linear_multiply(0.45);
-    visuals.widgets.active.bg_stroke = Stroke::new(2.0_f32, EMBER);
+    visuals.widgets.active.bg_fill = ember_deep().linear_multiply(0.45);
+    visuals.widgets.active.weak_bg_fill = ember_deep().linear_multiply(0.45);
+    visuals.widgets.active.bg_stroke = Stroke::new(2.0_f32, ember());
     visuals.widgets.active.corner_radius = CornerRadius::same(RADIUS_MD);
     visuals.widgets.active.expansion = -1.0; // slight press-down effect
-    visuals.widgets.open.bg_fill = PANEL2;
+    visuals.widgets.open.bg_fill = panel2();
 
-    visuals.selection.bg_fill = EMBER_DEEP.linear_multiply(0.35);
-    visuals.selection.stroke = Stroke::new(1.0_f32, EMBER);
-    visuals.hyperlink_color = TEAL;
+    visuals.selection.bg_fill = ember_deep().linear_multiply(0.35);
+    visuals.selection.stroke = Stroke::new(1.0_f32, ember());
+    visuals.hyperlink_color = teal();
 
     ctx.set_visuals(visuals);
 

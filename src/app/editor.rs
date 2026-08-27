@@ -403,7 +403,7 @@ pub fn editor_sidebar(app: &mut App, ui: &mut egui::Ui) {
     let mut actions: Vec<Action> = Vec::new();
 
     if app.repo.is_none() {
-        ui.label(RichText::new("Open a repository to edit files.").color(theme::FG_DIM));
+        ui.label(RichText::new("Open a repository to edit files.").color(theme::fg_dim()));
         return;
     }
     // The tree is the tracked file list; ask for it the first time it is
@@ -457,7 +457,7 @@ pub fn editor_sidebar(app: &mut App, ui: &mut egui::Ui) {
     if app.editor.tree.is_empty() {
         ui.horizontal(|ui| {
             ui.add(egui::Spinner::new().size(12.0));
-            ui.label(RichText::new("reading the work tree…").small().color(theme::FG_DIM));
+            ui.label(RichText::new("reading the work tree…").small().color(theme::fg_dim()));
         });
         run_actions(app, actions);
         return;
@@ -537,7 +537,7 @@ fn search_panel(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
     let hits = app.editor.search.hits.clone();
     if hits.is_empty() {
         if app.editor.search.searched && !app.editor.search.running {
-            ui.label(RichText::new("No matches.").small().color(theme::FG_DIM));
+            ui.label(RichText::new("No matches.").small().color(theme::fg_dim()));
         }
         return;
     }
@@ -546,7 +546,7 @@ fn search_panel(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
     ui.label(
         RichText::new(format!("{} hit(s) in {files} file(s)", hits.len()))
             .small()
-            .color(theme::FG_DIM),
+            .color(theme::fg_dim()),
     );
 
     let Some(repo) = app.repo.clone() else { return };
@@ -556,7 +556,7 @@ fn search_panel(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
             // Grouped by file, with the path shown once.
             if last_path != Some(hit.path.as_str()) {
                 ui.add_space(4.0);
-                ui.label(RichText::new(&hit.path).small().color(theme::TEAL));
+                ui.label(RichText::new(&hit.path).small().color(theme::teal()));
                 last_path = Some(hit.path.as_str());
             }
             let line = format!("{:>5}  {}", hit.line, hit.text.trim());
@@ -608,7 +608,7 @@ fn tree_node(
         let default_open = !context.filter.is_empty()
             || app.editor.expanded.contains(&node.path);
         let header = egui::CollapsingHeader::new(
-            RichText::new(&node.name).color(theme::TEAL),
+            RichText::new(&node.name).color(theme::teal()),
         )
         .id_salt(("tree", &node.path))
         .default_open(default_open);
@@ -630,7 +630,7 @@ fn tree_node(
     let is_open = context.open.contains(&node.path);
     let is_dirty = context.dirty.contains(&node.path);
     let label = format!("{}{}", node.name, if is_dirty { " •" } else { "" });
-    let color = if is_open { theme::FG } else { theme::FG_DIM };
+    let color = if is_open { theme::fg() } else { theme::fg_dim() };
     let selected = context.active.as_deref() == Some(node.path.as_str());
     if ui
         .selectable_label(selected, RichText::new(label).color(color))
@@ -650,14 +650,14 @@ pub fn editor_viewport(app: &mut App, ui: &mut egui::Ui) {
     if app.editor.active_file().is_none() {
         ui.add_space(24.0);
         ui.vertical_centered(|ui| {
-            ui.label(RichText::new("No file open").color(theme::FG_DIM));
+            ui.label(RichText::new("No file open").color(theme::fg_dim()));
             ui.add_space(6.0);
             ui.label(
                 RichText::new(
                     "Open one from the Editor panel, double-click a file in Changes, \
                      or press Cmd/Ctrl+O.",
                 )
-                .color(theme::FG_DIM)
+                .color(theme::fg_dim())
                 .small(),
             );
         });
@@ -706,7 +706,7 @@ fn find_bar(app: &mut App, ui: &mut egui::Ui) {
     let mut replace_one = false;
     let mut replace_all = false;
 
-    egui::Frame::new().fill(theme::PANEL2).inner_margin(6.0).show(ui, |ui| {
+    egui::Frame::new().fill(theme::panel2()).inner_margin(6.0).show(ui, |ui| {
         ui.horizontal(|ui| {
             let response = ui.add(
                 egui::TextEdit::singleline(&mut app.editor.find.query)
@@ -737,7 +737,7 @@ fn find_bar(app: &mut App, ui: &mut egui::Ui) {
             } else {
                 format!("{} of {count}", app.editor.find.current + 1)
             };
-            ui.label(RichText::new(label).small().color(theme::FG_DIM));
+            ui.label(RichText::new(label).small().color(theme::fg_dim()));
             if ui.small_button("‹").on_hover_text("Previous").clicked() {
                 step = -1;
             }
@@ -834,7 +834,7 @@ fn goto_line_bar(app: &mut App, ui: &mut egui::Ui) {
     let Some(index) = app.editor.active else { return };
 
     let mut go = false;
-    egui::Frame::new().fill(theme::PANEL2).inner_margin(6.0).show(ui, |ui| {
+    egui::Frame::new().fill(theme::panel2()).inner_margin(6.0).show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Go to line").small());
             let response = ui.add(
@@ -845,7 +845,7 @@ fn goto_line_bar(app: &mut App, ui: &mut egui::Ui) {
                 go = true;
             }
             let lines = app.editor.files[index].text.lines().count();
-            ui.label(RichText::new(format!("of {lines}")).small().color(theme::FG_DIM));
+            ui.label(RichText::new(format!("of {lines}")).small().color(theme::fg_dim()));
             if ui.small_button("Go").clicked() {
                 go = true;
             }
@@ -870,9 +870,9 @@ fn viewport_header(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) 
     let Some(file) = app.editor.active_file() else { return };
     let (rel, dirty) = (file.rel.clone(), file.is_dirty());
     ui.horizontal(|ui| {
-        ui.label(RichText::new(&rel).strong().color(theme::EMBER));
+        ui.label(RichText::new(&rel).strong().color(theme::ember()));
         if dirty {
-            ui.label(RichText::new("• unsaved").small().color(theme::WARN));
+            ui.label(RichText::new("• unsaved").small().color(theme::warn()));
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if super::views::panel_button(ui, "Save", dirty)
@@ -908,7 +908,7 @@ fn viewport_header(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) 
                         "on the whole file"
                     })
                     .small()
-                    .color(theme::FG_DIM),
+                    .color(theme::fg_dim()),
                 );
                 for kind in [Kind::Explain, Kind::Fix, Kind::Tests, Kind::Document] {
                     if ui.button(kind.label()).clicked() {
@@ -941,7 +941,7 @@ fn quick_open(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         if app.editor.quick_open.loading {
             ui.horizontal(|ui| {
                 ui.add(egui::Spinner::new().size(12.0));
-                ui.label(RichText::new("listing files…").small().color(theme::FG_DIM));
+                ui.label(RichText::new("listing files…").small().color(theme::fg_dim()));
             });
             return;
         }
@@ -949,7 +949,7 @@ fn quick_open(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         let matches: Vec<String> =
             app.editor.quick_open.matches().into_iter().cloned().collect();
         if matches.is_empty() {
-            ui.label(RichText::new("no matching file").small().color(theme::FG_DIM));
+            ui.label(RichText::new("no matching file").small().color(theme::fg_dim()));
             return;
         }
         let selected = app.editor.quick_open.selected.min(matches.len() - 1);
@@ -1004,7 +1004,7 @@ fn outline(app: &mut App, ui: &mut egui::Ui, height: f32, actions: &mut Vec<Acti
     ui.vertical(|ui| {
         ui.label(theme::overline("OUTLINE"));
         if symbols.is_empty() {
-            ui.label(RichText::new("no symbols").small().color(theme::FG_DIM));
+            ui.label(RichText::new("no symbols").small().color(theme::fg_dim()));
             return;
         }
         ScrollArea::vertical().max_height(height).id_salt("editor-outline").show(ui, |ui| {
@@ -1247,17 +1247,17 @@ fn gutter(
         for line in 0..lines {
             let marker = by_line.get(&(line as u32));
             let (glyph, color) = match marker {
-                Some(Severity::Error) => ("●", theme::DANGER),
-                Some(Severity::Warning) => ("●", theme::WARN),
-                Some(_) => ("·", theme::FG_DIM),
-                None => (" ", theme::FG_DIM),
+                Some(Severity::Error) => ("●", theme::danger()),
+                Some(Severity::Warning) => ("●", theme::warn()),
+                Some(_) => ("·", theme::fg_dim()),
+                None => (" ", theme::fg_dim()),
             };
             ui.horizontal(|ui| {
                 ui.set_height(row_height);
                 ui.label(RichText::new(glyph).color(color).monospace().size(11.0));
                 ui.label(
                     RichText::new(format!("{:>width$}", line + 1, width = format!("{lines}").len()))
-                        .color(theme::FG_DIM)
+                        .color(theme::fg_dim())
                         .monospace()
                         .size(11.0),
                 );
@@ -1397,7 +1397,7 @@ fn completion_popup(
                                     ui.label(
                                         RichText::new(kind)
                                             .small()
-                                            .color(theme::TEAL)
+                                            .color(theme::teal())
                                             .monospace(),
                                     );
                                 }
@@ -1407,7 +1407,7 @@ fn completion_popup(
                                 ui.label(label);
                                 if let Some(detail) = &item.detail {
                                     ui.label(
-                                        RichText::new(detail).small().color(theme::FG_DIM),
+                                        RichText::new(detail).small().color(theme::fg_dim()),
                                     );
                                 }
                             });
@@ -1416,7 +1416,7 @@ fn completion_popup(
                                 ui.painter().rect_stroke(
                                     response.rect.expand(1.0),
                                     2.0_f32,
-                                    egui::Stroke::new(1.0_f32, theme::EMBER),
+                                    egui::Stroke::new(1.0_f32, theme::ember()),
                                     egui::StrokeKind::Outside,
                                 );
                             }
@@ -1503,13 +1503,13 @@ fn bottom_panel(
             BottomPanel::Diagnostics => {
                 let path = app.editor.active_file().map(|f| f.path.clone());
                 if diagnostics.is_empty() {
-                    ui.label(RichText::new("No problems reported.").small().color(theme::ADD));
+                    ui.label(RichText::new("No problems reported.").small().color(theme::add()));
                 }
                 for d in diagnostics {
                     let color = match d.severity {
-                        Severity::Error => theme::DANGER,
-                        Severity::Warning => theme::WARN,
-                        _ => theme::FG_DIM,
+                        Severity::Error => theme::danger(),
+                        Severity::Warning => theme::warn(),
+                        _ => theme::fg_dim(),
                     };
                     let line = d.line();
                     if ui
@@ -1530,7 +1530,7 @@ fn bottom_panel(
                     ui.label(
                         RichText::new("Put the cursor on a symbol and press Shift+F12.")
                             .small()
-                            .color(theme::FG_DIM),
+                            .color(theme::fg_dim()),
                     );
                 }
                 let references = app.editor.references.clone();
@@ -1687,7 +1687,7 @@ pub fn highlight(
         // Spans carry text, not offsets, so the offset is accumulated as
         // they are walked — that is what the diagnostic ranges are in.
         let mut at = 0usize;
-        for span in super::syntax::highlight_line(line_lang, line, theme::FG) {
+        for span in super::syntax::highlight_line(line_lang, line, theme::fg()) {
             let (span_start, span_end) = (at, at + span.text.len());
             at = span_end;
             // A span can straddle the start or end of a diagnostic, so it is
@@ -1698,9 +1698,9 @@ pub fn highlight(
                     format.underline = egui::Stroke::new(
                         if severity == Severity::Error { 2.0_f32 } else { 1.0_f32 },
                         match severity {
-                            Severity::Error => theme::DANGER,
-                            Severity::Warning => theme::WARN,
-                            _ => theme::FG_DIM,
+                            Severity::Error => theme::danger(),
+                            Severity::Warning => theme::warn(),
+                            _ => theme::fg_dim(),
                         },
                     );
                 }
@@ -1708,7 +1708,7 @@ pub fn highlight(
             }
         }
         if number + 1 < lines.len() {
-            job.append("\n", 0.0, TextFormat::simple(font.clone(), theme::FG));
+            job.append("\n", 0.0, TextFormat::simple(font.clone(), theme::fg()));
         }
     }
     job

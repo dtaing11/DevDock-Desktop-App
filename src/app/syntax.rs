@@ -131,18 +131,36 @@ impl Lang {
     }
 }
 
-/// Syntax palette tuned for the app's dark "dock at night" theme.
+/// Syntax colours, in two sets.
+///
+/// A light theme cannot reuse dark-theme syntax colours: pastels chosen to
+/// glow on near-black are washed out on paper. Each role is picked again
+/// rather than darkened, so both sets have the same relationships and
+/// neither looks like a filter over the other.
 mod palette {
     use egui::Color32;
-    pub const KEYWORD: Color32 = Color32::from_rgb(0xc7, 0x8f, 0xff); // violet
-    pub const TYPE: Color32 = Color32::from_rgb(0x6f, 0xc2, 0xff); // sky blue
-    pub const STRING: Color32 = Color32::from_rgb(0xa8, 0xd8, 0x8a); // soft green
-    pub const NUMBER: Color32 = Color32::from_rgb(0xff, 0xb8, 0x6b); // amber
-    pub const COMMENT: Color32 = Color32::from_rgb(0x6b, 0x75, 0x85); // slate
-    pub const FUNCTION: Color32 = Color32::from_rgb(0xff, 0xd7, 0x8a); // gold
-    pub const TAG: Color32 = Color32::from_rgb(0xff, 0x8f, 0x8f); // coral (html tags / css selectors)
-    pub const ATTR: Color32 = Color32::from_rgb(0x9a, 0xe6, 0xd2); // mint (attributes / css props)
-    pub const PUNCT: Color32 = Color32::from_rgb(0x8a, 0x93, 0xa6); // dim
+
+    macro_rules! role {
+        ($name:ident, $dark:expr, $light:expr) => {
+            pub fn $name() -> Color32 {
+                if crate::app::theme::is_light() {
+                    $light
+                } else {
+                    $dark
+                }
+            }
+        };
+    }
+
+    role!(keyword, Color32::from_rgb(0xc7, 0x8f, 0xff), Color32::from_rgb(0x7c, 0x28, 0xb8));
+    role!(r#type, Color32::from_rgb(0x6f, 0xc2, 0xff), Color32::from_rgb(0x0a, 0x5a, 0x9e));
+    role!(string, Color32::from_rgb(0xa8, 0xd8, 0x8a), Color32::from_rgb(0x1c, 0x6b, 0x2e));
+    role!(number, Color32::from_rgb(0xff, 0xb8, 0x6b), Color32::from_rgb(0x9c, 0x51, 0x00));
+    role!(comment, Color32::from_rgb(0x6b, 0x75, 0x85), Color32::from_rgb(0x76, 0x7e, 0x8c));
+    role!(function, Color32::from_rgb(0xff, 0xd7, 0x8a), Color32::from_rgb(0x8a, 0x5c, 0x00));
+    role!(tag, Color32::from_rgb(0xff, 0x8f, 0x8f), Color32::from_rgb(0xa8, 0x2b, 0x2b));
+    role!(attr, Color32::from_rgb(0x9a, 0xe6, 0xd2), Color32::from_rgb(0x0d, 0x6b, 0x5c));
+    role!(punct, Color32::from_rgb(0x8a, 0x93, 0xa6), Color32::from_rgb(0x6b, 0x72, 0x80));
 }
 
 /// A colored fragment of one line.
@@ -201,7 +219,7 @@ fn highlight_code(lang: Lang, line: &str, default_color: Color32) -> Vec<Span> {
                 == prefix.len();
             if matches_prefix {
                 let rest: String = chars[i..].iter().collect();
-                push(&mut spans, &rest, palette::COMMENT);
+                push(&mut spans, &rest, palette::comment());
                 break;
             }
         }
@@ -223,7 +241,7 @@ fn highlight_code(lang: Lang, line: &str, default_color: Color32) -> Vec<Span> {
                 i += 1;
             }
             let text: String = chars[start..i.min(chars.len())].iter().collect();
-            push(&mut spans, &text, palette::STRING);
+            push(&mut spans, &text, palette::string());
             continue;
         }
 
@@ -236,7 +254,7 @@ fn highlight_code(lang: Lang, line: &str, default_color: Color32) -> Vec<Span> {
                 i += 1;
             }
             let text: String = chars[start..i].iter().collect();
-            push(&mut spans, &text, palette::NUMBER);
+            push(&mut spans, &text, palette::number());
             continue;
         }
 
@@ -248,11 +266,11 @@ fn highlight_code(lang: Lang, line: &str, default_color: Color32) -> Vec<Span> {
             }
             let word: String = chars[start..i].iter().collect();
             let color = if lang.keywords().contains(&word.as_str()) {
-                palette::KEYWORD
+                palette::keyword()
             } else if lang.types().contains(&word.as_str()) {
-                palette::TYPE
+                palette::r#type()
             } else if chars.get(i) == Some(&'(') {
-                palette::FUNCTION
+                palette::function()
             } else {
                 default_color
             };
@@ -262,7 +280,7 @@ fn highlight_code(lang: Lang, line: &str, default_color: Color32) -> Vec<Span> {
 
         // Punctuation and everything else.
         let color = if "{}()[]<>;,.:=+-*/&|!?%^~@".contains(c) {
-            palette::PUNCT
+            palette::punct()
         } else {
             default_color
         };
@@ -294,7 +312,7 @@ fn highlight_html(line: &str, default_color: Color32) -> Vec<Span> {
                     i += 1;
                 }
                 let text: String = chars[start..i].iter().collect();
-                push(&mut spans, &text, palette::TAG);
+                push(&mut spans, &text, palette::tag());
             } else {
                 push(&mut spans, &c.to_string(), default_color);
                 i += 1;
@@ -304,7 +322,7 @@ fn highlight_html(line: &str, default_color: Color32) -> Vec<Span> {
         // Inside a tag.
         if c == '>' {
             in_tag = false;
-            push(&mut spans, ">", palette::TAG);
+            push(&mut spans, ">", palette::tag());
             i += 1;
         } else if c == '"' || c == '\'' {
             let quote = c;
@@ -315,16 +333,16 @@ fn highlight_html(line: &str, default_color: Color32) -> Vec<Span> {
             }
             i = (i + 1).min(chars.len());
             let text: String = chars[start..i].iter().collect();
-            push(&mut spans, &text, palette::STRING);
+            push(&mut spans, &text, palette::string());
         } else if c.is_alphabetic() || c == '-' {
             let start = i;
             while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '-') {
                 i += 1;
             }
             let text: String = chars[start..i].iter().collect();
-            push(&mut spans, &text, palette::ATTR);
+            push(&mut spans, &text, palette::attr());
         } else {
-            push(&mut spans, &c.to_string(), palette::PUNCT);
+            push(&mut spans, &c.to_string(), palette::punct());
             i += 1;
         }
     }
@@ -342,8 +360,8 @@ fn highlight_css(line: &str, default_color: Color32) -> Vec<Span> {
         {
             let indent_len = prop.len() - name.len();
             push(&mut spans, &prop[..indent_len], default_color);
-            push(&mut spans, name, palette::ATTR);
-            push(&mut spans, ":", palette::PUNCT);
+            push(&mut spans, name, palette::attr());
+            push(&mut spans, ":", palette::punct());
             // Color numbers inside the value; keep the rest default.
             for span in highlight_code(Lang::Plain, value, default_color) {
                 push(&mut spans, &span.text, span.color);
@@ -354,7 +372,7 @@ fn highlight_css(line: &str, default_color: Color32) -> Vec<Span> {
     // Selector / at-rule lines.
     let trimmed = line.trim_start();
     if trimmed.starts_with('@') || trimmed.ends_with('{') || trimmed.starts_with('.') || trimmed.starts_with('#') {
-        push(&mut spans, line, palette::TAG);
+        push(&mut spans, line, palette::tag());
         return spans;
     }
     push(&mut spans, line, default_color);
@@ -443,43 +461,43 @@ mod tests {
     #[test]
     fn rust_keywords_types_strings_and_comments() {
         let spans = highlight_line(Lang::Rust, "pub fn go(x: u32) { // note", FG);
-        assert_eq!(colors_of(&spans, "pub"), Some(palette::KEYWORD));
-        assert_eq!(colors_of(&spans, "fn"), Some(palette::KEYWORD));
-        assert_eq!(colors_of(&spans, "u32"), Some(palette::TYPE));
-        assert_eq!(colors_of(&spans, "// note"), Some(palette::COMMENT));
+        assert_eq!(colors_of(&spans, "pub"), Some(palette::keyword()));
+        assert_eq!(colors_of(&spans, "fn"), Some(palette::keyword()));
+        assert_eq!(colors_of(&spans, "u32"), Some(palette::r#type()));
+        assert_eq!(colors_of(&spans, "// note"), Some(palette::comment()));
 
         let spans = highlight_line(Lang::Rust, r#"let s = "hi"; let n = 42;"#, FG);
-        assert_eq!(colors_of(&spans, "\"hi\""), Some(palette::STRING));
-        assert_eq!(colors_of(&spans, "42"), Some(palette::NUMBER));
+        assert_eq!(colors_of(&spans, "\"hi\""), Some(palette::string()));
+        assert_eq!(colors_of(&spans, "42"), Some(palette::number()));
     }
 
     #[test]
     fn python_uses_hash_comments() {
         let spans = highlight_line(Lang::Python, "def f():  # docs", FG);
-        assert_eq!(colors_of(&spans, "def"), Some(palette::KEYWORD));
-        assert_eq!(colors_of(&spans, "# docs"), Some(palette::COMMENT));
+        assert_eq!(colors_of(&spans, "def"), Some(palette::keyword()));
+        assert_eq!(colors_of(&spans, "# docs"), Some(palette::comment()));
     }
 
     #[test]
     fn html_tags_and_attributes() {
         let spans = highlight_line(Lang::Html, r#"<div class="box">"#, FG);
-        assert_eq!(colors_of(&spans, "<div"), Some(palette::TAG));
-        assert_eq!(colors_of(&spans, "class"), Some(palette::ATTR));
-        assert_eq!(colors_of(&spans, "\"box\""), Some(palette::STRING));
+        assert_eq!(colors_of(&spans, "<div"), Some(palette::tag()));
+        assert_eq!(colors_of(&spans, "class"), Some(palette::attr()));
+        assert_eq!(colors_of(&spans, "\"box\""), Some(palette::string()));
     }
 
     #[test]
     fn css_properties_and_selectors() {
         let spans = highlight_line(Lang::Css, "  color: #fff;", FG);
-        assert_eq!(colors_of(&spans, "color"), Some(palette::ATTR));
+        assert_eq!(colors_of(&spans, "color"), Some(palette::attr()));
         let spans = highlight_line(Lang::Css, ".card {", FG);
-        assert_eq!(spans[0].color, palette::TAG);
+        assert_eq!(spans[0].color, palette::tag());
     }
 
     #[test]
     fn function_calls_get_gold() {
         let spans = highlight_line(Lang::Go, "fmt.Println(x)", FG);
-        assert_eq!(colors_of(&spans, "Println"), Some(palette::FUNCTION));
+        assert_eq!(colors_of(&spans, "Println"), Some(palette::function()));
     }
 
     #[test]

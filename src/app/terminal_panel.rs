@@ -45,13 +45,13 @@ impl TerminalState {
 fn color(value: Color, bright: bool) -> Color32 {
     let base = match value {
         Color::Black => Color32::from_rgb(0x2b, 0x30, 0x3b),
-        Color::Red => theme::DANGER,
-        Color::Green => theme::ADD,
-        Color::Yellow => theme::WARN,
+        Color::Red => theme::danger(),
+        Color::Green => theme::add(),
+        Color::Yellow => theme::warn(),
         Color::Blue => Color32::from_rgb(0x6f, 0x9b, 0xf0),
         Color::Magenta => Color32::from_rgb(0xc0, 0x8c, 0xe8),
-        Color::Cyan => theme::TEAL,
-        Color::White => theme::FG,
+        Color::Cyan => theme::teal(),
+        Color::White => theme::fg(),
         Color::Bright(n) => return color(Color::from_index(n), true),
         // The 256-colour cube and true colour are used verbatim; there is
         // no palette to map them onto.
@@ -84,10 +84,10 @@ fn indexed(n: u8) -> Color32 {
 
 /// Foreground and background for a cell, honouring inverse and dim.
 fn cell_colors(style: Style) -> (Color32, Option<Color32>) {
-    let mut fg = style.fg.map(|c| color(c, style.bold)).unwrap_or(theme::FG);
+    let mut fg = style.fg.map(|c| color(c, style.bold)).unwrap_or(theme::fg());
     let mut bg = style.bg.map(|c| color(c, false));
     if style.inverse {
-        let previous = bg.unwrap_or(theme::BG);
+        let previous = bg.unwrap_or(theme::bg());
         bg = Some(fg);
         fg = previous;
     }
@@ -112,7 +112,7 @@ pub fn panel(app: &mut App, ctx: &egui::Context) {
         .height_range(120.0..=(ctx.screen_rect().height() * 0.8))
         .frame(
             egui::Frame::new()
-                .fill(theme::BG)
+                .fill(theme::bg())
                 .inner_margin(egui::Margin::symmetric(8, 6)),
         )
         .show(ctx, |ui| {
@@ -134,7 +134,7 @@ fn tabs(app: &mut App, ui: &mut egui::Ui) {
             } else {
                 format!("{} (exited)", session.title)
             };
-            let color = if session.pty.alive() { theme::FG } else { theme::FG_DIM };
+            let color = if session.pty.alive() { theme::fg() } else { theme::fg_dim() };
             if ui
                 .selectable_label(app.terminal.active == i, RichText::new(label).color(color))
                 .clicked()
@@ -186,7 +186,7 @@ fn screen(app: &mut App, ui: &mut egui::Ui) {
             } else {
                 "The integrated terminal needs a pty, which this platform does not provide."
             })
-            .color(theme::FG_DIM),
+            .color(theme::fg_dim()),
         );
         return;
     }
@@ -237,7 +237,7 @@ fn screen(app: &mut App, ui: &mut egui::Ui) {
         ui.label(
             RichText::new("click the terminal to type in it")
                 .small()
-                .color(theme::FG_DIM),
+                .color(theme::fg_dim()),
         );
     }
     if alternate {
@@ -247,7 +247,7 @@ fn screen(app: &mut App, ui: &mut egui::Ui) {
                  Press q or ^C to leave it.",
             )
             .small()
-            .color(theme::WARN),
+            .color(theme::warn()),
         );
     }
 

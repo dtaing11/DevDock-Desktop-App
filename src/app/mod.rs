@@ -2603,119 +2603,23 @@ impl App {
             self.toast("Nothing to submit: this branch is the trunk.", true);
             return;
         }
-        // A branch that is behind its parent would open a pull request whose
-        // diff includes the branch below it. Restacking is a rebase, so it is
-        // the user's call, not something to slip into a submit.
+        // Checked here as well as in `stack::submit` so the refusal is
+        // immediate rather than arriving after a push and a round trip.
         if let Some(e) = stack.entries.iter().find(|e| e.needs_restack) {
-            self.toast(
-                format!("Restack first: {} is behind {}.", e.branch, e.parent),
-                true,
-            );
+            self.toast(format!("Restack first: {} is behind {}.", e.branch, e.parent), true);
             return;
         }
         let token = self.gh_token();
         self.stack_op(move |repo| {
             let client = github::Client::from_store().ok_or("Not signed in")?;
             let slug = views::origin_slug(&repo).ok_or("No github.com remote found")?;
-            let mut log = Vec::new();
-            // Re-derived here rather than reusing what the view was showing:
-            // this runs after a network round trip and a review, and the
-            // branches may have moved in between.
+            // Re-derived rather than reusing what the view was showing: this
+            // runs after a review and a network round trip, and the branches
+            // may have moved in between.
             let stack = current_stack(&repo)?;
-
-            if let Some(e) = stack.entries.iter().find(|e| e.needs_restack) {
-                return Err(format!(
-                    "Restack first: {} is behind {}. Its pull request would show \
-                     the changes below it as its own.",
-                    e.branch, e.parent
-                ));
-            }
-
-            // The bases have to exist on the remote before a PR can name one.
-            crate::stack::push_stack(&repo, &stack, token.as_deref())
-                .map_err(|e| e.to_string())?;
-            log.push(format!("pushed {} branch(es)", stack.entries.len()));
-
-            let open = client.pull_requests(&slug).map_err(|e| e.to_string())?;
-            let mut rows = Vec::new();
-            let mut opened = 0;
-            for entry in &stack.entries {
-                let existing = open.iter().find(|pr| pr.head == entry.branch);
-                // A branch whose changes are already in the trunk has nothing
-                // to open a pull request about; GitHub would refuse it with
-                // "no commits between", which says less than this does.
-                if existing.is_none() && entry.merged {
-                    log.push(format!(
-                        "{}: already in {}, skipped",
-                        entry.branch, stack.trunk
-                    ));
-                    continue;
-                }
-                let number = match existing {
-                    Some(pr) => {
-                        if pr.base != entry.parent {
-                            client
-                                .update_pull_request(
-                                    &slug,
-                                    pr.number,
-                                    Some(&entry.parent),
-                                    None,
-                                    None,
-                                )
-                                .map_err(|e| e.to_string())?;
-                            log.push(format!(
-                                "#{} {}: base retargeted to {}",
-                                pr.number, entry.branch, entry.parent
-                            ));
-                        }
-                        pr.number
-                    }
-                    None => {
-                        let (title, body) = crate::stack::draft_pr(entry);
-                        let created = client
-                            .create_pull_request(
-                                &slug,
-                                &title,
-                                &body,
-                                &entry.branch,
-                                &entry.parent,
-                            )
-                            .map_err(|e| e.to_string())?;
-                        opened += 1;
-                        log.push(format!(
-                            "#{} {}: opened into {}",
-                            created.number, entry.branch, entry.parent
-                        ));
-                        created.number
-                    }
-                };
-                // Remembered so a later sync can ask GitHub whether this one
-                // merged; the list endpoint only ever returns open PRs.
-                let _ = crate::stack::set_pr(&repo, &entry.branch, number);
-                rows.push(crate::stack::NavRow {
-                    branch: entry.branch.clone(),
-                    pr: Some(number),
-                });
-            }
-
-            // Every body gets the same map of the stack, marked where it is.
-            // Done last so the newly opened PRs are in it too.
-            for row in &rows {
-                let Some(number) = row.pr else { continue };
-                let nav = crate::stack::nav_section(&rows, &stack.trunk, &row.branch);
-                let detail = client.pull_request(&slug, number).map_err(|e| e.to_string())?;
-                let body = crate::stack::with_nav(&detail.body, &nav);
-                if body != detail.body {
-                    client
-                        .update_pull_request(&slug, number, None, None, Some(&body))
-                        .map_err(|e| e.to_string())?;
-                }
-            }
-            let message = match opened {
-                0 => format!("Stack submitted: {} pull request(s) updated.", rows.len()),
-                n => format!("Stack submitted: {n} opened, {} in the stack.", rows.len()),
-            };
-            Ok((message, log, false))
+            let report =
+                crate::stack::submit(&repo, &client, &slug, &stack, token.as_deref())?;
+            Ok((report.message(), report.log, false))
         });
     }
 
@@ -2728,69 +2632,17 @@ impl App {
     pub fn stack_sync(&mut self) {
         let token = self.gh_token();
         self.stack_op(move |repo| {
-            let mut log = Vec::new();
             repo.fetch(token.as_deref()).map_err(|e| e.to_string())?;
-            log.push("fetched".to_string());
-            // After the fetch, so a branch that landed while this was open is
-            // seen as landed.
+            // After the fetch, so a branch that landed while the view was open
+            // is seen as landed.
             let stack = current_stack(&repo)?;
-
-            // Ask about each remembered pull request. A squash merge leaves no
-            // trace in the local history, so GitHub's answer is the one that
-            // counts; the patch-id check is the fallback for branches merged
-            // outside a PR entirely.
-            let mut merged: Vec<String> = Vec::new();
             let client = github::Client::from_store();
             let slug = views::origin_slug(&repo);
-            for entry in &stack.entries {
-                let landed = match (&client, &slug, entry.pr) {
-                    (Some(client), Some(slug), Some(number)) => {
-                        match client.pull_request(slug, number) {
-                            Ok(detail) => detail.merged,
-                            // An unreachable GitHub must not silently drop a
-                            // branch out of the stack.
-                            Err(e) => {
-                                log.push(format!("#{number}: could not check ({e})"));
-                                false
-                            }
-                        }
-                    }
-                    _ => entry.merged,
-                };
-                if landed || entry.merged {
-                    merged.push(entry.branch.clone());
-                }
-            }
-            if merged.is_empty() {
-                return Ok(("Nothing has merged yet; the stack is unchanged.".into(), log, false));
-            }
-
-            let dropped = crate::stack::drop_merged(&repo, &stack, &merged)
-                .map_err(|e| e.to_string())?;
-            for branch in &dropped {
-                log.push(format!("{branch}: merged, left the stack"));
-            }
-
-            // What is left has to move onto the trunk it now sits on.
-            let branch = repo.current_branch();
-            let rest = crate::stack::stack_for(&repo, &branch).map_err(|e| e.to_string())?;
-            let report = crate::stack::restack(&repo, &rest).map_err(|e| e.to_string())?;
-            for step in &report.steps {
-                if step.moved {
-                    log.push(format!("{}: rebased onto its new parent", step.branch));
-                }
-            }
-            let conflicted = report.conflicted.is_some();
-            let message = if conflicted {
-                report.message()
-            } else {
-                format!(
-                    "{} merged branch(es) left the stack. Submit to update the \
-                     remaining pull requests.",
-                    dropped.len()
-                )
-            };
-            Ok((message, log, conflicted))
+            let github = client.as_ref().zip(slug.as_ref());
+            let mut report = crate::stack::sync(&repo, github, &stack)?;
+            report.log.insert(0, "fetched".to_string());
+            let conflicted = report.restack.conflicted.is_some();
+            Ok((report.message(), report.log, conflicted))
         });
     }
 

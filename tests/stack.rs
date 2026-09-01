@@ -31,6 +31,10 @@ fn setup() -> (tempfile::TempDir, Repo) {
     (tmp, repo)
 }
 
+fn read(repo: &Repo, name: &str) -> String {
+    fs::read_to_string(repo.path().join(name)).unwrap()
+}
+
 fn commit(repo: &Repo, name: &str, content: &str, message: &str) {
     fs::write(repo.path().join(name), content).unwrap();
     repo.stage_all().unwrap();
@@ -430,4 +434,97 @@ fn the_trunk_itself_is_never_an_entry() {
     let stack = stack::stack_for(&repo, "main").unwrap();
     assert!(stack.is_empty());
     assert_eq!(stack.trunk, "main");
+}
+
+#[test]
+fn a_squash_merged_branch_leaves_without_replaying_its_commits() {
+    let (_tmp, repo) = setup();
+    // Two commits on `a`, so a squash of it is one commit whose patch matches
+    // neither — the case where nothing local can tell it landed, and where a
+    // rebase from the trunk would apply its changes a second time.
+    branch_on(&repo, "a", "main");
+    commit(&repo, "a1.txt", "a1\n", "feat: A1");
+    commit(&repo, "a2.txt", "a2\n", "feat: A2");
+    branch_on(&repo, "b", "a");
+    commit(&repo, "b.txt", "b1\n", "feat: B1");
+
+    // Squash-merge `a` the way GitHub's "Squash and merge" does.
+    repo.checkout("main").unwrap();
+    sh(repo.path(), "git", &["merge", "--squash", "a"]);
+    repo.stage_all().unwrap();
+    repo.commit("feat: A, squashed", "", false).unwrap();
+    repo.checkout("b").unwrap();
+
+    let stack = stack::stack_for(&repo, "b").unwrap();
+    assert!(!stack.entry("a").unwrap().merged, "a squash is invisible locally");
+
+    // GitHub is what knows; `drop_and_restack` is handed that answer.
+    let report = stack::drop_and_restack(&repo, &stack, &["a".to_string()]).unwrap();
+    assert_eq!(report.restack.conflicted, None, "{:?}", report.log);
+    assert_eq!(report.dropped, ["a"]);
+
+    // `b` sits on the squashed trunk carrying only its own commit. Replaying
+    // A1 and A2 on top of a commit that already contains them is the failure
+    // this exists to prevent.
+    assert_eq!(subjects(&repo, "b"), ["feat: B1"]);
+    assert_eq!(stack::parent_of(&repo, "b").as_deref(), Some("main"));
+    let all: Vec<String> =
+        repo.log(20, Some("b")).unwrap().iter().map(|c| c.subject.clone()).collect();
+    assert!(!all.contains(&"feat: A1".to_string()), "A1 was replayed: {all:?}");
+}
+
+/// The discriminating case: a squash merge whose content is not identical to
+/// the branch's commits, because something was changed during review.
+///
+/// Git drops a replayed commit that turns out to be empty, which hides the
+/// problem when the squash is byte-identical. Once a reviewer's tweak goes in
+/// with the merge, the replayed commit is not empty — it conflicts with the
+/// change it is a duplicate of. Rebasing from where the merged branch *ended*
+/// never replays it at all.
+#[test]
+fn a_squash_merge_that_was_tweaked_in_review_still_rebases_cleanly() {
+    let (_tmp, repo) = setup();
+    branch_on(&repo, "a", "main");
+    commit(&repo, "a1.txt", "one\n", "feat: A1");
+    branch_on(&repo, "b", "a");
+    commit(&repo, "b.txt", "b\n", "feat: B1");
+
+    // Squash-merged with a change applied at merge time.
+    repo.checkout("main").unwrap();
+    commit(&repo, "a1.txt", "one, tweaked in review\n", "feat: A, squashed");
+    repo.checkout("b").unwrap();
+
+    let stack = stack::stack_for(&repo, "b").unwrap();
+    let report = stack::drop_and_restack(&repo, &stack, &["a".to_string()]).unwrap();
+
+    assert_eq!(report.restack.conflicted, None, "conflicted: {:?}", report.log);
+    assert_eq!(subjects(&repo, "b"), ["feat: B1"], "A1 was replayed onto its own change");
+    assert_eq!(read(&repo, "a1.txt"), "one, tweaked in review\n", "the review tweak survived");
+}
+
+#[test]
+fn dropping_the_bottom_of_a_three_branch_stack_keeps_the_rest_in_order() {
+    let (_tmp, repo) = setup();
+    branch_on(&repo, "a", "main");
+    commit(&repo, "a.txt", "a\n", "feat: A");
+    branch_on(&repo, "b", "a");
+    commit(&repo, "b.txt", "b\n", "feat: B");
+    branch_on(&repo, "c", "b");
+    commit(&repo, "c.txt", "c\n", "feat: C");
+
+    repo.checkout("main").unwrap();
+    sh(repo.path(), "git", &["merge", "--squash", "a"]);
+    repo.stage_all().unwrap();
+    repo.commit("feat: A, squashed", "", false).unwrap();
+    repo.checkout("c").unwrap();
+
+    let stack = stack::stack_for(&repo, "c").unwrap();
+    let report = stack::drop_and_restack(&repo, &stack, &["a".to_string()]).unwrap();
+    assert_eq!(report.restack.conflicted, None, "{:?}", report.log);
+
+    assert_eq!(subjects(&repo, "b"), ["feat: B"]);
+    assert_eq!(subjects(&repo, "c"), ["feat: B", "feat: C"]);
+    let names: Vec<String> =
+        stack::stack_for(&repo, "c").unwrap().entries.iter().map(|e| e.branch.clone()).collect();
+    assert_eq!(names, ["b", "c"]);
 }

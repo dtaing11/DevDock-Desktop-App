@@ -176,6 +176,7 @@ src/
 tests/
   workflow.rs  End-to-end git workflow tests against throwaway repos
   stack.rs     Stacked PRs: parent links, restacking, merge detection
+  stack_live.rs  The same flow against real GitHub (ignored by default)
   agent.rs     Harness tests: sandbox limits, proposals, applied merges,
                and the coding agent against a real server and real checks
   lsp.rs       Language server client, against a real child process
@@ -191,6 +192,19 @@ cargo test        # unit + integration tests
 cargo clippy      # lints
 cargo run         # debug build
 ```
+
+Some tests talk to real services and are ignored by default — a language
+server, an Ollama or Claude model, and GitHub:
+
+```sh
+cargo test --test stack_live -- --ignored --nocapture
+```
+
+That one creates a private scratch repository, opens a three-branch stack of
+pull requests in it, squash-merges the bottom one, syncs, and checks that the
+pull request above it was rebased and retargeted. It prints the repository's
+URL at the end; deleting it needs the `delete_repo` scope, which the app never
+asks for, so tidy it up by hand.
 
 ## License
 

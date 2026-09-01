@@ -395,17 +395,65 @@ impl RestackReport {
     }
 }
 
+/// One branch to move: rebase `branch` onto `parent`, replaying only the
+/// commits in `upstream..branch`.
+#[derive(Debug, Clone)]
+struct Move {
+    branch: String,
+    parent: String,
+    upstream: String,
+}
+
 /// Rebases every branch in the stack back on top of its parent, bottom-up.
-///
-/// The subtlety is which commits to replay. Once the bottom branch is rebased
-/// its children point at commits whose parent no longer exists in the chain,
-/// and `git merge-base` then finds the *trunk* as the common ancestor — so a
-/// naive rebase replays the branch below's commits a second time. Every
-/// branch's tip is therefore recorded up front, before anything moves, and
-/// each rebase replays exactly `<old parent tip>..<branch>`.
 pub fn restack(repo: &Repo, stack: &Stack) -> Result<RestackReport> {
-    let mut report = RestackReport::default();
     if stack.entries.is_empty() {
+        return Ok(RestackReport::default());
+    }
+    apply_moves(repo, &plan(repo, stack, &[])?)
+}
+
+/// Works out what to rebase onto what, and — the part that matters — which
+/// commits each rebase should replay.
+///
+/// The subtlety is that a branch's own commits cannot be identified after the
+/// branch below it moves. Once the bottom branch is rebased its children point
+/// at commits whose parent is no longer in the chain, and `git merge-base` then
+/// finds the *trunk* as the common ancestor, so a naive rebase replays the
+/// branch below's commits a second time. Every branch's tip is therefore read
+/// here, before anything moves, and each rebase replays exactly
+/// `<the tip the branch below had>..<branch>`.
+///
+/// `merged` names branches that are leaving the stack. They still count for
+/// the tips: the branch above a squash-merged one must replay from where that
+/// branch *ended*, not from the trunk — the squash gave its changes a new
+/// commit whose patch matches none of the originals, so replaying from the
+/// trunk would apply them a second time and conflict.
+fn plan(repo: &Repo, stack: &Stack, merged: &[String]) -> Result<Vec<Move>> {
+    let mut tips: Vec<String> = Vec::new();
+    for e in &stack.entries {
+        tips.push(rev_parse(repo, &e.branch)?);
+    }
+    let mut moves = Vec::new();
+    // The nearest branch below that is staying, or the trunk.
+    let mut parent = stack.trunk.clone();
+    for (i, e) in stack.entries.iter().enumerate() {
+        if merged.contains(&e.branch) {
+            continue;
+        }
+        let upstream = match i {
+            0 => fork_point(repo, &parent, &e.branch),
+            _ => tips[i - 1].clone(),
+        };
+        moves.push(Move { branch: e.branch.clone(), parent: parent.clone(), upstream });
+        parent = e.branch.clone();
+    }
+    Ok(moves)
+}
+
+/// Runs the rebases, bottom-up, and puts the original branch back.
+fn apply_moves(repo: &Repo, moves: &[Move]) -> Result<RestackReport> {
+    let mut report = RestackReport::default();
+    if moves.is_empty() {
         return Ok(report);
     }
     if !repo.status()?.files.is_empty() {
@@ -417,30 +465,19 @@ pub fn restack(repo: &Repo, stack: &Stack) -> Result<RestackReport> {
     }
     let start = repo.current_branch();
 
-    // Tips as they are now, before any rebase rewrites them.
-    let mut old_tips: Vec<String> = Vec::new();
-    for e in &stack.entries {
-        old_tips.push(rev_parse(repo, &e.branch)?);
-    }
-
-    for (i, e) in stack.entries.iter().enumerate() {
+    for mv in moves {
         // Already contains its parent: nothing to replay.
-        if repo.git(&["merge-base", "--is-ancestor", &e.parent, &e.branch]).is_ok() {
-            report.steps.push(RestackStep { branch: e.branch.clone(), moved: false });
+        if repo.git(&["merge-base", "--is-ancestor", &mv.parent, &mv.branch]).is_ok() {
+            report.steps.push(RestackStep { branch: mv.branch.clone(), moved: false });
             continue;
         }
-        let upstream = if i == 0 {
-            fork_point(repo, &e.parent, &e.branch)
-        } else {
-            old_tips[i - 1].clone()
-        };
-        match repo.git(&["rebase", "--onto", &e.parent, &upstream, &e.branch]) {
-            Ok(_) => report.steps.push(RestackStep { branch: e.branch.clone(), moved: true }),
+        match repo.git(&["rebase", "--onto", &mv.parent, &mv.upstream, &mv.branch]) {
+            Ok(_) => report.steps.push(RestackStep { branch: mv.branch.clone(), moved: true }),
             Err(err) => {
                 // Leave the rebase in progress: the conflict resolver picks it
                 // up from here, and aborting would throw away the work.
                 if repo.git(&["rev-parse", "--verify", "--quiet", "REBASE_HEAD"]).is_ok() {
-                    report.conflicted = Some(e.branch.clone());
+                    report.conflicted = Some(mv.branch.clone());
                     return Ok(report);
                 }
                 let _ = repo.checkout(&start);
@@ -602,4 +639,216 @@ pub fn draft_pr(entry: &StackEntry) -> (String, String) {
         }
     }
     (title, body)
+}
+
+// ---------------------------------------------------------------------------
+// Submit and sync (the GitHub half)
+// ---------------------------------------------------------------------------
+
+/// What [`submit`] did, for the toast and the activity log.
+#[derive(Debug, Clone, Default)]
+pub struct SubmitReport {
+    /// One line per branch and pull request touched.
+    pub log: Vec<String>,
+    /// Pull requests opened (as opposed to updated).
+    pub opened: usize,
+    /// The stack as it now stands, with each branch's pull request number.
+    pub rows: Vec<NavRow>,
+}
+
+impl SubmitReport {
+    pub fn message(&self) -> String {
+        match self.opened {
+            0 => format!("Stack submitted: {} pull request(s) updated.", self.rows.len()),
+            n => format!("Stack submitted: {n} opened, {} in the stack.", self.rows.len()),
+        }
+    }
+}
+
+/// Publishes the stack: every branch pushed, every branch's pull request open
+/// and pointed at its parent, and the stack map written into every body.
+///
+/// Refuses a stale stack outright. A branch that is behind its parent would
+/// open a pull request whose diff includes the branch below it, which is the
+/// one thing a stack exists to prevent — and restacking is a rebase, so it is
+/// the user's decision, not something to slip into a submit.
+pub fn submit(
+    repo: &Repo,
+    client: &crate::github::Client,
+    slug: &crate::github::RepoSlug,
+    stack: &Stack,
+    auth: Option<&str>,
+) -> std::result::Result<SubmitReport, String> {
+    if let Some(e) = stack.entries.iter().find(|e| e.needs_restack) {
+        return Err(format!(
+            "Restack first: {} is behind {}. Its pull request would show the \
+             changes below it as its own.",
+            e.branch, e.parent
+        ));
+    }
+    let mut report = SubmitReport::default();
+
+    // The bases have to exist on the remote before a pull request can name one.
+    push_stack(repo, stack, auth).map_err(|e| e.to_string())?;
+    report.log.push(format!("pushed {} branch(es)", stack.entries.len()));
+
+    let open = client.pull_requests(slug).map_err(|e| e.to_string())?;
+    for entry in &stack.entries {
+        let existing = open.iter().find(|pr| pr.head == entry.branch);
+        // A branch whose changes are already in the trunk has nothing to open a
+        // pull request about. GitHub would refuse it with "no commits between",
+        // which says less than this does.
+        if existing.is_none() && entry.merged {
+            report.log.push(format!("{}: already in {}, skipped", entry.branch, stack.trunk));
+            continue;
+        }
+        let number = match existing {
+            Some(pr) => {
+                if pr.base != entry.parent {
+                    client
+                        .update_pull_request(slug, pr.number, Some(&entry.parent), None, None)
+                        .map_err(|e| e.to_string())?;
+                    report.log.push(format!(
+                        "#{} {}: base retargeted to {}",
+                        pr.number, entry.branch, entry.parent
+                    ));
+                } else {
+                    report.log.push(format!("#{} {}: up to date", pr.number, entry.branch));
+                }
+                pr.number
+            }
+            None => {
+                let (title, body) = draft_pr(entry);
+                let created = client
+                    .create_pull_request(slug, &title, &body, &entry.branch, &entry.parent)
+                    .map_err(|e| e.to_string())?;
+                report.opened += 1;
+                report.log.push(format!(
+                    "#{} {}: opened into {}",
+                    created.number, entry.branch, entry.parent
+                ));
+                created.number
+            }
+        };
+        // Remembered so a later sync can ask GitHub whether this one merged:
+        // the list endpoint only ever returns open pull requests.
+        let _ = set_pr(repo, &entry.branch, number);
+        report.rows.push(NavRow { branch: entry.branch.clone(), pr: Some(number) });
+    }
+
+    // Every body gets the same map of the stack, marked where it is. Done last,
+    // so the pull requests opened a moment ago are in it too.
+    for row in &report.rows {
+        let Some(number) = row.pr else { continue };
+        let nav = nav_section(&report.rows, &stack.trunk, &row.branch);
+        let detail = client.pull_request(slug, number).map_err(|e| e.to_string())?;
+        let body = with_nav(&detail.body, &nav);
+        if body != detail.body {
+            client
+                .update_pull_request(slug, number, None, None, Some(&body))
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(report)
+}
+
+/// What [`sync`] did.
+#[derive(Debug, Clone, Default)]
+pub struct SyncReport {
+    pub log: Vec<String>,
+    /// Branches that landed and left the stack.
+    pub dropped: Vec<String>,
+    /// The rebase of what was left, if anything was dropped.
+    pub restack: RestackReport,
+}
+
+impl SyncReport {
+    pub fn message(&self) -> String {
+        if self.restack.conflicted.is_some() {
+            return self.restack.message();
+        }
+        match self.dropped.len() {
+            0 => "Nothing has merged yet; the stack is unchanged.".to_string(),
+            n => format!(
+                "{n} merged branch(es) left the stack. Submit to update the \
+                 remaining pull requests."
+            ),
+        }
+    }
+}
+
+/// Brings the stack back in line with the remote after something merged.
+///
+/// Nothing is pushed and no branch is deleted: what the remote should look
+/// like afterwards is a separate decision, made by submitting again.
+///
+/// `github` is optional so this still does something useful offline — but a
+/// pull request that cannot be checked is never assumed merged. Silently
+/// dropping a branch out of a stack because a request timed out would be a way
+/// to lose work.
+pub fn sync(
+    repo: &Repo,
+    github: Option<(&crate::github::Client, &crate::github::RepoSlug)>,
+    stack: &Stack,
+) -> std::result::Result<SyncReport, String> {
+    let mut report = SyncReport::default();
+
+    // A squash merge leaves no trace in the local history, so GitHub's answer
+    // is the one that counts; the patch-id check is the fallback for a branch
+    // merged outside a pull request entirely.
+    let mut merged: Vec<String> = Vec::new();
+    for entry in &stack.entries {
+        let landed = match (github, entry.pr) {
+            (Some((client, slug)), Some(number)) => match client.pull_request(slug, number) {
+                Ok(detail) => detail.merged,
+                Err(e) => {
+                    report.log.push(format!("#{number}: could not check ({e})"));
+                    false
+                }
+            },
+            _ => false,
+        };
+        if landed || entry.merged {
+            merged.push(entry.branch.clone());
+        }
+    }
+    if merged.is_empty() {
+        return Ok(report);
+    }
+    let rest = drop_and_restack(repo, stack, &merged).map_err(|e| e.to_string())?;
+    report.log.extend(rest.log);
+    report.dropped = rest.dropped;
+    report.restack = rest.restack;
+    Ok(report)
+}
+
+/// Takes the named branches out of the stack and rebases what is left.
+///
+/// Split out from [`sync`] because deciding *what* merged needs GitHub and
+/// doing something about it does not — and because the rebase below is the
+/// part with the sharp edge, so it is worth being able to test on its own.
+pub fn drop_and_restack(
+    repo: &Repo,
+    stack: &Stack,
+    merged: &[String],
+) -> Result<SyncReport> {
+    let mut report = SyncReport::default();
+    // The plan is built from the stack as it was, before the merged branches
+    // are unlinked: the branch above a squash-merged one has to replay from
+    // where that branch ended, and once it is dropped there is no way to know
+    // where that was.
+    let moves = plan(repo, stack, merged)?;
+
+    report.dropped = drop_merged(repo, stack, merged)?;
+    for branch in &report.dropped {
+        report.log.push(format!("{branch}: merged, left the stack"));
+    }
+
+    report.restack = apply_moves(repo, &moves)?;
+    for step in &report.restack.steps {
+        if step.moved {
+            report.log.push(format!("{}: rebased onto its new parent", step.branch));
+        }
+    }
+    Ok(report)
 }

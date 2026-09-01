@@ -115,6 +115,24 @@ afterwards is a separate decision, made by submitting again. If GitHub cannot be
 reached, the branch stays in the stack and the activity log says why — an
 unreachable service must not silently drop work out of a stack.
 
+## Checking it yourself
+
+`tests/stack.rs` covers the git side offline — the parent chain, restacking
+(including the case where a rebase would otherwise replay a branch's commits
+twice), merge detection, and the PR body block.
+
+The GitHub half is exercised against the real API by an ignored test:
+
+```sh
+cargo test --test stack_live -- --ignored --nocapture
+```
+
+It creates a private scratch repository, submits a three-branch stack, checks
+each pull request targets the branch below it and shows only its own files,
+squash-merges the bottom one, syncs, and checks that the branch above it was
+rebased onto the trunk with only its own commit and its pull request
+retargeted. The repository is left behind for you to delete.
+
 ## What it does not do
 
 - **Deleting merged branches.** Sync takes them out of the stack; removing the

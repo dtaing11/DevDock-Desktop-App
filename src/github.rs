@@ -365,6 +365,53 @@ impl Client {
         serde_json::from_value(value).map_err(|e| GhError(e.to_string()))
     }
 
+    /// Creates a repository owned by the authenticated user.
+    ///
+    /// `auto_init` is deliberately off: a repository with a commit already in
+    /// it has a root the caller did not make, which is the wrong start for
+    /// pushing an existing history.
+    pub fn create_repo(&self, name: &str, private: bool) -> Result<RemoteRepo> {
+        let payload = serde_json::json!({
+            "name": name,
+            "private": private,
+            "auto_init": false,
+        });
+        let value = self.post("/user/repos", payload)?;
+        Ok(RemoteRepo {
+            full_name: value
+                .get("full_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(name)
+                .to_string(),
+            clone_url: value
+                .get("clone_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            private,
+        })
+    }
+
+    /// The account's login and what this token is allowed to do.
+    ///
+    /// The scopes come back in a response header, so this is the only way to
+    /// know before trying — useful for telling "your token cannot do that"
+    /// apart from "that failed".
+    pub fn scopes(&self) -> Result<(String, String)> {
+        let resp = agent()
+            .get(&format!("{API_BASE}/user"))
+            .set("Authorization", &format!("Bearer {}", self.token))
+            .set("Accept", "application/vnd.github+json")
+            .call()
+            .map_err(|e| GhError(e.to_string()))?;
+        let scopes = resp.header("x-oauth-scopes").unwrap_or_default().to_string();
+        let value: serde_json::Value =
+            resp.into_json().map_err(|e| GhError(e.to_string()))?;
+        let login =
+            value.get("login").and_then(|l| l.as_str()).unwrap_or_default().to_string();
+        Ok((login, scopes))
+    }
+
     /// Lists open pull requests for a repository.
     pub fn pull_requests(&self, slug: &RepoSlug) -> Result<Vec<PullRequest>> {
         let path = format!("/repos/{}/{}/pulls?state=open&per_page=50", slug.owner, slug.repo);

@@ -21,6 +21,13 @@ macOS/Windows since egui is cross-platform).
   files it needs, proposes a merge for each conflict plus any other file the
   merge requires touching, and shows you every change as a diff. Nothing is
   written until you tick it and apply.
+- **Code editor** with **language server** support: diagnostics inline, hover
+  types, go-to-definition, find references, an outline, completion, format on
+  save, and workspace rename. Servers start on demand (rust-analyzer, pyright,
+  gopls, clangd, and more) and can be configured per repository.
+- **Coding agent**: give it a task and it reads, edits, asks the language
+  server what it broke, and runs your own checks until it works. Every change
+  it makes is reviewed as a diff and applied — or reverted — by you.
 - **GitHub**: sign in via browser device flow or a personal access token,
   authenticated push/pull/fetch, list and **create pull requests**
   (with an AI-generated title and description written from **every commit on
@@ -113,6 +120,23 @@ See the full guide: [docs/local-ci.md](docs/local-ci.md)
 [AI code review](docs/local-ci.md#ai-code-review))
 and the extension API: [docs/extending-local-ci.md](docs/extending-local-ci.md).
 
+## Editor, language servers, and the coding agent
+
+The **Editor** tab is a real editor with everything a language server
+provides; the **Agent** tab takes a task and works on the repository, using
+the same language server and your own CI checks to verify itself.
+
+Both are documented in
+[docs/editor-and-agent.md](docs/editor-and-agent.md) — including how to point
+DevDock at a server it does not know about:
+
+```toml
+# .git-manage-ci.toml
+[[lsp]]
+extensions = ["nim"]
+command = "nimlangserver"
+```
+
 ## GitHub sign-in
 
 Click the **🐙** button. Either:
@@ -130,17 +154,23 @@ src/
   github.rs    Device-flow auth + PR REST API (library, reusable)
   ollama.rs    Commit-message generation client (library, reusable)
   review.rs    The AI review gate: config, prompts, findings, thresholds
-  agent/       Tool-use harness: a model reads the repo (review) or
-               proposes edits across it (conflicts), never writing itself
+  agent/       Tool-use harness: read, edit, language server, and check
+               tools; the conflict resolver and the coding agent run on it
+  lsp/         Language server client: JSON-RPC over stdio, one process per
+               server, diagnostics and navigation for the editor and agent
   app/
     mod.rs     App state, config, background message pump
     theme.rs   Visual identity (indigo/ember/teal, not a GitHub clone)
     views.rs   Toolbar, sidebar, diff panel
     dialogs.rs Repo picker, GitHub, PRs, conflicts, settings
+    editor.rs  Code editor: buffers, highlighting, LSP interactions
+    agent_tab.rs The coding agent's task panel and change review
     worker.rs  Background thread runner
 tests/
   workflow.rs  End-to-end git workflow tests against throwaway repos
-  agent.rs     Harness tests: sandbox limits, proposals, applied merges
+  agent.rs     Harness tests: sandbox limits, proposals, applied merges,
+               and the coding agent against a real server and real checks
+  lsp.rs       Language server client, against a real child process
 ```
 
 The `git_manage` library (git/github/ollama modules) has no UI dependencies and

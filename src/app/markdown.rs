@@ -14,7 +14,7 @@ use super::{syntax, theme};
 use egui::{text::LayoutJob, Color32, FontId, RichText, TextFormat};
 
 /// Emphasis colour. The app loads no bold face, so `**bold**` and headings
-/// read as a brighter tone than [`theme::FG`] instead of a heavier weight.
+/// read as a brighter tone than [`theme::fg()`] instead of a heavier weight.
 const STRONG: Color32 = Color32::from_rgb(0xff, 0xfb, 0xf2);
 
 /// One parsed block. Markdown is block-structured, so rendering happens in
@@ -54,7 +54,7 @@ pub fn render(ui: &mut egui::Ui, md: &str) {
                     _ => 10.0,
                 });
                 let mut job = LayoutJob::default();
-                inline(&mut job, &text, theme::FG, size, true);
+                inline(&mut job, &text, theme::fg(), size, true);
                 ui.label(job);
                 // Only the document title gets a hairline. Giving every
                 // H2 one turns a normal README into a stack of rules.
@@ -64,13 +64,13 @@ pub fn render(ui: &mut egui::Ui, md: &str) {
                         egui::vec2(ui.available_width(), 1.0),
                         egui::Sense::hover(),
                     );
-                    ui.painter().rect_filled(rect, 0.0, theme::BORDER);
+                    ui.painter().rect_filled(rect, 0.0, theme::border());
                 }
                 ui.add_space(5.0);
             }
             Block::Paragraph(text) => {
                 let mut job = LayoutJob::default();
-                inline(&mut job, &text, theme::FG, 13.5, false);
+                inline(&mut job, &text, theme::fg(), 13.5, false);
                 ui.label(job);
                 ui.add_space(9.0);
             }
@@ -86,7 +86,7 @@ pub fn render(ui: &mut egui::Ui, md: &str) {
                     );
                     ui.add_space(8.0);
                     let mut job = LayoutJob::default();
-                    inline(&mut job, &text, theme::FG_DIM, 13.5, false);
+                    inline(&mut job, &text, theme::fg_dim(), 13.5, false);
                     // Explicit wrap: a horizontal layout does not wrap text
                     // by default, so a long quote would run off the panel.
                     let response = ui.add(egui::Label::new(job).wrap());
@@ -94,16 +94,16 @@ pub fn render(ui: &mut egui::Ui, md: &str) {
                         bar.0.min,
                         egui::vec2(3.0, response.rect.height()),
                     );
-                    ui.painter().rect_filled(rule, 1.0, theme::EMBER_DEEP);
+                    ui.painter().rect_filled(rule, 1.0, theme::ember_deep());
                 });
                 ui.add_space(9.0);
             }
             Block::ListItem { marker, text, indent } => {
                 ui.horizontal_top(|ui| {
                     ui.add_space(10.0 + indent as f32 * 14.0);
-                    ui.label(RichText::new(marker).color(theme::EMBER).monospace().size(13.0));
+                    ui.label(RichText::new(marker).color(theme::ember()).monospace().size(13.0));
                     let mut job = LayoutJob::default();
-                    inline(&mut job, &text, theme::FG, 13.5, false);
+                    inline(&mut job, &text, theme::fg(), 13.5, false);
                     // Explicit wrap, for the same reason as a quote: the
                     // marker sits beside the text in a horizontal layout,
                     // where egui extends rather than wraps by default.
@@ -114,15 +114,15 @@ pub fn render(ui: &mut egui::Ui, md: &str) {
             Block::Code { lang, lines } => {
                 let detected = detect_lang(&lang);
                 egui::Frame::new()
-                    .fill(theme::PANEL2)
-                    .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+                    .fill(theme::panel2())
+                    .stroke(egui::Stroke::new(1.0_f32, theme::border()))
                     .corner_radius(theme::RADIUS_SM as f32)
                     .inner_margin(egui::Margin::symmetric(10, 8))
                     .show(ui, |ui| {
                         for line in &lines {
                             let mut job = LayoutJob::default();
                             for span in
-                                syntax::highlight_line(detected, line, theme::FG)
+                                syntax::highlight_line(detected, line, theme::fg())
                             {
                                 job.append(
                                     &span.text,
@@ -141,7 +141,7 @@ pub fn render(ui: &mut egui::Ui, md: &str) {
                                     0.0,
                                     TextFormat {
                                         font_id: FontId::monospace(12.5),
-                                        color: theme::FG,
+                                        color: theme::fg(),
                                         ..Default::default()
                                     },
                                 );
@@ -314,7 +314,7 @@ fn inline(job: &mut LayoutJob, text: &str, color: Color32, size: f32, strong: bo
         // No bold face is loaded, so emphasis reads as a brighter tone rather
         // than a heavier weight. Changing the font here would be a no-op.
         let color = if code {
-            theme::TEAL
+            theme::teal()
         } else if bold || strong {
             STRONG
         } else {
@@ -337,7 +337,7 @@ fn inline(job: &mut LayoutJob, text: &str, color: Color32, size: f32, strong: bo
                 extra_letter_spacing: if bold || strong { 0.4 } else { 0.0 },
                 // Inline code reads as a chip, the way it does everywhere
                 // else Markdown is rendered.
-                background: if code { theme::PANEL2 } else { Color32::TRANSPARENT },
+                background: if code { theme::panel2() } else { Color32::TRANSPARENT },
                 ..Default::default()
             },
         );
@@ -388,8 +388,8 @@ fn inline(job: &mut LayoutJob, text: &str, color: Color32, size: f32, strong: bo
                             0.0,
                             TextFormat {
                                 font_id: FontId::proportional(size),
-                                color: theme::TEAL,
-                                underline: egui::Stroke::new(1.0_f32, theme::TEAL),
+                                color: theme::teal(),
+                                underline: egui::Stroke::new(1.0_f32, theme::teal()),
                                 ..Default::default()
                             },
                         );
@@ -517,14 +517,14 @@ mod tests {
     #[test]
     fn unmatched_inline_markers_are_literal() {
         let mut job = LayoutJob::default();
-        inline(&mut job, "a * b `c", theme::FG, 13.0, false);
+        inline(&mut job, "a * b `c", theme::fg(), 13.0, false);
         assert!(job.text.contains("a * b `c"), "got {:?}", job.text);
     }
 
     #[test]
     fn inline_code_and_emphasis_are_extracted() {
         let mut job = LayoutJob::default();
-        inline(&mut job, "see `src/git.rs` and **fix** it", theme::FG, 13.0, false);
+        inline(&mut job, "see `src/git.rs` and **fix** it", theme::fg(), 13.0, false);
         // Markers are consumed; the content survives.
         assert!(job.text.contains("src/git.rs"));
         assert!(job.text.contains("fix"));
@@ -535,7 +535,7 @@ mod tests {
     #[test]
     fn links_render_their_label() {
         let mut job = LayoutJob::default();
-        inline(&mut job, "see [the docs](https://x.test/a) now", theme::FG, 13.0, false);
+        inline(&mut job, "see [the docs](https://x.test/a) now", theme::fg(), 13.0, false);
         assert!(job.text.contains("the docs"));
         assert!(!job.text.contains("https://"), "url should not be shown: {:?}", job.text);
     }

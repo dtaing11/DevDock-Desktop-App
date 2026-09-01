@@ -627,6 +627,12 @@ fn ensure_trailing_newline(s: &str) -> String {
 }
 
 /// Truncates to at most `max` bytes on a char boundary, marking the cut.
+/// Public form, for prompt builders elsewhere in the crate.
+pub fn truncate_for_prompt(s: &str, max: usize) -> String {
+    truncate_utf8(s, max)
+}
+
+/// Truncates to at most `max` bytes on a char boundary, marking the cut.
 fn truncate_utf8(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();

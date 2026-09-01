@@ -21,7 +21,7 @@ impl eframe::App for Shot {
         self.frame += 1;
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(theme::BG).inner_margin(12.0))
+            .frame(egui::Frame::new().fill(theme::bg()).inner_margin(12.0))
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])

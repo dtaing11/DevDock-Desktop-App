@@ -170,6 +170,44 @@ review-then-accept flow. Custom per-repo conflict instructions from the
 AI Prompts dialog apply here too. When every file is resolved, the
 command offers to run the merge/rebase continue step for you.
 
+#### resolve --agent
+
+`devdock resolve --agent` runs one repository-wide pass first. Instead of
+seeing three versions of a single file, the model gets read access to every
+tracked file and may propose edits anywhere in the worktree — the caller that
+must be updated, the import that must move, the test that names a renamed
+symbol. It prints what it reads as it goes:
+
+```
+$ devdock resolve --agent
+── agent ───────────── Claude (claude-opus-5) is reading the repository…
+  · read src/lib.rs
+  · search "halve"
+  · read src/main.rs
+  · propose an edit to src/lib.rs
+  · propose an edit to src/main.rs
+
+── summary ─────────
+- src/lib.rs: kept both signatures, took theirs' error type…
+
+[proposed] src/lib.rs +4 -2
+  pub fn halve(n: u32) -> u32 {
+- <<<<<<< HEAD
+-     n / 2
+…
+[a]pply [s]kip [q]uit ? a
+applied src/lib.rs
+```
+
+Every proposal is shown as a diff and applied only when you answer `a`.
+Conflicted files are staged as resolved; any other file is written unstaged so
+it shows up in `devdock status` for a second look. Anything the model did not
+resolve falls through to the per-file prompts above.
+
+The model comes from the conflict-resolution selection in the GUI's model
+picker (falling back to the commit-message selection). An Ollama model must
+support tool calling; Claude models all do.
+
 ### ci
 
 Runs every job in `.git-manage-ci.toml` and prints per-job results.

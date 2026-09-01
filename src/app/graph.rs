@@ -12,15 +12,18 @@ use crate::git::Commit;
 use egui::{Color32, Pos2, RichText, ScrollArea, Stroke, Vec2};
 use std::collections::HashMap;
 
-/// Lane colors cycled across branches.
-const LANE_COLORS: &[Color32] = &[
-    theme::EMBER,
-    theme::TEAL,
-    Color32::from_rgb(0xb0, 0x8c, 0xff), // violet
-    theme::ADD,
-    Color32::from_rgb(0xff, 0x8c, 0xc4), // pink
-    theme::WARN,
-];
+/// Lane colors cycled across branches. A function rather than a constant,
+/// since the palette can change while the app is running.
+fn lane_colors() -> [Color32; 6] {
+    [
+        theme::ember(),
+        theme::teal(),
+        Color32::from_rgb(0xb0, 0x8c, 0xff), // violet
+        theme::add(),
+        Color32::from_rgb(0xff, 0x8c, 0xc4), // pink
+        theme::warn(),
+    ]
+}
 
 const ROW_H: f32 = 34.0;
 const LANE_W: f32 = 26.0;
@@ -105,16 +108,16 @@ pub fn draw_side_panel(app: &mut App, ctx: &egui::Context) {
         .min_width(140.0)
         .max_width(420.0)
         .resizable(true)
-        .frame(egui::Frame::new().fill(theme::BG).inner_margin(0.0))
+        .frame(egui::Frame::new().fill(theme::bg()).inner_margin(0.0))
         .show(ctx, |ui| {
             egui::Frame::new()
-                .fill(theme::PANEL2)
+                .fill(theme::panel2())
                 .inner_margin(egui::Margin::symmetric(10, 6))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
                             RichText::new(format!("Graph · {}", app.graph.len()))
-                                .color(theme::FG_DIM)
+                                .color(theme::fg_dim())
                                 .small(),
                         );
                         ui.with_layout(
@@ -130,7 +133,7 @@ pub fn draw_side_panel(app: &mut App, ctx: &egui::Context) {
 
             if app.graph.is_empty() {
                 ui.centered_and_justified(|ui| {
-                    ui.label(RichText::new("no commits").color(theme::FG_DIM).small());
+                    ui.label(RichText::new("no commits").color(theme::fg_dim()).small());
                 });
                 return;
             }
@@ -163,7 +166,7 @@ pub fn draw_side_panel(app: &mut App, ctx: &egui::Context) {
                     let from = pos_of(i, node.lane);
                     for (pi, plane) in &node.parent_edges {
                         let to = pos_of(*pi, *plane);
-                        let color = LANE_COLORS[node.lane % LANE_COLORS.len()]
+                        let color = lane_colors()[node.lane % lane_colors().len()]
                             .linear_multiply(0.45);
                         draw_edge(&painter, from, to, color);
                     }
@@ -177,7 +180,7 @@ pub fn draw_side_panel(app: &mut App, ctx: &egui::Context) {
                         let phase = ((i * 31 + pi * 17) % 97) as f32 / 97.0;
                         let t = (time * 0.35 + phase) % 1.0;
                         let p = edge_point(from, to, t);
-                        let color = LANE_COLORS[node.lane % LANE_COLORS.len()];
+                        let color = lane_colors()[node.lane % lane_colors().len()];
                         painter.circle_filled(p, 1.8, Color32::WHITE);
                         painter.circle_filled(p, 3.6, color.linear_multiply(0.55));
                         painter.circle_filled(p, 7.0, color.linear_multiply(0.15));
@@ -189,10 +192,10 @@ pub fn draw_side_panel(app: &mut App, ctx: &egui::Context) {
                 let mut hovered_popup: Option<(Pos2, usize)> = None;
                 for (i, node) in app.graph.iter().enumerate() {
                     let p = pos_of(i, node.lane);
-                    let color = LANE_COLORS[node.lane % LANE_COLORS.len()];
+                    let color = lane_colors()[node.lane % lane_colors().len()];
                     let breathe = 0.5 + 0.5 * (time * 2.0 + i as f32 * 0.7).sin();
                     painter.circle_filled(p, NODE_R + 5.0 * breathe, color.linear_multiply(0.10));
-                    painter.circle_filled(p, NODE_R, theme::BG);
+                    painter.circle_filled(p, NODE_R, theme::bg());
                     painter.circle_stroke(p, NODE_R, Stroke::new(2.0_f32, color));
                     painter.circle_filled(p, 2.0, color);
 
@@ -201,7 +204,7 @@ pub fn draw_side_panel(app: &mut App, ctx: &egui::Context) {
                         painter.circle_stroke(
                             p,
                             NODE_R + 3.0,
-                            Stroke::new(1.0_f32, theme::EMBER),
+                            Stroke::new(1.0_f32, theme::ember()),
                         );
                     }
 
@@ -235,7 +238,7 @@ pub fn draw_side_panel(app: &mut App, ctx: &egui::Context) {
                         .fixed_pos(p + Vec2::new(-260.0, -10.0))
                         .show(ui.ctx(), |ui| {
                             egui::Frame::new()
-                                .fill(theme::PANEL)
+                                .fill(theme::panel())
                                 .stroke(egui::Stroke::new(
                                     1.0_f32,
                                     Color32::WHITE.linear_multiply(0.35),
@@ -248,15 +251,15 @@ pub fn draw_side_panel(app: &mut App, ctx: &egui::Context) {
                                             .small(),
                                     );
                                     ui.label(
-                                        RichText::new(meta).color(theme::FG_DIM).small(),
+                                        RichText::new(meta).color(theme::fg_dim()).small(),
                                     );
                                     for name in refs.iter().take(6) {
                                         let color = if name.starts_with("HEAD") {
-                                            theme::EMBER
+                                            theme::ember()
                                         } else if name.starts_with("tag:") {
-                                            theme::WARN
+                                            theme::warn()
                                         } else {
-                                            theme::TEAL
+                                            theme::teal()
                                         };
                                         ui.label(
                                             RichText::new(name).color(color).small(),

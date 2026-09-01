@@ -28,8 +28,14 @@ sha2 = "0.10"
 toml = "0.8"
 aes-gcm = "0.10"
 
+# The integrated terminal needs a pty: openpty, ioctl(TIOCSWINSZ), waitpid.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
+# The terminal tests send signals to the child.
+libc = "0.2"
 
 [profile.release]
 strip = true

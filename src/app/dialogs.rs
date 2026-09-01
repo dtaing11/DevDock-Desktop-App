@@ -28,6 +28,11 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         Dialog::ReviewGate => review_gate(app, ctx, &mut open),
         Dialog::ChecksGate => checks_gate(app, ctx, &mut open),
         Dialog::AgentChanges => agent_changes(app, ctx, &mut open),
+        Dialog::Rename => rename_dialog(app, ctx, &mut open),
+        Dialog::Reflog => reflog_dialog(app, ctx, &mut open),
+        Dialog::CommandPalette => command_palette(app, ctx, &mut open),
+        Dialog::SplitCommits => split_dialog(app, ctx, &mut open),
+        Dialog::TidyHistory => tidy_dialog(app, ctx, &mut open),
     }
     // Dismissing a gate with the X is a deferred decision, not an approval:
     // the modal closes but the held action stays available behind the
@@ -81,8 +86,8 @@ fn modal(
         .backdrop_color(egui::Color32::from_black_alpha(140))
         .frame(
             egui::Frame::window(&ctx.style())
-                .fill(theme::PANEL)
-                .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+                .fill(theme::panel())
+                .stroke(egui::Stroke::new(1.0_f32, theme::border()))
                 .inner_margin(16.0),
         )
         .show(ctx, |ui| {
@@ -228,7 +233,7 @@ fn repo_picker(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                 }
             });
             if app.gh_repos_loading {
-                ui.label(RichText::new("Loading…").color(theme::FG_DIM));
+                ui.label(RichText::new("Loading…").color(theme::fg_dim()));
             }
             let repos = app.gh_repos.clone();
             ScrollArea::vertical().max_height(180.0).id_salt("gh-repos").show(ui, |ui| {
@@ -290,7 +295,7 @@ fn github_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                 ui.label("2. Enter code:");
                 ui.label(
                     RichText::new(&device.user_code)
-                        .color(theme::EMBER)
+                        .color(theme::ember())
                         .monospace()
                         .size(18.0),
                 );
@@ -299,7 +304,7 @@ fn github_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                     app.toast("Code copied.", false);
                 }
             });
-            ui.label(RichText::new("Waiting for authorization…").color(theme::FG_DIM));
+            ui.label(RichText::new("Waiting for authorization…").color(theme::fg_dim()));
         } else if ui.button("Start browser sign-in").clicked() {
             app.worker.spawn(|| {
                 Msg::GhDeviceCode(strerr(github::device_flow_start(github::DEFAULT_CLIENT_ID)))
@@ -392,7 +397,7 @@ fn pull_requests(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                 && !app.pr.title.trim().is_empty()
                 && app.pr.head != app.pr.base;
             if ui
-                .add_enabled(create_enabled, egui::Button::new("Create PR").fill(theme::EMBER))
+                .add_enabled(create_enabled, egui::Button::new("Create PR").fill(theme::ember()))
                 .clicked()
             {
                 // Runs the AI reviewer first when `[review] run = true`;
@@ -404,9 +409,9 @@ fn pull_requests(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         ui.separator();
         ui.label(theme::overline("OPEN PULL REQUESTS"));
         if app.pr.loading {
-            ui.label(RichText::new("Loading…").color(theme::FG_DIM));
+            ui.label(RichText::new("Loading…").color(theme::fg_dim()));
         } else if app.pr.open_prs.is_empty() {
-            ui.label(RichText::new("No open pull requests.").color(theme::FG_DIM));
+            ui.label(RichText::new("No open pull requests.").color(theme::fg_dim()));
         }
         let prs = app.pr.open_prs.clone();
         ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
@@ -423,7 +428,7 @@ fn pull_requests(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                             RichText::new(
                                 "GitHub enforces repository rules and reports back",
                             )
-                            .color(theme::FG_DIM)
+                            .color(theme::fg_dim())
                             .small(),
                         );
                         for (label, method) in [
@@ -463,7 +468,7 @@ fn pull_requests(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                     match app.pr.mergeable.get(&pr.number) {
                         Some(Some(false)) => {
                             ui.label(
-                                RichText::new("[conflicts]").color(theme::DANGER).small(),
+                                RichText::new("[conflicts]").color(theme::danger()).small(),
                             )
                             .on_hover_text("This PR cannot be merged until conflicts are resolved");
                             if ui
@@ -481,7 +486,7 @@ fn pull_requests(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                         }
                         Some(Some(true)) => {
                             ui.label(
-                                RichText::new("[mergeable]").color(theme::ADD).small(),
+                                RichText::new("[mergeable]").color(theme::add()).small(),
                             );
                         }
                         _ => {}
@@ -489,10 +494,10 @@ fn pull_requests(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                     if let Some(checks) = app.pr.checks.get(&pr.number) {
                         use crate::github::CheckState;
                         let (label, color) = match checks.state {
-                            CheckState::Passing => ("[CI passing]", theme::ADD),
-                            CheckState::Failing => ("[CI failing]", theme::DANGER),
-                            CheckState::Pending => ("[CI running]", theme::WARN),
-                            CheckState::None => ("[no CI]", theme::FG_DIM),
+                            CheckState::Passing => ("[CI passing]", theme::add()),
+                            CheckState::Failing => ("[CI failing]", theme::danger()),
+                            CheckState::Pending => ("[CI running]", theme::warn()),
+                            CheckState::None => ("[no CI]", theme::fg_dim()),
                         };
                         ui.label(RichText::new(label).color(color).small()).on_hover_text(
                             format!(
@@ -514,9 +519,9 @@ fn pull_requests(app: &mut App, ctx: &egui::Context, open: &mut bool) {
 /// Colour for a severity chip.
 fn severity_color(s: crate::review::Severity) -> egui::Color32 {
     match s {
-        crate::review::Severity::High => theme::DANGER,
-        crate::review::Severity::Medium => theme::EMBER,
-        crate::review::Severity::Low => theme::FG_DIM,
+        crate::review::Severity::High => theme::danger(),
+        crate::review::Severity::Medium => theme::ember(),
+        crate::review::Severity::Low => theme::fg_dim(),
     }
 }
 
@@ -561,7 +566,7 @@ fn review_gate(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         )));
         ui.label(
             RichText::new(format!("{high} high · {medium} medium · {low} low"))
-                .color(theme::FG_DIM)
+                .color(theme::fg_dim())
                 .small(),
         );
 
@@ -577,7 +582,7 @@ fn review_gate(app: &mut App, ctx: &egui::Context, open: &mut bool) {
             egui::CollapsingHeader::new("Reviewer's reasoning")
                 .default_open(true)
                 .show(ui, |ui| {
-                    ui.label(RichText::new(&outcome.reasoning).color(theme::FG_DIM));
+                    ui.label(RichText::new(&outcome.reasoning).color(theme::fg_dim()));
                 });
         }
 
@@ -601,7 +606,7 @@ fn review_gate(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                         .strong(),
                 );
                 if !where_.is_empty() {
-                    ui.label(RichText::new(where_).color(theme::FG_DIM).small().monospace());
+                    ui.label(RichText::new(where_).color(theme::fg_dim()).small().monospace());
                 }
                 ui.label(RichText::new(&finding.title).strong());
             });
@@ -612,7 +617,7 @@ fn review_gate(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                     app.review.expanded = if expanded { None } else { Some(i) };
                 }
                 if expanded {
-                    ui.label(RichText::new(&finding.detail).color(theme::FG_DIM));
+                    ui.label(RichText::new(&finding.detail).color(theme::fg_dim()));
                     // The line the reviewer quoted, checked against the file
                     // before this was shown. It is what makes the finding
                     // checkable rather than something to take on faith.
@@ -622,7 +627,7 @@ fn review_gate(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                             RichText::new(finding.evidence.trim())
                                 .monospace()
                                 .small()
-                                .color(theme::TEAL),
+                                .color(theme::teal()),
                         );
                     }
                 }
@@ -664,11 +669,11 @@ fn checks_gate(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         ui.add_space(8.0);
 
         for (name, output) in &failed {
-            ui.label(RichText::new(name).color(theme::DANGER).strong());
+            ui.label(RichText::new(name).color(theme::danger()).strong());
             // The tail is where the failure is; the head is usually setup.
             let tail: Vec<&str> = output.lines().rev().take(8).collect();
             for line in tail.into_iter().rev() {
-                ui.label(RichText::new(line).color(theme::FG_DIM).monospace().small());
+                ui.label(RichText::new(line).color(theme::fg_dim()).monospace().small());
             }
             ui.add_space(6.0);
         }
@@ -684,7 +689,7 @@ fn checks_gate(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                 app.toast(format!("{noun} cancelled."), false);
             }
             let label = held.override_label();
-            let proceed = egui::Button::new(RichText::new(label).color(theme::FG_DIM))
+            let proceed = egui::Button::new(RichText::new(label).color(theme::fg_dim()))
                 .min_size(egui::vec2(0.0, theme::CONTROL_MD));
             if ui
                 .add(proceed)
@@ -724,7 +729,7 @@ fn context_log(ui: &mut egui::Ui, log: &[String]) {
                 |ui| {
                     for line in log {
                         ui.label(
-                            RichText::new(line).small().monospace().color(theme::FG_DIM),
+                            RichText::new(line).small().monospace().color(theme::fg_dim()),
                         );
                     }
                 },
@@ -742,7 +747,7 @@ fn review_gate_buttons(app: &mut App, ui: &mut egui::Ui, noun: &str, override_la
             app.dialog = Dialog::None;
             app.toast(format!("{noun} cancelled. Review kept in the Checks tab."), false);
         }
-        let proceed = egui::Button::new(RichText::new(override_label).color(theme::FG_DIM))
+        let proceed = egui::Button::new(RichText::new(override_label).color(theme::fg_dim()))
             .min_size(egui::vec2(0.0, theme::CONTROL_MD));
         if ui
             .add(proceed)
@@ -785,7 +790,7 @@ fn conflict_resolver(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         ui.set_min_width(680.0);
 
         if app.conflicts.files.is_empty() {
-            ui.label(RichText::new("All conflicts resolved").color(theme::ADD));
+            ui.label(RichText::new("All conflicts resolved").color(theme::add()));
         }
 
         agent_panel(app, ui);
@@ -802,9 +807,9 @@ fn conflict_resolver(app: &mut App, ctx: &egui::Context, open: &mut bool) {
             let resolved = app.conflicts.resolved.contains(path);
             let marker = if resolved { "[resolved]" } else { "[conflict]" };
             let text = RichText::new(format!("{marker} {path}")).color(if resolved {
-                theme::ADD
+                theme::add()
             } else {
-                theme::WARN
+                theme::warn()
             });
             if ui.selectable_label(app.conflicts.selected == Some(*i), text).clicked() {
                 app.conflicts.selected = Some(*i);
@@ -822,7 +827,7 @@ fn conflict_resolver(app: &mut App, ctx: &egui::Context, open: &mut bool) {
             let ours = app.conflicts.files[i].ours.clone().unwrap_or_default();
             let theirs = app.conflicts.files[i].theirs.clone().unwrap_or_default();
             ui.separator();
-            ui.label(RichText::new(&path).color(theme::EMBER).strong());
+            ui.label(RichText::new(&path).color(theme::ember()).strong());
             ui.horizontal(|ui| {
                 if ui.button("Take ours (current branch)").clicked() {
                     resolve(app, &path, Resolution::Ours);
@@ -865,12 +870,12 @@ fn conflict_resolver(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                         "AI PROPOSAL. Review the merged result below and edit it \
                          if needed. Nothing is applied until you accept.",
                     )
-                    .color(theme::WARN)
+                    .color(theme::warn())
                     .small(),
                 );
                 ui.horizontal(|ui| {
                     if ui
-                        .add(egui::Button::new("Accept AI merge").fill(theme::EMBER))
+                        .add(egui::Button::new("Accept AI merge").fill(theme::ember()))
                         .on_hover_text(
                             "Writes the reviewed content (including your edits) \
                              to the file and marks it resolved",
@@ -896,7 +901,7 @@ fn conflict_resolver(app: &mut App, ctx: &egui::Context, open: &mut bool) {
             // Side-by-side: ours | theirs (read-only context above the editor).
             let lang = crate::app::syntax::Lang::from_path(&path);
             ui.columns(2, |cols| {
-                cols[0].label(RichText::new("OURS (current branch)").color(theme::TEAL).small());
+                cols[0].label(RichText::new("OURS (current branch)").color(theme::teal()).small());
                 let font = egui::TextStyle::Small.resolve(cols[0].style());
                 ScrollArea::vertical().max_height(140.0).id_salt("ours").show(
                     &mut cols[0],
@@ -905,14 +910,14 @@ fn conflict_resolver(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                             ui.label(crate::app::syntax::diff_line_job(
                                 lang,
                                 line,
-                                theme::FG,
+                                theme::fg(),
                                 font.clone(),
                                 true,
                             ));
                         }
                     },
                 );
-                cols[1].label(RichText::new("THEIRS (incoming)").color(theme::WARN).small());
+                cols[1].label(RichText::new("THEIRS (incoming)").color(theme::warn()).small());
                 let font = egui::TextStyle::Small.resolve(cols[1].style());
                 ScrollArea::vertical().max_height(140.0).id_salt("theirs").show(
                     &mut cols[1],
@@ -921,7 +926,7 @@ fn conflict_resolver(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                             ui.label(crate::app::syntax::diff_line_job(
                                 lang,
                                 line,
-                                theme::FG,
+                                theme::fg(),
                                 font.clone(),
                                 true,
                             ));
@@ -935,7 +940,7 @@ fn conflict_resolver(app: &mut App, ctx: &egui::Context, open: &mut bool) {
             } else {
                 "MERGED RESULT (edit freely, then Save manual edit)"
             };
-            ui.label(RichText::new(editor_label).color(theme::EMBER).small());
+            ui.label(RichText::new(editor_label).color(theme::ember()).small());
             ScrollArea::vertical().max_height(200.0).id_salt("merged").show(ui, |ui| {
                 ui.add(
                     egui::TextEdit::multiline(&mut app.conflicts.editor)
@@ -952,7 +957,7 @@ fn conflict_resolver(app: &mut App, ctx: &egui::Context, open: &mut bool) {
             if ui
                 .add_enabled(
                     all_resolved || app.conflicts.files.is_empty(),
-                    egui::Button::new("Finish (continue merge/rebase)").fill(theme::EMBER),
+                    egui::Button::new("Finish (continue merge/rebase)").fill(theme::ember()),
                 )
                 .clicked()
             {
@@ -976,9 +981,9 @@ fn pr_review(app: &mut App, ctx: &egui::Context, open: &mut bool) {
     modal(ctx, &title, open, |ui| {
         ui.set_min_width(760.0);
         ui.horizontal(|ui| {
-            ui.label(RichText::new(&pr.head).color(theme::TEAL).monospace());
+            ui.label(RichText::new(&pr.head).color(theme::teal()).monospace());
             ui.label(RichText::new("into").weak());
-            ui.label(RichText::new(&pr.base).color(theme::TEAL).monospace());
+            ui.label(RichText::new(&pr.base).color(theme::teal()).monospace());
             ui.label(RichText::new(format!("by {}", pr.user)).weak());
             if ui.small_button("Back to list").clicked() {
                 app.dialog = Dialog::PullRequests;
@@ -991,10 +996,10 @@ fn pr_review(app: &mut App, ctx: &egui::Context, open: &mut bool) {
             ui.horizontal_wrapped(|ui| {
                 for review in &app.pr.review.reviews {
                     let (label, color) = match review.state.as_str() {
-                        "APPROVED" => ("approved", theme::ADD),
-                        "CHANGES_REQUESTED" => ("requested changes", theme::DANGER),
-                        "DISMISSED" => ("dismissed", theme::FG_DIM),
-                        _ => ("commented", theme::FG_DIM),
+                        "APPROVED" => ("approved", theme::add()),
+                        "CHANGES_REQUESTED" => ("requested changes", theme::danger()),
+                        "DISMISSED" => ("dismissed", theme::fg_dim()),
+                        _ => ("commented", theme::fg_dim()),
                     };
                     let chip = format!("{} {label}", review.user);
                     let resp = ui.label(RichText::new(chip).color(color).small());
@@ -1022,13 +1027,13 @@ fn pr_review(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         let total_del: u64 = app.pr.review.files.iter().map(|f| f.deletions).sum();
         ui.horizontal(|ui| {
             ui.label(theme::overline(&format!("{file_count} CHANGED FILES")));
-            ui.label(RichText::new(format!("+{total_add}")).color(theme::ADD).small());
-            ui.label(RichText::new(format!("-{total_del}")).color(theme::DEL).small());
+            ui.label(RichText::new(format!("+{total_add}")).color(theme::add()).small());
+            ui.label(RichText::new(format!("-{total_del}")).color(theme::del()).small());
             let pending = app.pr.review.pending.len();
             if pending > 0 {
                 ui.label(
                     RichText::new(format!("{pending} pending comment(s)"))
-                        .color(theme::WARN)
+                        .color(theme::warn())
                         .small(),
                 );
             }
@@ -1042,10 +1047,10 @@ fn pr_review(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                 };
                 let selected = app.pr.review.selected == Some(fi);
                 let marker = match status.as_str() {
-                    "added" => RichText::new("[A]").color(theme::ADD),
-                    "removed" => RichText::new("[D]").color(theme::DEL),
-                    "renamed" => RichText::new("[R]").color(theme::TEAL),
-                    _ => RichText::new("[M]").color(theme::WARN),
+                    "added" => RichText::new("[A]").color(theme::add()),
+                    "removed" => RichText::new("[D]").color(theme::del()),
+                    "renamed" => RichText::new("[R]").color(theme::teal()),
+                    _ => RichText::new("[M]").color(theme::warn()),
                 };
                 ui.horizontal(|ui| {
                     ui.label(marker.monospace().small());
@@ -1054,8 +1059,8 @@ fn pr_review(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                         app.pr.review.selected = if selected { None } else { Some(fi) };
                         app.pr.review.comment_target = None;
                     }
-                    ui.label(RichText::new(format!("+{adds}")).color(theme::ADD).small());
-                    ui.label(RichText::new(format!("-{dels}")).color(theme::DEL).small());
+                    ui.label(RichText::new(format!("+{adds}")).color(theme::add()).small());
+                    ui.label(RichText::new(format!("-{dels}")).color(theme::del()).small());
                 });
 
                 if !selected {
@@ -1073,7 +1078,7 @@ fn pr_review(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                 let lang = crate::app::syntax::Lang::from_path(&path);
                 let font = egui::TextStyle::Monospace.resolve(ui.style());
                 egui::Frame::default()
-                    .fill(theme::BG)
+                    .fill(theme::bg())
                     .inner_margin(6.0)
                     .corner_radius(4.0)
                     .show(ui, |ui| {
@@ -1112,7 +1117,7 @@ fn pr_review(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                                     if has_pending {
                                         ui.label(
                                             RichText::new("[comment]")
-                                                .color(theme::WARN)
+                                                .color(theme::warn())
                                                 .small(),
                                         );
                                     }
@@ -1196,7 +1201,7 @@ fn pr_review(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                         RichText::new(format!("{}:{}", c.path, c.line))
                             .monospace()
                             .small()
-                            .color(theme::TEAL),
+                            .color(theme::teal()),
                     );
                     ui.label(RichText::new(&c.body).small());
                     if ui.small_button("Remove").clicked() {
@@ -1226,7 +1231,7 @@ fn pr_review(app: &mut App, ctx: &egui::Context, open: &mut bool) {
             } else {
                 let own_pr = app.gh.user.as_ref().map(|u| u.login == pr.user).unwrap_or(false);
                 let approve = ui
-                    .add_enabled(!own_pr, egui::Button::new("Approve").fill(theme::ADD.linear_multiply(0.35)))
+                    .add_enabled(!own_pr, egui::Button::new("Approve").fill(theme::add().linear_multiply(0.35)))
                     .on_hover_text(if own_pr {
                         "GitHub does not allow approving your own pull request"
                     } else {
@@ -1239,7 +1244,7 @@ fn pr_review(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                     .add_enabled(
                         !own_pr,
                         egui::Button::new("Request changes")
-                            .fill(theme::DANGER.linear_multiply(0.35)),
+                            .fill(theme::danger().linear_multiply(0.35)),
                     )
                     .on_hover_text(if own_pr {
                         "GitHub does not allow requesting changes on your own pull request"
@@ -1285,7 +1290,7 @@ fn ci_config_review(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                 "AI PROPOSAL. Review and edit the config below. Nothing is \
                  written to your repository until you click Save.",
             )
-            .color(theme::WARN)
+            .color(theme::warn())
             .small(),
         );
         ui.add_space(4.0);
@@ -1316,14 +1321,14 @@ fn ci_config_review(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                 };
                 ui.label(
                     RichText::new(format!("Valid: {jobs} job(s){on_push}"))
-                        .color(theme::ADD)
+                        .color(theme::add())
                         .small(),
                 );
             }
             Err(e) => {
                 ui.label(
                     RichText::new(format!("Invalid TOML: {e}"))
-                        .color(theme::DANGER)
+                        .color(theme::danger())
                         .small(),
                 );
             }
@@ -1340,7 +1345,7 @@ fn ci_config_review(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                     "{} already exists and will be overwritten.",
                     crate::local_ci::CONFIG_FILE
                 ))
-                .color(theme::WARN)
+                .color(theme::warn())
                 .small(),
             );
         }
@@ -1353,7 +1358,7 @@ fn ci_config_review(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                 format!("Save {}", crate::local_ci::CONFIG_FILE)
             };
             if ui
-                .add_enabled(parsed.is_ok(), egui::Button::new(save_label).fill(theme::EMBER))
+                .add_enabled(parsed.is_ok(), egui::Button::new(save_label).fill(theme::ember()))
                 .clicked()
             {
                 if let Some(repo) = app.repo.as_ref() {
@@ -1423,7 +1428,7 @@ fn agent_panel(app: &mut App, ui: &mut egui::Ui) {
         } else if ui
             .add_enabled(
                 enabled,
-                egui::Button::new("Resolve all with AI").fill(theme::EMBER),
+                egui::Button::new("Resolve all with AI").fill(theme::ember()),
             )
             .on_hover_text(
                 "Gives the model read access to every tracked file and lets it \
@@ -1459,7 +1464,7 @@ fn agent_panel(app: &mut App, ui: &mut egui::Ui) {
                     |ui| {
                         for line in &lines {
                             ui.label(
-                                RichText::new(line).small().color(theme::FG_DIM).monospace(),
+                                RichText::new(line).small().color(theme::fg_dim()).monospace(),
                             );
                         }
                     },
@@ -1467,7 +1472,7 @@ fn agent_panel(app: &mut App, ui: &mut egui::Ui) {
             });
     }
     if let Some(error) = app.agent.error.clone() {
-        ui.label(RichText::new(error).color(theme::DANGER).small());
+        ui.label(RichText::new(error).color(theme::danger()).small());
     }
     ui.separator();
 }
@@ -1487,7 +1492,7 @@ fn agent_changes(app: &mut App, ctx: &egui::Context, open: &mut bool) {
             RichText::new(
                 "Nothing has been written yet. Tick the changes you want, then apply.",
             )
-            .color(theme::WARN)
+            .color(theme::warn())
             .small(),
         );
         if app.agent.truncated {
@@ -1496,7 +1501,7 @@ fn agent_changes(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                     "The model ran out of budget and finished on partial context — \
                      read these diffs with extra care.",
                 )
-                .color(theme::DANGER)
+                .color(theme::danger())
                 .small(),
             );
         }
@@ -1535,13 +1540,13 @@ fn agent_changes(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                     if proposed.edit.is_new() { "  (new file)" } else { "" }
                 );
                 let color = if applied {
-                    theme::ADD
+                    theme::add()
                 } else if proposed.unresolved {
-                    theme::DANGER
+                    theme::danger()
                 } else if conflicted.contains(&proposed.edit.path) {
-                    theme::WARN
+                    theme::warn()
                 } else {
-                    theme::FG
+                    theme::fg()
                 };
                 if ui
                     .selectable_label(
@@ -1553,17 +1558,17 @@ fn agent_changes(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                     select = Some(i);
                 }
                 if applied {
-                    ui.label(RichText::new("applied").color(theme::ADD).small());
+                    ui.label(RichText::new("applied").color(theme::add()).small());
                 } else if proposed.unresolved {
                     ui.label(
                         RichText::new("still has conflict markers")
-                            .color(theme::DANGER)
+                            .color(theme::danger())
                             .small(),
                     );
                 } else if !conflicted.contains(&proposed.edit.path) {
                     ui.label(
                         RichText::new("not a conflicted file")
-                            .color(theme::FG_DIM)
+                            .color(theme::fg_dim())
                             .small(),
                     )
                     .on_hover_text(
@@ -1580,50 +1585,7 @@ fn agent_changes(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         // Diff of the selected proposal.
         if let Some(proposed) = app.agent.selected.and_then(|i| app.agent.edits.get(i)) {
             ui.separator();
-            ui.label(RichText::new(&proposed.edit.path).color(theme::EMBER).strong());
-            let lines = crate::app::textdiff::diff(
-                proposed.edit.before.as_deref().unwrap_or(""),
-                &proposed.edit.after,
-            );
-            let lang = crate::app::syntax::Lang::from_path(&proposed.edit.path);
-            let font = egui::TextStyle::Small.resolve(ui.style());
-            ScrollArea::vertical().max_height(320.0).id_salt("agent-diff").show(ui, |ui| {
-                for line in &lines {
-                    use crate::app::textdiff::Line;
-                    match line {
-                        Line::Skipped(n) => {
-                            ui.label(
-                                RichText::new(format!("    … {n} unchanged line(s)"))
-                                    .small()
-                                    .color(theme::FG_DIM),
-                            );
-                        }
-                        Line::Context(text) => {
-                            ui.label(crate::app::syntax::diff_line_job(
-                                lang,
-                                &format!("  {text}"),
-                                theme::FG,
-                                font.clone(),
-                                true,
-                            ));
-                        }
-                        Line::Added(text) => {
-                            ui.label(
-                                RichText::new(format!("+ {text}"))
-                                    .color(theme::ADD)
-                                    .font(font.clone()),
-                            );
-                        }
-                        Line::Removed(text) => {
-                            ui.label(
-                                RichText::new(format!("- {text}"))
-                                    .color(theme::DEL)
-                                    .font(font.clone()),
-                            );
-                        }
-                    }
-                }
-            });
+            proposal_diff(ui, &proposed.edit, "agent-diff");
         }
 
         ui.separator();
@@ -1633,7 +1595,7 @@ fn agent_changes(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                 .add_enabled(
                     pending > 0,
                     egui::Button::new(format!("Apply {pending} selected change(s)"))
-                        .fill(theme::EMBER),
+                        .fill(theme::ember()),
                 )
                 .on_hover_text(
                     "Writes only the ticked files. Conflicted files are staged as \
@@ -1668,6 +1630,405 @@ fn agent_changes(app: &mut App, ctx: &egui::Context, open: &mut bool) {
     });
 }
 
+/// Renders one proposed change as a unified diff.
+///
+/// Shared by the conflict resolver's dialog and the coding agent's tab:
+/// both are asking the same question — is this change right? — and they
+/// should not answer it in two different visual languages.
+pub fn proposal_diff(ui: &mut egui::Ui, edit: &crate::agent::PendingEdit, salt: &str) {
+    use crate::app::textdiff::Line;
+
+    ui.label(RichText::new(&edit.path).color(theme::ember()).strong());
+    let lines = crate::app::textdiff::diff(edit.before.as_deref().unwrap_or(""), &edit.after);
+    let lang = crate::app::syntax::Lang::from_path(&edit.path);
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    ScrollArea::vertical().max_height(320.0).id_salt(salt).show(ui, |ui| {
+        for line in &lines {
+            match line {
+                Line::Skipped(n) => {
+                    ui.label(
+                        RichText::new(format!("    … {n} unchanged line(s)"))
+                            .small()
+                            .color(theme::fg_dim()),
+                    );
+                }
+                Line::Context(text) => {
+                    ui.label(crate::app::syntax::diff_line_job(
+                        lang,
+                        &format!("  {text}"),
+                        theme::fg(),
+                        font.clone(),
+                        true,
+                    ));
+                }
+                Line::Added(text) => {
+                    ui.label(
+                        RichText::new(format!("+ {text}")).color(theme::add()).font(font.clone()),
+                    );
+                }
+                Line::Removed(text) => {
+                    ui.label(
+                        RichText::new(format!("- {text}")).color(theme::del()).font(font.clone()),
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// Everything the app can do, by name.
+fn command_palette(app: &mut App, ctx: &egui::Context, open: &mut bool) {
+    modal(ctx, "Commands", open, |ui| {
+        ui.set_min_width(560.0);
+
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut app.palette_query)
+                .hint_text(super::views::dim_hint("type a command"))
+                .desired_width(f32::INFINITY),
+        );
+        response.request_focus();
+        if response.changed() {
+            app.palette_selected = 0;
+        }
+
+        let commands = crate::app::palette::commands();
+        let hits: Vec<&crate::app::palette::Command> =
+            crate::app::palette::matches(&commands, &app.palette_query);
+        if hits.is_empty() {
+            ui.label(RichText::new("Nothing matches.").small().color(theme::fg_dim()));
+            return;
+        }
+
+        let (up, down, accept) = ui.input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+            )
+        });
+        if down {
+            app.palette_selected = (app.palette_selected + 1) % hits.len();
+        }
+        if up {
+            app.palette_selected = (app.palette_selected + hits.len() - 1) % hits.len();
+        }
+        let selected = app.palette_selected.min(hits.len() - 1);
+
+        let mut chosen = accept.then(|| hits[selected].cmd);
+        ScrollArea::vertical().max_height(420.0).id_salt("palette").show(ui, |ui| {
+            for (i, command) in hits.iter().enumerate() {
+                let row = ui.selectable_label(
+                    i == selected,
+                    RichText::new(command.name).color(theme::fg()),
+                );
+                if row.clicked() {
+                    chosen = Some(command.cmd);
+                }
+                // The hint under the name is what makes an unfamiliar
+                // command findable; it is not decoration.
+                if i == selected {
+                    ui.label(
+                        RichText::new(format!("   {}", command.hint))
+                            .small()
+                            .color(theme::fg_dim()),
+                    );
+                }
+            }
+        });
+
+        if let Some(cmd) = chosen {
+            app.palette_query.clear();
+            app.palette_selected = 0;
+            crate::app::palette::run(app, cmd);
+        }
+    });
+}
+
+/// The commits an AI proposes the working tree should become.
+///
+/// Editable before anything is committed: the grouping is the hard part and
+/// the model is usually right about it, while a message is one line the
+/// developer may well want to word themselves.
+fn split_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
+    modal(ctx, "Split into commits", open, |ui| {
+        ui.set_min_width(720.0);
+        if !app.split.notes.trim().is_empty() {
+            ui.label(RichText::new(&app.split.notes).color(theme::fg_dim()).small());
+        }
+        ui.label(
+            RichText::new(
+                "Nothing is committed until you apply. Each commit is staged and made in \
+                 order, from the top.",
+            )
+            .color(theme::warn())
+            .small(),
+        );
+        ui.separator();
+
+        let mut remove: Option<usize> = None;
+        ScrollArea::vertical().max_height(430.0).id_salt("split-groups").show(ui, |ui| {
+            for (i, group) in app.split.groups.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("{}.", i + 1)).color(theme::ember()).strong());
+                    ui.add(
+                        egui::TextEdit::singleline(&mut group.summary)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("summary"),
+                    );
+                });
+                ui.add(
+                    egui::TextEdit::multiline(&mut group.description)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(2)
+                        .hint_text("description (optional)"),
+                );
+                for file in &group.files {
+                    ui.label(RichText::new(format!("   {file}")).small().monospace());
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button("Drop this commit")
+                        .on_hover_text("Its files stay uncommitted in the working tree")
+                        .clicked()
+                    {
+                        remove = Some(i);
+                    }
+                });
+                ui.separator();
+            }
+        });
+        if let Some(i) = remove {
+            app.split.groups.remove(i);
+        }
+
+        ui.horizontal(|ui| {
+            let ready = !app.split.groups.is_empty()
+                && app.split.groups.iter().all(|g| !g.summary.trim().is_empty());
+            if ui
+                .add_enabled(
+                    ready,
+                    egui::Button::new(format!("Make {} commit(s)", app.split.groups.len()))
+                        .fill(theme::ember()),
+                )
+                .clicked()
+            {
+                app.apply_split();
+            }
+            if ui.button("Cancel").clicked() {
+                app.split.groups.clear();
+                app.dialog = Dialog::None;
+            }
+            if !ready {
+                ui.label(RichText::new("every commit needs a summary").small().color(theme::warn()));
+            }
+        });
+    });
+}
+
+/// The history an AI proposes this branch should have.
+fn tidy_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
+    let Some(plan) = app.tidy.plan.clone() else {
+        app.dialog = Dialog::None;
+        return;
+    };
+    modal(ctx, "Tidy history", open, |ui| {
+        ui.set_min_width(720.0);
+        if !app.tidy.notes.trim().is_empty() {
+            ui.label(RichText::new(&app.tidy.notes).color(theme::fg_dim()).small());
+        }
+        ui.label(
+            RichText::new(
+                "The branch's commits are replayed onto the base. Your files do not \
+                 change; only the commits do, and the old ones stay in the reflog.",
+            )
+            .color(theme::warn())
+            .small(),
+        );
+        ui.separator();
+
+        ScrollArea::vertical().max_height(430.0).id_salt("tidy-plan").show(ui, |ui| {
+            for (i, group) in plan.groups.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("{}.", i + 1)).color(theme::ember()).strong());
+                    ui.label(RichText::new(&group.summary).strong());
+                });
+                if !group.description.trim().is_empty() {
+                    ui.label(RichText::new(&group.description).small().color(theme::fg_dim()));
+                }
+                // What folds into it, so a squash is visible as a squash.
+                for sha in &group.commits {
+                    let subject = app
+                        .tidy
+                        .originals
+                        .get(sha)
+                        .cloned()
+                        .unwrap_or_else(|| sha.clone());
+                    ui.label(
+                        RichText::new(format!("   {} {subject}", &sha[..sha.len().min(7)]))
+                            .small()
+                            .monospace()
+                            .color(theme::fg_dim()),
+                    );
+                }
+                ui.separator();
+            }
+        });
+
+        let folded = plan.commits().len();
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::Button::new(format!(
+                        "Rewrite {folded} commit(s) as {}",
+                        plan.groups.len()
+                    ))
+                    .fill(theme::ember()),
+                )
+                .on_hover_text("Replays the commits; refuses if anything is uncommitted")
+                .clicked()
+            {
+                app.apply_tidy();
+            }
+            if ui.button("Cancel").clicked() {
+                app.tidy.plan = None;
+                app.dialog = Dialog::None;
+            }
+        });
+    });
+}
+
+/// Recent `HEAD` movements, with the option to go back to one.
+///
+/// This is the app's undo of last resort: a bad merge, a rebase that went
+/// sideways, a reset to the wrong commit. The reflog remembers where `HEAD`
+/// was even when nothing else does.
+fn reflog_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
+    modal(ctx, "Undo — recent history", open, |ui| {
+        ui.set_min_width(700.0);
+        ui.label(
+            RichText::new(
+                "Where this branch has been. Going back keeps your files: the undone \
+                 commits' changes stay staged in the working tree.",
+            )
+            .color(theme::fg_dim())
+            .small(),
+        );
+        ui.separator();
+
+        if app.reflog.is_empty() {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(14.0));
+                ui.label(RichText::new("reading the reflog…").small().color(theme::fg_dim()));
+            });
+            return;
+        }
+
+        let entries = app.reflog.clone();
+        let current = entries.first().map(|e| e.sha.clone()).unwrap_or_default();
+        let mut undo_to: Option<crate::git::ReflogEntry> = None;
+
+        ScrollArea::vertical().max_height(420.0).id_salt("reflog").show(ui, |ui| {
+            for entry in &entries {
+                // Checkouts crowd the list without being places to go back to.
+                if !entry.is_interesting() {
+                    continue;
+                }
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(&entry.short_sha)
+                            .monospace()
+                            .small()
+                            .color(theme::teal()),
+                    );
+                    ui.label(RichText::new(&entry.action).small().color(theme::ember()));
+                    ui.label(RichText::new(&entry.subject).small());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if entry.sha == current {
+                            ui.label(RichText::new("now").small().color(theme::add()));
+                        } else if ui
+                            .small_button("Go back to here")
+                            .on_hover_text("Moves the branch here; asks first")
+                            .clicked()
+                        {
+                            undo_to = Some(entry.clone());
+                        }
+                    });
+                });
+            }
+        });
+
+        if let Some(entry) = undo_to {
+            app.confirm(crate::app::ConfirmAction::UndoTo {
+                sha: entry.sha.clone(),
+                short: entry.short_sha.clone(),
+                what: if entry.subject.trim().is_empty() {
+                    entry.action.clone()
+                } else {
+                    entry.subject.clone()
+                },
+            });
+        }
+    });
+}
+
+/// Names a symbol for a workspace-wide rename.
+///
+/// The rename itself is computed by the language server and applied through
+/// the proposal dialog, so this only collects the new name.
+fn rename_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
+    let Some(rename) = app.editor.rename.as_ref() else {
+        app.dialog = Dialog::None;
+        return;
+    };
+    let (path, position, old_name) = (rename.path.clone(), rename.position, rename.old_name.clone());
+
+    modal(ctx, "Rename symbol", open, |ui| {
+        ui.set_min_width(360.0);
+        ui.label(
+            RichText::new(format!("Renaming `{old_name}` everywhere the language server finds it."))
+                .color(theme::fg_dim())
+                .small(),
+        );
+        ui.add_space(6.0);
+
+        let response = {
+            let Some(rename) = app.editor.rename.as_mut() else { return };
+            ui.add(
+                egui::TextEdit::singleline(&mut rename.new_name)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("new name"),
+            )
+        };
+        response.request_focus();
+
+        let new_name = app
+            .editor
+            .rename
+            .as_ref()
+            .map(|r| r.new_name.trim().to_string())
+            .unwrap_or_default();
+        let valid = !new_name.is_empty() && new_name != old_name;
+        let submit = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let clicked = ui
+                .add_enabled(valid, egui::Button::new("Rename").fill(theme::ember()))
+                .on_hover_text("Every change is shown for review before anything is written")
+                .clicked();
+            if clicked || (submit && valid) {
+                app.editor.rename = None;
+                app.dialog = Dialog::None;
+                app.lsp_rename(&path, position, &new_name);
+            }
+            if ui.button("Cancel").clicked() {
+                app.editor.rename = None;
+                app.dialog = Dialog::None;
+            }
+        });
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
@@ -1675,6 +2036,34 @@ fn agent_changes(app: &mut App, ctx: &egui::Context, open: &mut bool) {
 fn settings(app: &mut App, ctx: &egui::Context, open: &mut bool) {
     modal(ctx, "Settings", open, |ui| {
         ui.set_min_width(420.0);
+
+        ui.label(theme::overline("APPEARANCE"));
+        ui.horizontal(|ui| {
+            let light = app.config.light_theme;
+            if ui.selectable_label(!light, "Dark").clicked() && light {
+                app.set_light_theme(false);
+            }
+            if ui.selectable_label(light, "Light").clicked() && !light {
+                app.set_light_theme(true);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Interface scale");
+            if ui.small_button("−").on_hover_text("Cmd/Ctrl+−").clicked() {
+                app.zoom_by(-0.1);
+            }
+            ui.label(
+                RichText::new(format!("{:.0}%", app.config.zoom * 100.0)).monospace(),
+            );
+            if ui.small_button("+").on_hover_text("Cmd/Ctrl++").clicked() {
+                app.zoom_by(0.1);
+            }
+            if ui.small_button("Reset").clicked() {
+                app.set_zoom(1.0);
+            }
+        });
+        ui.add_space(8.0);
+        ui.separator();
 
         ui.label("Ollama server URL");
         ui.add(
@@ -1717,7 +2106,7 @@ fn settings(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         if !app.ollama_models.is_empty() {
             ui.label(
                 RichText::new(format!("Connected. {} model(s) available.", app.ollama_models.len()))
-                    .color(theme::ADD),
+                    .color(theme::add()),
             );
         }
 
@@ -1787,7 +2176,7 @@ fn shortcut_settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         if let Some((a, b)) = app.config.shortcuts.conflict() {
             ui.label(
                 RichText::new(format!("Conflict: {} and {} share a binding", a.label(), b.label()))
-                    .color(theme::DANGER)
+                    .color(theme::danger())
                     .small(),
             );
         }
@@ -1803,7 +2192,7 @@ fn repo_prompt_settings(app: &mut App, ui: &mut egui::Ui) {
     ui.label(theme::overline("CUSTOM AI INSTRUCTIONS (THIS REPOSITORY)"));
 
     let Some(repo) = app.repo.as_ref() else {
-        ui.label(RichText::new("Open a repository to customize its prompts.").color(theme::FG_DIM));
+        ui.label(RichText::new("Open a repository to customize its prompts.").color(theme::fg_dim()));
         return;
     };
     let key = repo.path().display().to_string();
@@ -1850,7 +2239,7 @@ fn repo_prompt_settings(app: &mut App, ui: &mut egui::Ui) {
         error: &mut Option<String>,
     ) {
         let PromptSlot { label, hint, text, file } = slot;
-        ui.label(RichText::new(label).color(theme::FG_DIM).small());
+        ui.label(RichText::new(label).color(theme::fg_dim()).small());
         *changed |= ui
             .add(
                 egui::TextEdit::multiline(text)
@@ -1868,10 +2257,10 @@ fn repo_prompt_settings(app: &mut App, ui: &mut egui::Ui) {
                         .unwrap_or_else(|| path.clone());
                     let exists = std::path::Path::new(path.as_str()).exists();
                     let label_text = if exists {
-                        RichText::new(format!("File: {name}")).color(theme::TEAL).small()
+                        RichText::new(format!("File: {name}")).color(theme::teal()).small()
                     } else {
                         RichText::new(format!("File: {name} (missing)"))
-                            .color(theme::DANGER)
+                            .color(theme::danger())
                             .small()
                     };
                     ui.label(label_text).on_hover_text(path.as_str());
@@ -1961,7 +2350,7 @@ fn repo_prompt_settings(app: &mut App, ui: &mut egui::Ui) {
             "Inline text and file contents are both appended to the AI prompt \
              for this repository only. Saved automatically.",
         )
-        .color(theme::FG_DIM)
+        .color(theme::fg_dim())
         .small(),
     );
 }
@@ -2036,7 +2425,7 @@ fn local_ci_panel(app: &mut App, ui: &mut egui::Ui) {
                  Docker container of your choice) before you create a PR.",
                 local_ci::CONFIG_FILE
             ))
-            .color(theme::FG_DIM)
+            .color(theme::fg_dim())
             .small(),
         );
         return;
@@ -2047,11 +2436,11 @@ fn local_ci_panel(app: &mut App, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let (status, color) = match app.local_ci.results.get(i).and_then(|r| r.as_ref()) {
                 Some(result) if result.ok => {
-                    (format!("[pass {:.1}s]", result.duration_secs), theme::ADD)
+                    (format!("[pass {:.1}s]", result.duration_secs), theme::add())
                 }
-                Some(result) => (format!("[fail {:.1}s]", result.duration_secs), theme::DANGER),
-                None if app.local_ci.running => ("[running]".into(), theme::WARN),
-                None => ("[pending]".into(), theme::FG_DIM),
+                Some(result) => (format!("[fail {:.1}s]", result.duration_secs), theme::danger()),
+                None if app.local_ci.running => ("[running]".into(), theme::warn()),
+                None => ("[pending]".into(), theme::fg_dim()),
             };
             ui.label(RichText::new(status).color(color).small().monospace());
             let env = job
@@ -2072,7 +2461,7 @@ fn local_ci_panel(app: &mut App, ui: &mut egui::Ui) {
             if let Some(Some(result)) = app.local_ci.results.get(i) {
                 ScrollArea::vertical().max_height(140.0).id_salt(("ci-out", i)).show(ui, |ui| {
                     egui::Frame::new()
-                        .fill(theme::BG)
+                        .fill(theme::bg())
                         .inner_margin(egui::Margin::symmetric(8, 6))
                         .show(ui, |ui| {
                             for line in result.output.lines() {
@@ -2087,18 +2476,18 @@ fn local_ci_panel(app: &mut App, ui: &mut egui::Ui) {
     if app.local_ci.any_failed() {
         ui.label(
             RichText::new("Checks failed. You can still create the PR, but consider fixing first.")
-                .color(theme::DANGER)
+                .color(theme::danger())
                 .small(),
         );
     } else if app.local_ci.all_passed() {
-        ui.label(RichText::new("All checks passed.").color(theme::ADD).small());
+        ui.label(RichText::new("All checks passed.").color(theme::add()).small());
     }
     if !crate::local_ci::docker_available()
         && app.local_ci.jobs.iter().any(|j| j.image.is_some())
     {
         ui.label(
             RichText::new("Docker not found: container jobs will fail until it is installed.")
-                .color(theme::WARN)
+                .color(theme::warn())
                 .small(),
         );
     }
@@ -2110,7 +2499,7 @@ fn hook_settings(app: &mut App, ui: &mut egui::Ui) {
     use crate::local_ci;
     ui.label(theme::overline("GIT PRE-PUSH HOOK"));
     let Some(repo) = app.repo.as_ref() else {
-        ui.label(RichText::new("Open a repository first.").color(theme::FG_DIM));
+        ui.label(RichText::new("Open a repository first.").color(theme::fg_dim()));
         return;
     };
     let root = repo.path().to_path_buf();
@@ -2118,7 +2507,7 @@ fn hook_settings(app: &mut App, ui: &mut egui::Ui) {
 
     ui.horizontal(|ui| {
         if installed {
-            ui.label(RichText::new("Installed").color(theme::ADD).small());
+            ui.label(RichText::new("Installed").color(theme::add()).small());
             if ui.small_button("Remove").clicked() {
                 let hook = root.join(".git").join("hooks").join("pre-push");
                 match std::fs::remove_file(&hook) {
@@ -2138,7 +2527,7 @@ fn hook_settings(app: &mut App, ui: &mut egui::Ui) {
             "Runs the local CI jobs before every `git push` from any terminal, \
              not just from this app. Failing checks abort the push.",
         )
-        .color(theme::FG_DIM)
+        .color(theme::fg_dim())
         .small(),
     );
 }
@@ -2249,7 +2638,7 @@ fn add_remote(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         ui.horizontal(|ui| {
             let can_add = !app.remote_url_input.trim().is_empty();
             if ui
-                .add_enabled(can_add, egui::Button::new("Add remote and publish").fill(theme::EMBER))
+                .add_enabled(can_add, egui::Button::new("Add remote and publish").fill(theme::ember()))
                 .clicked()
             {
                 let url = app.remote_url_input.trim().to_string();
@@ -2288,7 +2677,7 @@ fn switch_branch(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         ));
         ui.label(
             RichText::new(format!("Switching to \"{target}\""))
-                .color(theme::FG_DIM)
+                .color(theme::fg_dim())
                 .small(),
         );
         ui.add_space(8.0);
@@ -2338,24 +2727,24 @@ fn confirm_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         // Merge gets a visual source -> target card so direction is obvious.
         if let crate::app::ConfirmAction::MergeInto { source, target, protected } = &action {
             egui::Frame::new()
-                .fill(theme::PANEL2)
-                .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+                .fill(theme::panel2())
+                .stroke(egui::Stroke::new(1.0_f32, theme::border()))
                 .corner_radius(theme::RADIUS_MD as f32)
                 .inner_margin(egui::Margin::symmetric(14, 10))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        branch_chip(ui, source, theme::TEAL);
+                        branch_chip(ui, source, theme::teal());
                         ui.label(
-                            RichText::new("  merges into  ").color(theme::FG_DIM).small(),
+                            RichText::new("  merges into  ").color(theme::fg_dim()).small(),
                         );
                         branch_chip(
                             ui,
                             target,
-                            if *protected { theme::DANGER } else { theme::EMBER },
+                            if *protected { theme::danger() } else { theme::ember() },
                         );
                         if *protected {
                             ui.label(
-                                RichText::new(" protected").color(theme::DANGER).small(),
+                                RichText::new(" protected").color(theme::danger()).small(),
                             );
                         }
                     });
@@ -2369,7 +2758,7 @@ fn confirm_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
             let confirm = egui::Button::new(
                 RichText::new(action.verb()).color(egui::Color32::WHITE).strong(),
             )
-            .fill(theme::DANGER.linear_multiply(0.85))
+            .fill(theme::danger().linear_multiply(0.85))
             .min_size(egui::vec2(0.0, theme::CONTROL_MD));
             if ui.add(confirm).clicked() || enter {
                 app.execute_confirmed(action.clone());
@@ -2382,7 +2771,7 @@ fn confirm_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         });
         ui.label(
             RichText::new("Enter confirms · Esc cancels")
-                .color(theme::FG_DIM)
+                .color(theme::fg_dim())
                 .small(),
         );
     });

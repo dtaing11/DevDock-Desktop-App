@@ -14,6 +14,12 @@ pub enum Action {
     Pull,
     RepoPicker,
     ToggleHistory,
+    /// Open the editor's file finder.
+    QuickOpen,
+    /// Show or hide the terminal panel.
+    Terminal,
+    /// Everything the app can do, by name.
+    CommandPalette,
 }
 
 impl Action {
@@ -25,6 +31,9 @@ impl Action {
         Action::Pull,
         Action::RepoPicker,
         Action::ToggleHistory,
+        Action::QuickOpen,
+        Action::Terminal,
+        Action::CommandPalette,
     ];
 
     /// Human-readable label for Settings.
@@ -36,6 +45,9 @@ impl Action {
             Action::Pull => "Pull",
             Action::RepoPicker => "Open repository picker",
             Action::ToggleHistory => "Toggle Changes/History tab",
+            Action::QuickOpen => "Open a file in the editor",
+            Action::Terminal => "Show or hide the terminal",
+            Action::CommandPalette => "Command palette",
         }
     }
 }
@@ -101,6 +113,30 @@ pub struct Shortcuts {
     pub pull: Binding,
     pub repo_picker: Binding,
     pub toggle_history: Binding,
+    /// Added after the first release: an older config file has no entry for
+    /// it, and a missing field must not invalidate the whole config.
+    #[serde(default = "default_quick_open")]
+    pub quick_open: Binding,
+    #[serde(default = "default_terminal")]
+    pub terminal: Binding,
+    #[serde(default = "default_palette")]
+    pub command_palette: Binding,
+}
+
+fn default_palette() -> Binding {
+    // Not Cmd+Shift+P, which every editor uses but which is Pull here —
+    // and a git client's pull is not a shortcut to move. Cmd+Shift+A is
+    // "find action" in JetBrains and is free.
+    Binding::new(true, true, false, egui::Key::A)
+}
+
+fn default_terminal() -> Binding {
+    // Ctrl+` — what every editor uses, and not taken here.
+    Binding::new(true, false, false, egui::Key::Backtick)
+}
+
+fn default_quick_open() -> Binding {
+    Binding::new(true, false, false, egui::Key::O)
 }
 
 impl Default for Shortcuts {
@@ -112,6 +148,9 @@ impl Default for Shortcuts {
             pull: Binding::new(true, true, false, egui::Key::P),
             repo_picker: Binding::new(true, false, false, egui::Key::K),
             toggle_history: Binding::new(true, false, false, egui::Key::H),
+            quick_open: default_quick_open(),
+            terminal: default_terminal(),
+            command_palette: default_palette(),
         }
     }
 }
@@ -125,6 +164,9 @@ impl Shortcuts {
             Action::Pull => self.pull,
             Action::RepoPicker => self.repo_picker,
             Action::ToggleHistory => self.toggle_history,
+            Action::QuickOpen => self.quick_open,
+            Action::Terminal => self.terminal,
+            Action::CommandPalette => self.command_palette,
         }
     }
 
@@ -136,6 +178,9 @@ impl Shortcuts {
             Action::Pull => self.pull = binding,
             Action::RepoPicker => self.repo_picker = binding,
             Action::ToggleHistory => self.toggle_history = binding,
+            Action::QuickOpen => self.quick_open = binding,
+            Action::Terminal => self.terminal = binding,
+            Action::CommandPalette => self.command_palette = binding,
         }
     }
 
@@ -185,6 +230,25 @@ pub fn capture(input: &egui::InputState) -> Option<Binding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A config written before a binding existed must still load: serde
+    /// fails the whole struct on a missing field, and `Config::load` falls
+    /// back to defaults for everything when that happens — silently
+    /// resetting every other setting the user has.
+    #[test]
+    fn an_older_config_without_the_newest_binding_still_loads() {
+        let json = r#"{
+            "commit": {"command": true, "shift": false, "alt": false, "key": "Enter"},
+            "refresh": {"command": true, "shift": false, "alt": false, "key": "R"},
+            "push": {"command": true, "shift": false, "alt": false, "key": "P"},
+            "pull": {"command": true, "shift": true, "alt": false, "key": "P"},
+            "repo_picker": {"command": true, "shift": false, "alt": false, "key": "K"},
+            "toggle_history": {"command": true, "shift": false, "alt": false, "key": "H"}
+        }"#;
+        let shortcuts: Shortcuts = serde_json::from_str(json).expect("old config must load");
+        assert_eq!(shortcuts.quick_open, default_quick_open());
+        assert_eq!(shortcuts.commit.key, egui::Key::Enter);
+    }
 
     #[test]
     fn defaults_have_no_conflicts() {

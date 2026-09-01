@@ -3,6 +3,8 @@
 //!
 //! `cargo run --example app_shot -- <repo> <tab> <out.rgba> [width] [height]`
 //! where tab is one of: changes, history, checks, editor, agent.
+//!
+//! `DIALOG=stack` opens a dialog over the app before the picture is taken.
 
 use eframe::egui;
 use git_manage::app::{views, App, Tab};
@@ -15,6 +17,8 @@ struct Shot {
     /// is undone, because a repository change clears the editor.
     open: Option<String>,
     shoot_at: u32,
+    /// Last observed size of the dialog named by `DIALOG_ID`.
+    last_modal: Option<egui::Vec2>,
 }
 
 impl eframe::App for Shot {
@@ -24,6 +28,11 @@ impl eframe::App for Shot {
         if self.frame == 5 {
             if let Some(file) = self.open.take() {
                 self.app.editor_open(std::path::Path::new(&file), None);
+            }
+            match std::env::var("DIALOG").as_deref() {
+                Ok("stack") => self.app.open_stack(),
+                Ok("pr") => self.app.dialog = git_manage::app::Dialog::PullRequests,
+                _ => {}
             }
             if std::env::var("TERMINAL").is_ok() {
                 self.app.terminal_open(false);
@@ -38,6 +47,7 @@ impl eframe::App for Shot {
         #[cfg(unix)]
         git_manage::app::terminal_panel::panel(&mut self.app, ctx);
         views::diff_panel(&mut self.app, ctx);
+        git_manage::app::dialogs::show(&mut self.app, ctx);
 
         // The sidebar must not grow frame over frame: egui stores a panel's
         // width from its content, so a greedy child compounds.
@@ -55,6 +65,19 @@ impl eframe::App for Shot {
                 print!("  terminal {:.0}pt", state.rect.height());
             }
             println!();
+        }
+
+        // A modal is anchored from the size it had last frame, so one that is
+        // still filling in is drawn from a stale centre and can hang off the
+        // bottom for a frame. Printing the size makes that visible instead of
+        // it looking like a layout bug in the screenshot.
+        if let Ok(name) = std::env::var("DIALOG_ID") {
+            if let Some(state) = egui::AreaState::load(ctx, egui::Id::new(name.as_str())) {
+                if state.size != self.last_modal {
+                    self.last_modal = state.size;
+                    println!("frame {}: modal size {:?}", self.frame, state.size);
+                }
+            }
         }
 
         // Give background work (tracked files, language servers) a few
@@ -118,7 +141,14 @@ fn main() -> eframe::Result<()> {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30);
-            Ok(Box::new(Shot { app, out, frame: 0, open: open.clone(), shoot_at }))
+            Ok(Box::new(Shot {
+                app,
+                out,
+                frame: 0,
+                open: open.clone(),
+                shoot_at,
+                last_modal: None,
+            }))
         }),
     )
 }

@@ -118,6 +118,16 @@ pub fn toolbar(app: &mut App, ctx: &egui::Context) {
                     if ui.button("Pull Request").clicked() {
                         open_pr_dialog(app);
                     }
+                    if ui
+                        .button("Stack")
+                        .on_hover_text(
+                            "Stacked pull requests: a chain of branches, each \
+                             reviewed against the one below it",
+                        )
+                        .clicked()
+                    {
+                        app.open_stack();
+                    }
                 });
             });
             state_banner(app, ui);
@@ -880,18 +890,8 @@ fn open_pr_dialog(app: &mut App) {
     app.pr.title.clear();
     app.pr.body.clear();
     app.pr.open_prs.clear();
-    app.pr.loading = true;
     app.dialog = Dialog::PullRequests;
-
-    let Some(repo) = app.repo.clone() else { return };
-    app.worker.spawn(move || {
-        let result = (|| -> Result<Vec<crate::github::PullRequest>, String> {
-            let client = crate::github::Client::from_store().ok_or("Not signed in")?;
-            let slug = origin_slug(&repo).ok_or("No github.com remote found")?;
-            strerr(client.pull_requests(&slug))
-        })();
-        Msg::GhPrs(result)
-    });
+    app.load_open_prs();
 }
 
 /// The GitHub slug of `origin` (or the first github.com remote).

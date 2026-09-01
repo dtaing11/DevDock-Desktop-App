@@ -298,6 +298,8 @@ pub enum Dialog {
     SplitCommits,
     /// An AI-proposed tidy-up of the branch's history.
     TidyHistory,
+    /// The stack of branches this one sits in, and its pull requests.
+    Stack,
 }
 
 /// A destructive action awaiting user confirmation.
@@ -501,6 +503,26 @@ pub struct PrState {
     pub creating: bool,
 }
 
+/// Stacked-pull-request state for the branch that is checked out.
+///
+/// The stack itself is derived from git config on a worker rather than kept
+/// in sync by hand: branches move under the app's feet (a rebase in the
+/// terminal, a merge on GitHub), and a cached chain that disagrees with the
+/// repository is worse than no chain at all.
+#[derive(Default)]
+pub struct StackState {
+    pub stack: Option<crate::stack::Stack>,
+    pub loading: bool,
+    /// An operation (restack, push, submit, sync) is running.
+    pub busy: bool,
+    /// Name for a new branch stacked on the tip.
+    pub new_branch: String,
+    /// What the last operation did, line by line, kept visible in the dialog
+    /// because submitting a stack touches several branches and pull requests
+    /// and a one-line toast cannot say which.
+    pub log: Vec<String>,
+}
+
 /// Conflict-resolver dialog state.
 #[derive(Default)]
 pub struct ConflictState {
@@ -574,6 +596,8 @@ pub struct LocalCiState {
 pub enum GatedAction {
     Push { action: String, set_upstream: bool },
     PullRequest,
+    /// Push every branch in the stack and open or retarget its PRs.
+    SubmitStack,
 }
 
 impl GatedAction {
@@ -583,6 +607,7 @@ impl GatedAction {
             Self::Push { action, .. } if action == "force-push" => "Force-push anyway",
             Self::Push { .. } => "Push anyway",
             Self::PullRequest => "Create pull request anyway",
+            Self::SubmitStack => "Submit the stack anyway",
         }
     }
 
@@ -590,6 +615,7 @@ impl GatedAction {
         match self {
             Self::Push { .. } => "push",
             Self::PullRequest => "pull request",
+            Self::SubmitStack => "stack submission",
         }
     }
 }
@@ -748,6 +774,8 @@ pub struct App {
     pub gh: GhState,
     pub claude: ClaudeState,
     pub pr: PrState,
+    /// The branch chain the current branch belongs to, and what it is doing.
+    pub stack: StackState,
     pub local_ci: LocalCiState,
     pub review: ReviewState,
     pub conflicts: ConflictState,
@@ -883,6 +911,7 @@ impl App {
             gh: Default::default(),
             claude: Default::default(),
             pr: Default::default(),
+            stack: Default::default(),
             local_ci: Default::default(),
             review: Default::default(),
             conflicts: Default::default(),
@@ -1445,6 +1474,9 @@ impl App {
                     self.agent = Default::default();
                     self.conflicts = Default::default();
                     self.review = Default::default();
+                    // A stack is a chain of branches in one repository; the
+                    // next one has its own.
+                    self.stack = Default::default();
                     // Graph belongs to the previous repo too.
                     self.graph.clear();
                     self.graph_open = false;
@@ -1663,6 +1695,33 @@ impl App {
                     }
                     Err(e) => self.toast(e, true),
                 }
+            }
+
+            Msg::Stack(result) => {
+                self.stack.loading = false;
+                match result {
+                    Ok(stack) => self.stack.stack = Some(stack),
+                    Err(e) => {
+                        self.stack.stack = None;
+                        self.toast(e, true);
+                    }
+                }
+            }
+            Msg::StackDone { message, log, conflicted } => {
+                self.stack.busy = false;
+                self.stack.log.extend(log);
+                match message {
+                    Ok(message) => self.toast(message, conflicted),
+                    Err(e) => self.toast(e, true),
+                }
+                if conflicted {
+                    // The rebase is still in progress: hand it to the resolver
+                    // rather than leaving the repository mid-restack with no
+                    // sign of where it stopped.
+                    self.load_conflicts();
+                }
+                self.load_stack();
+                self.refresh();
             }
 
             Msg::GhBranchChecks { branch, summary } => {
@@ -2247,7 +2306,9 @@ impl App {
         // the repo only set the simple switch.
         let enabled = match &gated {
             Some(GatedAction::Push { .. }) => self.review.config.runs_on_push(),
-            Some(GatedAction::PullRequest) => self.review.config.runs_on_pull_request(),
+            Some(GatedAction::PullRequest) | Some(GatedAction::SubmitStack) => {
+                self.review.config.runs_on_pull_request()
+            }
             // A manual review from the Checks tab is its own consent.
             None => true,
         };
@@ -2273,6 +2334,11 @@ impl App {
         // against whatever the branch would publish.
         let base = match &gated {
             Some(GatedAction::PullRequest) => Some(self.pr.base.clone()),
+            // A stack is reviewed against the trunk: the whole series is what
+            // is being proposed, even though each PR shows one slice of it.
+            Some(GatedAction::SubmitStack) => {
+                self.stack.stack.as_ref().map(|s| s.trunk.clone())
+            }
             _ => None,
         };
         let cfg = self.review.config.clone();
@@ -2341,6 +2407,7 @@ impl App {
                 self.execute_push(&action, set_upstream)
             }
             GatedAction::PullRequest => dialogs::create_pr(self),
+            GatedAction::SubmitStack => self.submit_stack(),
         }
     }
 
@@ -2381,6 +2448,370 @@ impl App {
                 })
             };
             Msg::Done { message: strerr(result), refresh: true }
+        });
+    }
+
+    /// Loads the repository's open pull requests (and, per PR, its checks).
+    ///
+    /// Shared by the pull request dialog and the stack view: both need to know
+    /// which branches already have a PR, and asking twice for the same list
+    /// would be two round trips for one answer.
+    pub fn load_open_prs(&mut self) {
+        let Some(repo) = self.repo.clone() else { return };
+        self.pr.loading = true;
+        self.worker.spawn(move || {
+            let result = (|| -> Result<Vec<github::PullRequest>, String> {
+                let client = github::Client::from_store().ok_or("Not signed in")?;
+                let slug = views::origin_slug(&repo).ok_or("No github.com remote found")?;
+                strerr(client.pull_requests(&slug))
+            })();
+            Msg::GhPrs(result)
+        });
+    }
+
+    // -- stacked pull requests ----------------------------------------------
+
+    /// Opens the stack view for the checked-out branch.
+    pub fn open_stack(&mut self) {
+        if self.repo.is_none() {
+            self.dialog = Dialog::RepoPicker;
+            return;
+        }
+        self.stack.log.clear();
+        self.dialog = Dialog::Stack;
+        self.load_stack();
+        // The numbers and CI state beside each branch come from here.
+        if self.gh.user.is_some() {
+            self.load_open_prs();
+        }
+    }
+
+    /// Re-derives the stack from the repository.
+    ///
+    /// Always from git, never from what the app last saw: branches move
+    /// underneath it — a rebase in the terminal, a merge on GitHub — and a
+    /// remembered chain that disagrees with the repository would restack the
+    /// wrong branches onto the wrong commits.
+    pub fn load_stack(&mut self) {
+        let Some(repo) = self.repo.clone() else { return };
+        self.stack.loading = true;
+        self.worker.spawn(move || {
+            let branch = repo.current_branch();
+            Msg::Stack(crate::stack::stack_for(&repo, &branch).map_err(|e| e.to_string()))
+        });
+    }
+
+    /// Starts a new branch on top of the stack and records what it sits on.
+    pub fn stack_branch_on_tip(&mut self) {
+        let name = self.stack.new_branch.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let Some(repo) = self.repo.clone() else { return };
+        let parent = match self.stack.stack.as_ref() {
+            Some(stack) => stack.tip(),
+            None => repo.current_branch(),
+        };
+        self.stack.new_branch.clear();
+        self.stack_op(move |repo| {
+            repo.git(&["checkout", "-b", &name, &parent]).map_err(|e| e.to_string())?;
+            crate::stack::set_parent(&repo, &name, &parent).map_err(|e| e.to_string())?;
+            Ok((format!("Started {name} on top of {parent}."), Vec::new(), false))
+        });
+    }
+
+    /// Re-bases one branch's place in the stack (config only; restack applies it).
+    pub fn stack_set_parent(&mut self, branch: String, parent: String) {
+        self.stack_op(move |repo| {
+            crate::stack::set_parent(&repo, &branch, &parent).map_err(|e| e.to_string())?;
+            Ok((format!("{branch} is now stacked on {parent}."), Vec::new(), false))
+        });
+    }
+
+    /// Takes one branch out of the stack, leaving the branch itself alone.
+    pub fn stack_untrack(&mut self, branch: String) {
+        self.stack_op(move |repo| {
+            // Children would otherwise point at a branch that is no longer in
+            // any stack, so they move down to what it was based on.
+            let parent = crate::stack::parent_of(&repo, &branch)
+                .unwrap_or_else(|| crate::stack::default_branch(&repo));
+            for (child, p) in crate::stack::parents(&repo) {
+                if p == branch {
+                    crate::stack::set_parent(&repo, &child, &parent)
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            crate::stack::clear_parent(&repo, &branch).map_err(|e| e.to_string())?;
+            crate::stack::clear_pr(&repo, &branch).map_err(|e| e.to_string())?;
+            Ok((format!("{branch} left the stack."), Vec::new(), false))
+        });
+    }
+
+    /// Switches to a branch from the stack view, leaving the view open.
+    ///
+    /// Plain `git checkout`, which carries uncommitted changes across and
+    /// refuses when they would be overwritten — the same behaviour as the
+    /// branch menu, minus the dialog that would close the stack.
+    pub fn stack_checkout(&mut self, name: String) {
+        self.stack_op(move |repo| {
+            repo.checkout(&name).map_err(|e| e.to_string())?;
+            Ok((format!("Switched to {name}."), Vec::new(), false))
+        });
+    }
+
+    /// Rebases every branch back on top of its parent, bottom-up.
+    pub fn stack_restack(&mut self) {
+        self.stack_op(move |repo| {
+            let stack = current_stack(&repo)?;
+            let report = crate::stack::restack(&repo, &stack).map_err(|e| e.to_string())?;
+            let log = report
+                .steps
+                .iter()
+                .map(|s| {
+                    let what = if s.moved { "rebased" } else { "already in place" };
+                    format!("{}: {what}", s.branch)
+                })
+                .collect();
+            let conflicted = report.conflicted.is_some();
+            Ok((report.message(), log, conflicted))
+        });
+    }
+
+    /// Publishes every branch in the stack without opening any pull requests.
+    pub fn stack_push(&mut self) {
+        let token = self.gh_token();
+        self.stack_op(move |repo| {
+            let stack = current_stack(&repo)?;
+            let pushed = crate::stack::push_stack(&repo, &stack, token.as_deref())
+                .map_err(|e| e.to_string())?;
+            let log = pushed.iter().map(|b| format!("{b}: pushed")).collect();
+            Ok((format!("Pushed {} branch(es).", pushed.len()), log, false))
+        });
+    }
+
+    /// Pushes the stack and opens or retargets a pull request for each branch.
+    ///
+    /// Runs through the review gate first, like any other pull request.
+    pub fn stack_submit(&mut self) {
+        self.gate_with_review(GatedAction::SubmitStack);
+    }
+
+    /// The submission itself, once the review gate has let it through.
+    fn submit_stack(&mut self) {
+        let Some(stack) = self.stack.stack.clone() else { return };
+        if stack.is_empty() {
+            self.toast("Nothing to submit: this branch is the trunk.", true);
+            return;
+        }
+        // A branch that is behind its parent would open a pull request whose
+        // diff includes the branch below it. Restacking is a rebase, so it is
+        // the user's call, not something to slip into a submit.
+        if let Some(e) = stack.entries.iter().find(|e| e.needs_restack) {
+            self.toast(
+                format!("Restack first: {} is behind {}.", e.branch, e.parent),
+                true,
+            );
+            return;
+        }
+        let token = self.gh_token();
+        self.stack_op(move |repo| {
+            let client = github::Client::from_store().ok_or("Not signed in")?;
+            let slug = views::origin_slug(&repo).ok_or("No github.com remote found")?;
+            let mut log = Vec::new();
+            // Re-derived here rather than reusing what the view was showing:
+            // this runs after a network round trip and a review, and the
+            // branches may have moved in between.
+            let stack = current_stack(&repo)?;
+
+            if let Some(e) = stack.entries.iter().find(|e| e.needs_restack) {
+                return Err(format!(
+                    "Restack first: {} is behind {}. Its pull request would show \
+                     the changes below it as its own.",
+                    e.branch, e.parent
+                ));
+            }
+
+            // The bases have to exist on the remote before a PR can name one.
+            crate::stack::push_stack(&repo, &stack, token.as_deref())
+                .map_err(|e| e.to_string())?;
+            log.push(format!("pushed {} branch(es)", stack.entries.len()));
+
+            let open = client.pull_requests(&slug).map_err(|e| e.to_string())?;
+            let mut rows = Vec::new();
+            let mut opened = 0;
+            for entry in &stack.entries {
+                let existing = open.iter().find(|pr| pr.head == entry.branch);
+                // A branch whose changes are already in the trunk has nothing
+                // to open a pull request about; GitHub would refuse it with
+                // "no commits between", which says less than this does.
+                if existing.is_none() && entry.merged {
+                    log.push(format!(
+                        "{}: already in {}, skipped",
+                        entry.branch, stack.trunk
+                    ));
+                    continue;
+                }
+                let number = match existing {
+                    Some(pr) => {
+                        if pr.base != entry.parent {
+                            client
+                                .update_pull_request(
+                                    &slug,
+                                    pr.number,
+                                    Some(&entry.parent),
+                                    None,
+                                    None,
+                                )
+                                .map_err(|e| e.to_string())?;
+                            log.push(format!(
+                                "#{} {}: base retargeted to {}",
+                                pr.number, entry.branch, entry.parent
+                            ));
+                        }
+                        pr.number
+                    }
+                    None => {
+                        let (title, body) = crate::stack::draft_pr(entry);
+                        let created = client
+                            .create_pull_request(
+                                &slug,
+                                &title,
+                                &body,
+                                &entry.branch,
+                                &entry.parent,
+                            )
+                            .map_err(|e| e.to_string())?;
+                        opened += 1;
+                        log.push(format!(
+                            "#{} {}: opened into {}",
+                            created.number, entry.branch, entry.parent
+                        ));
+                        created.number
+                    }
+                };
+                // Remembered so a later sync can ask GitHub whether this one
+                // merged; the list endpoint only ever returns open PRs.
+                let _ = crate::stack::set_pr(&repo, &entry.branch, number);
+                rows.push(crate::stack::NavRow {
+                    branch: entry.branch.clone(),
+                    pr: Some(number),
+                });
+            }
+
+            // Every body gets the same map of the stack, marked where it is.
+            // Done last so the newly opened PRs are in it too.
+            for row in &rows {
+                let Some(number) = row.pr else { continue };
+                let nav = crate::stack::nav_section(&rows, &stack.trunk, &row.branch);
+                let detail = client.pull_request(&slug, number).map_err(|e| e.to_string())?;
+                let body = crate::stack::with_nav(&detail.body, &nav);
+                if body != detail.body {
+                    client
+                        .update_pull_request(&slug, number, None, None, Some(&body))
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            let message = match opened {
+                0 => format!("Stack submitted: {} pull request(s) updated.", rows.len()),
+                n => format!("Stack submitted: {n} opened, {} in the stack.", rows.len()),
+            };
+            Ok((message, log, false))
+        });
+    }
+
+    /// Brings the stack back in line with the remote after something merged.
+    ///
+    /// Fetches, asks GitHub which of the stack's pull requests have landed,
+    /// drops those branches out of the chain, and rebases what is left onto
+    /// the trunk. Nothing is pushed and no branch is deleted: what the remote
+    /// should look like afterwards is a separate decision, made by submitting.
+    pub fn stack_sync(&mut self) {
+        let token = self.gh_token();
+        self.stack_op(move |repo| {
+            let mut log = Vec::new();
+            repo.fetch(token.as_deref()).map_err(|e| e.to_string())?;
+            log.push("fetched".to_string());
+            // After the fetch, so a branch that landed while this was open is
+            // seen as landed.
+            let stack = current_stack(&repo)?;
+
+            // Ask about each remembered pull request. A squash merge leaves no
+            // trace in the local history, so GitHub's answer is the one that
+            // counts; the patch-id check is the fallback for branches merged
+            // outside a PR entirely.
+            let mut merged: Vec<String> = Vec::new();
+            let client = github::Client::from_store();
+            let slug = views::origin_slug(&repo);
+            for entry in &stack.entries {
+                let landed = match (&client, &slug, entry.pr) {
+                    (Some(client), Some(slug), Some(number)) => {
+                        match client.pull_request(slug, number) {
+                            Ok(detail) => detail.merged,
+                            // An unreachable GitHub must not silently drop a
+                            // branch out of the stack.
+                            Err(e) => {
+                                log.push(format!("#{number}: could not check ({e})"));
+                                false
+                            }
+                        }
+                    }
+                    _ => entry.merged,
+                };
+                if landed || entry.merged {
+                    merged.push(entry.branch.clone());
+                }
+            }
+            if merged.is_empty() {
+                return Ok(("Nothing has merged yet; the stack is unchanged.".into(), log, false));
+            }
+
+            let dropped = crate::stack::drop_merged(&repo, &stack, &merged)
+                .map_err(|e| e.to_string())?;
+            for branch in &dropped {
+                log.push(format!("{branch}: merged, left the stack"));
+            }
+
+            // What is left has to move onto the trunk it now sits on.
+            let branch = repo.current_branch();
+            let rest = crate::stack::stack_for(&repo, &branch).map_err(|e| e.to_string())?;
+            let report = crate::stack::restack(&repo, &rest).map_err(|e| e.to_string())?;
+            for step in &report.steps {
+                if step.moved {
+                    log.push(format!("{}: rebased onto its new parent", step.branch));
+                }
+            }
+            let conflicted = report.conflicted.is_some();
+            let message = if conflicted {
+                report.message()
+            } else {
+                format!(
+                    "{} merged branch(es) left the stack. Submit to update the \
+                     remaining pull requests.",
+                    dropped.len()
+                )
+            };
+            Ok((message, log, conflicted))
+        });
+    }
+
+    /// Runs one stack operation on a worker.
+    ///
+    /// The closure returns a message for the toast, lines for the dialog's
+    /// log, and whether it stopped in conflict — every stack action has the
+    /// same shape, and they all end by re-deriving the stack.
+    fn stack_op<F>(&mut self, op: F)
+    where
+        F: FnOnce(crate::git::Repo) -> Result<(String, Vec<String>, bool), String>
+            + Send
+            + 'static,
+    {
+        let Some(repo) = self.repo.clone() else { return };
+        self.stack.busy = true;
+        self.worker.spawn(move || match op(repo) {
+            Ok((message, log, conflicted)) => {
+                Msg::StackDone { message: Ok(message), log, conflicted }
+            }
+            Err(e) => Msg::StackDone { message: Err(e), log: Vec::new(), conflicted: false },
         });
     }
 
@@ -3984,6 +4415,21 @@ const MAX_ZOOM: f32 = 2.0;
 /// A repaint callback for background threads that change state nobody
 /// asked for — diagnostics arriving, indexing progress — so the UI wakes up
 /// and shows them.
+/// The stack of the branch checked out right now, as git describes it.
+///
+/// Every stack action re-derives this on its worker rather than acting on the
+/// chain the view happened to be showing: an action can start after a network
+/// round trip, a review, or a rebase in a terminal, and rebasing branches on
+/// the strength of a stale picture is how a stack loses commits.
+fn current_stack(repo: &crate::git::Repo) -> Result<crate::stack::Stack, String> {
+    let branch = repo.current_branch();
+    let stack = crate::stack::stack_for(repo, &branch).map_err(|e| e.to_string())?;
+    if stack.is_empty() {
+        return Err(format!("{branch} is not part of a stack."));
+    }
+    Ok(stack)
+}
+
 fn repaint_handle(ctx: &egui::Context) -> std::sync::Arc<dyn Fn() + Send + Sync> {
     let ctx = ctx.clone();
     std::sync::Arc::new(move || ctx.request_repaint())
@@ -4701,6 +5147,104 @@ mod tests {
     /// Their paths are repo-relative, so an unapplied proposal that survived
     /// a repository switch would be written into the *new* project — one
     /// repo's edits landing in another's files.
+    /// The stack view shows the chain, and its actions really move branches.
+    #[test]
+    fn the_stack_view_renders_the_chain_and_restacks_it() {
+        let (tmp, mut app, _file) = app_with_repo();
+        let root = tmp.path();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-m", "chore: root"]);
+
+        // main → lower → upper, then a new commit on `lower` so `upper`
+        // is behind it: the state the whole feature exists to fix.
+        git(root, &["checkout", "-b", "lower"]);
+        std::fs::write(root.join("lower.txt"), "l\n").unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-m", "feat: lower"]);
+        git(root, &["config", "branch.lower.devdock-parent", "main"]);
+        git(root, &["checkout", "-b", "upper"]);
+        std::fs::write(root.join("upper.txt"), "u\n").unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-m", "feat: upper"]);
+        git(root, &["config", "branch.upper.devdock-parent", "lower"]);
+        git(root, &["checkout", "lower"]);
+        std::fs::write(root.join("lower2.txt"), "l2\n").unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-m", "feat: lower again"]);
+
+        let settle = |app: &mut App| {
+            for _ in 0..80 {
+                app.handle_messages_for_test();
+                if !app.stack.busy && !app.stack.loading && app.stack.stack.is_some() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("the stack never loaded");
+        };
+
+        app.open_stack();
+        settle(&mut app);
+        assert_eq!(app.dialog, Dialog::Stack);
+
+        let stack = app.stack.stack.as_ref().unwrap();
+        let names: Vec<&str> = stack.entries.iter().map(|e| e.branch.as_str()).collect();
+        assert_eq!(names, ["lower", "upper"], "bottom first");
+        assert_eq!(stack.current, Some(0), "lower is checked out");
+        assert!(stack.entry("upper").unwrap().needs_restack);
+        assert_eq!(stack.stale().len(), 1);
+
+        // It draws.
+        egui::__run_test_ctx(|ctx| dialogs::show(&mut app, ctx));
+
+        // And the action does the rebase, not just the report.
+        app.stack_restack();
+        settle(&mut app);
+        assert!(app.stack.stack.as_ref().unwrap().stale().is_empty(), "still behind");
+        assert!(
+            app.stack.log.iter().any(|l| l.contains("upper")),
+            "the activity log said nothing: {:?}",
+            app.stack.log
+        );
+        let log = crate::git::Repo::open(root)
+            .unwrap()
+            .log(10, Some("main..upper"))
+            .unwrap();
+        let subjects: Vec<&str> = log.iter().map(|c| c.subject.as_str()).collect();
+        assert_eq!(
+            subjects,
+            ["feat: upper", "feat: lower again", "feat: lower"],
+            "upper was replayed onto the new lower, once"
+        );
+    }
+
+    /// Submitting is refused while any branch is behind its parent: the pull
+    /// requests would show the changes underneath them as their own.
+    #[test]
+    fn a_stale_stack_is_not_submitted() {
+        let (_tmp, mut app, _file) = app_with_repo();
+        app.stack.stack = Some(crate::stack::Stack {
+            trunk: "main".into(),
+            entries: vec![crate::stack::StackEntry {
+                branch: "upper".into(),
+                parent: "lower".into(),
+                commits: Vec::new(),
+                pr: None,
+                needs_restack: true,
+                merged: false,
+            }],
+            current: Some(0),
+            forks: Vec::new(),
+        });
+
+        app.perform(GatedAction::SubmitStack);
+
+        assert!(!app.stack.busy, "a stale stack must not reach GitHub");
+        let toast = app.toast.as_ref().expect("no explanation was given");
+        assert!(toast.error);
+        assert!(toast.text.contains("Restack first"), "{}", toast.text);
+    }
+
     #[test]
     fn switching_repositories_drops_proposals_from_the_old_one() {
         let (_tmp, mut app, file) = app_with_repo();
@@ -4722,6 +5266,10 @@ mod tests {
             theirs: None,
             working: None,
         }];
+        app.stack.stack = Some(crate::stack::Stack {
+            trunk: "main".into(),
+            ..Default::default()
+        });
 
         let other = tempfile::tempdir().unwrap();
         git(other.path(), &["init", "-b", "main"]);
@@ -4735,6 +5283,7 @@ mod tests {
         assert!(app.agent.summary.is_empty());
         assert!(app.conflicts.files.is_empty(), "conflicts outlived the repository");
         assert!(app.review.outcome.is_none(), "a review verdict outlived the repository");
+        assert!(app.stack.stack.is_none(), "a branch chain outlived the repository");
 
         // Neither repository was touched.
         assert_eq!(

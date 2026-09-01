@@ -1528,6 +1528,23 @@ impl Repo {
         self.push_inner(false, true, auth)
     }
 
+    /// Pushes one named branch to `origin`, tracking it if it is new.
+    ///
+    /// Unlike [`Self::push`] this does not touch the checked-out branch, which
+    /// is what publishing a stack needs: every branch in the chain goes up in
+    /// one action without checking any of them out. `force` uses
+    /// `--force-with-lease`, since restacking rewrites branches that were
+    /// already pushed but must still refuse to clobber someone else's work.
+    pub fn push_branch(&self, branch: &str, force: bool, auth: Option<&str>) -> Result<String> {
+        let mut args: Vec<&str> = vec!["push"];
+        if force {
+            args.push("--force-with-lease");
+        }
+        args.extend(["--set-upstream", "origin", branch]);
+        let out = self.git_auth(&args, auth)?;
+        Ok(out.trim().to_string())
+    }
+
     fn push_inner(&self, set_upstream: bool, force: bool, auth: Option<&str>) -> Result<String> {
         let branch = self.current_branch();
         let mut args: Vec<&str> = vec!["push"];

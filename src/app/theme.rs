@@ -162,22 +162,50 @@ pub const RADIUS_LG: u8 = 12;
 // Type scale
 // ---------------------------------------------------------------------------
 
-/// Section headers inside panels (small caps feel via spacing + color).
+/// Section header inside a panel: small, dim, upper case, and — now that
+/// there is a face for it — actually heavier than the text it labels.
 pub fn overline(text: &str) -> egui::RichText {
-    egui::RichText::new(text.to_uppercase())
-        .size(10.0)
-        .color(fg_dim())
-        .letter_spacing_note()
+    egui::RichText::new(text.to_uppercase()).font(semibold(10.0)).color(fg_dim())
 }
 
-/// Extension trait workaround: egui has no letter spacing; emulate the
-/// overline style with size + weight only.
-trait OverlineExt {
-    fn letter_spacing_note(self) -> Self;
+/// A heading in the interface, at one of the type scale's sizes.
+pub fn heading(text: &str, size: f32) -> egui::RichText {
+    egui::RichText::new(text).font(semibold(size)).color(fg())
 }
-impl OverlineExt for egui::RichText {
-    fn letter_spacing_note(self) -> Self {
-        self.strong()
+
+/// Emphasised body text: the same size as its surroundings, heavier.
+pub fn strong(text: &str) -> egui::RichText {
+    egui::RichText::new(text).font(semibold(TEXT)).color(fg())
+}
+
+// The type scale. Sizes are named so a view asks for a role rather than a
+// number, which is what keeps two panels showing the same kind of thing at
+// the same size.
+
+/// Dialog and view titles.
+pub const TITLE: f32 = 16.0;
+/// Section titles within a view.
+pub const SUBTITLE: f32 = 13.5;
+/// Body text.
+pub const TEXT: f32 = 13.0;
+/// Secondary text: hints, counts, timestamps.
+pub const SMALL: f32 = 11.5;
+
+/// Runs `f` against a throwaway context that has the app's fonts installed.
+///
+/// `egui::__run_test_ctx` gives a context with no bound font families, so any
+/// view that asks for the semibold or italic face panics on it — which is a
+/// property of the test harness, not of the view. Every UI test goes through
+/// here so it starts the way the app does.
+#[doc(hidden)]
+pub fn run_test_ctx(mut f: impl FnMut(&egui::Context)) {
+    let ctx = egui::Context::default();
+    // Before the first frame, not during one: fonts installed mid-frame only
+    // take effect on the next, which is too late for the code being tested.
+    apply(&ctx);
+    // Two passes, because the first lays out before the font atlas is warm.
+    for _ in 0..2 {
+        let _ = ctx.run(Default::default(), &mut f);
     }
 }
 
@@ -256,12 +284,26 @@ pub fn apply(ctx: &egui::Context) {
 /// Bundles Inter (UI) and JetBrains Mono (code/diffs) into the binary so the
 /// app looks the same on every machine, with egui's defaults as glyph
 /// fallback (emoji, symbols).
+///
+/// Three weights of Inter, not one. egui has no synthetic bold: text is drawn
+/// from the glyphs of whichever face it is given, so with only a regular face
+/// loaded, "bold" can be nothing but a brighter colour — which is why every
+/// heading and every `**bold**` in a rendered document used to read as plain
+/// text with the contrast turned up. Italic is the same story. Both are named
+/// families here, and [`semibold`] and [`italic`] are how the rest of the app
+/// asks for them.
 fn install_fonts(ctx: &egui::Context) {
     const INTER: &[u8] = include_bytes!("../../assets/fonts/Inter-Regular.ttf");
+    const INTER_SEMIBOLD: &[u8] = include_bytes!("../../assets/fonts/Inter-SemiBold.ttf");
+    const INTER_ITALIC: &[u8] = include_bytes!("../../assets/fonts/Inter-Italic.ttf");
     const MONO: &[u8] = include_bytes!("../../assets/fonts/JetBrainsMono-Regular.ttf");
 
     let mut fonts = FontDefinitions::default();
     fonts.font_data.insert("inter".into(), FontData::from_static(INTER).into());
+    fonts
+        .font_data
+        .insert("inter-semibold".into(), FontData::from_static(INTER_SEMIBOLD).into());
+    fonts.font_data.insert("inter-italic".into(), FontData::from_static(INTER_ITALIC).into());
     fonts.font_data.insert("jetbrains-mono".into(), FontData::from_static(MONO).into());
 
     fonts
@@ -274,6 +316,31 @@ fn install_fonts(ctx: &egui::Context) {
         .entry(FontFamily::Monospace)
         .or_default()
         .insert(0, "jetbrains-mono".into());
+    // The named families fall back to the regular face for anything the
+    // weight does not cover, and to egui's own for symbols and emoji.
+    for (name, file) in
+        [(SEMIBOLD, "inter-semibold"), (ITALIC, "inter-italic")]
+    {
+        fonts.families.insert(
+            FontFamily::Name(name.into()),
+            vec![file.into(), "inter".into(), "NotoEmoji-Regular".into()],
+        );
+    }
 
     ctx.set_fonts(fonts);
+}
+
+/// Name of the semibold font family.
+const SEMIBOLD: &str = "semibold";
+/// Name of the italic font family.
+const ITALIC: &str = "italic";
+
+/// A semibold font of `size`, for headings and emphasis.
+pub fn semibold(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(SEMIBOLD.into()))
+}
+
+/// An italic font of `size`.
+pub fn italic(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(ITALIC.into()))
 }

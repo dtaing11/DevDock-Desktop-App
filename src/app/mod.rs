@@ -836,6 +836,10 @@ impl App {
     /// investigation.
     #[cfg(test)]
     pub fn new_for_test(ctx: &egui::Context) -> Self {
+        // The app installs its fonts before its first frame; a test that
+        // renders into a bare context would otherwise ask for a font family
+        // nothing has bound.
+        theme::apply(ctx);
         Self::new_bare(ctx)
     }
 
@@ -4596,7 +4600,7 @@ mod tests {
             kind: Some(3),
         }];
 
-        egui::__run_test_ctx(|ctx| {
+        theme::run_test_ctx(|ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 editor::editor_sidebar(&mut app, ui);
                 editor::editor_viewport(&mut app, ui);
@@ -4630,7 +4634,7 @@ mod tests {
 
         for live in [false, true] {
             app.coding.live = live;
-            egui::__run_test_ctx(|ctx| {
+            theme::run_test_ctx(|ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     agent_tab::agent_sidebar(&mut app, ui);
                     agent_tab::agent_viewport(&mut app, ui);
@@ -4742,7 +4746,7 @@ mod tests {
     fn the_editor_tab_renders_when_there_is_nothing_to_show() {
         let ctx = egui::Context::default();
         let mut app = App::new_for_test(&ctx);
-        egui::__run_test_ctx(|ctx| {
+        theme::run_test_ctx(|ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 editor::editor_sidebar(&mut app, ui);
                 editor::editor_viewport(&mut app, ui);
@@ -4750,7 +4754,7 @@ mod tests {
         });
 
         let (_tmp, mut app, _file) = app_with_repo();
-        egui::__run_test_ctx(|ctx| {
+        theme::run_test_ctx(|ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 editor::editor_sidebar(&mut app, ui);
                 editor::editor_viewport(&mut app, ui);
@@ -4812,7 +4816,7 @@ mod tests {
     fn the_command_palette_renders_and_runs_a_command() {
         let (_tmp, mut app, _file) = app_with_repo();
         app.palette_query = "theme".into();
-        egui::__run_test_ctx(|ctx| {
+        theme::run_test_ctx(|ctx| {
             app.dialog = Dialog::CommandPalette;
             dialogs::show(&mut app, ctx);
         });
@@ -4864,7 +4868,7 @@ mod tests {
             text: "two".into(),
         }];
 
-        egui::__run_test_ctx(|ctx| {
+        theme::run_test_ctx(|ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 editor::editor_sidebar(&mut app, ui);
                 editor::editor_viewport(&mut app, ui);
@@ -4900,7 +4904,7 @@ mod tests {
             description: "why".into(),
         }];
         app.split.notes = "one change".into();
-        egui::__run_test_ctx(|ctx| {
+        theme::run_test_ctx(|ctx| {
             app.dialog = Dialog::SplitCommits;
             dialogs::show(&mut app, ctx);
         });
@@ -4914,7 +4918,7 @@ mod tests {
             }],
         });
         app.tidy.originals.insert("a".repeat(40), "wip".into());
-        egui::__run_test_ctx(|ctx| {
+        theme::run_test_ctx(|ctx| {
             app.dialog = Dialog::TidyHistory;
             dialogs::show(&mut app, ctx);
         });
@@ -4965,7 +4969,7 @@ mod tests {
     #[test]
     fn the_reflog_dialog_renders() {
         let (_tmp, mut app, _file) = app_with_repo();
-        egui::__run_test_ctx(|ctx| {
+        theme::run_test_ctx(|ctx| {
             app.dialog = Dialog::Reflog;
             dialogs::show(&mut app, ctx);
         });
@@ -4988,7 +4992,7 @@ mod tests {
                 date: "2026-01-01T00:00:00Z".into(),
             },
         ];
-        egui::__run_test_ctx(|ctx| {
+        theme::run_test_ctx(|ctx| {
             app.dialog = Dialog::Reflog;
             dialogs::show(&mut app, ctx);
         });
@@ -5058,7 +5062,7 @@ mod tests {
         assert_eq!(stack.stale().len(), 1);
 
         // It draws.
-        egui::__run_test_ctx(|ctx| dialogs::show(&mut app, ctx));
+        theme::run_test_ctx(|ctx| dialogs::show(&mut app, ctx));
 
         // And the action does the rebase, not just the report.
         app.stack_restack();

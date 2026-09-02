@@ -2852,16 +2852,16 @@ mod tests {
         app.config.md_preview = true;
 
         // Not loaded yet: the spinner path.
-        egui::__run_test_ctx(|ctx| super::diff_panel(&mut app, ctx));
+        crate::app::theme::run_test_ctx(|ctx| super::diff_panel(&mut app, ctx));
 
         // Loaded: the rendering path.
         app.preview_text = "# Title\n\nSome *prose* and `code`.\n\n- a\n- b\n".into();
-        egui::__run_test_ctx(|ctx| super::diff_panel(&mut app, ctx));
+        crate::app::theme::run_test_ctx(|ctx| super::diff_panel(&mut app, ctx));
 
         // Toggled off: back to the diff, with the same file selected.
         app.config.md_preview = false;
         app.diff_text = "@@ -1 +1 @@\n-old\n+new\n".into();
-        egui::__run_test_ctx(|ctx| super::diff_panel(&mut app, ctx));
+        crate::app::theme::run_test_ctx(|ctx| super::diff_panel(&mut app, ctx));
     }
 
     #[test]

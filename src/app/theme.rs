@@ -191,6 +191,11 @@ pub const TEXT: f32 = 13.0;
 /// Secondary text: hints, counts, timestamps.
 pub const SMALL: f32 = 11.5;
 
+/// One size for every "something is running" spinner. Three different sizes
+/// for the same affordance is the kind of thing nobody reports and everybody
+/// feels.
+pub const SPINNER: f32 = 14.0;
+
 /// Runs `f` against a throwaway context that has the app's fonts installed.
 ///
 /// `egui::__run_test_ctx` gives a context with no bound font families, so any

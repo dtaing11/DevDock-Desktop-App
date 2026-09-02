@@ -3332,6 +3332,8 @@ impl App {
 
         self.tab = Tab::Agent;
         self.coding.running = true;
+        self.coding.started = Some(Instant::now());
+        self.coding.took = None;
         self.coding.log.clear();
         self.coding.plan.clear();
         self.coding.summary.clear();
@@ -3552,6 +3554,8 @@ impl App {
         let lsp = self.lsp.clone();
 
         self.coding.running = true;
+        self.coding.started = Some(Instant::now());
+        self.coding.took = None;
         self.coding.log.clear();
         self.coding.plan.clear();
         self.coding.summary.clear();
@@ -3624,6 +3628,7 @@ impl App {
     /// Files the run changed, ready for review.
     fn finish_coding_run(&mut self, result: Result<AgentReport, String>) {
         self.coding.running = false;
+        self.coding.took = self.coding.started.take().map(|s| s.elapsed());
         let task = std::mem::take(&mut self.coding.task);
         match result {
             Ok(report) => {
@@ -4640,6 +4645,89 @@ mod tests {
                     agent_tab::agent_viewport(&mut app, ui);
                 });
             });
+        }
+
+        // And while it is still working, which draws the plan pipeline and
+        // its animation rather than any of the above.
+        app.coding.running = true;
+        app.coding.edits.clear();
+        app.coding.plan = vec![
+            crate::agent::PlanStep { text: "read the file".into(), done: true },
+            crate::agent::PlanStep { text: "change it".into(), done: false },
+        ];
+        theme::run_test_ctx(|ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                agent_tab::agent_sidebar(&mut app, ui);
+                agent_tab::agent_viewport(&mut app, ui);
+            });
+        });
+    }
+
+    /// Every change is in the viewport, not just the selected one.
+    ///
+    /// A run that touches four files is four diffs to read before ticking
+    /// anything; showing one at a time in a panel this size is an invitation
+    /// to skim.
+    #[test]
+    fn the_agent_viewport_shows_every_change() {
+        let (_tmp, mut app, _file) = app_with_repo();
+        let edit = |path: &str| ProposedEdit {
+            edit: crate::agent::PendingEdit {
+                path: path.into(),
+                before: Some("before\n".into()),
+                after: "after\n".into(),
+            },
+            accepted: false,
+            applied: false,
+            unresolved: false,
+        };
+        app.coding.summary = "done".into();
+        app.coding.edits = vec![edit("src/one.rs"), edit("src/two.rs"), edit("src/three.rs")];
+        // One is selected: that must not hide the other two.
+        app.coding.selected = Some(0);
+
+        let mut painted = String::new();
+        theme::run_test_ctx(|ctx| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(1100.0, 2400.0),
+                )),
+                ..Default::default()
+            };
+            let output = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    agent_tab::agent_viewport(&mut app, ui);
+                });
+            });
+            painted.clear();
+            for clipped in &output.shapes {
+                collect_shape_text(&clipped.shape, &mut painted);
+            }
+        });
+
+        for path in ["src/one.rs", "src/two.rs", "src/three.rs"] {
+            assert!(painted.contains(path), "{path} is not in the viewport:\n{painted}");
+        }
+        // And the diffs themselves, not just the headers.
+        assert!(painted.contains("+ after"), "no diff body:\n{painted}");
+    }
+
+    /// Collects the text of every painted shape, for asserting on what is
+    /// actually on screen rather than on what the code meant to draw.
+    fn collect_shape_text(shape: &egui::Shape, out: &mut String) {
+        match shape {
+            egui::Shape::Text(t) => {
+                out.push_str(t.galley.text());
+                out.push('\n');
+            }
+            egui::Shape::Vec(shapes) => {
+                for s in shapes {
+                    collect_shape_text(s, out);
+                }
+            }
+            egui::Shape::Callback(_) => {}
+            _ => {}
         }
     }
 

@@ -97,10 +97,13 @@ fn modal(
 
             // Title bar with a close button.
             ui.horizontal(|ui| {
-                ui.label(RichText::new(title).strong().size(16.0));
+                ui.label(theme::heading(title, theme::TITLE));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
-                        .add(egui::Button::new(RichText::new("Close").size(13.0)))
+                        .add(
+                            egui::Button::new(RichText::new("Close").size(theme::TEXT))
+                                .min_size(egui::vec2(0.0, theme::CONTROL_SM)),
+                        )
                         .on_hover_text("Or press Esc")
                         .clicked()
                     {
@@ -298,7 +301,7 @@ fn github_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                     RichText::new(&device.user_code)
                         .color(theme::ember())
                         .monospace()
-                        .size(18.0),
+                        .size(theme::TITLE + 2.0),
                 );
                 if ui.small_button("Copy").clicked() {
                     ctx.copy_text(device.user_code.clone());
@@ -1153,7 +1156,7 @@ fn conflict_resolver(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                 let ai_busy_here =
                     app.conflicts.ai_busy.as_deref() == Some(path.as_str());
                 if ai_busy_here {
-                    ui.add(egui::Spinner::new().size(14.0));
+                    ui.add(egui::Spinner::new().size(theme::SPINNER));
                     ui.label(RichText::new("AI is merging…").italics().weak());
                 } else if ui
                     .button("Resolve with AI")
@@ -1324,7 +1327,7 @@ fn pr_review(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         if app.pr.review.loading {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                ui.add(egui::Spinner::new().size(16.0));
+                ui.add(egui::Spinner::new().size(theme::SPINNER));
                 ui.label(RichText::new("Loading changed files…").italics().weak());
             });
             return;
@@ -1537,7 +1540,7 @@ fn pr_review(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         ui.horizontal(|ui| {
             let submitting = app.pr.review.submitting;
             if submitting {
-                ui.add(egui::Spinner::new().size(14.0));
+                ui.add(egui::Spinner::new().size(theme::SPINNER));
                 ui.label(RichText::new("Submitting…").italics().weak());
             } else {
                 let own_pr = app.gh.user.as_ref().map(|u| u.login == pr.user).unwrap_or(false);
@@ -1734,7 +1737,7 @@ fn agent_panel(app: &mut App, ui: &mut egui::Ui) {
         let busy = app.agent.running;
         let enabled = !busy && !app.conflicts.files.is_empty();
         if busy {
-            ui.add(egui::Spinner::new().size(14.0));
+            ui.add(egui::Spinner::new().size(theme::SPINNER));
             ui.label(RichText::new("AI is working through the repository…").italics().weak());
         } else if ui
             .add_enabled(
@@ -1947,13 +1950,27 @@ fn agent_changes(app: &mut App, ctx: &egui::Context, open: &mut bool) {
 /// both are asking the same question — is this change right? — and they
 /// should not answer it in two different visual languages.
 pub fn proposal_diff(ui: &mut egui::Ui, edit: &crate::agent::PendingEdit, salt: &str) {
+    ui.label(RichText::new(&edit.path).color(theme::ember()).strong());
+    proposal_diff_body(ui, edit, Some(320.0), salt);
+}
+
+/// The diff itself, without the path above it.
+///
+/// `max_height` puts the lines in their own scroll area; `None` lets them run
+/// to their natural height, for a caller whose whole viewport already
+/// scrolls — a scroll area inside a scroll area is a trap for a mouse wheel.
+pub fn proposal_diff_body(
+    ui: &mut egui::Ui,
+    edit: &crate::agent::PendingEdit,
+    max_height: Option<f32>,
+    salt: &str,
+) {
     use crate::app::textdiff::Line;
 
-    ui.label(RichText::new(&edit.path).color(theme::ember()).strong());
     let lines = crate::app::textdiff::diff(edit.before.as_deref().unwrap_or(""), &edit.after);
     let lang = crate::app::syntax::Lang::from_path(&edit.path);
     let font = egui::TextStyle::Small.resolve(ui.style());
-    ScrollArea::vertical().max_height(320.0).id_salt(salt).show(ui, |ui| {
+    let draw = |ui: &mut egui::Ui| {
         for line in &lines {
             match line {
                 Line::Skipped(n) => {
@@ -1984,7 +2001,13 @@ pub fn proposal_diff(ui: &mut egui::Ui, edit: &crate::agent::PendingEdit, salt: 
                 }
             }
         }
-    });
+    };
+    match max_height {
+        Some(height) => {
+            ScrollArea::vertical().max_height(height).id_salt(salt).show(ui, draw);
+        }
+        None => draw(ui),
+    }
 }
 
 /// Everything the app can do, by name.
@@ -2228,7 +2251,7 @@ fn reflog_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
 
         if app.reflog.is_empty() {
             ui.horizontal(|ui| {
-                ui.add(egui::Spinner::new().size(14.0));
+                ui.add(egui::Spinner::new().size(theme::SPINNER));
                 ui.label(RichText::new("reading the reflog…").small().color(theme::fg_dim()));
             });
             return;
@@ -2692,7 +2715,7 @@ fn local_ci_panel(app: &mut App, ui: &mut egui::Ui) {
                 }
             }
             if app.ci_ai_busy {
-                ui.add(egui::Spinner::new().size(14.0));
+                ui.add(egui::Spinner::new().size(theme::SPINNER));
                 ui.label(RichText::new("AI is drafting…").italics().weak());
             } else if ui
                 .small_button("Generate with AI")

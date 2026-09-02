@@ -31,6 +31,9 @@ fn segment_text(caption: &str, value: &str) -> LayoutJob {
 /// Uniform width for all toolbar segments.
 const SEGMENT_W: f32 = 190.0;
 
+/// Width of the AI model picker wherever it appears.
+const PICKER_W: f32 = 150.0;
+
 /// How many "Stage hunk N" buttons the hunk bar shows before collapsing the
 /// rest behind a "Show N more" toggle.
 pub(crate) const HUNK_BAR_LIMIT: usize = 10;
@@ -61,6 +64,21 @@ fn segment_menu<R>(
     .inner
 }
 
+/// A toolbar action: Graph, Stack, Pull Request, the account, Settings.
+///
+/// Distinct from a [`segment`], and deliberately so. A segment is a piece of
+/// state you can open a menu on; these are things you do. Before this they
+/// were egui's default buttons at egui's default height, sitting next to
+/// 48pt cards — two control languages in one bar, neither of them chosen.
+fn toolbar_button(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
+    let button = egui::Button::new(egui::RichText::new(label).size(theme::TEXT))
+        .min_size(egui::vec2(0.0, theme::CONTROL_MD))
+        .fill(if active { theme::select_wash() } else { theme::panel() })
+        .stroke(egui::Stroke::new(1.0_f32, theme::border()))
+        .corner_radius(theme::RADIUS_SM as f32);
+    ui.add(button)
+}
+
 fn segment(ui: &mut egui::Ui, caption: &str, value: &str, min_width: f32) -> egui::Response {
     let button = egui::Button::new(segment_text(caption, value))
         .min_size(egui::vec2(min_width, theme::SEGMENT_H))
@@ -89,9 +107,7 @@ pub fn toolbar(app: &mut App, ctx: &egui::Context) {
                 sync_segment(app, ui);
 
                 // Graph toggle
-                let graph_btn = if app.graph_open { "Graph ✦" } else { "Graph" };
-                if ui
-                    .selectable_label(app.graph_open, graph_btn)
+                if toolbar_button(ui, "Graph", app.graph_open)
                     .on_hover_text("Animated commit graph of all branches")
                     .clicked()
                 {
@@ -103,23 +119,36 @@ pub fn toolbar(app: &mut App, ctx: &egui::Context) {
 
                 // Right side
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Settings").on_hover_text("Settings").clicked() {
+                    if toolbar_button(ui, "Settings", app.dialog == Dialog::Settings)
+                        .on_hover_text("Settings")
+                        .clicked()
+                    {
                         app.dialog = Dialog::Settings;
                     }
+                    let signed_in = app.gh.user.is_some();
                     let gh_label = app
                         .gh
                         .user
                         .as_ref()
                         .map(|u| u.login.clone())
                         .unwrap_or_else(|| "Sign in".into());
-                    if ui.button(gh_label.clone()).on_hover_text("GitHub").clicked() {
+                    if toolbar_button(ui, &gh_label, signed_in)
+                        .on_hover_text(if signed_in {
+                            "Signed in to GitHub"
+                        } else {
+                            "Sign in to GitHub"
+                        })
+                        .clicked()
+                    {
                         app.dialog = Dialog::GitHub;
                     }
-                    if ui.button("Pull Request").clicked() {
+                    if toolbar_button(ui, "Pull Request", false)
+                        .on_hover_text("Open or review pull requests")
+                        .clicked()
+                    {
                         open_pr_dialog(app);
                     }
-                    if ui
-                        .button("Stack")
+                    if toolbar_button(ui, "Stack", false)
                         .on_hover_text(
                             "Stacked pull requests: a chain of branches, each \
                              reviewed against the one below it",
@@ -709,7 +738,7 @@ fn segment_spinner(ui: &mut egui::Ui, caption: &str, value: &str) {
             ui.set_min_size(egui::vec2(SEGMENT_W, theme::SEGMENT_H));
             ui.horizontal_centered(|ui| {
                 ui.add_space(12.0);
-                ui.add(egui::Spinner::new().size(16.0).color(theme::teal()));
+                ui.add(egui::Spinner::new().size(theme::SPINNER).color(theme::teal()));
                 ui.add_space(6.0);
                 ui.label(segment_text(caption, value));
             });
@@ -966,6 +995,32 @@ pub fn sidebar(app: &mut App, ctx: &egui::Context) {
         .width_range(280.0..=460.0)
         .frame(egui::Frame::new().fill(theme::panel()).inner_margin(8.0))
         .show(ctx, |ui| {
+            // The sidebar's width belongs to the user, not to its content.
+            //
+            // egui stores a panel's width from the rect its content took, and
+            // starts the next frame from that — so one label, one unwrapped
+            // row, one long branch name anywhere in any tab widens the
+            // sidebar, and nothing ever narrows it again. Drawing into a
+            // child of exactly the panel's size, and telling the parent only
+            // about that size, breaks the loop for good: anything too wide is
+            // clipped instead of being allowed to push.
+            let size = egui::vec2(ui.available_width(), ui.available_height());
+            let rect = egui::Rect::from_min_size(ui.cursor().min, size);
+            let mut child = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(rect)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+            );
+            child.set_clip_rect(rect.intersect(ui.clip_rect()));
+            sidebar_body(app, &mut child);
+            ui.advance_cursor_after_rect(rect);
+        });
+}
+
+/// Everything inside the sidebar, drawn into a `ui` of the panel's exact size.
+fn sidebar_body(app: &mut App, ui: &mut egui::Ui) {
+    {
+        {
             // Wrapped: five tab buttons in one unwrapped row are wider than
             // the panel's default width, and a panel grows to fit its
             // content — so an unwrapped row silently widens the sidebar.
@@ -1051,7 +1106,8 @@ pub fn sidebar(app: &mut App, ctx: &egui::Context) {
                 Tab::Editor => super::editor::editor_sidebar(app, ui),
                 Tab::Agent => super::agent_tab::agent_sidebar(app, ui),
             }
-        });
+        }
+    }
 }
 
 fn status_glyph(status: Option<FileStatus>, conflicted: bool) -> (&'static str, Color32) {
@@ -1135,7 +1191,7 @@ fn changes_tab(app: &mut App, ui: &mut egui::Ui) {
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if app.split.running {
-                    ui.add(egui::Spinner::new().size(12.0));
+                    ui.add(egui::Spinner::new().size(theme::SPINNER));
                 } else if files.len() > 1
                     && ui
                         .small_button("Split…")
@@ -1507,7 +1563,13 @@ pub fn ai_model_picker(app: &mut App, ui: &mut egui::Ui, target: crate::app::wor
         None => "Select a model…".into(),
     };
 
-    egui::ComboBox::from_id_salt(salt).selected_text(selected).show_ui(ui, |ui| {
+    // A bounded width, so a long model name cannot decide how wide the panel
+    // this sits in has to be — and so a wrapped row can place it at all,
+    // which it cannot do for a widget whose width is "however much it wants".
+    egui::ComboBox::from_id_salt(salt)
+        .selected_text(egui::RichText::new(selected).size(theme::SMALL))
+        .width(PICKER_W)
+        .show_ui(ui, |ui| {
         // Ollama section
         ui.label(theme::overline("OLLAMA (LOCAL)"));
         if app.ollama_models.is_empty() {
@@ -1829,8 +1891,15 @@ fn checks_tab(app: &mut App, ui: &mut egui::Ui) {
         {
             app.review_now();
         }
+    });
+    ui.horizontal(|ui| {
         // The reviewer picks its own model, like every other AI task.
         // `[review] provider/model` in the repo config still wins when set.
+        //
+        // Its own row: four controls do not fit across a 340pt panel, and a
+        // wrapped row cannot place a combo box whose width is "as much as the
+        // longest model name" — it ends up half off the edge.
+        ui.label(theme::overline("REVIEWED BY"));
         ai_model_picker(app, ui, crate::app::worker::AiTarget::Review);
     });
 
@@ -2047,7 +2116,7 @@ fn history_search_bar(app: &mut App, ui: &mut egui::Ui) {
             app.open_reflog();
         }
         if app.tidy.running {
-            ui.add(egui::Spinner::new().size(12.0));
+            ui.add(egui::Spinner::new().size(theme::SPINNER));
         }
     });
 
@@ -2148,6 +2217,9 @@ pub fn diff_panel(app: &mut App, ctx: &egui::Context) {
                 .fill(theme::panel2())
                 .inner_margin(egui::Margin::symmetric(12, 8))
                 .show(ui, |ui| {
+                    // A header bar, so it spans the viewport. Sized to its
+                    // text it reads as a floating label stuck in the corner.
+                    ui.set_min_width(ui.available_width());
                     ui.horizontal(|ui| {
                         let title = match app.tab {
                             Tab::Editor => "Editor",
@@ -2155,7 +2227,7 @@ pub fn diff_panel(app: &mut App, ctx: &egui::Context) {
                             _ if app.diff_title.is_empty() => "Select a file to view its diff",
                             _ => &app.diff_title,
                         };
-                        ui.label(RichText::new(title).strong());
+                        ui.label(theme::heading(title, theme::SUBTITLE));
                         // File-level controls only when a working file is
                         // selected and the viewport is showing its diff.
                         if app.selected_file.is_some()
@@ -2370,7 +2442,7 @@ fn markdown_view(app: &mut App, ui: &mut egui::Ui) {
         load_preview(app);
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.add(egui::Spinner::new().size(14.0));
+            ui.add(egui::Spinner::new().size(theme::SPINNER));
             ui.label(RichText::new("rendering…").color(theme::fg_dim()).small());
         });
         return;
@@ -2828,6 +2900,61 @@ mod tests {
     /// The diff panel renders in every state the Markdown preview can be in.
     /// A panel that panics on an empty buffer or an unloaded preview is the
     /// failure this catches.
+    /// The sidebar is the width the user left it at, whatever tab is open.
+    ///
+    /// egui stores a panel's width from the rect its content took, so a tab
+    /// with one row too wide used to widen the sidebar — permanently, since
+    /// nothing ever narrows it again.
+    #[test]
+    fn the_sidebar_keeps_one_width_across_every_tab() {
+        let tmp = tempfile::tempdir().unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "t@t.io"],
+            vec!["config", "user.name", "T"],
+        ] {
+            let out = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(tmp.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        }
+        let ctx = egui::Context::default();
+        let mut app = crate::app::App::new_for_test(&ctx);
+        app.repo = Some(crate::git::Repo::open(tmp.path()).unwrap());
+
+        let mut widths = Vec::new();
+        use crate::app::Tab;
+        for tab in [Tab::Changes, Tab::History, Tab::Checks, Tab::Editor, Tab::Agent] {
+            app.tab = tab;
+            // Twice: the first pass lays out, the second reads back what the
+            // first stored, which is where the growth used to show up.
+            for _ in 0..2 {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::pos2(0.0, 0.0),
+                        egui::vec2(1200.0, 800.0),
+                    )),
+                    ..Default::default()
+                };
+                let _ = ctx.run(input, |ctx| super::sidebar(&mut app, ctx));
+            }
+            let state =
+                egui::containers::panel::PanelState::load(&ctx, egui::Id::new("sidebar"))
+                    .expect("the sidebar panel should have laid out");
+            widths.push((tab, state.rect.width()));
+        }
+
+        let first = widths[0].1;
+        for (tab, width) in &widths {
+            assert!(
+                (width - first).abs() < 0.5,
+                "{tab:?} made the sidebar {width}pt, not {first}pt: {widths:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_markdown_preview_renders_without_panicking() {
         let tmp = tempfile::tempdir().unwrap();

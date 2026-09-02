@@ -1393,7 +1393,7 @@ impl App {
                     // description comes from an understanding of the change
                     // rather than from the diff's surface.
                     match pull_request_with_context(&repo, &sel, &url, &summary, custom) {
-                        Err(e) if lacks_tool_support(&e) => {
+                        Err(e) if crate::review::lacks_tool_support(&e) => {
                             // The model cannot call tools; the commits and
                             // the diff still describe the branch.
                         }
@@ -2365,19 +2365,9 @@ impl App {
                 if diff.trim().is_empty() {
                     return Err("Nothing to review: no outgoing changes found.".into());
                 }
-                let sel = AiSelection { provider, model };
-                // Whatever path runs, the user is told how much of the diff
-                // the verdict actually covers.
-                let coverage = crate::review::coverage_note(&diff, cfg.max_diff_bytes);
-                let mut outcome = if !cfg.repo_context {
-                    review_single_shot(&sel, &url, &diff, &cfg)?
-                } else {
-                    review_with_repo_context_or_fallback(&repo, &sel, &url, &diff, &cfg)?
-                };
-                if let Some(note) = coverage {
-                    outcome.context_log.push(note);
-                }
-                Ok(outcome)
+                let reviewer =
+                    crate::review::Reviewer { provider, model, ollama_url: url };
+                crate::review::review_diff(&repo, &reviewer, &diff, &cfg, &mut |_| {})
             })();
             Msg::ReviewDone(result)
         });
@@ -4333,26 +4323,6 @@ fn write_worktree_file(root: &std::path::Path, rel: &str, content: &str) -> Resu
 /// Read-only: the review gate inspects code, it never edits it. The
 /// reviewer's reading list comes back on the outcome, so a verdict can be
 /// weighed against the context it was reached from.
-fn review_with_repo_context(
-    repo: &crate::git::Repo,
-    sel: &AiSelection,
-    ollama_url: &str,
-    diff: &str,
-    cfg: &crate::review::ReviewConfig,
-) -> Result<crate::review::ReviewOutcome, String> {
-    let provider = agent_provider(sel, ollama_url)?;
-    let tracked = strerr(repo.tracked_files())?;
-    let mut workspace =
-        crate::agent::Workspace::new(repo.path(), tracked, crate::agent::Access::ReadOnly)?;
-    crate::review::run_with_context(
-        provider.as_ref(),
-        &mut workspace,
-        diff,
-        cfg,
-        &mut |_| {},
-    )
-}
-
 /// Writes pull request text with the repository open to the model.
 ///
 /// The commits and diff are handed over up front; the tools let it check
@@ -4384,65 +4354,6 @@ fn pull_request_with_context(
 
 /// Runs the context-reading review, falling back to a diff-only one when the
 /// model turns out not to be able to call tools.
-fn review_with_repo_context_or_fallback(
-    repo: &crate::git::Repo,
-    sel: &AiSelection,
-    url: &str,
-    diff: &str,
-    cfg: &crate::review::ReviewConfig,
-) -> Result<crate::review::ReviewOutcome, String> {
-    match review_with_repo_context(repo, sel, url, diff, cfg) {
-        Err(e) if lacks_tool_support(&e) => {
-            // The model cannot call tools, so it cannot read the repository.
-            // Review the diff alone rather than failing: a diff-only review
-            // is the old behaviour, and a gate that errors out gets switched
-            // off.
-            let mut outcome = review_single_shot(sel, url, diff, cfg)?;
-            outcome.context_log.push(format!("! {e}"));
-            outcome
-                .context_log
-                .push("! reviewed the diff alone, without repository context".into());
-            Ok(outcome)
-        }
-        other => other,
-    }
-}
-
-/// The diff-only review: one request, no tools. Used when `repo_context` is
-/// off and as the fallback for a model that cannot call tools.
-fn review_single_shot(
-    sel: &AiSelection,
-    ollama_url: &str,
-    diff: &str,
-    cfg: &crate::review::ReviewConfig,
-) -> Result<crate::review::ReviewOutcome, String> {
-    if sel.provider == "claude" {
-        let client = claude::Client::from_store(sel.model.clone())
-            .ok_or("Claude is not signed in. Open Settings.")?;
-        return strerr(client.review(diff, cfg));
-    }
-    strerr(ollama::Client::new(ollama_url).review(&sel.model, diff, cfg))
-}
-
-/// Whether a failure means "this model cannot call tools", which is worth
-/// falling back for, as opposed to a real error worth reporting.
-fn lacks_tool_support(error: &str) -> bool {
-    let e = error.to_lowercase();
-    // Only these mean "this model cannot do tools at all". Anything else —
-    // a timeout, a 500, a refused connection — must propagate: silently
-    // downgrading to a diff-only review on a transient failure would hide
-    // that the reviewer never got its context.
-    [
-        "cannot call tools",
-        "does not support tools",
-        "tools are not supported",
-        "tool use is not supported",
-        "does not support tool",
-    ]
-    .iter()
-    .any(|phrase| e.contains(phrase))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5255,7 +5166,7 @@ mod tests {
             "Ollama error 400: registry.ollama.ai/library/x does not support tools",
             "the server said tools are not supported for this model",
         ] {
-            assert!(lacks_tool_support(tool_error), "{tool_error}");
+            assert!(crate::review::lacks_tool_support(tool_error), "{tool_error}");
         }
         // Everything else must propagate: a review that silently became
         // diff-only after a timeout would hide that it lost its context.
@@ -5264,7 +5175,7 @@ mod tests {
             "Cannot reach Claude: connection refused",
             "The reviewer did not return a usable review: {",
         ] {
-            assert!(!lacks_tool_support(real_error), "{real_error}");
+            assert!(!crate::review::lacks_tool_support(real_error), "{real_error}");
         }
     }
 

@@ -743,6 +743,143 @@ fn check_citation(
     ))
 }
 
+/// Which model reviews, and where to reach it.
+///
+/// Lives here rather than in the app, because the app is not the only thing
+/// that reviews: `devdock push` gates on the same config and has to run the
+/// same review, and it has no egui context to borrow the logic from.
+#[derive(Debug, Clone)]
+pub struct Reviewer {
+    /// "claude" or "ollama".
+    pub provider: String,
+    pub model: String,
+    /// Base URL for Ollama; ignored for Claude.
+    pub ollama_url: String,
+}
+
+impl Reviewer {
+    /// The reviewer a config asks for, if it names one.
+    ///
+    /// `fallback` is what the caller would use otherwise — the app's own
+    /// model picker, or nothing at all on the command line.
+    pub fn resolve(
+        config: &ReviewConfig,
+        fallback: Option<(String, String)>,
+        ollama_url: &str,
+    ) -> Option<Self> {
+        let (provider, model) = match (&config.provider, &config.model) {
+            (Some(p), Some(m)) => (p.clone(), m.clone()),
+            _ => {
+                let (p, m) = fallback?;
+                (
+                    config.provider.clone().unwrap_or(p),
+                    config.model.clone().unwrap_or(m),
+                )
+            }
+        };
+        Some(Self { provider, model, ollama_url: ollama_url.to_string() })
+    }
+
+    fn agent(&self) -> std::result::Result<Box<dyn crate::agent::Provider>, String> {
+        if self.provider == "claude" {
+            return crate::claude::Client::from_store(self.model.clone())
+                .map(|c| Box::new(c) as Box<dyn crate::agent::Provider>)
+                .ok_or_else(|| "Claude is not signed in.".to_string());
+        }
+        if self.model.trim().is_empty() {
+            return Err("No Ollama model selected.".into());
+        }
+        Ok(Box::new(crate::ollama::Client::new(&self.ollama_url).agent(self.model.clone())))
+    }
+
+    /// The diff-only review: one request, no tools. Used when `repo_context`
+    /// is off, and as the fallback for a model that cannot call tools.
+    fn single_shot(
+        &self,
+        diff: &str,
+        config: &ReviewConfig,
+    ) -> std::result::Result<ReviewOutcome, String> {
+        if self.provider == "claude" {
+            let client = crate::claude::Client::from_store(self.model.clone())
+                .ok_or("Claude is not signed in.")?;
+            return client.review(diff, config).map_err(|e| e.to_string());
+        }
+        crate::ollama::Client::new(&self.ollama_url)
+            .review(&self.model, diff, config)
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Reviews `diff` the way the configuration asks for, with the repository
+/// open to the model unless `repo_context` is off.
+///
+/// One path, used by the app's gate, its Checks tab, and `devdock push`, so
+/// that all three agree about what a review is.
+pub fn review_diff(
+    repo: &crate::git::Repo,
+    reviewer: &Reviewer,
+    diff: &str,
+    config: &ReviewConfig,
+    on_event: &mut dyn FnMut(crate::agent::Event),
+) -> std::result::Result<ReviewOutcome, String> {
+    let coverage = coverage_note(diff, config.max_diff_bytes);
+    let mut outcome = if !config.repo_context {
+        reviewer.single_shot(diff, config)?
+    } else {
+        match with_repo_context(repo, reviewer, diff, config, on_event) {
+            Err(e) if lacks_tool_support(&e) => {
+                // The model cannot call tools, so it cannot read the
+                // repository. Review the diff alone rather than failing: a
+                // gate that errors out gets switched off.
+                let mut outcome = reviewer.single_shot(diff, config)?;
+                outcome.context_log.push(format!("! {e}"));
+                outcome
+                    .context_log
+                    .push("! reviewed the diff alone, without repository context".into());
+                outcome
+            }
+            other => other?,
+        }
+    };
+    if let Some(note) = coverage {
+        outcome.context_log.push(note);
+    }
+    Ok(outcome)
+}
+
+fn with_repo_context(
+    repo: &crate::git::Repo,
+    reviewer: &Reviewer,
+    diff: &str,
+    config: &ReviewConfig,
+    on_event: &mut dyn FnMut(crate::agent::Event),
+) -> std::result::Result<ReviewOutcome, String> {
+    let provider = reviewer.agent()?;
+    let tracked = repo.tracked_files().map_err(|e| e.to_string())?;
+    let mut workspace =
+        crate::agent::Workspace::new(repo.path(), tracked, crate::agent::Access::ReadOnly)?;
+    run_with_context(provider.as_ref(), &mut workspace, diff, config, on_event)
+}
+
+/// Whether a failure means "this model cannot call tools", which is worth
+/// falling back for, as opposed to a real error worth reporting.
+pub fn lacks_tool_support(error: &str) -> bool {
+    let e = error.to_lowercase();
+    // Only these mean "this model cannot do tools at all". Anything else — a
+    // timeout, a 500, a refused connection — must propagate: silently
+    // downgrading to a diff-only review on a transient failure would hide
+    // that the reviewer never got its context.
+    [
+        "cannot call tools",
+        "does not support tools",
+        "tools are not supported",
+        "tool use is not supported",
+        "does not support tool",
+    ]
+    .iter()
+    .any(|phrase| e.contains(phrase))
+}
+
 /// Tool calls the verifier is given per finding it has to check.
 ///
 /// Two reads and a search is a realistic cost for deciding whether one

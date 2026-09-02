@@ -24,6 +24,10 @@ pub struct Palette {
     pub panel2: Color32,
     pub border: Color32,
     pub fg: Color32,
+    /// Emphasised text: brighter than `fg` on a dark ground, darker on a
+    /// light one. A single constant cannot do both, and a near-white one on
+    /// paper is invisible.
+    pub strong: Color32,
     pub fg_dim: Color32,
     pub ember: Color32,
     pub ember_deep: Color32,
@@ -43,6 +47,7 @@ pub const DARK: Palette = Palette {
     panel2: Color32::from_rgb(0x1e, 0x25, 0x32),
     border: Color32::from_rgb(0x2c, 0x35, 0x47),
     fg: Color32::from_rgb(0xe8, 0xe3, 0xd8),
+    strong: Color32::from_rgb(0xff, 0xfb, 0xf2),
     fg_dim: Color32::from_rgb(0x8a, 0x93, 0xa6),
     ember: Color32::from_rgb(0xff, 0x9d, 0x4d),
     ember_deep: Color32::from_rgb(0xe0, 0x7b, 0x2a),
@@ -64,6 +69,7 @@ pub const LIGHT: Palette = Palette {
     panel2: Color32::from_rgb(0xe6, 0xe1, 0xd8),
     border: Color32::from_rgb(0xd0, 0xc8, 0xba),
     fg: Color32::from_rgb(0x24, 0x28, 0x30),
+    strong: Color32::from_rgb(0x0d, 0x10, 0x16),
     fg_dim: Color32::from_rgb(0x69, 0x70, 0x7e),
     ember: Color32::from_rgb(0xc2, 0x5b, 0x0a),
     ember_deep: Color32::from_rgb(0x9c, 0x45, 0x05),
@@ -110,6 +116,11 @@ pub fn border() -> Color32 {
 pub fn fg() -> Color32 {
     palette().fg
 }
+/// Emphasised text: heavier *and* a shade further from the background.
+pub fn strong_fg() -> Color32 {
+    palette().strong
+}
+
 pub fn fg_dim() -> Color32 {
     palette().fg_dim
 }
@@ -348,4 +359,46 @@ pub fn semibold(size: f32) -> FontId {
 /// An italic font of `size`.
 pub fn italic(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name(ITALIC.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Rough perceptual distance between two colours, 0..1.
+    fn distance(a: Color32, b: Color32) -> f32 {
+        let channel = |x: u8, y: u8| (x as f32 - y as f32).abs() / 255.0;
+        (channel(a.r(), b.r()) + channel(a.g(), b.g()) + channel(a.b(), b.b())) / 3.0
+    }
+
+    /// Emphasis has to be legible in both palettes.
+    ///
+    /// It used to be one hard-coded near-white constant, which is emphasis on
+    /// a dark ground and invisible on paper — every bold word in a rendered
+    /// document disappeared the moment someone switched to the light theme.
+    #[test]
+    fn emphasised_text_is_readable_in_both_palettes() {
+        for (name, palette) in [("dark", DARK), ("light", LIGHT)] {
+            let contrast = distance(palette.strong, palette.bg);
+            assert!(
+                contrast > 0.4,
+                "{name}: emphasis is {contrast:.2} from the background",
+            );
+            // And it has to be further from the background than body text is,
+            // or it reads as less important rather than more.
+            assert!(
+                contrast > distance(palette.fg, palette.bg),
+                "{name}: emphasis is closer to the background than body text",
+            );
+        }
+    }
+
+    /// The type scale steps, and every step is distinguishable.
+    #[test]
+    fn the_type_scale_is_a_scale() {
+        let sizes = [SMALL, TEXT, SUBTITLE, TITLE];
+        for pair in sizes.windows(2) {
+            assert!(pair[1] > pair[0], "{sizes:?} does not step up");
+        }
+    }
 }

@@ -24,11 +24,6 @@ const SPACE_LG: f32 = 18.0;
 /// Body size, and the base of the heading scale.
 const TEXT: f32 = 13.5;
 
-/// Emphasis colour: a shade brighter than body text, under a heavier face.
-/// Weight does the work; the tone stops a semibold run from looking merely
-/// thicker on a dark background.
-const STRONG: Color32 = Color32::from_rgb(0xff, 0xfb, 0xf2);
-
 /// One parsed block. Markdown is block-structured, so rendering happens in
 /// two passes: split into blocks, then render inline spans within each.
 enum Block {
@@ -373,7 +368,7 @@ fn inline(job: &mut LayoutJob, text: &str, color: Color32, size: f32, strong: bo
         let color = if code {
             theme::teal()
         } else if heavy {
-            STRONG
+            theme::strong_fg()
         } else {
             color
         };

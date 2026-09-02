@@ -1,7 +1,8 @@
 //! Screenshots the Markdown renderer, so its output can be looked at rather
 //! than reasoned about.
 //!
-//! `cargo run --example md_shot -- <file.md> <out.rgba> [width]`
+//! `cargo run --example md_shot -- <file.md> <out.rgba> [width] [scroll]`
+//! `LIGHT=1` renders in the light palette.
 //!
 //! Writes raw RGBA plus a `<out>.size` file with the dimensions. A window
 //! flashes up for a few frames and closes itself.
@@ -76,6 +77,9 @@ fn main() -> eframe::Result<()> {
         "md_shot",
         options,
         Box::new(move |cc| {
+            if std::env::var("LIGHT").is_ok() {
+                theme::set_light(true);
+            }
             theme::apply(&cc.egui_ctx);
             Ok(Box::new(Shot { md, out, frame: 0, scroll }))
         }),

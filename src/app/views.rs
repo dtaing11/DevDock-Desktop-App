@@ -342,7 +342,7 @@ fn checks_badge(app: &mut App, ui: &mut egui::Ui) {
                 CheckState::Pending => (format!("{name}: checks running"), theme::warn()),
                 CheckState::None => (format!("{name}: no checks"), theme::fg_dim()),
             };
-            ui.label(RichText::new(label).color(mcolor).strong());
+            ui.label(RichText::new(label).color(mcolor).font(theme::semibold(theme::TEXT)));
             ui.separator();
         }
         ui.set_min_width(340.0);
@@ -961,7 +961,7 @@ fn state_banner(app: &mut App, ui: &mut egui::Ui) {
                     RepoState::CherryPicking => "Cherry-pick in progress.".to_string(),
                     RepoState::Clean => unreachable!(),
                 };
-                ui.label(RichText::new(text).strong());
+                ui.label(RichText::new(text).font(theme::semibold(theme::TEXT)));
                 if ui.button("Resolve conflicts").clicked() {
                     app.load_conflicts();
                 }
@@ -1689,7 +1689,7 @@ fn held_action_banner(app: &mut App, ui: &mut egui::Ui) {
             ui.label(
                 RichText::new(format!("{} held", action.noun()))
                     .color(theme::danger())
-                    .strong(),
+                    .font(theme::semibold(theme::TEXT)),
             );
             ui.label(RichText::new(reason).color(theme::fg_dim()));
             ui.add_space(6.0);
@@ -1767,7 +1767,9 @@ fn review_section(app: &mut App, ui: &mut egui::Ui) {
     // Markdown mode: render the reviewer's own formatting.
     if let Some(md) = outcome.markdown.clone() {
         let held = if outcome.verdict_blocks { " — reviewer asked to hold" } else { "" };
-        egui::CollapsingHeader::new(RichText::new(format!("AI review{held}")).strong())
+        egui::CollapsingHeader::new(
+            RichText::new(format!("AI review{held}")).font(theme::semibold(theme::TEXT)),
+        )
             .default_open(true)
             .show(ui, |ui| {
                 super::markdown::render(ui, &md);
@@ -1782,7 +1784,7 @@ fn review_section(app: &mut App, ui: &mut egui::Ui) {
     } else {
         format!("AI review — {high} high · {medium} medium · {low} low")
     };
-    egui::CollapsingHeader::new(RichText::new(header).strong())
+    egui::CollapsingHeader::new(RichText::new(header).font(theme::semibold(theme::TEXT)))
         .default_open(!outcome.findings.is_empty())
         .show(ui, |ui| {
             if !outcome.summary.is_empty() {
@@ -2151,7 +2153,7 @@ fn history_tab(app: &mut App, ui: &mut egui::Ui) {
         }
         for commit in &commits {
             let selected = app.selected_commit.as_deref() == Some(&commit.sha);
-            let heading = RichText::new(&commit.subject).strong();
+            let heading = RichText::new(&commit.subject).font(theme::semibold(theme::TEXT));
             let meta = RichText::new(format!(
                 "{} · {} · {}",
                 commit.short_sha,

@@ -21,6 +21,9 @@ macOS/Windows since egui is cross-platform).
   files it needs, proposes a merge for each conflict plus any other file the
   merge requires touching, and shows you every change as a diff. Nothing is
   written until you tick it and apply.
+- **Markdown, rendered**: `.md` files, AI review output, and the coding
+  agent's summaries are rendered rather than dumped as source — real bold and
+  italic faces, syntax-highlighted fenced code, blockquotes, lists, and links.
 - **Code editor** with **language server** support: diagnostics inline, hover
   types, go-to-definition, find references, an outline, completion, format on
   save, and workspace rename. Servers start on demand (rust-analyzer, pyright,
@@ -167,7 +170,8 @@ src/
                server, diagnostics and navigation for the editor and agent
   app/
     mod.rs     App state, config, background message pump
-    theme.rs   Visual identity (indigo/ember/teal, not a GitHub clone)
+    theme.rs   Visual identity: colour tokens, type scale, bundled fonts
+    markdown.rs  Markdown rendering for reviews, agent summaries, and .md files
     views.rs   Toolbar, sidebar, diff panel
     dialogs.rs Repo picker, GitHub, PRs, stacks, conflicts, settings
     editor.rs  Code editor: buffers, highlighting, LSP interactions

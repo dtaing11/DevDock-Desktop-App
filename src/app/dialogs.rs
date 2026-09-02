@@ -886,7 +886,7 @@ fn review_gate(app: &mut App, ctx: &egui::Context, open: &mut bool) {
 
         if !outcome.summary.is_empty() {
             ui.add_space(6.0);
-            ui.label(RichText::new(&outcome.summary).strong());
+            ui.label(RichText::new(&outcome.summary).font(theme::semibold(theme::TEXT)));
         }
 
         // The reviewer's own account of what it checked. This is what makes
@@ -922,7 +922,7 @@ fn review_gate(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                 if !where_.is_empty() {
                     ui.label(RichText::new(where_).color(theme::fg_dim()).small().monospace());
                 }
-                ui.label(RichText::new(&finding.title).strong());
+                ui.label(RichText::new(&finding.title).font(theme::semibold(theme::TEXT)));
             });
             if !finding.detail.is_empty() {
                 let expanded = app.review.expanded == Some(i);
@@ -983,7 +983,7 @@ fn checks_gate(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         ui.add_space(8.0);
 
         for (name, output) in &failed {
-            ui.label(RichText::new(name).color(theme::danger()).strong());
+            ui.label(RichText::new(name).color(theme::danger()).font(theme::semibold(theme::TEXT)));
             // The tail is where the failure is; the head is usually setup.
             let tail: Vec<&str> = output.lines().rev().take(8).collect();
             for line in tail.into_iter().rev() {
@@ -1141,7 +1141,7 @@ fn conflict_resolver(app: &mut App, ctx: &egui::Context, open: &mut bool) {
             let ours = app.conflicts.files[i].ours.clone().unwrap_or_default();
             let theirs = app.conflicts.files[i].theirs.clone().unwrap_or_default();
             ui.separator();
-            ui.label(RichText::new(&path).color(theme::ember()).strong());
+            ui.label(RichText::new(&path).color(theme::ember()).font(theme::semibold(theme::TEXT)));
             ui.horizontal(|ui| {
                 if ui.button("Take ours (current branch)").clicked() {
                     resolve(app, &path, Resolution::Ours);
@@ -1950,7 +1950,7 @@ fn agent_changes(app: &mut App, ctx: &egui::Context, open: &mut bool) {
 /// both are asking the same question — is this change right? — and they
 /// should not answer it in two different visual languages.
 pub fn proposal_diff(ui: &mut egui::Ui, edit: &crate::agent::PendingEdit, salt: &str) {
-    ui.label(RichText::new(&edit.path).color(theme::ember()).strong());
+    ui.label(RichText::new(&edit.path).color(theme::ember()).font(theme::semibold(theme::TEXT)));
     proposal_diff_body(ui, edit, Some(320.0), salt);
 }
 
@@ -2184,7 +2184,7 @@ fn tidy_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
             for (i, group) in plan.groups.iter().enumerate() {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("{}.", i + 1)).color(theme::ember()).strong());
-                    ui.label(RichText::new(&group.summary).strong());
+                    ui.label(RichText::new(&group.summary).font(theme::semibold(theme::TEXT)));
                 });
                 if !group.description.trim().is_empty() {
                     ui.label(RichText::new(&group.description).small().color(theme::fg_dim()));

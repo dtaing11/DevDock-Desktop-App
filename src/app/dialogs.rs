@@ -923,6 +923,21 @@ fn review_gate(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                     ui.label(RichText::new(where_).color(theme::fg_dim()).small().monospace());
                 }
                 ui.label(RichText::new(&finding.title).font(theme::semibold(theme::TEXT)));
+                // A finding the verifier never reached is kept — silence is
+                // not a verdict — but it is not the same as one that survived
+                // scrutiny, and someone deciding whether to override a gate
+                // should be able to tell them apart.
+                if !finding.verified {
+                    ui.label(
+                        RichText::new("unchecked")
+                            .size(theme::SMALL)
+                            .color(theme::warn()),
+                    )
+                    .on_hover_text(
+                        "The verifier did not examine this one — it ran out of \
+                         budget, or was switched off. Read it yourself.",
+                    );
+                }
             });
             if !finding.detail.is_empty() {
                 let expanded = app.review.expanded == Some(i);

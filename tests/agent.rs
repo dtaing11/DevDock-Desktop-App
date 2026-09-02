@@ -647,72 +647,141 @@ fn verification_is_skipped_when_it_is_turned_off_or_there_is_nothing_to_check() 
     assert_eq!(outcome.findings.len(), 1);
 }
 
-/// The verifier against the findings that started this: three real false
-/// positives from a review of this repository, plus one real defect.
+/// The verifier against three findings that the code itself refutes, plus one
+/// defect the code itself proves.
 ///
-/// It has to drop the three and keep the one. Ignored by default — needs
-/// Claude credentials and costs tokens.
+/// Against a fixture, not this repository. The original version seeded
+/// findings about the app's own source and asserted the model's verdict on
+/// each; two runs a minute apart disagreed about whether a bounded scan of
+/// every tracked file is a defect, which is a fair thing to disagree about
+/// and a terrible thing to assert. Every finding here is settled by reading
+/// one file: three are refuted by the line below the one they quote, and the
+/// fourth indexes past the end of a slice.
+///
+/// Ignored by default — needs Claude credentials and costs tokens.
 /// `cargo test --test agent -- --ignored --nocapture live_verifier`
 #[test]
 #[ignore]
-fn live_verifier_drops_the_false_positives() {
+fn live_verifier_drops_what_the_code_refutes() {
     use git_manage::review::{Finding, ReviewConfig, ReviewOutcome, Severity};
 
     let Some(client) = git_manage::claude::Client::from_store("claude-opus-5") else {
         eprintln!("Claude is not signed in; skipping");
         return;
     };
-    let repo = Repo::open(env!("CARGO_MANIFEST_DIR")).unwrap();
-    let mut ws = Workspace::new(repo.path(), repo.tracked_files().unwrap(), Access::ReadOnly)
-        .unwrap();
 
-    let finding = |file: &str, line: u32, title: &str, detail: &str, evidence: &str| Finding {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let write = |name: &str, body: &str| {
+        std::fs::write(root.join(name), body).unwrap();
+    };
+
+    // Refuted by the attribute on the field itself.
+    write(
+        "config.rs",
+        "use serde::Deserialize;\n\
+         \n\
+         fn default_true() -> bool {\n    true\n}\n\
+         \n\
+         #[derive(Deserialize)]\n\
+         pub struct Config {\n\
+         \x20   /// Whether the reviewer may read the repository.\n\
+         \x20   #[serde(default = \"default_true\")]\n\
+         \x20   pub repo_context: bool,\n\
+         }\n",
+    );
+
+    // Refuted by the caller two lines down, which supplies the default.
+    write(
+        "prompt.rs",
+        "const DEFAULT_PROMPT: &str = \"You are resolving a merge conflict.\";\n\
+         \n\
+         /// The project's own instructions, if it has any.\n\
+         pub fn custom_prompt() -> Option<String> {\n\
+         \x20   std::fs::read_to_string(\".merge-prompt\").ok()\n\
+         }\n\
+         \n\
+         pub fn system_prompt() -> String {\n\
+         \x20   custom_prompt().unwrap_or_else(|| DEFAULT_PROMPT.to_string())\n\
+         }\n",
+    );
+
+    // Refuted by the bounds check on the line above the indexing.
+    write(
+        "index.rs",
+        "pub fn nth(items: &[u32], i: usize) -> Option<u32> {\n\
+         \x20   if i >= items.len() {\n\
+         \x20       return None;\n\
+         \x20   }\n\
+         \x20   Some(items[i])\n\
+         }\n",
+    );
+
+    // A real defect: an inclusive range over indices, which reads one past
+    // the end on the last iteration and panics. Nothing in the file argues
+    // otherwise.
+    write(
+        "sum.rs",
+        "pub fn total(values: &[u32]) -> u32 {\n\
+         \x20   let mut sum = 0;\n\
+         \x20   for i in 0..=values.len() {\n\
+         \x20       sum += values[i];\n\
+         \x20   }\n\
+         \x20   sum\n\
+         }\n",
+    );
+
+    let files: Vec<String> =
+        ["config.rs", "prompt.rs", "index.rs", "sum.rs"].iter().map(|s| s.to_string()).collect();
+    let mut ws = Workspace::new(root, files, Access::ReadOnly).unwrap();
+
+    let finding = |file: &str, title: &str, detail: &str, evidence: &str| Finding {
         file: file.into(),
-        line: Some(line),
+        line: None,
         severity: Severity::High,
         title: title.into(),
         detail: detail.into(),
         evidence: evidence.into(),
+        verified: false,
     };
+
+    let refuted = [
+        "repo_context may be uninitialised when the config omits it",
+        "a missing prompt file leaves the model with no instructions",
+        "nth indexes a slice with a caller-supplied index",
+    ];
+    let real = "total indexes one past the end of values";
 
     let mut outcome = ReviewOutcome {
         summary: "four findings".into(),
         findings: vec![
-            // 1. False: there is nothing to validate client-side.
             finding(
-                "src/claude.rs",
-                558,
-                "OAuth token passed directly in Authorization header without validation",
-                "The access token is interpolated into the header with no validation, \
-                 which could send a malformed or expired credential.",
-                ".set(\"Authorization\", &format!(\"Bearer {}\", tokens.access_token))",
+                "config.rs",
+                refuted[0],
+                "Config::repo_context is a plain bool, so a config file that omits \
+                 the key leaves it unset.",
+                "    pub repo_context: bool,",
             ),
-            // 2. False: the built-in prompt always applies.
             finding(
-                "src/app/mod.rs",
-                1,
-                "Conflict prompt source is unchecked; missing prompt means no guidance",
-                "conflict_prompt() returns Option<String> and a None means the model is \
+                "prompt.rs",
+                refuted[1],
+                "custom_prompt returns Option<String>, and a None means the model is \
                  given no instructions at all.",
-                "let custom = self.conflict_prompt();",
+                "pub fn custom_prompt() -> Option<String> {",
             ),
-            // 3. False: serde default plus a Default impl.
             finding(
-                "src/review.rs",
-                1,
-                "repo_context may not be initialized from config",
-                "The reviewer depends on cfg.repo_context, which may be uninitialised when \
-                 the config file omits it.",
-                "pub repo_context: bool,",
+                "index.rs",
+                refuted[2],
+                "nth indexes items with an index that comes from the caller, which \
+                 panics when it is out of range.",
+                "    Some(items[i])",
             ),
-            // 4. Real: this one has to survive.
             finding(
-                "src/agent/workspace.rs",
-                1,
-                "search reads every tracked file on each call",
-                "Each search opens every tracked file in turn, so a search in a large \
-                 repository reads the whole tree before returning.",
-                "for rel in self.visible_paths() {",
+                "sum.rs",
+                real,
+                "The loop runs to values.len() inclusive, so the last iteration \
+                 indexes one element past the end and panics.",
+                "    for i in 0..=values.len() {",
             ),
         ],
         ..Default::default()
@@ -733,15 +802,16 @@ fn live_verifier_drops_the_false_positives() {
     }
 
     let kept: Vec<&str> = outcome.findings.iter().map(|f| f.title.as_str()).collect();
-    for false_positive in [
-        "OAuth token passed directly in Authorization header without validation",
-        "Conflict prompt source is unchecked; missing prompt means no guidance",
-        "repo_context may not be initialized from config",
-    ] {
+    for false_positive in refuted {
         assert!(!kept.contains(&false_positive), "kept a false positive: {false_positive}");
     }
-    assert!(
-        kept.contains(&"search reads every tracked file on each call"),
-        "the real finding was dropped: {kept:?}"
-    );
+    // And it must not simply drop everything: a gate that silences every
+    // finding is worse than no gate, because it looks like it is working.
+    assert!(kept.contains(&real), "the real defect was dropped: {kept:?}");
+    // Every survivor was examined. One kept because the verifier ran out of
+    // budget before reaching it has not passed verification, and the two used
+    // to be indistinguishable.
+    for finding in &outcome.findings {
+        assert!(finding.verified, "\"{}\" survived without being checked", finding.title);
+    }
 }

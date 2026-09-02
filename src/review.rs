@@ -135,6 +135,14 @@ pub struct Finding {
     /// the reviewer offered none.
     #[serde(default)]
     pub evidence: String,
+    /// Whether a verifier looked at this finding and stood by it.
+    ///
+    /// False also means "never examined": a finding the verifier ran out of
+    /// budget before reaching is kept, because silence is not a verdict — but
+    /// it has not been checked, and a reader deciding whether to override a
+    /// gate deserves to know which of the two it is.
+    #[serde(default)]
+    pub verified: bool,
 }
 
 /// The result of one review pass.
@@ -602,12 +610,15 @@ pub fn verify(
 
     // 2. The model, with the whole repository, judging its own findings.
     if !kept.is_empty() {
+        // The budget is per finding, not per review. Verification checks each
+        // finding independently — a couple of reads apiece — so a fixed pool
+        // is spent on the first few and the rest are never examined. They are
+        // then kept, which is right, and indistinguishable from findings that
+        // survived scrutiny, which is not.
         let limits = crate::agent::Limits {
-            // Verification reads more than finding does: it has to check
-            // each finding independently, and the cheap way to be wrong is
-            // to run out of budget halfway and keep the rest unexamined.
-            max_tool_calls: config.max_context_calls.saturating_mul(2).max(24),
-            max_turns: (config.max_context_calls / 2).clamp(6, 24),
+            max_tool_calls: (CALLS_PER_FINDING * kept.len())
+                .clamp(config.max_context_calls, MAX_VERIFY_CALLS),
+            max_turns: (TURNS_PER_FINDING * kept.len()).clamp(6, MAX_VERIFY_TURNS),
             ..config.limits()
         };
         match crate::agent::run(
@@ -627,16 +638,35 @@ pub fn verify(
                         .push("! verification returned nothing usable; findings kept".into());
                 } else {
                     let mut survivors = Vec::new();
-                    for (i, finding) in kept.into_iter().enumerate() {
+                    let mut unjudged = 0;
+                    for (i, mut finding) in kept.into_iter().enumerate() {
                         match verdicts.iter().find(|(index, ..)| *index == i) {
                             Some((_, false, why)) => outcome.context_log.push(format!(
                                 "! dropped \"{}\" — {why}",
                                 finding.title
                             )),
+                            Some((_, true, _)) => {
+                                finding.verified = true;
+                                survivors.push(finding);
+                            }
                             // Unjudged findings are kept: silence is not a
-                            // verdict.
-                            _ => survivors.push(finding),
+                            // verdict. But they are reported as unchecked
+                            // rather than passed off as having been examined.
+                            None => {
+                                unjudged += 1;
+                                outcome.context_log.push(format!(
+                                    "? not verified \"{}\" — the verifier did not \
+                                     reach it; kept unchecked",
+                                    finding.title
+                                ));
+                                survivors.push(finding);
+                            }
                         }
+                    }
+                    if unjudged > 0 {
+                        outcome.context_log.push(format!(
+                            "? {unjudged} finding(s) were kept without being checked"
+                        ));
                     }
                     kept = survivors;
                 }
@@ -712,6 +742,27 @@ fn check_citation(
         excerpt(&finding.evidence)
     ))
 }
+
+/// Tool calls the verifier is given per finding it has to check.
+///
+/// Two reads and a search is a realistic cost for deciding whether one
+/// finding is real: the file it names, whatever calls it, and a look for the
+/// definition of whatever it depends on.
+const CALLS_PER_FINDING: usize = 8;
+
+/// Turns per finding.
+///
+/// Turns, not calls, are what runs out: a model batches its reads, so it
+/// spends a turn per question it wants answered rather than per file. Four is
+/// what it took to check a finding that needed a definition looked up and its
+/// caller read — with three, a four-finding review hit the ceiling with two
+/// findings still unexamined.
+const TURNS_PER_FINDING: usize = 4;
+
+/// Ceilings, so a review that somehow produced fifty findings cannot spend an
+/// unbounded number of requests checking them.
+const MAX_VERIFY_CALLS: usize = 120;
+const MAX_VERIFY_TURNS: usize = 40;
 
 const VERIFY_SYSTEM_PROMPT: &str = r#"You are checking a code review before it is shown to the developer. For each finding, decide whether it is a real defect in this code.
 
@@ -1007,6 +1058,8 @@ pub fn parse(text: &str) -> ReviewOutcome {
             },
             detail: f.detail.trim().to_string(),
             evidence: f.evidence.trim().to_string(),
+            // Nothing has checked it yet; `verify` is what sets this.
+            verified: false,
         })
         .collect();
 

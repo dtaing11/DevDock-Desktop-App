@@ -5024,19 +5024,30 @@ mod tests {
         git(root, &["add", "-A"]);
         git(root, &["commit", "-m", "feat: lower again"]);
 
-        let settle = |app: &mut App| {
-            for _ in 0..80 {
+        // Every stack action runs on a worker and ends by re-deriving the
+        // chain, so the test waits for both to land. The deadline is generous
+        // on purpose: this shells out to git several times, and the whole
+        // suite runs in parallel — a budget tight enough to be a stopwatch
+        // fails on a busy machine and says nothing when it does.
+        let settle = |app: &mut App, what: &str| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline {
                 app.handle_messages_for_test();
                 if !app.stack.busy && !app.stack.loading && app.stack.stack.is_some() {
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            panic!("the stack never loaded");
+            panic!(
+                "{what} never finished: busy={} loading={} stack={:?}",
+                app.stack.busy,
+                app.stack.loading,
+                app.stack.stack.as_ref().map(|s| s.entries.len())
+            );
         };
 
         app.open_stack();
-        settle(&mut app);
+        settle(&mut app, "loading the stack");
         assert_eq!(app.dialog, Dialog::Stack);
 
         let stack = app.stack.stack.as_ref().unwrap();
@@ -5051,7 +5062,7 @@ mod tests {
 
         // And the action does the rebase, not just the report.
         app.stack_restack();
-        settle(&mut app);
+        settle(&mut app, "the restack");
         assert!(app.stack.stack.as_ref().unwrap().stale().is_empty(), "still behind");
         assert!(
             app.stack.log.iter().any(|l| l.contains("upper")),

@@ -298,6 +298,8 @@ pub enum Dialog {
     SplitCommits,
     /// An AI-proposed tidy-up of the branch's history.
     TidyHistory,
+    /// The stack of branches this one sits in, and its pull requests.
+    Stack,
 }
 
 /// A destructive action awaiting user confirmation.
@@ -501,6 +503,26 @@ pub struct PrState {
     pub creating: bool,
 }
 
+/// Stacked-pull-request state for the branch that is checked out.
+///
+/// The stack itself is derived from git config on a worker rather than kept
+/// in sync by hand: branches move under the app's feet (a rebase in the
+/// terminal, a merge on GitHub), and a cached chain that disagrees with the
+/// repository is worse than no chain at all.
+#[derive(Default)]
+pub struct StackState {
+    pub stack: Option<crate::stack::Stack>,
+    pub loading: bool,
+    /// An operation (restack, push, submit, sync) is running.
+    pub busy: bool,
+    /// Name for a new branch stacked on the tip.
+    pub new_branch: String,
+    /// What the last operation did, line by line, kept visible in the dialog
+    /// because submitting a stack touches several branches and pull requests
+    /// and a one-line toast cannot say which.
+    pub log: Vec<String>,
+}
+
 /// Conflict-resolver dialog state.
 #[derive(Default)]
 pub struct ConflictState {
@@ -574,6 +596,8 @@ pub struct LocalCiState {
 pub enum GatedAction {
     Push { action: String, set_upstream: bool },
     PullRequest,
+    /// Push every branch in the stack and open or retarget its PRs.
+    SubmitStack,
 }
 
 impl GatedAction {
@@ -583,6 +607,7 @@ impl GatedAction {
             Self::Push { action, .. } if action == "force-push" => "Force-push anyway",
             Self::Push { .. } => "Push anyway",
             Self::PullRequest => "Create pull request anyway",
+            Self::SubmitStack => "Submit the stack anyway",
         }
     }
 
@@ -590,6 +615,7 @@ impl GatedAction {
         match self {
             Self::Push { .. } => "push",
             Self::PullRequest => "pull request",
+            Self::SubmitStack => "stack submission",
         }
     }
 }
@@ -748,6 +774,8 @@ pub struct App {
     pub gh: GhState,
     pub claude: ClaudeState,
     pub pr: PrState,
+    /// The branch chain the current branch belongs to, and what it is doing.
+    pub stack: StackState,
     pub local_ci: LocalCiState,
     pub review: ReviewState,
     pub conflicts: ConflictState,
@@ -808,6 +836,10 @@ impl App {
     /// investigation.
     #[cfg(test)]
     pub fn new_for_test(ctx: &egui::Context) -> Self {
+        // The app installs its fonts before its first frame; a test that
+        // renders into a bare context would otherwise ask for a font family
+        // nothing has bound.
+        theme::apply(ctx);
         Self::new_bare(ctx)
     }
 
@@ -883,6 +915,7 @@ impl App {
             gh: Default::default(),
             claude: Default::default(),
             pr: Default::default(),
+            stack: Default::default(),
             local_ci: Default::default(),
             review: Default::default(),
             conflicts: Default::default(),
@@ -1360,7 +1393,7 @@ impl App {
                     // description comes from an understanding of the change
                     // rather than from the diff's surface.
                     match pull_request_with_context(&repo, &sel, &url, &summary, custom) {
-                        Err(e) if lacks_tool_support(&e) => {
+                        Err(e) if crate::review::lacks_tool_support(&e) => {
                             // The model cannot call tools; the commits and
                             // the diff still describe the branch.
                         }
@@ -1445,6 +1478,9 @@ impl App {
                     self.agent = Default::default();
                     self.conflicts = Default::default();
                     self.review = Default::default();
+                    // A stack is a chain of branches in one repository; the
+                    // next one has its own.
+                    self.stack = Default::default();
                     // Graph belongs to the previous repo too.
                     self.graph.clear();
                     self.graph_open = false;
@@ -1663,6 +1699,33 @@ impl App {
                     }
                     Err(e) => self.toast(e, true),
                 }
+            }
+
+            Msg::Stack(result) => {
+                self.stack.loading = false;
+                match result {
+                    Ok(stack) => self.stack.stack = Some(stack),
+                    Err(e) => {
+                        self.stack.stack = None;
+                        self.toast(e, true);
+                    }
+                }
+            }
+            Msg::StackDone { message, log, conflicted } => {
+                self.stack.busy = false;
+                self.stack.log.extend(log);
+                match message {
+                    Ok(message) => self.toast(message, conflicted),
+                    Err(e) => self.toast(e, true),
+                }
+                if conflicted {
+                    // The rebase is still in progress: hand it to the resolver
+                    // rather than leaving the repository mid-restack with no
+                    // sign of where it stopped.
+                    self.load_conflicts();
+                }
+                self.load_stack();
+                self.refresh();
             }
 
             Msg::GhBranchChecks { branch, summary } => {
@@ -2247,7 +2310,9 @@ impl App {
         // the repo only set the simple switch.
         let enabled = match &gated {
             Some(GatedAction::Push { .. }) => self.review.config.runs_on_push(),
-            Some(GatedAction::PullRequest) => self.review.config.runs_on_pull_request(),
+            Some(GatedAction::PullRequest) | Some(GatedAction::SubmitStack) => {
+                self.review.config.runs_on_pull_request()
+            }
             // A manual review from the Checks tab is its own consent.
             None => true,
         };
@@ -2273,6 +2338,11 @@ impl App {
         // against whatever the branch would publish.
         let base = match &gated {
             Some(GatedAction::PullRequest) => Some(self.pr.base.clone()),
+            // A stack is reviewed against the trunk: the whole series is what
+            // is being proposed, even though each PR shows one slice of it.
+            Some(GatedAction::SubmitStack) => {
+                self.stack.stack.as_ref().map(|s| s.trunk.clone())
+            }
             _ => None,
         };
         let cfg = self.review.config.clone();
@@ -2295,19 +2365,9 @@ impl App {
                 if diff.trim().is_empty() {
                     return Err("Nothing to review: no outgoing changes found.".into());
                 }
-                let sel = AiSelection { provider, model };
-                // Whatever path runs, the user is told how much of the diff
-                // the verdict actually covers.
-                let coverage = crate::review::coverage_note(&diff, cfg.max_diff_bytes);
-                let mut outcome = if !cfg.repo_context {
-                    review_single_shot(&sel, &url, &diff, &cfg)?
-                } else {
-                    review_with_repo_context_or_fallback(&repo, &sel, &url, &diff, &cfg)?
-                };
-                if let Some(note) = coverage {
-                    outcome.context_log.push(note);
-                }
-                Ok(outcome)
+                let reviewer =
+                    crate::review::Reviewer { provider, model, ollama_url: url };
+                crate::review::review_diff(&repo, &reviewer, &diff, &cfg, &mut |_| {})
             })();
             Msg::ReviewDone(result)
         });
@@ -2341,6 +2401,7 @@ impl App {
                 self.execute_push(&action, set_upstream)
             }
             GatedAction::PullRequest => dialogs::create_pr(self),
+            GatedAction::SubmitStack => self.submit_stack(),
         }
     }
 
@@ -2381,6 +2442,222 @@ impl App {
                 })
             };
             Msg::Done { message: strerr(result), refresh: true }
+        });
+    }
+
+    /// Loads the repository's open pull requests (and, per PR, its checks).
+    ///
+    /// Shared by the pull request dialog and the stack view: both need to know
+    /// which branches already have a PR, and asking twice for the same list
+    /// would be two round trips for one answer.
+    pub fn load_open_prs(&mut self) {
+        let Some(repo) = self.repo.clone() else { return };
+        self.pr.loading = true;
+        self.worker.spawn(move || {
+            let result = (|| -> Result<Vec<github::PullRequest>, String> {
+                let client = github::Client::from_store().ok_or("Not signed in")?;
+                let slug = views::origin_slug(&repo).ok_or("No github.com remote found")?;
+                strerr(client.pull_requests(&slug))
+            })();
+            Msg::GhPrs(result)
+        });
+    }
+
+    // -- stacked pull requests ----------------------------------------------
+
+    /// Opens the stack view for the checked-out branch.
+    pub fn open_stack(&mut self) {
+        if self.repo.is_none() {
+            self.dialog = Dialog::RepoPicker;
+            return;
+        }
+        self.stack.log.clear();
+        self.dialog = Dialog::Stack;
+        self.load_stack();
+        // The numbers and CI state beside each branch come from here.
+        if self.gh.user.is_some() {
+            self.load_open_prs();
+        }
+    }
+
+    /// Re-derives the stack from the repository.
+    ///
+    /// Always from git, never from what the app last saw: branches move
+    /// underneath it — a rebase in the terminal, a merge on GitHub — and a
+    /// remembered chain that disagrees with the repository would restack the
+    /// wrong branches onto the wrong commits.
+    pub fn load_stack(&mut self) {
+        let Some(repo) = self.repo.clone() else { return };
+        self.stack.loading = true;
+        self.worker.spawn(move || {
+            let branch = repo.current_branch();
+            Msg::Stack(crate::stack::stack_for(&repo, &branch).map_err(|e| e.to_string()))
+        });
+    }
+
+    /// Starts a new branch on top of the stack and records what it sits on.
+    pub fn stack_branch_on_tip(&mut self) {
+        let name = self.stack.new_branch.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let Some(repo) = self.repo.clone() else { return };
+        let parent = match self.stack.stack.as_ref() {
+            Some(stack) => stack.tip(),
+            None => repo.current_branch(),
+        };
+        self.stack.new_branch.clear();
+        self.stack_op(move |repo| {
+            repo.git(&["checkout", "-b", &name, &parent]).map_err(|e| e.to_string())?;
+            crate::stack::set_parent(&repo, &name, &parent).map_err(|e| e.to_string())?;
+            Ok((format!("Started {name} on top of {parent}."), Vec::new(), false))
+        });
+    }
+
+    /// Re-bases one branch's place in the stack (config only; restack applies it).
+    pub fn stack_set_parent(&mut self, branch: String, parent: String) {
+        self.stack_op(move |repo| {
+            crate::stack::set_parent(&repo, &branch, &parent).map_err(|e| e.to_string())?;
+            Ok((format!("{branch} is now stacked on {parent}."), Vec::new(), false))
+        });
+    }
+
+    /// Takes one branch out of the stack, leaving the branch itself alone.
+    pub fn stack_untrack(&mut self, branch: String) {
+        self.stack_op(move |repo| {
+            // Children would otherwise point at a branch that is no longer in
+            // any stack, so they move down to what it was based on.
+            let parent = crate::stack::parent_of(&repo, &branch)
+                .unwrap_or_else(|| crate::stack::default_branch(&repo));
+            for (child, p) in crate::stack::parents(&repo) {
+                if p == branch {
+                    crate::stack::set_parent(&repo, &child, &parent)
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            crate::stack::clear_parent(&repo, &branch).map_err(|e| e.to_string())?;
+            crate::stack::clear_pr(&repo, &branch).map_err(|e| e.to_string())?;
+            Ok((format!("{branch} left the stack."), Vec::new(), false))
+        });
+    }
+
+    /// Switches to a branch from the stack view, leaving the view open.
+    ///
+    /// Plain `git checkout`, which carries uncommitted changes across and
+    /// refuses when they would be overwritten — the same behaviour as the
+    /// branch menu, minus the dialog that would close the stack.
+    pub fn stack_checkout(&mut self, name: String) {
+        self.stack_op(move |repo| {
+            repo.checkout(&name).map_err(|e| e.to_string())?;
+            Ok((format!("Switched to {name}."), Vec::new(), false))
+        });
+    }
+
+    /// Rebases every branch back on top of its parent, bottom-up.
+    pub fn stack_restack(&mut self) {
+        self.stack_op(move |repo| {
+            let stack = current_stack(&repo)?;
+            let report = crate::stack::restack(&repo, &stack).map_err(|e| e.to_string())?;
+            let log = report
+                .steps
+                .iter()
+                .map(|s| {
+                    let what = if s.moved { "rebased" } else { "already in place" };
+                    format!("{}: {what}", s.branch)
+                })
+                .collect();
+            let conflicted = report.conflicted.is_some();
+            Ok((report.message(), log, conflicted))
+        });
+    }
+
+    /// Publishes every branch in the stack without opening any pull requests.
+    pub fn stack_push(&mut self) {
+        let token = self.gh_token();
+        self.stack_op(move |repo| {
+            let stack = current_stack(&repo)?;
+            let pushed = crate::stack::push_stack(&repo, &stack, token.as_deref())
+                .map_err(|e| e.to_string())?;
+            let log = pushed.iter().map(|b| format!("{b}: pushed")).collect();
+            Ok((format!("Pushed {} branch(es).", pushed.len()), log, false))
+        });
+    }
+
+    /// Pushes the stack and opens or retargets a pull request for each branch.
+    ///
+    /// Runs through the review gate first, like any other pull request.
+    pub fn stack_submit(&mut self) {
+        self.gate_with_review(GatedAction::SubmitStack);
+    }
+
+    /// The submission itself, once the review gate has let it through.
+    fn submit_stack(&mut self) {
+        let Some(stack) = self.stack.stack.clone() else { return };
+        if stack.is_empty() {
+            self.toast("Nothing to submit: this branch is the trunk.", true);
+            return;
+        }
+        // Checked here as well as in `stack::submit` so the refusal is
+        // immediate rather than arriving after a push and a round trip.
+        if let Some(e) = stack.entries.iter().find(|e| e.needs_restack) {
+            self.toast(format!("Restack first: {} is behind {}.", e.branch, e.parent), true);
+            return;
+        }
+        let token = self.gh_token();
+        self.stack_op(move |repo| {
+            let client = github::Client::from_store().ok_or("Not signed in")?;
+            let slug = views::origin_slug(&repo).ok_or("No github.com remote found")?;
+            // Re-derived rather than reusing what the view was showing: this
+            // runs after a review and a network round trip, and the branches
+            // may have moved in between.
+            let stack = current_stack(&repo)?;
+            let report =
+                crate::stack::submit(&repo, &client, &slug, &stack, token.as_deref())?;
+            Ok((report.message(), report.log, false))
+        });
+    }
+
+    /// Brings the stack back in line with the remote after something merged.
+    ///
+    /// Fetches, asks GitHub which of the stack's pull requests have landed,
+    /// drops those branches out of the chain, and rebases what is left onto
+    /// the trunk. Nothing is pushed and no branch is deleted: what the remote
+    /// should look like afterwards is a separate decision, made by submitting.
+    pub fn stack_sync(&mut self) {
+        let token = self.gh_token();
+        self.stack_op(move |repo| {
+            repo.fetch(token.as_deref()).map_err(|e| e.to_string())?;
+            // After the fetch, so a branch that landed while the view was open
+            // is seen as landed.
+            let stack = current_stack(&repo)?;
+            let client = github::Client::from_store();
+            let slug = views::origin_slug(&repo);
+            let github = client.as_ref().zip(slug.as_ref());
+            let mut report = crate::stack::sync(&repo, github, &stack)?;
+            report.log.insert(0, "fetched".to_string());
+            let conflicted = report.restack.conflicted.is_some();
+            Ok((report.message(), report.log, conflicted))
+        });
+    }
+
+    /// Runs one stack operation on a worker.
+    ///
+    /// The closure returns a message for the toast, lines for the dialog's
+    /// log, and whether it stopped in conflict — every stack action has the
+    /// same shape, and they all end by re-deriving the stack.
+    fn stack_op<F>(&mut self, op: F)
+    where
+        F: FnOnce(crate::git::Repo) -> Result<(String, Vec<String>, bool), String>
+            + Send
+            + 'static,
+    {
+        let Some(repo) = self.repo.clone() else { return };
+        self.stack.busy = true;
+        self.worker.spawn(move || match op(repo) {
+            Ok((message, log, conflicted)) => {
+                Msg::StackDone { message: Ok(message), log, conflicted }
+            }
+            Err(e) => Msg::StackDone { message: Err(e), log: Vec::new(), conflicted: false },
         });
     }
 
@@ -3045,6 +3322,8 @@ impl App {
 
         self.tab = Tab::Agent;
         self.coding.running = true;
+        self.coding.started = Some(Instant::now());
+        self.coding.took = None;
         self.coding.log.clear();
         self.coding.plan.clear();
         self.coding.summary.clear();
@@ -3265,6 +3544,8 @@ impl App {
         let lsp = self.lsp.clone();
 
         self.coding.running = true;
+        self.coding.started = Some(Instant::now());
+        self.coding.took = None;
         self.coding.log.clear();
         self.coding.plan.clear();
         self.coding.summary.clear();
@@ -3337,6 +3618,7 @@ impl App {
     /// Files the run changed, ready for review.
     fn finish_coding_run(&mut self, result: Result<AgentReport, String>) {
         self.coding.running = false;
+        self.coding.took = self.coding.started.take().map(|s| s.elapsed());
         let task = std::mem::take(&mut self.coding.task);
         match result {
             Ok(report) => {
@@ -3984,6 +4266,21 @@ const MAX_ZOOM: f32 = 2.0;
 /// A repaint callback for background threads that change state nobody
 /// asked for — diagnostics arriving, indexing progress — so the UI wakes up
 /// and shows them.
+/// The stack of the branch checked out right now, as git describes it.
+///
+/// Every stack action re-derives this on its worker rather than acting on the
+/// chain the view happened to be showing: an action can start after a network
+/// round trip, a review, or a rebase in a terminal, and rebasing branches on
+/// the strength of a stale picture is how a stack loses commits.
+fn current_stack(repo: &crate::git::Repo) -> Result<crate::stack::Stack, String> {
+    let branch = repo.current_branch();
+    let stack = crate::stack::stack_for(repo, &branch).map_err(|e| e.to_string())?;
+    if stack.is_empty() {
+        return Err(format!("{branch} is not part of a stack."));
+    }
+    Ok(stack)
+}
+
 fn repaint_handle(ctx: &egui::Context) -> std::sync::Arc<dyn Fn() + Send + Sync> {
     let ctx = ctx.clone();
     std::sync::Arc::new(move || ctx.request_repaint())
@@ -4026,26 +4323,6 @@ fn write_worktree_file(root: &std::path::Path, rel: &str, content: &str) -> Resu
 /// Read-only: the review gate inspects code, it never edits it. The
 /// reviewer's reading list comes back on the outcome, so a verdict can be
 /// weighed against the context it was reached from.
-fn review_with_repo_context(
-    repo: &crate::git::Repo,
-    sel: &AiSelection,
-    ollama_url: &str,
-    diff: &str,
-    cfg: &crate::review::ReviewConfig,
-) -> Result<crate::review::ReviewOutcome, String> {
-    let provider = agent_provider(sel, ollama_url)?;
-    let tracked = strerr(repo.tracked_files())?;
-    let mut workspace =
-        crate::agent::Workspace::new(repo.path(), tracked, crate::agent::Access::ReadOnly)?;
-    crate::review::run_with_context(
-        provider.as_ref(),
-        &mut workspace,
-        diff,
-        cfg,
-        &mut |_| {},
-    )
-}
-
 /// Writes pull request text with the repository open to the model.
 ///
 /// The commits and diff are handed over up front; the tools let it check
@@ -4077,65 +4354,6 @@ fn pull_request_with_context(
 
 /// Runs the context-reading review, falling back to a diff-only one when the
 /// model turns out not to be able to call tools.
-fn review_with_repo_context_or_fallback(
-    repo: &crate::git::Repo,
-    sel: &AiSelection,
-    url: &str,
-    diff: &str,
-    cfg: &crate::review::ReviewConfig,
-) -> Result<crate::review::ReviewOutcome, String> {
-    match review_with_repo_context(repo, sel, url, diff, cfg) {
-        Err(e) if lacks_tool_support(&e) => {
-            // The model cannot call tools, so it cannot read the repository.
-            // Review the diff alone rather than failing: a diff-only review
-            // is the old behaviour, and a gate that errors out gets switched
-            // off.
-            let mut outcome = review_single_shot(sel, url, diff, cfg)?;
-            outcome.context_log.push(format!("! {e}"));
-            outcome
-                .context_log
-                .push("! reviewed the diff alone, without repository context".into());
-            Ok(outcome)
-        }
-        other => other,
-    }
-}
-
-/// The diff-only review: one request, no tools. Used when `repo_context` is
-/// off and as the fallback for a model that cannot call tools.
-fn review_single_shot(
-    sel: &AiSelection,
-    ollama_url: &str,
-    diff: &str,
-    cfg: &crate::review::ReviewConfig,
-) -> Result<crate::review::ReviewOutcome, String> {
-    if sel.provider == "claude" {
-        let client = claude::Client::from_store(sel.model.clone())
-            .ok_or("Claude is not signed in. Open Settings.")?;
-        return strerr(client.review(diff, cfg));
-    }
-    strerr(ollama::Client::new(ollama_url).review(&sel.model, diff, cfg))
-}
-
-/// Whether a failure means "this model cannot call tools", which is worth
-/// falling back for, as opposed to a real error worth reporting.
-fn lacks_tool_support(error: &str) -> bool {
-    let e = error.to_lowercase();
-    // Only these mean "this model cannot do tools at all". Anything else —
-    // a timeout, a 500, a refused connection — must propagate: silently
-    // downgrading to a diff-only review on a transient failure would hide
-    // that the reviewer never got its context.
-    [
-        "cannot call tools",
-        "does not support tools",
-        "tools are not supported",
-        "tool use is not supported",
-        "does not support tool",
-    ]
-    .iter()
-    .any(|phrase| e.contains(phrase))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4298,7 +4516,7 @@ mod tests {
             kind: Some(3),
         }];
 
-        egui::__run_test_ctx(|ctx| {
+        theme::run_test_ctx(|ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 editor::editor_sidebar(&mut app, ui);
                 editor::editor_viewport(&mut app, ui);
@@ -4332,12 +4550,95 @@ mod tests {
 
         for live in [false, true] {
             app.coding.live = live;
-            egui::__run_test_ctx(|ctx| {
+            theme::run_test_ctx(|ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     agent_tab::agent_sidebar(&mut app, ui);
                     agent_tab::agent_viewport(&mut app, ui);
                 });
             });
+        }
+
+        // And while it is still working, which draws the plan pipeline and
+        // its animation rather than any of the above.
+        app.coding.running = true;
+        app.coding.edits.clear();
+        app.coding.plan = vec![
+            crate::agent::PlanStep { text: "read the file".into(), done: true },
+            crate::agent::PlanStep { text: "change it".into(), done: false },
+        ];
+        theme::run_test_ctx(|ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                agent_tab::agent_sidebar(&mut app, ui);
+                agent_tab::agent_viewport(&mut app, ui);
+            });
+        });
+    }
+
+    /// Every change is in the viewport, not just the selected one.
+    ///
+    /// A run that touches four files is four diffs to read before ticking
+    /// anything; showing one at a time in a panel this size is an invitation
+    /// to skim.
+    #[test]
+    fn the_agent_viewport_shows_every_change() {
+        let (_tmp, mut app, _file) = app_with_repo();
+        let edit = |path: &str| ProposedEdit {
+            edit: crate::agent::PendingEdit {
+                path: path.into(),
+                before: Some("before\n".into()),
+                after: "after\n".into(),
+            },
+            accepted: false,
+            applied: false,
+            unresolved: false,
+        };
+        app.coding.summary = "done".into();
+        app.coding.edits = vec![edit("src/one.rs"), edit("src/two.rs"), edit("src/three.rs")];
+        // One is selected: that must not hide the other two.
+        app.coding.selected = Some(0);
+
+        let mut painted = String::new();
+        theme::run_test_ctx(|ctx| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(1100.0, 2400.0),
+                )),
+                ..Default::default()
+            };
+            let output = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    agent_tab::agent_viewport(&mut app, ui);
+                });
+            });
+            painted.clear();
+            for clipped in &output.shapes {
+                collect_shape_text(&clipped.shape, &mut painted);
+            }
+        });
+
+        for path in ["src/one.rs", "src/two.rs", "src/three.rs"] {
+            assert!(painted.contains(path), "{path} is not in the viewport:\n{painted}");
+        }
+        // And the diffs themselves, not just the headers.
+        assert!(painted.contains("+ after"), "no diff body:\n{painted}");
+    }
+
+    /// Collects the text of every painted shape, for asserting on what is
+    /// actually on screen rather than on what the code meant to draw.
+    fn collect_shape_text(shape: &egui::Shape, out: &mut String) {
+        match shape {
+            egui::Shape::Text(t) => {
+                out.push_str(t.galley.text());
+                out.push('\n');
+            }
+            egui::Shape::Vec(shapes) => {
+                for s in shapes {
+                    collect_shape_text(s, out);
+                }
+            }
+            egui::Shape::Callback(_) => {}
+            _ => {}
         }
     }
 
@@ -4444,7 +4745,7 @@ mod tests {
     fn the_editor_tab_renders_when_there_is_nothing_to_show() {
         let ctx = egui::Context::default();
         let mut app = App::new_for_test(&ctx);
-        egui::__run_test_ctx(|ctx| {
+        theme::run_test_ctx(|ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 editor::editor_sidebar(&mut app, ui);
                 editor::editor_viewport(&mut app, ui);
@@ -4452,7 +4753,7 @@ mod tests {
         });
 
         let (_tmp, mut app, _file) = app_with_repo();
-        egui::__run_test_ctx(|ctx| {
+        theme::run_test_ctx(|ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 editor::editor_sidebar(&mut app, ui);
                 editor::editor_viewport(&mut app, ui);
@@ -4514,7 +4815,7 @@ mod tests {
     fn the_command_palette_renders_and_runs_a_command() {
         let (_tmp, mut app, _file) = app_with_repo();
         app.palette_query = "theme".into();
-        egui::__run_test_ctx(|ctx| {
+        theme::run_test_ctx(|ctx| {
             app.dialog = Dialog::CommandPalette;
             dialogs::show(&mut app, ctx);
         });
@@ -4566,7 +4867,7 @@ mod tests {
             text: "two".into(),
         }];
 
-        egui::__run_test_ctx(|ctx| {
+        theme::run_test_ctx(|ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 editor::editor_sidebar(&mut app, ui);
                 editor::editor_viewport(&mut app, ui);
@@ -4602,7 +4903,7 @@ mod tests {
             description: "why".into(),
         }];
         app.split.notes = "one change".into();
-        egui::__run_test_ctx(|ctx| {
+        theme::run_test_ctx(|ctx| {
             app.dialog = Dialog::SplitCommits;
             dialogs::show(&mut app, ctx);
         });
@@ -4616,7 +4917,7 @@ mod tests {
             }],
         });
         app.tidy.originals.insert("a".repeat(40), "wip".into());
-        egui::__run_test_ctx(|ctx| {
+        theme::run_test_ctx(|ctx| {
             app.dialog = Dialog::TidyHistory;
             dialogs::show(&mut app, ctx);
         });
@@ -4667,7 +4968,7 @@ mod tests {
     #[test]
     fn the_reflog_dialog_renders() {
         let (_tmp, mut app, _file) = app_with_repo();
-        egui::__run_test_ctx(|ctx| {
+        theme::run_test_ctx(|ctx| {
             app.dialog = Dialog::Reflog;
             dialogs::show(&mut app, ctx);
         });
@@ -4690,7 +4991,7 @@ mod tests {
                 date: "2026-01-01T00:00:00Z".into(),
             },
         ];
-        egui::__run_test_ctx(|ctx| {
+        theme::run_test_ctx(|ctx| {
             app.dialog = Dialog::Reflog;
             dialogs::show(&mut app, ctx);
         });
@@ -4701,6 +5002,115 @@ mod tests {
     /// Their paths are repo-relative, so an unapplied proposal that survived
     /// a repository switch would be written into the *new* project — one
     /// repo's edits landing in another's files.
+    /// The stack view shows the chain, and its actions really move branches.
+    #[test]
+    fn the_stack_view_renders_the_chain_and_restacks_it() {
+        let (tmp, mut app, _file) = app_with_repo();
+        let root = tmp.path();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-m", "chore: root"]);
+
+        // main → lower → upper, then a new commit on `lower` so `upper`
+        // is behind it: the state the whole feature exists to fix.
+        git(root, &["checkout", "-b", "lower"]);
+        std::fs::write(root.join("lower.txt"), "l\n").unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-m", "feat: lower"]);
+        git(root, &["config", "branch.lower.devdock-parent", "main"]);
+        git(root, &["checkout", "-b", "upper"]);
+        std::fs::write(root.join("upper.txt"), "u\n").unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-m", "feat: upper"]);
+        git(root, &["config", "branch.upper.devdock-parent", "lower"]);
+        git(root, &["checkout", "lower"]);
+        std::fs::write(root.join("lower2.txt"), "l2\n").unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-m", "feat: lower again"]);
+
+        // Every stack action runs on a worker and ends by re-deriving the
+        // chain, so the test waits for both to land. The deadline is generous
+        // on purpose: this shells out to git several times, and the whole
+        // suite runs in parallel — a budget tight enough to be a stopwatch
+        // fails on a busy machine and says nothing when it does.
+        let settle = |app: &mut App, what: &str| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline {
+                app.handle_messages_for_test();
+                if !app.stack.busy && !app.stack.loading && app.stack.stack.is_some() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!(
+                "{what} never finished: busy={} loading={} stack={:?}",
+                app.stack.busy,
+                app.stack.loading,
+                app.stack.stack.as_ref().map(|s| s.entries.len())
+            );
+        };
+
+        app.open_stack();
+        settle(&mut app, "loading the stack");
+        assert_eq!(app.dialog, Dialog::Stack);
+
+        let stack = app.stack.stack.as_ref().unwrap();
+        let names: Vec<&str> = stack.entries.iter().map(|e| e.branch.as_str()).collect();
+        assert_eq!(names, ["lower", "upper"], "bottom first");
+        assert_eq!(stack.current, Some(0), "lower is checked out");
+        assert!(stack.entry("upper").unwrap().needs_restack);
+        assert_eq!(stack.stale().len(), 1);
+
+        // It draws.
+        theme::run_test_ctx(|ctx| dialogs::show(&mut app, ctx));
+
+        // And the action does the rebase, not just the report.
+        app.stack_restack();
+        settle(&mut app, "the restack");
+        assert!(app.stack.stack.as_ref().unwrap().stale().is_empty(), "still behind");
+        assert!(
+            app.stack.log.iter().any(|l| l.contains("upper")),
+            "the activity log said nothing: {:?}",
+            app.stack.log
+        );
+        let log = crate::git::Repo::open(root)
+            .unwrap()
+            .log(10, Some("main..upper"))
+            .unwrap();
+        let subjects: Vec<&str> = log.iter().map(|c| c.subject.as_str()).collect();
+        assert_eq!(
+            subjects,
+            ["feat: upper", "feat: lower again", "feat: lower"],
+            "upper was replayed onto the new lower, once"
+        );
+    }
+
+    /// Submitting is refused while any branch is behind its parent: the pull
+    /// requests would show the changes underneath them as their own.
+    #[test]
+    fn a_stale_stack_is_not_submitted() {
+        let (_tmp, mut app, _file) = app_with_repo();
+        app.stack.stack = Some(crate::stack::Stack {
+            trunk: "main".into(),
+            entries: vec![crate::stack::StackEntry {
+                branch: "upper".into(),
+                parent: "lower".into(),
+                commits: Vec::new(),
+                pr: None,
+                needs_restack: true,
+                merged: false,
+            }],
+            current: Some(0),
+            forks: Vec::new(),
+        });
+
+        app.perform(GatedAction::SubmitStack);
+
+        assert!(!app.stack.busy, "a stale stack must not reach GitHub");
+        let toast = app.toast.as_ref().expect("no explanation was given");
+        assert!(toast.error);
+        assert!(toast.text.contains("Restack first"), "{}", toast.text);
+    }
+
     #[test]
     fn switching_repositories_drops_proposals_from_the_old_one() {
         let (_tmp, mut app, file) = app_with_repo();
@@ -4722,6 +5132,10 @@ mod tests {
             theirs: None,
             working: None,
         }];
+        app.stack.stack = Some(crate::stack::Stack {
+            trunk: "main".into(),
+            ..Default::default()
+        });
 
         let other = tempfile::tempdir().unwrap();
         git(other.path(), &["init", "-b", "main"]);
@@ -4735,6 +5149,7 @@ mod tests {
         assert!(app.agent.summary.is_empty());
         assert!(app.conflicts.files.is_empty(), "conflicts outlived the repository");
         assert!(app.review.outcome.is_none(), "a review verdict outlived the repository");
+        assert!(app.stack.stack.is_none(), "a branch chain outlived the repository");
 
         // Neither repository was touched.
         assert_eq!(
@@ -4751,7 +5166,7 @@ mod tests {
             "Ollama error 400: registry.ollama.ai/library/x does not support tools",
             "the server said tools are not supported for this model",
         ] {
-            assert!(lacks_tool_support(tool_error), "{tool_error}");
+            assert!(crate::review::lacks_tool_support(tool_error), "{tool_error}");
         }
         // Everything else must propagate: a review that silently became
         // diff-only after a timeout would hide that it lost its context.
@@ -4760,7 +5175,7 @@ mod tests {
             "Cannot reach Claude: connection refused",
             "The reviewer did not return a usable review: {",
         ] {
-            assert!(!lacks_tool_support(real_error), "{real_error}");
+            assert!(!crate::review::lacks_tool_support(real_error), "{real_error}");
         }
     }
 

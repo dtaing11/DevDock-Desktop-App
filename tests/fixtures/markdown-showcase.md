@@ -11,8 +11,9 @@ so anything that breaks here breaks a test.
 
 ## Headings
 
-Levels 1 to 3 step down in size, and 4 to 6 share the smallest — a review or a
-README rarely needs six visual tiers. Only level 1 gets a rule under it, since
+Levels 1 to 3 step down in size, and 4 to 6 share body size in the heavier
+face — a review or a README rarely needs six visual tiers, and weight tells a
+small heading from a paragraph without another size for each. Only level 1 gets a rule under it, since
 giving every level 2 one turns a normal document into a stack of lines.
 
 # Level 1
@@ -48,9 +49,10 @@ Ordinary text, then **bold with asterisks**, then __bold with underscores__,
 then *italic with asterisks*, then _italic with underscores_, then `inline
 code`, then a [link to the repository](https://github.com/dtaing11/DevDock-Desktop-App).
 
-The app ships no bold face, so **bold** is faked with a brighter tone and a
-little extra tracking rather than a heavier weight. *Italic* really is slanted.
-`Code` is monospace, tinted, and sits on a chip.
+**Bold** is a real semibold face and *italic* a real slanted one — the app
+bundles all three weights of Inter, because a renderer with only a regular
+face can express emphasis with nothing but colour. `Code` is monospace,
+tinted, and sits on a chip.
 
 Emphasis inside a sentence works mid-word too: un**believ**able.
 
@@ -117,8 +119,8 @@ List items carry inline formatting:
 
 > A blockquote is dimmed text with a rule down its left side.
 
-> Each line is its own quote block.
-> This is the second one.
+> Consecutive quoted lines are one blockquote, so this line and the next
+> share a single rule down the side.
 
 >A quote without a space after the marker still works.
 

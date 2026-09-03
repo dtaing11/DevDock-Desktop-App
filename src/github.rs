@@ -171,6 +171,15 @@ pub struct PullRequest {
     pub user: String,
 }
 
+/// A pull request fetched on its own: summary, body text, merged state.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PrDetail {
+    pub pr: PullRequest,
+    pub body: String,
+    /// True once the PR has been merged (as opposed to closed unmerged).
+    pub merged: bool,
+}
+
 /// One changed file in a pull request.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PrFile {
@@ -354,6 +363,53 @@ impl Client {
     pub fn user(&self) -> Result<User> {
         let value = self.get("/user")?;
         serde_json::from_value(value).map_err(|e| GhError(e.to_string()))
+    }
+
+    /// Creates a repository owned by the authenticated user.
+    ///
+    /// `auto_init` is deliberately off: a repository with a commit already in
+    /// it has a root the caller did not make, which is the wrong start for
+    /// pushing an existing history.
+    pub fn create_repo(&self, name: &str, private: bool) -> Result<RemoteRepo> {
+        let payload = serde_json::json!({
+            "name": name,
+            "private": private,
+            "auto_init": false,
+        });
+        let value = self.post("/user/repos", payload)?;
+        Ok(RemoteRepo {
+            full_name: value
+                .get("full_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(name)
+                .to_string(),
+            clone_url: value
+                .get("clone_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            private,
+        })
+    }
+
+    /// The account's login and what this token is allowed to do.
+    ///
+    /// The scopes come back in a response header, so this is the only way to
+    /// know before trying — useful for telling "your token cannot do that"
+    /// apart from "that failed".
+    pub fn scopes(&self) -> Result<(String, String)> {
+        let resp = agent()
+            .get(&format!("{API_BASE}/user"))
+            .set("Authorization", &format!("Bearer {}", self.token))
+            .set("Accept", "application/vnd.github+json")
+            .call()
+            .map_err(|e| GhError(e.to_string()))?;
+        let scopes = resp.header("x-oauth-scopes").unwrap_or_default().to_string();
+        let value: serde_json::Value =
+            resp.into_json().map_err(|e| GhError(e.to_string()))?;
+        let login =
+            value.get("login").and_then(|l| l.as_str()).unwrap_or_default().to_string();
+        Ok((login, scopes))
     }
 
     /// Lists open pull requests for a repository.
@@ -607,6 +663,52 @@ impl Client {
             .unwrap_or_default())
     }
 
+    /// Changes an open pull request's base branch, title, or body.
+    ///
+    /// Retargeting the base is what makes a stack survive a merge: when the PR
+    /// below lands, the one above it must point at the trunk instead of a
+    /// branch that no longer exists.
+    pub fn update_pull_request(
+        &self,
+        slug: &RepoSlug,
+        number: u64,
+        base: Option<&str>,
+        title: Option<&str>,
+        body: Option<&str>,
+    ) -> Result<PullRequest> {
+        let mut payload = serde_json::Map::new();
+        if let Some(base) = base {
+            payload.insert("base".into(), base.into());
+        }
+        if let Some(title) = title {
+            payload.insert("title".into(), title.into());
+        }
+        if let Some(body) = body {
+            payload.insert("body".into(), body.into());
+        }
+        let path = format!("/repos/{}/{}/pulls/{number}", slug.owner, slug.repo);
+        let value = self.patch(&path, serde_json::Value::Object(payload))?;
+        parse_pull_request(&value).ok_or_else(|| GhError("Unexpected PR response".into()))
+    }
+
+    /// One pull request in full: the summary plus the body text and whether
+    /// it has been merged.
+    ///
+    /// The list endpoint only returns *open* PRs, so this is the only way to
+    /// find out that the PR at the bottom of a stack has landed — which is
+    /// exactly when the stack above it needs re-basing and re-targeting.
+    pub fn pull_request(&self, slug: &RepoSlug, number: u64) -> Result<PrDetail> {
+        let path = format!("/repos/{}/{}/pulls/{number}", slug.owner, slug.repo);
+        let value = self.get(&path)?;
+        let body = value.get("body").and_then(|b| b.as_str()).unwrap_or_default().to_string();
+        let merged = value.get("merged").and_then(|m| m.as_bool()).unwrap_or_else(|| {
+            value.get("merged_at").map(|m| !m.is_null()).unwrap_or(false)
+        });
+        let pr = parse_pull_request(&value)
+            .ok_or_else(|| GhError("Unexpected PR response".into()))?;
+        Ok(PrDetail { pr, body, merged })
+    }
+
     fn get(&self, path: &str) -> Result<serde_json::Value> {
         let resp = agent()
             .get(&format!("{API_BASE}{path}"))
@@ -619,6 +721,15 @@ impl Client {
     fn post(&self, path: &str, body: serde_json::Value) -> Result<serde_json::Value> {
         let resp = agent()
             .post(&format!("{API_BASE}{path}"))
+            .set("Authorization", &format!("Bearer {}", self.token))
+            .set("Accept", "application/vnd.github+json")
+            .send_json(body);
+        read_json(resp)
+    }
+
+    fn patch(&self, path: &str, body: serde_json::Value) -> Result<serde_json::Value> {
+        let resp = agent()
+            .request("PATCH", &format!("{API_BASE}{path}"))
             .set("Authorization", &format!("Bearer {}", self.token))
             .set("Accept", "application/vnd.github+json")
             .send_json(body);

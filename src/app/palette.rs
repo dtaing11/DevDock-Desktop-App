@@ -28,6 +28,7 @@ pub enum Cmd {
     Fetch,
     Branches,
     PullRequests,
+    Stack,
     Stash,
     History,
     SearchCommits,
@@ -83,6 +84,11 @@ pub fn commands() -> Vec<Command> {
         c("Refresh", "reload status and branches", Cmd::Refresh),
         c("Branches", "switch create delete branches", Cmd::Branches),
         c("Pull requests", "github open create review", Cmd::PullRequests),
+        c(
+            "Stacked pull requests",
+            "stack chain of branches restack submit sync dependent prs",
+            Cmd::Stack,
+        ),
         c("Stashes", "shelve changes for later", Cmd::Stash),
         c("Commit graph", "visualise branches and merges", Cmd::Graph),
         c("History", "commit log", Cmd::History),
@@ -171,6 +177,7 @@ pub fn run(app: &mut App, cmd: Cmd) {
         Cmd::Fetch => app.shortcut_sync("fetch"),
         Cmd::Branches => app.tab = Tab::Changes,
         Cmd::PullRequests => app.dialog = Dialog::PullRequests,
+        Cmd::Stack => app.open_stack(),
         Cmd::Stash => app.tab = Tab::Changes,
         Cmd::Graph => {
             app.graph_open = !app.graph_open;

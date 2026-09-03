@@ -13,9 +13,16 @@
 use super::{syntax, theme};
 use egui::{text::LayoutJob, Color32, FontId, RichText, TextFormat};
 
-/// Emphasis colour. The app loads no bold face, so `**bold**` and headings
-/// read as a brighter tone than [`theme::fg()`] instead of a heavier weight.
-const STRONG: Color32 = Color32::from_rgb(0xff, 0xfb, 0xf2);
+/// The document's vertical rhythm. Every gap in a rendered document is one
+/// of these three, so the spacing between a heading and its paragraph, two
+/// paragraphs, and two list items are related rather than each being whatever
+/// number the block that drew them happened to use.
+const SPACE_SM: f32 = 4.0;
+const SPACE_MD: f32 = 8.0;
+const SPACE_LG: f32 = 18.0;
+
+/// Body size, and the base of the heading scale.
+const TEXT: f32 = 13.5;
 
 /// One parsed block. Markdown is block-structured, so rendering happens in
 /// two passes: split into blocks, then render inline spans within each.
@@ -26,90 +33,115 @@ enum Block {
     Code { lang: String, lines: Vec<String> },
     /// `(marker, text)` where marker is the rendered bullet or number.
     ListItem { marker: String, text: String, indent: usize },
-    Quote(String),
+    /// The lines of one blockquote. Consecutive `>` lines are one quote, not
+    /// one per line: a quoted paragraph drawn as five separate bars with five
+    /// gaps is not a blockquote, it is a list of stubs.
+    Quote(Vec<String>),
     Rule,
 }
 
 /// Renders `md` into `ui`.
 pub fn render(ui: &mut egui::Ui, md: &str) {
-    for block in parse(md) {
+    // Blocks set their own spacing, so egui's between-widget gap would add a
+    // second, unrelated rhythm on top of it.
+    ui.spacing_mut().item_spacing.y = 0.0;
+    for (i, block) in parse(md).into_iter().enumerate() {
+        let first = i == 0;
         match block {
             Block::Heading { level, text } => {
-                // A real scale. With no bold face available, size is the
-                // only thing that separates a heading from a paragraph, so
-                // the steps have to be big enough to read as steps.
+                // Weight separates a heading from a paragraph, so the sizes
+                // no longer have to shout to be distinguishable. Six levels
+                // collapse onto four: past the third, a document is better
+                // served by a heavier face at body size than by three more
+                // sizes nobody can tell apart.
                 let size = match level {
-                    1 => 25.0,
-                    2 => 20.0,
-                    3 => 16.5,
-                    4 => 15.0,
-                    _ => 13.5,
+                    1 => 22.0,
+                    2 => 17.5,
+                    3 => 15.0,
+                    _ => TEXT,
                 };
                 // Space belongs above a heading, not below it: a heading
-                // groups with the text it introduces.
-                ui.add_space(match level {
-                    1 => 20.0,
-                    2 => 17.0,
-                    3 => 13.0,
-                    _ => 10.0,
-                });
+                // groups with the text it introduces. The first block in a
+                // document gets none, so it does not start with a gap.
+                if !first {
+                    ui.add_space(if level <= 2 { SPACE_LG } else { SPACE_MD + SPACE_SM });
+                }
                 let mut job = LayoutJob::default();
                 inline(&mut job, &text, theme::fg(), size, true);
                 ui.label(job);
                 // Only the document title gets a hairline. Giving every
                 // H2 one turns a normal README into a stack of rules.
                 if level == 1 {
-                    ui.add_space(3.0);
+                    ui.add_space(SPACE_SM);
                     let (rect, _) = ui.allocate_exact_size(
                         egui::vec2(ui.available_width(), 1.0),
                         egui::Sense::hover(),
                     );
                     ui.painter().rect_filled(rect, 0.0, theme::border());
                 }
-                ui.add_space(5.0);
+                ui.add_space(SPACE_MD);
             }
             Block::Paragraph(text) => {
                 let mut job = LayoutJob::default();
-                inline(&mut job, &text, theme::fg(), 13.5, false);
+                inline(&mut job, &text, theme::fg(), TEXT, false);
                 ui.label(job);
-                ui.add_space(9.0);
+                ui.add_space(SPACE_MD);
             }
-            Block::Quote(text) => {
+            Block::Quote(lines) => {
                 // A left rule plus dimmed text, rather than trying to draw a
                 // real blockquote frame. The rule is laid out *after* the
-                // text is measured, so it spans a wrapped quote instead of
-                // stopping after one line.
+                // text is measured, so it spans the whole quote — every line
+                // of it — instead of stopping after the first.
                 ui.horizontal_top(|ui| {
-                    let bar = ui.allocate_exact_size(
-                        egui::vec2(3.0, 0.0),
-                        egui::Sense::hover(),
-                    );
-                    ui.add_space(8.0);
-                    let mut job = LayoutJob::default();
-                    inline(&mut job, &text, theme::fg_dim(), 13.5, false);
-                    // Explicit wrap: a horizontal layout does not wrap text
-                    // by default, so a long quote would run off the panel.
-                    let response = ui.add(egui::Label::new(job).wrap());
+                    let bar =
+                        ui.allocate_exact_size(egui::vec2(2.0, 0.0), egui::Sense::hover());
+                    ui.add_space(SPACE_MD);
+                    let inner = ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        for line in &lines {
+                            if line.is_empty() {
+                                ui.add_space(SPACE_SM);
+                                continue;
+                            }
+                            let mut job = LayoutJob::default();
+                            inline(&mut job, line, theme::fg_dim(), TEXT, false);
+                            // Explicit wrap: a horizontal layout does not
+                            // wrap by default, so a long quote would run off
+                            // the panel.
+                            ui.add(egui::Label::new(job).wrap());
+                        }
+                    });
+                    // The rule is sized from what the text actually took, so
+                    // it runs the whole height of the quote rather than
+                    // leaving a stub next to the first line.
                     let rule = egui::Rect::from_min_size(
                         bar.0.min,
-                        egui::vec2(3.0, response.rect.height()),
+                        egui::vec2(2.0, inner.response.rect.height().max(TEXT)),
                     );
-                    ui.painter().rect_filled(rule, 1.0, theme::ember_deep());
+                    ui.painter().rect_filled(rule, 1.0, theme::border());
                 });
-                ui.add_space(9.0);
+                ui.add_space(SPACE_MD);
             }
             Block::ListItem { marker, text, indent } => {
                 ui.horizontal_top(|ui| {
-                    ui.add_space(10.0 + indent as f32 * 14.0);
-                    ui.label(RichText::new(marker).color(theme::ember()).monospace().size(13.0));
+                    ui.spacing_mut().item_spacing.x = SPACE_MD;
+                    ui.add_space(SPACE_MD + indent as f32 * 16.0);
+                    // The marker is dim, not accent-coloured: a list of ten
+                    // bullets in the app's one accent colour reads as ten
+                    // things demanding attention.
+                    ui.label(
+                        RichText::new(marker)
+                            .color(theme::fg_dim())
+                            .font(egui::FontId::monospace(TEXT - 1.5)),
+                    );
                     let mut job = LayoutJob::default();
-                    inline(&mut job, &text, theme::fg(), 13.5, false);
+                    inline(&mut job, &text, theme::fg(), TEXT, false);
                     // Explicit wrap, for the same reason as a quote: the
                     // marker sits beside the text in a horizontal layout,
                     // where egui extends rather than wraps by default.
                     ui.add(egui::Label::new(job).wrap());
                 });
-                ui.add_space(4.0);
+                ui.add_space(SPACE_SM);
             }
             Block::Code { lang, lines } => {
                 let detected = detect_lang(&lang);
@@ -119,6 +151,11 @@ pub fn render(ui: &mut egui::Ui, md: &str) {
                     .corner_radius(theme::RADIUS_SM as f32)
                     .inner_margin(egui::Margin::symmetric(10, 8))
                     .show(ui, |ui| {
+                        // Every code block is the same width. Letting each
+                        // shrink to its longest line gives a document a
+                        // ragged column of differently sized boxes.
+                        ui.set_min_width(ui.available_width());
+                        ui.spacing_mut().item_spacing.y = 0.0;
                         for line in &lines {
                             let mut job = LayoutJob::default();
                             for span in
@@ -149,12 +186,18 @@ pub fn render(ui: &mut egui::Ui, md: &str) {
                             ui.label(job);
                         }
                     });
-                ui.add_space(6.0);
+                ui.add_space(SPACE_MD);
             }
             Block::Rule => {
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(10.0);
+                // A rule is a separator, not a section: the space around it
+                // reads as one gap rather than two.
+                ui.add_space(SPACE_MD);
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 1.0),
+                    egui::Sense::hover(),
+                );
+                ui.painter().rect_filled(rect, 0.0, theme::border());
+                ui.add_space(SPACE_MD);
             }
         }
     }
@@ -188,6 +231,9 @@ fn parse(md: &str) -> Vec<Block> {
     let mut blocks = Vec::new();
     let mut paragraph: Vec<String> = Vec::new();
     let mut lines = md.lines().peekable();
+    // Whether the previous line was part of a blockquote. A blank line ends
+    // one, so `> a` / blank / `> b` is two quotes rather than one with a gap.
+    let mut in_quote = false;
 
     // Paragraph lines accumulate until a blank line or a block-level marker.
     macro_rules! flush {
@@ -206,6 +252,7 @@ fn parse(md: &str) -> Vec<Block> {
 
         if lean.is_empty() {
             flush!();
+            in_quote = false;
             continue;
         }
 
@@ -239,9 +286,15 @@ fn parse(md: &str) -> Vec<Block> {
 
         if let Some(text) = lean.strip_prefix("> ").or_else(|| lean.strip_prefix(">")) {
             flush!();
-            blocks.push(Block::Quote(text.trim().to_string()));
+            let text = text.trim().to_string();
+            match blocks.last_mut() {
+                Some(Block::Quote(lines)) if in_quote => lines.push(text),
+                _ => blocks.push(Block::Quote(vec![text])),
+            }
+            in_quote = true;
             continue;
         }
+        in_quote = false;
 
         if let Some((marker, text)) = list_item(lean) {
             flush!();
@@ -311,30 +364,33 @@ fn inline(job: &mut LayoutJob, text: &str, color: Color32, size: f32, strong: bo
         if s.is_empty() {
             return;
         }
-        // No bold face is loaded, so emphasis reads as a brighter tone rather
-        // than a heavier weight. Changing the font here would be a no-op.
+        let heavy = bold || strong;
         let color = if code {
             theme::teal()
-        } else if bold || strong {
-            STRONG
+        } else if heavy {
+            theme::strong_fg()
         } else {
             color
+        };
+        // Real faces, so emphasis is emphasis. There is no bold-italic
+        // bundled, and italic carries a phrase better than weight does, so
+        // `***both***` renders italic rather than shipping a fourth file for
+        // a construct almost nothing uses.
+        let font_id = if code {
+            FontId::monospace(size - 1.0)
+        } else if italics {
+            theme::italic(size)
+        } else if heavy {
+            theme::semibold(size)
+        } else {
+            FontId::proportional(size)
         };
         job.append(
             s,
             0.0,
             TextFormat {
-                font_id: if code {
-                    FontId::monospace(size - 1.0)
-                } else {
-                    FontId::proportional(size)
-                },
+                font_id,
                 color,
-                italics,
-                // No bold face is loaded, so weight is faked with colour and
-                // a little tracking. It is not a real bold, but it is the
-                // difference between "I can see the emphasis" and not.
-                extra_letter_spacing: if bold || strong { 0.4 } else { 0.0 },
                 // Inline code reads as a chip, the way it does everywhere
                 // else Markdown is rendered.
                 background: if code { theme::panel2() } else { Color32::TRANSPARENT },
@@ -362,12 +418,21 @@ fn inline(job: &mut LayoutJob, text: &str, color: Color32, size: f32, strong: bo
         if c == '*' || c == '_' {
             let double = i + 1 < bytes.len() && bytes[i + 1] == c;
             let marker_len = if double { 2 } else { 1 };
-            if let Some(end) = find_run(&bytes, i + marker_len, c, marker_len) {
+            // An opener cannot be followed by a space. Without this rule the
+            // `*` in "a lone * asterisk" opens emphasis and swallows the
+            // sentence up to the next asterisk — which is exactly what a
+            // reader did not write.
+            let opens = bytes
+                .get(i + marker_len)
+                .is_some_and(|c| !c.is_whitespace());
+            if let Some(end) = opens
+                .then(|| find_run(&bytes, i + marker_len, c, marker_len))
+                .flatten()
+            {
                 push(job, &buf, false, false, false);
                 buf.clear();
                 let inner: String = bytes[i + marker_len..end].iter().collect();
                 if double {
-                    // Bold: brighten instead of changing weight.
                     push(job, &inner, true, false, false);
                 } else {
                     push(job, &inner, false, true, false);
@@ -389,7 +454,13 @@ fn inline(job: &mut LayoutJob, text: &str, color: Color32, size: f32, strong: bo
                             TextFormat {
                                 font_id: FontId::proportional(size),
                                 color: theme::teal(),
-                                underline: egui::Stroke::new(1.0_f32, theme::teal()),
+                                // A hairline under the label rather than a
+                                // full-weight rule: a paragraph of links
+                                // should not read as a stack of underscores.
+                                underline: egui::Stroke::new(
+                                    1.0_f32,
+                                    theme::teal().gamma_multiply(0.5),
+                                ),
                                 ..Default::default()
                             },
                         );
@@ -409,13 +480,19 @@ fn find_from(chars: &[char], start: usize, needle: char) -> Option<usize> {
     (start..chars.len()).find(|&i| chars[i] == needle)
 }
 
-/// Finds a run of `len` copies of `marker` at or after `start`.
+/// Finds the run of `len` copies of `marker` that closes an emphasis span
+/// opened at `start`.
+///
+/// A closer cannot be preceded by whitespace, the mirror of the rule for
+/// openers: in "an unclosed *bold, and a stray * here" the second asterisk
+/// follows a space, so it closes nothing and both are text.
 fn find_run(chars: &[char], start: usize, marker: char, len: usize) -> Option<usize> {
     let mut i = start;
     while i + len <= chars.len() {
         if chars[i..i + len].iter().all(|c| *c == marker) {
+            let after_text = chars[i - 1].is_whitespace();
             // Reject an empty span (`**` immediately closing).
-            if i > start {
+            if i > start && !after_text {
                 return Some(i);
             }
         }
@@ -440,6 +517,73 @@ mod tests {
                 Block::Rule => "rule",
             })
             .collect()
+    }
+
+    /// The spans `inline` produced, as `(text, bold, italic)`.
+    fn spans(text: &str) -> Vec<(String, bool, bool)> {
+        let mut job = LayoutJob::default();
+        inline(&mut job, text, theme::fg(), TEXT, false);
+        job.sections
+            .iter()
+            .map(|s| {
+                let name = match &s.format.font_id.family {
+                    egui::FontFamily::Name(n) => n.to_string(),
+                    other => format!("{other:?}"),
+                };
+                (
+                    job.text[s.byte_range.clone()].to_string(),
+                    name == "semibold",
+                    name == "italic",
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn emphasis_uses_a_real_face_rather_than_a_colour() {
+        let spans = spans("plain **bold** and *italic* here");
+        let bold = spans.iter().find(|(t, ..)| t == "bold").expect("no bold span");
+        assert!(bold.1, "bold is not set in the semibold face");
+        let italic = spans.iter().find(|(t, ..)| t == "italic").expect("no italic span");
+        assert!(italic.2, "italic is not set in the italic face");
+        // And ordinary text is left alone.
+        assert!(spans.iter().any(|(t, b, i)| t.contains("plain") && !b && !i));
+    }
+
+    #[test]
+    fn a_marker_with_a_space_after_it_is_not_emphasis() {
+        // The sentence a reader actually wrote. Treating the first asterisk
+        // as an opener italicises everything up to the next one.
+        let spans = spans("a lone * asterisk, then an unclosed *bold");
+        assert!(
+            spans.iter().all(|(_, bold, italic)| !bold && !italic),
+            "something was emphasised: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn a_marker_with_a_space_before_it_closes_nothing() {
+        let spans = spans("*opened but the closer has a space before it *");
+        assert!(spans.iter().all(|(_, _, italic)| !italic), "{spans:?}");
+    }
+
+    #[test]
+    fn consecutive_quoted_lines_are_one_blockquote() {
+        // Five bars with five gaps is not a blockquote, it is a list of stubs.
+        let md = "> first line\n> second line\n> third line\n";
+        assert_eq!(kinds(md), ["quote"]);
+        match &parse(md)[0] {
+            Block::Quote(lines) => assert_eq!(lines.len(), 3, "{lines:?}"),
+            _ => panic!("expected one quote block, got {:?}", kinds(md)),
+        }
+    }
+
+    #[test]
+    fn a_blank_line_ends_a_blockquote() {
+        // Two quoted passages, not one with a hole in it.
+        assert_eq!(kinds("> one\n\n> two\n"), ["quote", "quote"]);
+        // And a paragraph between them separates them too.
+        assert_eq!(kinds("> one\nplain\n> two\n"), ["quote", "para", "quote"]);
     }
 
     #[test]
@@ -570,7 +714,9 @@ mod tests {
         assert!(count("heading") >= 12, "headings: {}", count("heading"));
         assert!(count("code") >= 14, "code blocks: {}", count("code"));
         assert!(count("item") >= 18, "list items: {}", count("item"));
-        assert!(count("quote") >= 4, "quotes: {}", count("quote"));
+        // Consecutive `>` lines are one quote, so this counts quoted
+        // passages rather than quoted lines.
+        assert!(count("quote") >= 3, "quotes: {}", count("quote"));
         assert!(count("rule") >= 8, "rules: {}", count("rule"));
     }
 
@@ -613,7 +759,7 @@ mod tests {
     #[test]
     fn the_showcase_renders_without_panicking() {
         let md = showcase();
-        egui::__run_test_ctx(|ctx| {
+        theme::run_test_ctx(|ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 render(ui, &md);
             });
@@ -623,7 +769,7 @@ mod tests {
     /// Renders `md` into a Ui of exactly `width` and reports the size the
     /// content actually took.
     ///
-    /// A real `Context` (not `__run_test_ctx`) because that one loads no
+    /// A real `Context` (not the test one) because that one loads no
     /// fonts, and text with no glyphs has no width to measure. Two passes,
     /// since the first lays out before the font atlas is warm.
     fn rendered_size(md: &str, width: f32) -> egui::Vec2 {

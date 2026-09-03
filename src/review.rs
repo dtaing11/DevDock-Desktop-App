@@ -135,6 +135,14 @@ pub struct Finding {
     /// the reviewer offered none.
     #[serde(default)]
     pub evidence: String,
+    /// Whether a verifier looked at this finding and stood by it.
+    ///
+    /// False also means "never examined": a finding the verifier ran out of
+    /// budget before reaching is kept, because silence is not a verdict — but
+    /// it has not been checked, and a reader deciding whether to override a
+    /// gate deserves to know which of the two it is.
+    #[serde(default)]
+    pub verified: bool,
 }
 
 /// The result of one review pass.
@@ -602,12 +610,15 @@ pub fn verify(
 
     // 2. The model, with the whole repository, judging its own findings.
     if !kept.is_empty() {
+        // The budget is per finding, not per review. Verification checks each
+        // finding independently — a couple of reads apiece — so a fixed pool
+        // is spent on the first few and the rest are never examined. They are
+        // then kept, which is right, and indistinguishable from findings that
+        // survived scrutiny, which is not.
         let limits = crate::agent::Limits {
-            // Verification reads more than finding does: it has to check
-            // each finding independently, and the cheap way to be wrong is
-            // to run out of budget halfway and keep the rest unexamined.
-            max_tool_calls: config.max_context_calls.saturating_mul(2).max(24),
-            max_turns: (config.max_context_calls / 2).clamp(6, 24),
+            max_tool_calls: (CALLS_PER_FINDING * kept.len())
+                .clamp(config.max_context_calls, MAX_VERIFY_CALLS),
+            max_turns: (TURNS_PER_FINDING * kept.len()).clamp(6, MAX_VERIFY_TURNS),
             ..config.limits()
         };
         match crate::agent::run(
@@ -627,16 +638,35 @@ pub fn verify(
                         .push("! verification returned nothing usable; findings kept".into());
                 } else {
                     let mut survivors = Vec::new();
-                    for (i, finding) in kept.into_iter().enumerate() {
+                    let mut unjudged = 0;
+                    for (i, mut finding) in kept.into_iter().enumerate() {
                         match verdicts.iter().find(|(index, ..)| *index == i) {
                             Some((_, false, why)) => outcome.context_log.push(format!(
                                 "! dropped \"{}\" — {why}",
                                 finding.title
                             )),
+                            Some((_, true, _)) => {
+                                finding.verified = true;
+                                survivors.push(finding);
+                            }
                             // Unjudged findings are kept: silence is not a
-                            // verdict.
-                            _ => survivors.push(finding),
+                            // verdict. But they are reported as unchecked
+                            // rather than passed off as having been examined.
+                            None => {
+                                unjudged += 1;
+                                outcome.context_log.push(format!(
+                                    "? not verified \"{}\" — the verifier did not \
+                                     reach it; kept unchecked",
+                                    finding.title
+                                ));
+                                survivors.push(finding);
+                            }
                         }
+                    }
+                    if unjudged > 0 {
+                        outcome.context_log.push(format!(
+                            "? {unjudged} finding(s) were kept without being checked"
+                        ));
                     }
                     kept = survivors;
                 }
@@ -712,6 +742,164 @@ fn check_citation(
         excerpt(&finding.evidence)
     ))
 }
+
+/// Which model reviews, and where to reach it.
+///
+/// Lives here rather than in the app, because the app is not the only thing
+/// that reviews: `devdock push` gates on the same config and has to run the
+/// same review, and it has no egui context to borrow the logic from.
+#[derive(Debug, Clone)]
+pub struct Reviewer {
+    /// "claude" or "ollama".
+    pub provider: String,
+    pub model: String,
+    /// Base URL for Ollama; ignored for Claude.
+    pub ollama_url: String,
+}
+
+impl Reviewer {
+    /// The reviewer a config asks for, if it names one.
+    ///
+    /// `fallback` is what the caller would use otherwise — the app's own
+    /// model picker, or nothing at all on the command line.
+    pub fn resolve(
+        config: &ReviewConfig,
+        fallback: Option<(String, String)>,
+        ollama_url: &str,
+    ) -> Option<Self> {
+        let (provider, model) = match (&config.provider, &config.model) {
+            (Some(p), Some(m)) => (p.clone(), m.clone()),
+            _ => {
+                let (p, m) = fallback?;
+                (
+                    config.provider.clone().unwrap_or(p),
+                    config.model.clone().unwrap_or(m),
+                )
+            }
+        };
+        Some(Self { provider, model, ollama_url: ollama_url.to_string() })
+    }
+
+    fn agent(&self) -> std::result::Result<Box<dyn crate::agent::Provider>, String> {
+        if self.provider == "claude" {
+            return crate::claude::Client::from_store(self.model.clone())
+                .map(|c| Box::new(c) as Box<dyn crate::agent::Provider>)
+                .ok_or_else(|| "Claude is not signed in.".to_string());
+        }
+        if self.model.trim().is_empty() {
+            return Err("No Ollama model selected.".into());
+        }
+        Ok(Box::new(crate::ollama::Client::new(&self.ollama_url).agent(self.model.clone())))
+    }
+
+    /// The diff-only review: one request, no tools. Used when `repo_context`
+    /// is off, and as the fallback for a model that cannot call tools.
+    fn single_shot(
+        &self,
+        diff: &str,
+        config: &ReviewConfig,
+    ) -> std::result::Result<ReviewOutcome, String> {
+        if self.provider == "claude" {
+            let client = crate::claude::Client::from_store(self.model.clone())
+                .ok_or("Claude is not signed in.")?;
+            return client.review(diff, config).map_err(|e| e.to_string());
+        }
+        crate::ollama::Client::new(&self.ollama_url)
+            .review(&self.model, diff, config)
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Reviews `diff` the way the configuration asks for, with the repository
+/// open to the model unless `repo_context` is off.
+///
+/// One path, used by the app's gate, its Checks tab, and `devdock push`, so
+/// that all three agree about what a review is.
+pub fn review_diff(
+    repo: &crate::git::Repo,
+    reviewer: &Reviewer,
+    diff: &str,
+    config: &ReviewConfig,
+    on_event: &mut dyn FnMut(crate::agent::Event),
+) -> std::result::Result<ReviewOutcome, String> {
+    let coverage = coverage_note(diff, config.max_diff_bytes);
+    let mut outcome = if !config.repo_context {
+        reviewer.single_shot(diff, config)?
+    } else {
+        match with_repo_context(repo, reviewer, diff, config, on_event) {
+            Err(e) if lacks_tool_support(&e) => {
+                // The model cannot call tools, so it cannot read the
+                // repository. Review the diff alone rather than failing: a
+                // gate that errors out gets switched off.
+                let mut outcome = reviewer.single_shot(diff, config)?;
+                outcome.context_log.push(format!("! {e}"));
+                outcome
+                    .context_log
+                    .push("! reviewed the diff alone, without repository context".into());
+                outcome
+            }
+            other => other?,
+        }
+    };
+    if let Some(note) = coverage {
+        outcome.context_log.push(note);
+    }
+    Ok(outcome)
+}
+
+fn with_repo_context(
+    repo: &crate::git::Repo,
+    reviewer: &Reviewer,
+    diff: &str,
+    config: &ReviewConfig,
+    on_event: &mut dyn FnMut(crate::agent::Event),
+) -> std::result::Result<ReviewOutcome, String> {
+    let provider = reviewer.agent()?;
+    let tracked = repo.tracked_files().map_err(|e| e.to_string())?;
+    let mut workspace =
+        crate::agent::Workspace::new(repo.path(), tracked, crate::agent::Access::ReadOnly)?;
+    run_with_context(provider.as_ref(), &mut workspace, diff, config, on_event)
+}
+
+/// Whether a failure means "this model cannot call tools", which is worth
+/// falling back for, as opposed to a real error worth reporting.
+pub fn lacks_tool_support(error: &str) -> bool {
+    let e = error.to_lowercase();
+    // Only these mean "this model cannot do tools at all". Anything else — a
+    // timeout, a 500, a refused connection — must propagate: silently
+    // downgrading to a diff-only review on a transient failure would hide
+    // that the reviewer never got its context.
+    [
+        "cannot call tools",
+        "does not support tools",
+        "tools are not supported",
+        "tool use is not supported",
+        "does not support tool",
+    ]
+    .iter()
+    .any(|phrase| e.contains(phrase))
+}
+
+/// Tool calls the verifier is given per finding it has to check.
+///
+/// Two reads and a search is a realistic cost for deciding whether one
+/// finding is real: the file it names, whatever calls it, and a look for the
+/// definition of whatever it depends on.
+const CALLS_PER_FINDING: usize = 8;
+
+/// Turns per finding.
+///
+/// Turns, not calls, are what runs out: a model batches its reads, so it
+/// spends a turn per question it wants answered rather than per file. Four is
+/// what it took to check a finding that needed a definition looked up and its
+/// caller read — with three, a four-finding review hit the ceiling with two
+/// findings still unexamined.
+const TURNS_PER_FINDING: usize = 4;
+
+/// Ceilings, so a review that somehow produced fifty findings cannot spend an
+/// unbounded number of requests checking them.
+const MAX_VERIFY_CALLS: usize = 120;
+const MAX_VERIFY_TURNS: usize = 40;
 
 const VERIFY_SYSTEM_PROMPT: &str = r#"You are checking a code review before it is shown to the developer. For each finding, decide whether it is a real defect in this code.
 
@@ -1007,6 +1195,8 @@ pub fn parse(text: &str) -> ReviewOutcome {
             },
             detail: f.detail.trim().to_string(),
             evidence: f.evidence.trim().to_string(),
+            // Nothing has checked it yet; `verify` is what sets this.
+            verified: false,
         })
         .collect();
 

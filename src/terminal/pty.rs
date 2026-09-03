@@ -180,11 +180,28 @@ impl Pty {
         }
     }
 
-    /// Sends a signal to the child's process group, the way a real terminal
-    /// does when you press ^C.
+    /// Sends a signal to whatever is in the foreground, the way a real
+    /// terminal does when you press ^C.
+    ///
+    /// The foreground process group, not the shell's: `sh` runs each command
+    /// it starts in a process group of its own, so signalling the shell's
+    /// group leaves the running command untouched and interrupts nothing. The
+    /// tty knows which group is in front — that is what `tcgetpgrp` is for,
+    /// and it is what the kernel's own line discipline uses to deliver ^C.
     pub fn signal(&self, signal: i32) {
+        // SAFETY: the fd is ours; the group is this tty's own foreground.
+        let group = unsafe { libc::tcgetpgrp(self.master) };
+        let group = if group > 0 { group } else { self.pid };
         // SAFETY: killing our own child's group.
-        unsafe { libc::killpg(self.pid, signal) };
+        unsafe { libc::killpg(group, signal) };
+    }
+
+    /// The process group currently in the foreground of this terminal, if the
+    /// tty will say.
+    fn foreground(&self) -> Option<libc::pid_t> {
+        // SAFETY: the fd is ours.
+        let group = unsafe { libc::tcgetpgrp(self.master) };
+        (group > 0).then_some(group)
     }
 
     /// The screen's text, for tests and for copying out.
@@ -195,8 +212,16 @@ impl Pty {
 
 impl Drop for Pty {
     fn drop(&mut self) {
-        // A terminal whose panel is closed must not leave a shell running.
+        // A terminal whose panel is closed must not leave a shell running —
+        // nor whatever the shell was running. That is a separate process
+        // group, so it needs signalling separately: killing only the shell
+        // orphans a build, a server, or a `tail -f` with nowhere to write.
+        let foreground = self.foreground().filter(|g| *g != self.pid);
         unsafe {
+            if let Some(group) = foreground {
+                libc::killpg(group, libc::SIGHUP);
+                libc::killpg(group, libc::SIGKILL);
+            }
             libc::killpg(self.pid, libc::SIGHUP);
             libc::kill(self.pid, libc::SIGKILL);
             let mut status = 0;

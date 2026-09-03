@@ -10,6 +10,9 @@
 //!   merge/rebase, conflict resolution, and remote sync.
 //! - [`github`]: GitHub device-flow sign-in, token storage, and the pull
 //!   request subset of the REST API.
+//! - [`stack`]: stacked pull requests — the chain of parent branches that
+//!   turns one large change into a reviewable series, and the restack /
+//!   submit / sync operations that keep it in order.
 //! - [`ollama`]: local Ollama client that turns diffs into commit messages.
 //! - [`app`]: the egui desktop application built on top of the layers above.
 
@@ -25,4 +28,5 @@ pub mod lsp;
 pub mod ollama;
 pub mod review;
 pub mod secure_store;
+pub mod stack;
 pub mod terminal;

@@ -21,6 +21,9 @@ macOS/Windows since egui is cross-platform).
   files it needs, proposes a merge for each conflict plus any other file the
   merge requires touching, and shows you every change as a diff. Nothing is
   written until you tick it and apply.
+- **Markdown, rendered**: `.md` files, AI review output, and the coding
+  agent's summaries are rendered rather than dumped as source — real bold and
+  italic faces, syntax-highlighted fenced code, blockquotes, lists, and links.
 - **Code editor** with **language server** support: diagnostics inline, hover
   types, go-to-definition, find references, an outline, completion, format on
   save, and workspace rename. Servers start on demand (rust-analyzer, pyright,
@@ -33,6 +36,12 @@ macOS/Windows since egui is cross-platform).
   (with an AI-generated title and description written from **every commit on
   the branch** — its subjects, bodies, and full diff against the base — not
   from whatever happens to be staged).
+- **Stacked pull requests**: split one large change into a chain of branches,
+  each PR targeting the branch below it so every reviewer sees one focused
+  diff. DevDock keeps the chain in order — restack after any branch changes,
+  push and open every PR in one action, write a stack map into each body, and
+  drop merged branches out of the stack after they land.
+  See [docs/stacked-prs.md](docs/stacked-prs.md).
 
 ## Install
 
@@ -154,20 +163,24 @@ src/
   github.rs    Device-flow auth + PR REST API (library, reusable)
   ollama.rs    Commit-message generation client (library, reusable)
   review.rs    The AI review gate: config, prompts, findings, thresholds
+  stack.rs     Stacked pull requests: the parent chain, restack, submit, sync
   agent/       Tool-use harness: read, edit, language server, and check
                tools; the conflict resolver and the coding agent run on it
   lsp/         Language server client: JSON-RPC over stdio, one process per
                server, diagnostics and navigation for the editor and agent
   app/
     mod.rs     App state, config, background message pump
-    theme.rs   Visual identity (indigo/ember/teal, not a GitHub clone)
+    theme.rs   Visual identity: colour tokens, type scale, bundled fonts
+    markdown.rs  Markdown rendering for reviews, agent summaries, and .md files
     views.rs   Toolbar, sidebar, diff panel
-    dialogs.rs Repo picker, GitHub, PRs, conflicts, settings
+    dialogs.rs Repo picker, GitHub, PRs, stacks, conflicts, settings
     editor.rs  Code editor: buffers, highlighting, LSP interactions
     agent_tab.rs The coding agent's task panel and change review
     worker.rs  Background thread runner
 tests/
   workflow.rs  End-to-end git workflow tests against throwaway repos
+  stack.rs     Stacked PRs: parent links, restacking, merge detection
+  stack_live.rs  The same flow against real GitHub (ignored by default)
   agent.rs     Harness tests: sandbox limits, proposals, applied merges,
                and the coding agent against a real server and real checks
   lsp.rs       Language server client, against a real child process
@@ -183,6 +196,19 @@ cargo test        # unit + integration tests
 cargo clippy      # lints
 cargo run         # debug build
 ```
+
+Some tests talk to real services and are ignored by default — a language
+server, an Ollama or Claude model, and GitHub:
+
+```sh
+cargo test --test stack_live -- --ignored --nocapture
+```
+
+That one creates a private scratch repository, opens a three-branch stack of
+pull requests in it, squash-merges the bottom one, syncs, and checks that the
+pull request above it was rebased and retargeted. It prints the repository's
+URL at the end; deleting it needs the `delete_repo` scope, which the app never
+asks for, so tidy it up by hand.
 
 ## License
 

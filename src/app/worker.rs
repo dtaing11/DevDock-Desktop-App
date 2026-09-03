@@ -77,6 +77,11 @@ pub enum Msg {
     SearchHits(Vec<crate::git::GrepHit>),
     /// Recent `HEAD` movements, for the undo dialog.
     Reflog(Result<Vec<crate::git::ReflogEntry>, String>),
+    /// The branch chain the current branch sits in.
+    Stack(Result<crate::stack::Stack, String>),
+    /// A stack operation finished: a toast message, the per-branch log the
+    /// stack view keeps, and whether it stopped in conflict.
+    StackDone { message: Result<String, String>, log: Vec<String>, conflicted: bool },
     /// A proposed split of the working tree into commits.
     SplitProposal(Result<crate::agent::split::Proposal, String>),
     /// A proposed rewrite of the branch, with the commits it was built from.

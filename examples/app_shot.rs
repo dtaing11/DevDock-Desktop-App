@@ -3,9 +3,13 @@
 //!
 //! `cargo run --example app_shot -- <repo> <tab> <out.rgba> [width] [height]`
 //! where tab is one of: changes, history, checks, editor, agent.
+//!
+//! `DIALOG=stack` opens a dialog over the app before the picture is taken.
+//! `AGENT_DEMO=running|changes` fills the coding agent with state, since a
+//! real run needs a model and a screenshot needs neither.
 
 use eframe::egui;
-use git_manage::app::{views, App, Tab};
+use git_manage::app::{views, App, ProposedEdit, Tab};
 
 struct Shot {
     app: App,
@@ -15,6 +19,8 @@ struct Shot {
     /// is undone, because a repository change clears the editor.
     open: Option<String>,
     shoot_at: u32,
+    /// Last observed size of the dialog named by `DIALOG_ID`.
+    last_modal: Option<egui::Vec2>,
 }
 
 impl eframe::App for Shot {
@@ -25,6 +31,14 @@ impl eframe::App for Shot {
             if let Some(file) = self.open.take() {
                 self.app.editor_open(std::path::Path::new(&file), None);
             }
+            if let Ok(mode) = std::env::var("AGENT_DEMO") {
+                seed_agent(&mut self.app, &mode);
+            }
+            match std::env::var("DIALOG").as_deref() {
+                Ok("stack") => self.app.open_stack(),
+                Ok("pr") => self.app.dialog = git_manage::app::Dialog::PullRequests,
+                _ => {}
+            }
             if std::env::var("TERMINAL").is_ok() {
                 self.app.terminal_open(false);
                 if let Ok(command) = std::env::var("TERMINAL_CMD") {
@@ -33,11 +47,16 @@ impl eframe::App for Shot {
             }
         }
 
+        // The same panels the app draws, in the same order, so a
+        // screenshot is of the app rather than of part of it.
+        views::toolbar(&mut self.app, ctx);
         views::sidebar(&mut self.app, ctx);
         // Bottom panel before the central one, as the app does it.
         #[cfg(unix)]
         git_manage::app::terminal_panel::panel(&mut self.app, ctx);
         views::diff_panel(&mut self.app, ctx);
+        git_manage::app::dialogs::show(&mut self.app, ctx);
+        views::toasts(&mut self.app, ctx);
 
         // The sidebar must not grow frame over frame: egui stores a panel's
         // width from its content, so a greedy child compounds.
@@ -55,6 +74,19 @@ impl eframe::App for Shot {
                 print!("  terminal {:.0}pt", state.rect.height());
             }
             println!();
+        }
+
+        // A modal is anchored from the size it had last frame, so one that is
+        // still filling in is drawn from a stale centre and can hang off the
+        // bottom for a frame. Printing the size makes that visible instead of
+        // it looking like a layout bug in the screenshot.
+        if let Ok(name) = std::env::var("DIALOG_ID") {
+            if let Some(state) = egui::AreaState::load(ctx, egui::Id::new(name.as_str())) {
+                if state.size != self.last_modal {
+                    self.last_modal = state.size;
+                    println!("frame {}: modal size {:?}", self.frame, state.size);
+                }
+            }
         }
 
         // Give background work (tracked files, language servers) a few
@@ -81,6 +113,63 @@ impl eframe::App for Shot {
             }
         }
         ctx.request_repaint();
+    }
+}
+
+/// Puts the coding agent into a state worth photographing.
+fn seed_agent(app: &mut App, mode: &str) {
+    use git_manage::agent::{PendingEdit, PlanStep};
+    let step = |text: &str, done: bool| PlanStep { text: text.into(), done };
+    app.tab = Tab::Agent;
+    app.coding.task = "add a --json flag to devdock status and cover it with a test".into();
+    app.coding.plan = vec![
+        step("Read the CLI argument parser", true),
+        step("Add a --json flag to `status`", true),
+        step("Serialise the status struct", mode == "changes"),
+        step("Write a test for the new output", false),
+        step("Run the test suite", false),
+    ];
+    app.coding.log = vec![
+        "· read src/cli.rs".into(),
+        "· read src/git.rs".into(),
+        "· plan: 2/5 done".into(),
+        "· edit src/cli.rs".into(),
+        "… the status struct already derives Serialize, so this is mostly wiring".into(),
+        "· edit src/cli.rs".into(),
+        "· run cargo test --lib cli".into(),
+    ];
+    app.coding.running = mode == "running";
+    app.coding.started = Some(std::time::Instant::now() - std::time::Duration::from_secs(74));
+    if mode == "changes" {
+        app.coding.running = false;
+        app.coding.took = Some(std::time::Duration::from_secs(96));
+        app.coding.summary = "Added a `--json` flag to `devdock status`.\n\n             The status struct already derived `Serialize`, so the flag only had to \
+             pick the encoder — **no new types**. The test covers the flag's output \
+             shape rather than its exact bytes, so field order cannot break it.\n\n             - `src/cli.rs` — the flag, and the branch that serialises\n             - `tests/workflow.rs` — one test, asserting the parsed JSON"
+            .into();
+        let edit = |path: &str, before: Option<&str>, after: &str| ProposedEdit {
+            edit: PendingEdit {
+                path: path.into(),
+                before: before.map(str::to_string),
+                after: after.into(),
+            },
+            accepted: false,
+            applied: false,
+            unresolved: false,
+        };
+        app.coding.edits = vec![
+            edit(
+                "src/cli.rs",
+                Some("fn status(repo: &Repo) -> Result<()> {\n    let s = repo.status()?;\n    println!(\"{}\", render(&s));\n    Ok(())\n}\n"),
+                "fn status(repo: &Repo, json: bool) -> Result<()> {\n    let s = repo.status()?;\n    if json {\n        println!(\"{}\", serde_json::to_string_pretty(&s)?);\n        return Ok(());\n    }\n    println!(\"{}\", render(&s));\n    Ok(())\n}\n",
+            ),
+            edit(
+                "tests/workflow.rs",
+                Some("#[test]\nfn status_reports_a_clean_tree() {\n    let (_tmp, repo) = setup();\n    assert!(repo.status().unwrap().files.is_empty());\n}\n"),
+                "#[test]\nfn status_reports_a_clean_tree() {\n    let (_tmp, repo) = setup();\n    assert!(repo.status().unwrap().files.is_empty());\n}\n\n#[test]\nfn status_json_carries_the_branch_and_files() {\n    let (_tmp, repo) = setup();\n    let out = run_cli(&repo, &[\"status\", \"--json\"]);\n    let value: serde_json::Value = serde_json::from_str(&out).unwrap();\n    assert_eq!(value[\"branch\"], \"main\");\n    assert!(value[\"files\"].is_array());\n}\n",
+            ),
+        ];
+        app.coding.selected = Some(0);
     }
 }
 
@@ -118,7 +207,14 @@ fn main() -> eframe::Result<()> {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30);
-            Ok(Box::new(Shot { app, out, frame: 0, open: open.clone(), shoot_at }))
+            Ok(Box::new(Shot {
+                app,
+                out,
+                frame: 0,
+                open: open.clone(),
+                shoot_at,
+                last_modal: None,
+            }))
         }),
     )
 }

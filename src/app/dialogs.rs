@@ -33,6 +33,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         Dialog::CommandPalette => command_palette(app, ctx, &mut open),
         Dialog::SplitCommits => split_dialog(app, ctx, &mut open),
         Dialog::TidyHistory => tidy_dialog(app, ctx, &mut open),
+        Dialog::Stack => stack_dialog(app, ctx, &mut open),
     }
     // Dismissing a gate with the X is a deferred decision, not an approval:
     // the modal closes but the held action stays available behind the
@@ -96,10 +97,13 @@ fn modal(
 
             // Title bar with a close button.
             ui.horizontal(|ui| {
-                ui.label(RichText::new(title).strong().size(16.0));
+                ui.label(theme::heading(title, theme::TITLE));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
-                        .add(egui::Button::new(RichText::new("Close").size(13.0)))
+                        .add(
+                            egui::Button::new(RichText::new("Close").size(theme::TEXT))
+                                .min_size(egui::vec2(0.0, theme::CONTROL_SM)),
+                        )
                         .on_hover_text("Or press Esc")
                         .clicked()
                     {
@@ -297,7 +301,7 @@ fn github_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                     RichText::new(&device.user_code)
                         .color(theme::ember())
                         .monospace()
-                        .size(18.0),
+                        .size(theme::TITLE + 2.0),
                 );
                 if ui.small_button("Copy").clicked() {
                     ctx.copy_text(device.user_code.clone());
@@ -403,6 +407,15 @@ fn pull_requests(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                 // Runs the AI reviewer first when `[review] run = true`;
                 // creates the PR straight away otherwise.
                 app.gate_with_review(crate::app::GatedAction::PullRequest);
+            }
+            if ui
+                .button("Stack…")
+                .on_hover_text(
+                    "Split this into a chain of smaller pull requests, each                      reviewed against the one below it",
+                )
+                .clicked()
+            {
+                app.open_stack();
             }
         });
 
@@ -513,6 +526,307 @@ fn pull_requests(app: &mut App, ctx: &egui::Context, open: &mut bool) {
 }
 
 // ---------------------------------------------------------------------------
+// Stacked pull requests
+// ---------------------------------------------------------------------------
+
+/// The chain of branches the current one sits in, and its pull requests.
+///
+/// Drawn top-first, the way the branches sit and the way the block in each PR
+/// body reads: the trunk is the floor, everything else rests on what is
+/// printed below it.
+fn stack_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
+    modal(ctx, "Stacked pull requests", open, |ui| {
+        ui.set_min_width(620.0);
+
+        let Some(stack) = app.stack.stack.clone() else {
+            ui.label(
+                RichText::new(if app.stack.loading {
+                    "Reading the stack…"
+                } else {
+                    "No stack for this branch."
+                })
+                .color(theme::fg_dim()),
+            );
+            return;
+        };
+
+        ui.label(
+            RichText::new(
+                "Each branch is reviewed on its own: its pull request targets the \
+                 branch below it, not the trunk.",
+            )
+            .color(theme::fg_dim())
+            .small(),
+        );
+        ui.add_space(8.0);
+
+        if stack.is_empty() {
+            ui.label(
+                RichText::new(format!(
+                    "`{}` is the trunk. Start a branch on it to open a stack.",
+                    stack.trunk
+                ))
+                .color(theme::fg_dim()),
+            );
+        }
+
+        let locals: Vec<String> = app
+            .branches
+            .as_ref()
+            .map(|b| b.local.iter().map(|br| br.name.clone()).collect())
+            .unwrap_or_default();
+        let busy = app.stack.busy;
+
+        // Top of the stack first; the trunk closes the list. A deep stack
+        // scrolls rather than pushing the actions off the bottom of the
+        // screen — they are the point of the dialog.
+        ScrollArea::vertical().max_height(340.0).id_salt("stack-entries").show(ui, |ui| {
+            for (i, entry) in stack.entries.iter().enumerate().rev() {
+                stack_entry_row(app, ui, &stack, i, entry, &locals, busy);
+            }
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("└").color(theme::border()).monospace());
+                ui.label(RichText::new(&stack.trunk).color(theme::fg_dim()).monospace());
+                ui.label(RichText::new("trunk").color(theme::fg_dim()).small());
+            });
+
+            if !stack.forks.is_empty() {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!(
+                        "Also stacked here: {}. A stack is one chain, so these are \
+                         left out of it.",
+                        stack.forks.join(", ")
+                    ))
+                    .color(theme::warn())
+                    .small(),
+                );
+            }
+        });
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        // New branch on top.
+        ui.horizontal(|ui| {
+            ui.label("New branch on");
+            ui.label(RichText::new(stack.tip()).color(theme::ember()).monospace());
+            ui.add(
+                egui::TextEdit::singleline(&mut app.stack.new_branch)
+                    .hint_text("branch name")
+                    .desired_width(180.0),
+            );
+            let can = !busy && !app.stack.new_branch.trim().is_empty();
+            if ui.add_enabled(can, egui::Button::new("Start")).clicked() {
+                app.stack_branch_on_tip();
+            }
+        });
+
+        ui.add_space(6.0);
+
+        let stale = stack.stale().len();
+        ui.horizontal(|ui| {
+            let restack = egui::Button::new("Restack")
+                .min_size(egui::vec2(0.0, theme::CONTROL_MD));
+            if ui
+                .add_enabled(!busy && !stack.is_empty(), restack)
+                .on_hover_text(
+                    "Rebases every branch back on top of its parent, bottom-up. \
+                     Needs a clean working tree.",
+                )
+                .clicked()
+            {
+                app.stack_restack();
+            }
+            let push = egui::Button::new("Push all")
+                .min_size(egui::vec2(0.0, theme::CONTROL_MD));
+            if ui
+                .add_enabled(!busy && !stack.is_empty(), push)
+                .on_hover_text("Force-pushes every branch (with lease). Opens nothing.")
+                .clicked()
+            {
+                app.stack_push();
+            }
+            let submit = egui::Button::new(RichText::new("Submit stack").strong())
+                .fill(theme::ember())
+                .min_size(egui::vec2(0.0, theme::CONTROL_MD));
+            let can_submit = !busy && !stack.is_empty() && stale == 0;
+            let response = ui.add_enabled(can_submit, submit);
+            let response = if stale > 0 {
+                response.on_disabled_hover_text(format!(
+                    "{stale} branch(es) are behind their parent. Restack first, or \
+                     their pull requests will show the changes below them too."
+                ))
+            } else {
+                response.on_hover_text(
+                    "Pushes the stack, opens or retargets a pull request for each \
+                     branch, and writes the stack map into every body.",
+                )
+            };
+            if response.clicked() {
+                app.stack_submit();
+            }
+            let sync = egui::Button::new("Sync")
+                .min_size(egui::vec2(0.0, theme::CONTROL_MD));
+            if ui
+                .add_enabled(!busy && !stack.is_empty(), sync)
+                .on_hover_text(
+                    "Fetches, drops branches whose pull requests have merged, and \
+                     rebases the rest onto the trunk.",
+                )
+                .clicked()
+            {
+                app.stack_sync();
+            }
+            if busy {
+                ui.spinner();
+            }
+        });
+
+        if !app.stack.log.is_empty() {
+            ui.add_space(6.0);
+            let log = app.stack.log.clone();
+            egui::CollapsingHeader::new(format!("Activity ({})", log.len()))
+                .default_open(true)
+                .id_salt("stack-log")
+                .show(ui, |ui| {
+                    ScrollArea::vertical().max_height(140.0).id_salt("stack-log-body").show(
+                        ui,
+                        |ui| {
+                            for line in &log {
+                                ui.label(
+                                    RichText::new(line)
+                                        .small()
+                                        .monospace()
+                                        .color(theme::fg_dim()),
+                                );
+                            }
+                        },
+                    );
+                });
+        }
+    });
+}
+
+/// One branch in the stack view.
+fn stack_entry_row(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    stack: &crate::stack::Stack,
+    index: usize,
+    entry: &crate::stack::StackEntry,
+    locals: &[String],
+    busy: bool,
+) {
+    let current = stack.current == Some(index);
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(if current { "●" } else { "○" })
+                .color(if current { theme::ember() } else { theme::border() })
+                .monospace(),
+        );
+        ui.label(
+            RichText::new(&entry.branch)
+                .color(if current { theme::ember() } else { theme::fg() })
+                .monospace()
+                .strong(),
+        );
+
+        // The pull request, if this branch has one.
+        match entry.pr {
+            Some(number) => {
+                let pr = app.pr.open_prs.iter().find(|p| p.number == number).cloned();
+                let url = pr.as_ref().map(|p| p.html_url.clone());
+                if ui.link(RichText::new(format!("#{number}")).color(theme::teal())).clicked() {
+                    if let Some(url) = url {
+                        let _ = open::that(&url);
+                    }
+                }
+                if let Some(checks) = app.pr.checks.get(&number) {
+                    use crate::github::CheckState;
+                    let (label, color) = match checks.state {
+                        CheckState::Passing => ("[CI passing]", theme::add()),
+                        CheckState::Failing => ("[CI failing]", theme::danger()),
+                        CheckState::Pending => ("[CI running]", theme::warn()),
+                        CheckState::None => ("[no CI]", theme::fg_dim()),
+                    };
+                    ui.label(RichText::new(label).color(color).small());
+                }
+            }
+            None => {
+                ui.label(RichText::new("not submitted").color(theme::fg_dim()).small());
+            }
+        }
+
+        if entry.merged {
+            ui.label(RichText::new("[merged]").color(theme::add()).small())
+                .on_hover_text("Its changes are in the trunk. Sync to take it out of the stack.");
+        }
+        if entry.needs_restack {
+            ui.label(RichText::new("[behind]").color(theme::warn()).small()).on_hover_text(
+                format!("{} has commits this branch does not have.", entry.parent),
+            );
+        }
+    });
+
+    ui.horizontal(|ui| {
+        ui.add_space(16.0);
+        ui.label(
+            RichText::new(format!(
+                "{} commit(s) · {}",
+                entry.commits.len(),
+                entry.summary()
+            ))
+            .color(theme::fg_dim())
+            .small(),
+        );
+    });
+
+    ui.horizontal(|ui| {
+        ui.add_space(16.0);
+        if !current
+            && ui.add_enabled(!busy, egui::Button::new("Checkout").small()).clicked()
+        {
+            app.stack_checkout(entry.branch.clone());
+        }
+        let branch = entry.branch.clone();
+        ui.menu_button("Base…", |ui| {
+            ui.label(
+                RichText::new("What this branch is stacked on")
+                    .color(theme::fg_dim())
+                    .small(),
+            );
+            // The trunk first, then every other branch, each once.
+            let mut choices: Vec<String> = vec![stack.trunk.clone()];
+            for name in locals.iter().filter(|b| **b != branch) {
+                if !choices.contains(name) {
+                    choices.push(name.clone());
+                }
+            }
+            for name in choices {
+                if name == entry.parent {
+                    ui.label(RichText::new(format!("{name}  (current)")).color(theme::ember()));
+                    continue;
+                }
+                if ui.button(&name).clicked() {
+                    app.stack_set_parent(branch.clone(), name.clone());
+                    ui.close();
+                }
+            }
+        });
+        if ui
+            .add_enabled(!busy, egui::Button::new("Untrack").small())
+            .on_hover_text("Takes the branch out of the stack. The branch itself is kept.")
+            .clicked()
+        {
+            app.stack_untrack(entry.branch.clone());
+        }
+    });
+    ui.add_space(2.0);
+}
+
+// ---------------------------------------------------------------------------
 // AI review gate
 // ---------------------------------------------------------------------------
 
@@ -572,7 +886,7 @@ fn review_gate(app: &mut App, ctx: &egui::Context, open: &mut bool) {
 
         if !outcome.summary.is_empty() {
             ui.add_space(6.0);
-            ui.label(RichText::new(&outcome.summary).strong());
+            ui.label(RichText::new(&outcome.summary).font(theme::semibold(theme::TEXT)));
         }
 
         // The reviewer's own account of what it checked. This is what makes
@@ -608,7 +922,22 @@ fn review_gate(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                 if !where_.is_empty() {
                     ui.label(RichText::new(where_).color(theme::fg_dim()).small().monospace());
                 }
-                ui.label(RichText::new(&finding.title).strong());
+                ui.label(RichText::new(&finding.title).font(theme::semibold(theme::TEXT)));
+                // A finding the verifier never reached is kept — silence is
+                // not a verdict — but it is not the same as one that survived
+                // scrutiny, and someone deciding whether to override a gate
+                // should be able to tell them apart.
+                if !finding.verified {
+                    ui.label(
+                        RichText::new("unchecked")
+                            .size(theme::SMALL)
+                            .color(theme::warn()),
+                    )
+                    .on_hover_text(
+                        "The verifier did not examine this one — it ran out of \
+                         budget, or was switched off. Read it yourself.",
+                    );
+                }
             });
             if !finding.detail.is_empty() {
                 let expanded = app.review.expanded == Some(i);
@@ -669,7 +998,7 @@ fn checks_gate(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         ui.add_space(8.0);
 
         for (name, output) in &failed {
-            ui.label(RichText::new(name).color(theme::danger()).strong());
+            ui.label(RichText::new(name).color(theme::danger()).font(theme::semibold(theme::TEXT)));
             // The tail is where the failure is; the head is usually setup.
             let tail: Vec<&str> = output.lines().rev().take(8).collect();
             for line in tail.into_iter().rev() {
@@ -827,7 +1156,7 @@ fn conflict_resolver(app: &mut App, ctx: &egui::Context, open: &mut bool) {
             let ours = app.conflicts.files[i].ours.clone().unwrap_or_default();
             let theirs = app.conflicts.files[i].theirs.clone().unwrap_or_default();
             ui.separator();
-            ui.label(RichText::new(&path).color(theme::ember()).strong());
+            ui.label(RichText::new(&path).color(theme::ember()).font(theme::semibold(theme::TEXT)));
             ui.horizontal(|ui| {
                 if ui.button("Take ours (current branch)").clicked() {
                     resolve(app, &path, Resolution::Ours);
@@ -842,7 +1171,7 @@ fn conflict_resolver(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                 let ai_busy_here =
                     app.conflicts.ai_busy.as_deref() == Some(path.as_str());
                 if ai_busy_here {
-                    ui.add(egui::Spinner::new().size(14.0));
+                    ui.add(egui::Spinner::new().size(theme::SPINNER));
                     ui.label(RichText::new("AI is merging…").italics().weak());
                 } else if ui
                     .button("Resolve with AI")
@@ -1013,7 +1342,7 @@ fn pr_review(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         if app.pr.review.loading {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                ui.add(egui::Spinner::new().size(16.0));
+                ui.add(egui::Spinner::new().size(theme::SPINNER));
                 ui.label(RichText::new("Loading changed files…").italics().weak());
             });
             return;
@@ -1226,7 +1555,7 @@ fn pr_review(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         ui.horizontal(|ui| {
             let submitting = app.pr.review.submitting;
             if submitting {
-                ui.add(egui::Spinner::new().size(14.0));
+                ui.add(egui::Spinner::new().size(theme::SPINNER));
                 ui.label(RichText::new("Submitting…").italics().weak());
             } else {
                 let own_pr = app.gh.user.as_ref().map(|u| u.login == pr.user).unwrap_or(false);
@@ -1423,7 +1752,7 @@ fn agent_panel(app: &mut App, ui: &mut egui::Ui) {
         let busy = app.agent.running;
         let enabled = !busy && !app.conflicts.files.is_empty();
         if busy {
-            ui.add(egui::Spinner::new().size(14.0));
+            ui.add(egui::Spinner::new().size(theme::SPINNER));
             ui.label(RichText::new("AI is working through the repository…").italics().weak());
         } else if ui
             .add_enabled(
@@ -1636,13 +1965,27 @@ fn agent_changes(app: &mut App, ctx: &egui::Context, open: &mut bool) {
 /// both are asking the same question — is this change right? — and they
 /// should not answer it in two different visual languages.
 pub fn proposal_diff(ui: &mut egui::Ui, edit: &crate::agent::PendingEdit, salt: &str) {
+    ui.label(RichText::new(&edit.path).color(theme::ember()).font(theme::semibold(theme::TEXT)));
+    proposal_diff_body(ui, edit, Some(320.0), salt);
+}
+
+/// The diff itself, without the path above it.
+///
+/// `max_height` puts the lines in their own scroll area; `None` lets them run
+/// to their natural height, for a caller whose whole viewport already
+/// scrolls — a scroll area inside a scroll area is a trap for a mouse wheel.
+pub fn proposal_diff_body(
+    ui: &mut egui::Ui,
+    edit: &crate::agent::PendingEdit,
+    max_height: Option<f32>,
+    salt: &str,
+) {
     use crate::app::textdiff::Line;
 
-    ui.label(RichText::new(&edit.path).color(theme::ember()).strong());
     let lines = crate::app::textdiff::diff(edit.before.as_deref().unwrap_or(""), &edit.after);
     let lang = crate::app::syntax::Lang::from_path(&edit.path);
     let font = egui::TextStyle::Small.resolve(ui.style());
-    ScrollArea::vertical().max_height(320.0).id_salt(salt).show(ui, |ui| {
+    let draw = |ui: &mut egui::Ui| {
         for line in &lines {
             match line {
                 Line::Skipped(n) => {
@@ -1673,7 +2016,13 @@ pub fn proposal_diff(ui: &mut egui::Ui, edit: &crate::agent::PendingEdit, salt: 
                 }
             }
         }
-    });
+    };
+    match max_height {
+        Some(height) => {
+            ScrollArea::vertical().max_height(height).id_salt(salt).show(ui, draw);
+        }
+        None => draw(ui),
+    }
 }
 
 /// Everything the app can do, by name.
@@ -1850,7 +2199,7 @@ fn tidy_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
             for (i, group) in plan.groups.iter().enumerate() {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("{}.", i + 1)).color(theme::ember()).strong());
-                    ui.label(RichText::new(&group.summary).strong());
+                    ui.label(RichText::new(&group.summary).font(theme::semibold(theme::TEXT)));
                 });
                 if !group.description.trim().is_empty() {
                     ui.label(RichText::new(&group.description).small().color(theme::fg_dim()));
@@ -1917,7 +2266,7 @@ fn reflog_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
 
         if app.reflog.is_empty() {
             ui.horizontal(|ui| {
-                ui.add(egui::Spinner::new().size(14.0));
+                ui.add(egui::Spinner::new().size(theme::SPINNER));
                 ui.label(RichText::new("reading the reflog…").small().color(theme::fg_dim()));
             });
             return;
@@ -2381,7 +2730,7 @@ fn local_ci_panel(app: &mut App, ui: &mut egui::Ui) {
                 }
             }
             if app.ci_ai_busy {
-                ui.add(egui::Spinner::new().size(14.0));
+                ui.add(egui::Spinner::new().size(theme::SPINNER));
                 ui.label(RichText::new("AI is drafting…").italics().weak());
             } else if ui
                 .small_button("Generate with AI")

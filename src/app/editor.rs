@@ -458,7 +458,7 @@ pub fn editor_sidebar(app: &mut App, ui: &mut egui::Ui) {
 
     if app.editor.tree.is_empty() {
         ui.horizontal(|ui| {
-            ui.add(egui::Spinner::new().size(12.0));
+            ui.add(egui::Spinner::new().size(theme::SPINNER));
             ui.label(RichText::new("reading the work tree…").small().color(theme::fg_dim()));
         });
         run_actions(app, actions);
@@ -527,7 +527,7 @@ fn search_panel(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
             run = true;
         }
         if app.editor.search.running {
-            ui.add(egui::Spinner::new().size(12.0));
+            ui.add(egui::Spinner::new().size(theme::SPINNER));
         }
     });
     ui.separator();
@@ -989,7 +989,7 @@ fn viewport_header(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) 
                 actions.push(Action::Format);
             }
             if app.editor.busy > 0 {
-                ui.add(egui::Spinner::new().size(12.0));
+                ui.add(egui::Spinner::new().size(theme::SPINNER));
             }
             ui.checkbox(&mut app.editor.outline_open, "Outline");
             ui.checkbox(&mut app.editor.minimap, "Map");
@@ -1042,7 +1042,7 @@ fn quick_open(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
 
         if app.editor.quick_open.loading {
             ui.horizontal(|ui| {
-                ui.add(egui::Spinner::new().size(12.0));
+                ui.add(egui::Spinner::new().size(theme::SPINNER));
                 ui.label(RichText::new("listing files…").small().color(theme::fg_dim()));
             });
             return;

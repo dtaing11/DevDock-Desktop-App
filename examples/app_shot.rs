@@ -37,6 +37,13 @@ impl eframe::App for Shot {
             match std::env::var("DIALOG").as_deref() {
                 Ok("stack") => self.app.open_stack(),
                 Ok("pr") => self.app.dialog = git_manage::app::Dialog::PullRequests,
+                Ok("tickets") => {
+                    seed_tickets(&mut self.app);
+                    self.app.dialog = git_manage::app::Dialog::Tickets;
+                }
+                Ok("tickets-connect") => {
+                    self.app.dialog = git_manage::app::Dialog::Tickets;
+                }
                 _ => {}
             }
             if std::env::var("TERMINAL").is_ok() {
@@ -114,6 +121,87 @@ impl eframe::App for Shot {
         }
         ctx.request_repaint();
     }
+}
+
+/// Puts the ticket writer into a state worth photographing: connected, with
+/// a list and the drafts a model wrote from it.
+fn seed_tickets(app: &mut App) {
+    use git_manage::agent::tickets::Draft;
+    use git_manage::app::DraftedTicket;
+    use git_manage::jira::{IssueType, Project};
+
+    app.tickets.account = Some("Dina Taing".into());
+    app.tickets.creds.site = "https://acme.atlassian.net".into();
+    app.tickets.projects = vec![
+        Project { id: "1".into(), key: "DEV".into(), name: "DevDock".into() },
+        Project { id: "2".into(), key: "OPS".into(), name: "Operations".into() },
+    ];
+    app.tickets.project = "DEV".into();
+    app.tickets.types = ["Task", "Bug", "Story"]
+        .iter()
+        .enumerate()
+        .map(|(i, name)| IssueType {
+            id: i.to_string(),
+            name: (*name).into(),
+            subtask: false,
+        })
+        .collect();
+    app.tickets.list = "- add a --json flag to devdock status\n         - fix the crash when the repository has no commits\n         - document the local CI config"
+        .into();
+    app.tickets.notes = "The second one is a real crash; the others are small.".into();
+
+    let draft = |summary: &str, kind: &str, description: &str, labels: &[&str], from: &str| {
+        DraftedTicket {
+            draft: Draft {
+                summary: summary.into(),
+                description: description.into(),
+                issue_type: kind.into(),
+                labels: labels.iter().map(|l| (*l).to_string()).collect(),
+                source: vec![from.into()],
+            },
+            accepted: true,
+            created: None,
+            error: None,
+        }
+    };
+    app.tickets.drafts = vec![
+        draft(
+            "Add a --json flag to devdock status",
+            "Task",
+            "`cmd_status` in `src/cli.rs` prints through `render()`. The status \
+             struct already derives `Serialize`, so the flag only has to pick the \
+             encoder.\n\n**Done when** `devdock status --json` prints the same \
+             information as valid JSON, and a test asserts the parsed shape rather \
+             than the bytes.",
+            &["cli"],
+            "add a --json flag to devdock status",
+        ),
+        draft(
+            "Fix the crash when the repository has no commits",
+            "Bug",
+            "`Repo::log` returns an empty vector for a repository with no commits, \
+             but `branch_summary` unwraps the first entry.\n\n**Done when** \
+             opening a freshly initialised repository shows an empty history \
+             instead of panicking.",
+            &["crash"],
+            "fix the crash when the repository has no commits",
+        ),
+        draft(
+            "Document the local CI config",
+            "Task",
+            "`docs/local-ci.md` covers the jobs but not the `[review]` block that \
+             sits in the same file.",
+            &["docs"],
+            "document the local CI config",
+        ),
+    ];
+    app.tickets.drafts[2].created = Some(git_manage::jira::Issue {
+        id: "10041".into(),
+        key: "DEV-118".into(),
+        url: "https://acme.atlassian.net/browse/DEV-118".into(),
+    });
+    app.tickets.drafts[2].accepted = false;
+    app.tickets.expanded = Some(0);
 }
 
 /// Puts the coding agent into a state worth photographing.

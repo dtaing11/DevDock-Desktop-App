@@ -77,6 +77,16 @@ pub enum Msg {
     SearchHits(Vec<crate::git::GrepHit>),
     /// Recent `HEAD` movements, for the undo dialog.
     Reflog(Result<Vec<crate::git::ReflogEntry>, String>),
+    /// The Jira account the stored credentials belong to, and the projects
+    /// it can file into.
+    JiraConnected(Result<(String, Vec<crate::jira::Project>), String>),
+    /// Issue types for one project.
+    JiraTypes { project: String, types: Result<Vec<crate::jira::IssueType>, String> },
+    /// Tickets drafted from a list, awaiting confirmation.
+    TicketDrafts(Result<crate::agent::tickets::Proposal, String>),
+    /// One ticket created, or not.
+    TicketCreated { index: usize, result: Result<crate::jira::Issue, String> },
+
     /// The branch chain the current branch sits in.
     Stack(Result<crate::stack::Stack, String>),
     /// A stack operation finished: a toast message, the per-branch log the
@@ -140,6 +150,8 @@ pub enum AgentKind {
     Conflict,
     /// The coding agent, in its own tab.
     Coding,
+    /// The ticket writer, in its dialog.
+    Tickets,
 }
 
 /// Which AI task a provider/model selection belongs to. Each task picks its
@@ -157,6 +169,8 @@ pub enum AiTarget {
     Review,
     /// The coding agent, which does both and runs checks.
     Coding,
+    /// The ticket writer, which reads the repository to draft them.
+    Tickets,
 }
 
 impl AiTarget {
@@ -168,6 +182,7 @@ impl AiTarget {
             Self::Conflict => "conflict resolution",
             Self::Review => "code review",
             Self::Coding => "the coding agent",
+            Self::Tickets => "Jira tickets",
         }
     }
 }
@@ -208,6 +223,11 @@ impl Worker {
     }
 
     /// Runs `job` on a new thread and delivers its message to the UI.
+    /// A handle for sending progress from inside a job.
+    pub fn sender(&self) -> std::sync::mpsc::Sender<Msg> {
+        self.tx.clone()
+    }
+
     pub fn spawn(&self, job: impl FnOnce() -> Msg + Send + 'static) {
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();

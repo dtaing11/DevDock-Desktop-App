@@ -29,6 +29,7 @@ pub enum Cmd {
     Branches,
     PullRequests,
     Stack,
+    Tickets,
     Stash,
     History,
     SearchCommits,
@@ -88,6 +89,11 @@ pub fn commands() -> Vec<Command> {
             "Stacked pull requests",
             "stack chain of branches restack submit sync dependent prs",
             Cmd::Stack,
+        ),
+        c(
+            "Write Jira tickets",
+            "jira tickets issues from a list backlog sprint atlassian",
+            Cmd::Tickets,
         ),
         c("Stashes", "shelve changes for later", Cmd::Stash),
         c("Commit graph", "visualise branches and merges", Cmd::Graph),
@@ -178,6 +184,7 @@ pub fn run(app: &mut App, cmd: Cmd) {
         Cmd::Branches => app.tab = Tab::Changes,
         Cmd::PullRequests => app.dialog = Dialog::PullRequests,
         Cmd::Stack => app.open_stack(),
+        Cmd::Tickets => app.open_tickets(),
         Cmd::Stash => app.tab = Tab::Changes,
         Cmd::Graph => {
             app.graph_open = !app.graph_open;

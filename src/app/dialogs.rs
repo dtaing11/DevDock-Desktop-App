@@ -34,6 +34,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         Dialog::SplitCommits => split_dialog(app, ctx, &mut open),
         Dialog::TidyHistory => tidy_dialog(app, ctx, &mut open),
         Dialog::Stack => stack_dialog(app, ctx, &mut open),
+        Dialog::Tickets => tickets_dialog(app, ctx, &mut open),
     }
     // Dismissing a gate with the X is a deferred decision, not an approval:
     // the modal closes but the held action stays available behind the
@@ -523,6 +524,401 @@ fn pull_requests(app: &mut App, ctx: &egui::Context, open: &mut bool) {
             }
         });
     });
+}
+
+// ---------------------------------------------------------------------------
+// Jira tickets
+// ---------------------------------------------------------------------------
+
+/// Turns a list of work into Jira tickets: paste the list, let a model draft
+/// them against the repository, read what it wrote, create the ones you want.
+///
+/// Nothing reaches Jira until the Create button. Drafts are editable in place
+/// because the model will get a summary slightly wrong and retyping it in the
+/// browser afterwards defeats the point.
+fn tickets_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
+    modal(ctx, "Write Jira tickets", open, |ui| {
+        ui.set_min_width(720.0);
+
+        if app.tickets.account.is_none() {
+            jira_connect(app, ui);
+            return;
+        }
+        jira_target(app, ui);
+        ui.add_space(theme::UNIT * 2.0);
+        ui.separator();
+        ui.add_space(theme::UNIT * 2.0);
+
+        ui.label(theme::overline("THE LIST"));
+        ui.label(
+            RichText::new(
+                "One item per line. Bullets, numbers and checkboxes are understood; \
+                 every item ends up in a ticket.",
+            )
+            .size(theme::SMALL)
+            .color(theme::fg_dim()),
+        );
+        ui.add(
+            egui::TextEdit::multiline(&mut app.tickets.list)
+                .desired_rows(6)
+                .desired_width(f32::INFINITY)
+                .hint_text(super::views::dim_hint(
+                    "- add a --json flag to devdock status\n- fix the crash on an empty repository",
+                )),
+        );
+
+        ui.add_space(theme::UNIT);
+        ui.horizontal(|ui| {
+            let items = crate::agent::tickets::parse_list(&app.tickets.list).len();
+            let can_draft = !app.tickets.drafting && items > 0;
+            let label =
+                if app.tickets.drafting { "Drafting…".to_string() } else { "Draft tickets".to_string() };
+            if ui
+                .add_enabled(
+                    can_draft,
+                    egui::Button::new(RichText::new(label).strong())
+                        .fill(theme::ember())
+                        .min_size(egui::vec2(0.0, theme::CONTROL_MD)),
+                )
+                .on_hover_text(
+                    "The model reads the repository while it writes, so a ticket can \
+                     name the file rather than restate the bullet",
+                )
+                .clicked()
+            {
+                app.draft_tickets();
+            }
+            super::views::ai_model_picker(app, ui, crate::app::worker::AiTarget::Tickets);
+            if app.tickets.drafting {
+                ui.add(egui::Spinner::new().size(theme::SPINNER));
+            }
+            ui.label(
+                RichText::new(format!("{items} item(s)"))
+                    .size(theme::SMALL)
+                    .color(theme::fg_dim()),
+            );
+            if app.review.outcome.is_some()
+                && ui
+                    .button("From the review")
+                    .on_hover_text("Fill the list with the findings of the last AI review")
+                    .clicked()
+            {
+                app.tickets_from_review();
+            }
+        });
+
+        if app.tickets.drafting && !app.tickets.log.is_empty() {
+            let last = app.tickets.log.last().cloned().unwrap_or_default();
+            ui.label(
+                RichText::new(last).monospace().size(theme::SMALL).color(theme::fg_dim()),
+            );
+            ui.ctx().request_repaint();
+        }
+        if let Some(error) = app.tickets.error.clone() {
+            ui.add_space(theme::UNIT);
+            ui.label(RichText::new(error).color(theme::danger()));
+        }
+        if app.tickets.drafts.is_empty() {
+            return;
+        }
+
+        ui.add_space(theme::UNIT * 2.0);
+        ui.separator();
+        ui.add_space(theme::UNIT);
+        if !app.tickets.notes.trim().is_empty() {
+            ui.label(
+                RichText::new(app.tickets.notes.clone())
+                    .size(theme::SMALL)
+                    .color(theme::fg_dim()),
+            );
+            ui.add_space(theme::UNIT);
+        }
+        ticket_actions(app, ui);
+        ui.add_space(theme::UNIT);
+
+        ScrollArea::vertical().max_height(360.0).id_salt("ticket-drafts").show(ui, |ui| {
+            for i in 0..app.tickets.drafts.len() {
+                draft_card(app, ui, i);
+                ui.add_space(theme::UNIT * 2.0);
+            }
+        });
+    });
+}
+
+/// The connection form, shown until a token has been accepted by Jira.
+fn jira_connect(app: &mut App, ui: &mut egui::Ui) {
+    ui.label(
+        RichText::new(
+            "Connect a Jira Cloud site to file tickets into. The token is stored \
+             encrypted on this machine and sent only to that site.",
+        )
+        .color(theme::fg_dim()),
+    );
+    ui.add_space(theme::UNIT * 2.0);
+
+    egui::Grid::new("jira-connect").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+        ui.label("Site");
+        ui.add(
+            egui::TextEdit::singleline(&mut app.tickets.creds.site)
+                .hint_text(super::views::dim_hint("acme.atlassian.net"))
+                .desired_width(320.0),
+        );
+        ui.end_row();
+        ui.label("Email");
+        ui.add(
+            egui::TextEdit::singleline(&mut app.tickets.creds.email)
+                .hint_text(super::views::dim_hint("you@example.com"))
+                .desired_width(320.0),
+        );
+        ui.end_row();
+        ui.label("API token");
+        ui.add(
+            egui::TextEdit::singleline(&mut app.tickets.creds.token)
+                .password(true)
+                .hint_text(super::views::dim_hint("from id.atlassian.com"))
+                .desired_width(320.0),
+        );
+        ui.end_row();
+    });
+
+    ui.add_space(theme::UNIT * 2.0);
+    ui.horizontal(|ui| {
+        let connect = egui::Button::new(RichText::new("Connect").strong())
+            .fill(theme::ember())
+            .min_size(egui::vec2(0.0, theme::CONTROL_MD));
+        if ui.add_enabled(!app.tickets.connecting, connect).clicked() {
+            app.connect_jira();
+        }
+        if app.tickets.connecting {
+            ui.add(egui::Spinner::new().size(theme::SPINNER));
+        }
+        if ui
+            .button("Get a token")
+            .on_hover_text("Opens Atlassian's API token page")
+            .clicked()
+        {
+            let _ = open::that("https://id.atlassian.com/manage-profile/security/api-tokens");
+        }
+    });
+    if let Some(error) = app.tickets.connect_error.clone() {
+        ui.add_space(theme::UNIT);
+        ui.label(RichText::new(error).color(theme::danger()));
+    }
+}
+
+/// Who is connected, and which project and type new tickets go into.
+fn jira_target(app: &mut App, ui: &mut egui::Ui) {
+    let account = app.tickets.account.clone().unwrap_or_default();
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(&account).font(theme::semibold(theme::TEXT)));
+        ui.label(
+            RichText::new(app.tickets.creds.site.replace("https://", ""))
+                .size(theme::SMALL)
+                .color(theme::fg_dim()),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button("Sign out").clicked() {
+                app.disconnect_jira();
+            }
+        });
+    });
+
+    ui.add_space(theme::UNIT);
+    ui.horizontal(|ui| {
+        ui.label("Project");
+        let selected = app
+            .tickets
+            .projects
+            .iter()
+            .find(|p| p.key == app.tickets.project)
+            .map(|p| format!("{} — {}", p.key, p.name))
+            .unwrap_or_else(|| "Pick one…".into());
+        let projects = app.tickets.projects.clone();
+        let mut chosen: Option<String> = None;
+        egui::ComboBox::from_id_salt("jira-project")
+            .selected_text(RichText::new(selected).size(theme::TEXT))
+            .width(260.0)
+            .show_ui(ui, |ui| {
+                for project in &projects {
+                    let label = format!("{} — {}", project.key, project.name);
+                    if ui
+                        .selectable_label(project.key == app.tickets.project, label)
+                        .clicked()
+                    {
+                        chosen = Some(project.key.clone());
+                    }
+                }
+            });
+        // Outside the combo's closure: loading types borrows the app.
+        if let Some(key) = chosen {
+            if key != app.tickets.project {
+                app.load_issue_types(key);
+            }
+        }
+        if app.tickets.types.is_empty() && !app.tickets.project.is_empty() {
+            ui.add(egui::Spinner::new().size(theme::SPINNER));
+        } else {
+            ui.label(
+                RichText::new(format!("{} type(s)", app.tickets.type_names().len()))
+                    .size(theme::SMALL)
+                    .color(theme::fg_dim()),
+            );
+        }
+    });
+}
+
+/// Select-all, select-none, and the Create button.
+fn ticket_actions(app: &mut App, ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        let pending = app.tickets.pending();
+        let ready = pending > 0 && !app.tickets.creating && !app.tickets.project.is_empty();
+        let label = if app.tickets.creating {
+            "Creating…".to_string()
+        } else {
+            format!("Create {pending} in {}", app.tickets.project)
+        };
+        let create = egui::Button::new(RichText::new(label).strong())
+            .fill(theme::ember())
+            .min_size(egui::vec2(0.0, theme::CONTROL_MD));
+        if ui
+            .add_enabled(ready, create)
+            .on_hover_text("Creates the ticked tickets in Jira")
+            .clicked()
+        {
+            app.create_tickets();
+        }
+        if app.tickets.creating {
+            ui.add(egui::Spinner::new().size(theme::SPINNER));
+        }
+        if ui.button("Select all").clicked() {
+            for drafted in &mut app.tickets.drafts {
+                drafted.accepted = drafted.created.is_none();
+            }
+        }
+        if ui.button("Select none").clicked() {
+            for drafted in &mut app.tickets.drafts {
+                drafted.accepted = false;
+            }
+        }
+        let created = app.tickets.drafts.iter().filter(|d| d.created.is_some()).count();
+        if created > 0 {
+            ui.label(
+                RichText::new(format!("{created} created"))
+                    .size(theme::SMALL)
+                    .color(theme::add()),
+            );
+        }
+    });
+}
+
+/// One drafted ticket: editable until it exists, a link once it does.
+fn draft_card(app: &mut App, ui: &mut egui::Ui, index: usize) {
+    let Some(drafted) = app.tickets.drafts.get(index) else { return };
+    let created = drafted.created.clone();
+    let error = drafted.error.clone();
+    let source = drafted.draft.source.clone();
+    let types = app.tickets.type_names();
+    let expanded = app.tickets.expanded == Some(index);
+
+    egui::Frame::new()
+        .fill(theme::panel())
+        .stroke(egui::Stroke::new(
+            1.0_f32,
+            if created.is_some() { theme::add() } else { theme::border() },
+        ))
+        .corner_radius(theme::RADIUS_MD as f32)
+        .inner_margin(egui::Margin::symmetric(12, 10))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                match &created {
+                    Some(issue) => {
+                        let key = issue.key.clone();
+                        let url = issue.url.clone();
+                        if ui
+                            .link(RichText::new(&key).color(theme::teal()).font(
+                                theme::semibold(theme::TEXT),
+                            ))
+                            .on_hover_text(&url)
+                            .clicked()
+                        {
+                            let _ = open::that(&url);
+                        }
+                    }
+                    None => {
+                        let mut accepted = app.tickets.drafts[index].accepted;
+                        if ui.add(egui::Checkbox::new(&mut accepted, "")).changed() {
+                            app.tickets.drafts[index].accepted = accepted;
+                        }
+                    }
+                }
+                // The type, as the project spells it.
+                let current = app.tickets.drafts[index].draft.issue_type.clone();
+                if types.is_empty() {
+                    ui.label(RichText::new(&current).size(theme::SMALL).color(theme::fg_dim()));
+                } else {
+                    egui::ComboBox::from_id_salt(("ticket-type", index))
+                        .selected_text(RichText::new(&current).size(theme::SMALL))
+                        .width(110.0)
+                        .show_ui(ui, |ui| {
+                            for name in &types {
+                                if ui.selectable_label(*name == current, name).clicked() {
+                                    app.tickets.drafts[index].draft.issue_type = name.clone();
+                                }
+                            }
+                        });
+                }
+                ui.add_enabled(
+                    created.is_none(),
+                    egui::TextEdit::singleline(&mut app.tickets.drafts[index].draft.summary)
+                        .desired_width(f32::INFINITY),
+                );
+            });
+
+            // What it came from, so coverage is visible without counting.
+            if !source.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new("from").size(theme::SMALL).color(theme::fg_dim()),
+                    );
+                    ui.label(
+                        RichText::new(source.join(" · "))
+                            .size(theme::SMALL)
+                            .color(theme::fg_dim())
+                            .italics(),
+                    );
+                });
+            }
+
+            ui.horizontal(|ui| {
+                let labels = app.tickets.drafts[index].draft.labels.join(", ");
+                if !labels.is_empty() {
+                    ui.label(RichText::new(labels).size(theme::SMALL).color(theme::teal()));
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let toggle = if expanded { "Hide description" } else { "Description" };
+                    if ui.small_button(toggle).clicked() {
+                        app.tickets.expanded = if expanded { None } else { Some(index) };
+                    }
+                });
+            });
+
+            if expanded {
+                ui.add_space(theme::UNIT);
+                ui.add_enabled(
+                    created.is_none(),
+                    egui::TextEdit::multiline(
+                        &mut app.tickets.drafts[index].draft.description,
+                    )
+                    .desired_rows(6)
+                    .desired_width(f32::INFINITY),
+                );
+            }
+            if let Some(error) = error {
+                ui.add_space(theme::UNIT);
+                ui.label(RichText::new(error).color(theme::danger()).size(theme::SMALL));
+            }
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -1071,6 +1467,10 @@ fn review_gate_buttons(app: &mut App, ui: &mut egui::Ui, noun: &str, override_la
         // Fixing is the default action, so it reads first and is plain.
         let fix = egui::Button::new(RichText::new("Cancel and fix").strong())
             .min_size(egui::vec2(0.0, theme::CONTROL_MD));
+        // A review is already a list of work. Retyping it into a ticket
+        // writer is the sort of copying a tool exists to remove.
+        let file = egui::Button::new("File as tickets")
+            .min_size(egui::vec2(0.0, theme::CONTROL_MD));
         if ui.add(fix).clicked() {
             app.review.pending = None;
             app.dialog = Dialog::None;
@@ -1088,6 +1488,13 @@ fn review_gate_buttons(app: &mut App, ui: &mut egui::Ui, noun: &str, override_la
                 app.toast("Overriding the review.", false);
                 app.perform(gated);
             }
+        }
+        if ui
+            .add(file)
+            .on_hover_text("Turn these findings into Jira tickets to pick up later")
+            .clicked()
+        {
+            app.tickets_from_review();
         }
     });
 }

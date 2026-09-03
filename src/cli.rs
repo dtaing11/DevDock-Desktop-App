@@ -24,6 +24,7 @@ pub fn run(args: &[String]) -> Option<ExitCode> {
         "pr" => cmd_pr(rest),
         "hook" => cmd_hook(rest),
         "resolve" => cmd_resolve(rest),
+        "tickets" => cmd_tickets(rest),
         "help" | "--help" | "-h" => {
             print_help();
             ExitCode::SUCCESS
@@ -64,6 +65,8 @@ fn print_help() {
         ("push --no-verify", "skip the local CI gate"),
         ("pr -t TITLE [-b BODY]", "CI gate, push, open PR into main"),
         ("pr --ai", "AI-generated PR title and body"),
+        ("tickets FILE", "draft Jira tickets from a list of work"),
+        ("tickets FILE --create", "…and create them in Jira"),
         ("resolve", "interactive conflict resolver with AI proposals"),
         ("resolve --agent", "AI reads the repo and proposes every fix, you confirm each"),
         ("ci", "run all local CI jobs (.git-manage-ci.toml)"),
@@ -806,6 +809,173 @@ fn default_base(repo: &Repo) -> String {
                 .map(|br| br.name.clone())
         })
         .unwrap_or_else(|| "main".into())
+}
+
+/// `devdock tickets [FILE] [--create] [--project KEY] [--type NAME]`
+///
+/// Reads a list of work, drafts a ticket for each item with the repository
+/// open to the model, and prints them. `--create` files them in Jira, using
+/// the credentials the app stores.
+///
+/// Printing by default, creating on request: a command that files twenty
+/// tickets because someone piped the wrong file is not one people run twice.
+fn cmd_tickets(rest: &[String]) -> ExitCode {
+    let repo = match repo() {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+    let create = rest.iter().any(|a| a == "--create");
+    let project = match flag_value(rest, "--project") {
+        Ok(value) => value.map(str::to_string),
+        Err(e) => {
+            eprintln!("devdock: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let path = rest.iter().find(|a| !a.starts_with("--")).cloned();
+
+    let list = match &path {
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) => {
+                eprintln!("devdock: {path}: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => {
+            use std::io::Read as _;
+            let mut buffer = String::new();
+            if std::io::stdin().read_to_string(&mut buffer).is_err() {
+                eprintln!("devdock: could not read the list from stdin");
+                return ExitCode::FAILURE;
+            }
+            buffer
+        }
+    };
+
+    let items = crate::agent::tickets::parse_list(&list);
+    if items.is_empty() {
+        eprintln!("devdock: nothing in the list to write tickets for");
+        return ExitCode::FAILURE;
+    }
+
+    // Types come from the project when one is named, so the model is told
+    // what this project actually has rather than guessing "Task".
+    let client = crate::jira::Client::from_store();
+    let types: Vec<String> = match (&client, &project) {
+        (Some(client), Some(key)) => client
+            .issue_types(key.as_str())
+            .map(|types| {
+                types.into_iter().filter(|t| !t.subtask).map(|t| t.name).collect()
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+
+    println!("{}", style::dim(&format!("drafting {} ticket(s)…", items.len())));
+    let config = crate::app::Config::load();
+    // No picker out here, so fall back through the tasks that are closest to
+    // this one: whatever writes code or reviews it can write a ticket about
+    // it. Failing because one more per-task selection is unset would be a
+    // setting nobody knew they had to make.
+    let explicit = config
+        .tickets_ai
+        .as_ref()
+        .or(config.coding_ai.as_ref())
+        .or(config.review_ai.as_ref())
+        .or(config.pr_ai.as_ref())
+        .or(config.commit_ai.as_ref());
+    let (provider, model) = ai_selection(&config, explicit);
+    let url = config.ollama_url.clone().unwrap_or_else(|| crate::ollama::DEFAULT_URL.into());
+    let sel = crate::app::AiSelection { provider, model };
+
+    let proposal = {
+        let provider = match crate::app::agent_provider(&sel, &url) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("devdock: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let tracked = match repo.tracked_files() {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("devdock: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let mut workspace = match crate::agent::Workspace::new(
+            repo.path(),
+            tracked,
+            crate::agent::Access::ReadOnly,
+        ) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("devdock: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        match crate::agent::tickets::run(
+            provider.as_ref(),
+            &mut workspace,
+            &list,
+            &types,
+            None,
+            &mut |event| println!("  {}", style::dim(&event.line())),
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("devdock: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+
+    println!();
+    for draft in &proposal.drafts {
+        println!("{} {}", style::dim(&format!("[{}]", draft.issue_type)), draft.summary);
+        if !draft.labels.is_empty() {
+            println!("      {}", style::dim(&draft.labels.join(", ")));
+        }
+        for line in draft.description.lines() {
+            println!("      {line}");
+        }
+        println!();
+    }
+    if !proposal.notes.trim().is_empty() {
+        println!("{}", style::dim(&proposal.notes));
+    }
+
+    if !create {
+        println!(
+            "{}",
+            style::dim("nothing created; pass --create --project KEY to file them")
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    let (Some(client), Some(key)) = (client, project) else {
+        eprintln!(
+            "devdock: --create needs --project KEY, and a Jira connection \\
+             (connect once from the app)"
+        );
+        return ExitCode::FAILURE;
+    };
+    let mut failed = 0;
+    for draft in &proposal.drafts {
+        match client.create_issue(&draft.to_issue(&key)) {
+            Ok(issue) => println!("{} {}", style::green(&issue.key), issue.url),
+            Err(e) => {
+                failed += 1;
+                eprintln!("devdock: {}: {e}", draft.summary);
+            }
+        }
+    }
+    if failed > 0 {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 /// The provider/model for one AI task, honouring the per-task selections the

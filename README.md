@@ -36,6 +36,11 @@ macOS/Windows since egui is cross-platform).
   (with an AI-generated title and description written from **every commit on
   the branch** — its subjects, bodies, and full diff against the base — not
   from whatever happens to be staged).
+- **Jira tickets from a list**: paste a list of work — or the findings of an
+  AI review — and a model drafts a ticket for each item with the repository
+  open to it, so each one names the file and function rather than restating
+  the bullet. Every item is checked to have ended up in a ticket. Editable
+  before anything is created. See [docs/jira-tickets.md](docs/jira-tickets.md).
 - **Stacked pull requests**: split one large change into a chain of branches,
   each PR targeting the branch below it so every reviewer sees one focused
   diff. DevDock keeps the chain in order — restack after any branch changes,
@@ -161,6 +166,7 @@ Tokens are stored at `~/.config/git-manage/auth.json` (mode 600).
 src/
   git.rs       Typed wrapper around the git CLI (library, reusable)
   github.rs    Device-flow auth + PR REST API (library, reusable)
+  jira.rs      Jira Cloud: credentials, projects, issue creation, ADF
   ollama.rs    Commit-message generation client (library, reusable)
   review.rs    The AI review gate: config, prompts, findings, thresholds
   stack.rs     Stacked pull requests: the parent chain, restack, submit, sync

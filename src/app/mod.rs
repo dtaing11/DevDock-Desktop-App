@@ -524,6 +524,11 @@ pub struct StackState {
     pub busy: bool,
     /// Name for a new branch stacked on the tip.
     pub new_branch: String,
+    /// Why the stack could not be read, shown in the dialog with the fix —
+    /// usually that `gh` or its stack extension is not installed.
+    pub error: Option<String>,
+    /// Submit opens pull requests ready for review rather than as drafts.
+    pub ready: bool,
     /// What the last operation did, line by line, kept visible in the dialog
     /// because submitting a stack touches several branches and pull requests
     /// and a one-line toast cannot say which.
@@ -1862,10 +1867,13 @@ impl App {
             Msg::Stack(result) => {
                 self.stack.loading = false;
                 match result {
-                    Ok(stack) => self.stack.stack = Some(stack),
+                    Ok(stack) => {
+                        self.stack.stack = Some(stack);
+                        self.stack.error = None;
+                    }
                     Err(e) => {
                         self.stack.stack = None;
-                        self.toast(e, true);
+                        self.stack.error = Some(e);
                     }
                 }
             }
@@ -2818,71 +2826,88 @@ impl App {
         self.stack.log.clear();
         self.dialog = Dialog::Stack;
         self.load_stack();
-        // The numbers and CI state beside each branch come from here.
+        // The CI state beside each pull request comes from here.
         if self.gh.user.is_some() {
             self.load_open_prs();
         }
     }
 
-    /// Re-derives the stack from the repository.
+    /// Re-reads the stack from `gh stack`.
     ///
-    /// Always from git, never from what the app last saw: branches move
-    /// underneath it — a rebase in the terminal, a merge on GitHub — and a
-    /// remembered chain that disagrees with the repository would restack the
-    /// wrong branches onto the wrong commits.
+    /// Always from the repository, never from what the app last saw:
+    /// branches move underneath it — a rebase in the terminal, a merge on
+    /// GitHub — and a remembered chain that disagrees with the repository
+    /// would restack the wrong branches onto the wrong commits.
     pub fn load_stack(&mut self) {
         let Some(repo) = self.repo.clone() else { return };
+        let token = self.gh_token();
         self.stack.loading = true;
         self.worker.spawn(move || {
             let branch = repo.current_branch();
-            Msg::Stack(crate::stack::stack_for(&repo, &branch).map_err(|e| e.to_string()))
+            Msg::Stack(
+                crate::stack::stack_for(&repo, &branch, token.as_deref())
+                    .map_err(|e| e.to_string()),
+            )
         });
     }
 
-    /// Starts a new branch on top of the stack and records what it sits on.
+    /// Starts a new branch on top of the stack. On an untracked branch, the
+    /// two become a stack together.
     pub fn stack_branch_on_tip(&mut self) {
         let name = self.stack.new_branch.trim().to_string();
         if name.is_empty() {
             return;
         }
-        let Some(repo) = self.repo.clone() else { return };
-        let parent = match self.stack.stack.as_ref() {
-            Some(stack) => stack.tip(),
-            None => repo.current_branch(),
-        };
+        let Some(stack) = self.stack.stack.clone() else { return };
+        let token = self.gh_token();
         self.stack.new_branch.clear();
         self.stack_op(move |repo| {
-            repo.git(&["checkout", "-b", &name, &parent]).map_err(|e| e.to_string())?;
-            crate::stack::set_parent(&repo, &name, &parent).map_err(|e| e.to_string())?;
-            Ok((format!("Started {name} on top of {parent}."), Vec::new(), false))
+            let message = crate::stack::branch_on_tip(&repo, &stack, &name, token.as_deref())
+                .map_err(|e| e.to_string())?;
+            Ok((message, Vec::new(), false))
         });
     }
 
-    /// Re-bases one branch's place in the stack (config only; restack applies it).
-    pub fn stack_set_parent(&mut self, branch: String, parent: String) {
+    /// Puts the checked-out branch under `gh stack`'s care as a stack of one.
+    pub fn stack_track(&mut self) {
+        let Some(stack) = self.stack.stack.clone() else { return };
+        let token = self.gh_token();
         self.stack_op(move |repo| {
-            crate::stack::set_parent(&repo, &branch, &parent).map_err(|e| e.to_string())?;
-            Ok((format!("{branch} is now stacked on {parent}."), Vec::new(), false))
+            let message = crate::stack::track(&repo, &stack, token.as_deref())
+                .map_err(|e| e.to_string())?;
+            Ok((message, Vec::new(), false))
         });
     }
 
-    /// Takes one branch out of the stack, leaving the branch itself alone.
-    pub fn stack_untrack(&mut self, branch: String) {
+    /// Hands a chain recorded by the previous, built-in implementation over
+    /// to `gh stack`.
+    pub fn stack_import_legacy(&mut self) {
+        let Some(stack) = self.stack.stack.clone() else { return };
+        let token = self.gh_token();
         self.stack_op(move |repo| {
-            // Children would otherwise point at a branch that is no longer in
-            // any stack, so they move down to what it was based on.
-            let parent = crate::stack::parent_of(&repo, &branch)
-                .unwrap_or_else(|| crate::stack::default_branch(&repo));
-            for (child, p) in crate::stack::parents(&repo) {
-                if p == branch {
-                    crate::stack::set_parent(&repo, &child, &parent)
-                        .map_err(|e| e.to_string())?;
-                }
-            }
-            crate::stack::clear_parent(&repo, &branch).map_err(|e| e.to_string())?;
-            crate::stack::clear_pr(&repo, &branch).map_err(|e| e.to_string())?;
-            Ok((format!("{branch} left the stack."), Vec::new(), false))
+            let message = crate::stack::import_legacy(&repo, &stack, token.as_deref())
+                .map_err(|e| e.to_string())?;
+            Ok((message, Vec::new(), false))
         });
+    }
+
+    /// Forgets the stack locally. The branches, and the stack on GitHub, are
+    /// left alone.
+    pub fn stack_untrack(&mut self) {
+        let token = self.gh_token();
+        self.stack_op(move |repo| {
+            let log = crate::stack::untrack(&repo, token.as_deref()).map_err(|e| e.to_string())?;
+            Ok(("The stack is no longer tracked. Its branches are untouched.".into(), log, false))
+        });
+    }
+
+    /// Restructures the stack — reorder, drop, fold, insert, rename — in
+    /// `gh stack modify`, which is a terminal UI, so it runs in the terminal
+    /// panel rather than being reimplemented here against gh's private state.
+    #[cfg(unix)]
+    pub fn stack_modify(&mut self) {
+        self.dialog = Dialog::None;
+        self.terminal_run(crate::stack::modify_command());
     }
 
     /// Switches to a branch from the stack view, leaving the view open.
@@ -2899,19 +2924,34 @@ impl App {
 
     /// Rebases every branch back on top of its parent, bottom-up.
     pub fn stack_restack(&mut self) {
+        let token = self.gh_token();
         self.stack_op(move |repo| {
-            let stack = current_stack(&repo)?;
-            let report = crate::stack::restack(&repo, &stack).map_err(|e| e.to_string())?;
-            let log = report
-                .steps
-                .iter()
-                .map(|s| {
-                    let what = if s.moved { "rebased" } else { "already in place" };
-                    format!("{}: {what}", s.branch)
-                })
-                .collect();
+            let stack = current_stack(&repo, token.as_deref())?;
+            let report = crate::stack::restack(&repo, &stack, token.as_deref())
+                .map_err(|e| e.to_string())?;
             let conflicted = report.conflicted.is_some();
-            Ok((report.message(), log, conflicted))
+            Ok((report.message(), report.log, conflicted))
+        });
+    }
+
+    /// Resumes a restack that stopped on a conflict, once it is resolved.
+    pub fn stack_restack_continue(&mut self) {
+        let token = self.gh_token();
+        self.stack_op(move |repo| {
+            let report = crate::stack::restack_continue(&repo, token.as_deref())
+                .map_err(|e| e.to_string())?;
+            let conflicted = report.conflicted.is_some();
+            Ok((report.message(), report.log, conflicted))
+        });
+    }
+
+    /// Gives up on a stopped restack, putting every branch back.
+    pub fn stack_restack_abort(&mut self) {
+        let token = self.gh_token();
+        self.stack_op(move |repo| {
+            let log = crate::stack::restack_abort(&repo, token.as_deref())
+                .map_err(|e| e.to_string())?;
+            Ok(("Restack aborted. Every branch is back where it was.".into(), log, false))
         });
     }
 
@@ -2919,11 +2959,14 @@ impl App {
     pub fn stack_push(&mut self) {
         let token = self.gh_token();
         self.stack_op(move |repo| {
-            let stack = current_stack(&repo)?;
-            let pushed = crate::stack::push_stack(&repo, &stack, token.as_deref())
+            let log = crate::stack::push_stack(&repo, token.as_deref())
                 .map_err(|e| e.to_string())?;
-            let log = pushed.iter().map(|b| format!("{b}: pushed")).collect();
-            Ok((format!("Pushed {} branch(es).", pushed.len()), log, false))
+            let message = log
+                .iter()
+                .find(|l| l.contains("Pushed"))
+                .map(|l| l.trim_start_matches(['✓', ' ']).to_string())
+                .unwrap_or_else(|| "Pushed the stack.".to_string());
+            Ok((message, log, false))
         });
     }
 
@@ -2937,50 +2980,42 @@ impl App {
     /// The submission itself, once the review gate has let it through.
     fn submit_stack(&mut self) {
         let Some(stack) = self.stack.stack.clone() else { return };
+        if !stack.tracked {
+            self.toast("Nothing to submit: this branch is not in a stack yet.", true);
+            return;
+        }
         if stack.is_empty() {
             self.toast("Nothing to submit: this branch is the trunk.", true);
             return;
         }
         // Checked here as well as in `stack::submit` so the refusal is
-        // immediate rather than arriving after a push and a round trip.
+        // immediate rather than arriving after a review and a round trip.
         if let Some(e) = stack.entries.iter().find(|e| e.needs_restack) {
             self.toast(format!("Restack first: {} is behind {}.", e.branch, e.parent), true);
             return;
         }
         let token = self.gh_token();
+        let ready = self.stack.ready;
         self.stack_op(move |repo| {
-            let client = github::Client::from_store().ok_or("Not signed in")?;
-            let slug = views::origin_slug(&repo).ok_or("No github.com remote found")?;
             // Re-derived rather than reusing what the view was showing: this
             // runs after a review and a network round trip, and the branches
             // may have moved in between.
-            let stack = current_stack(&repo)?;
-            let report =
-                crate::stack::submit(&repo, &client, &slug, &stack, token.as_deref())?;
+            let stack = current_stack(&repo, token.as_deref())?;
+            let report = crate::stack::submit(&repo, &stack, ready, token.as_deref())
+                .map_err(|e| e.to_string())?;
             Ok((report.message(), report.log, false))
         });
     }
 
-    /// Brings the stack back in line with the remote after something merged.
-    ///
-    /// Fetches, asks GitHub which of the stack's pull requests have landed,
-    /// drops those branches out of the chain, and rebases what is left onto
-    /// the trunk. Nothing is pushed and no branch is deleted: what the remote
-    /// should look like afterwards is a separate decision, made by submitting.
+    /// Brings the stack back in line with the remote: fetches, rebases,
+    /// pushes, and reads each pull request's state back from GitHub.
     pub fn stack_sync(&mut self) {
         let token = self.gh_token();
         self.stack_op(move |repo| {
-            repo.fetch(token.as_deref()).map_err(|e| e.to_string())?;
-            // After the fetch, so a branch that landed while the view was open
-            // is seen as landed.
-            let stack = current_stack(&repo)?;
-            let client = github::Client::from_store();
-            let slug = views::origin_slug(&repo);
-            let github = client.as_ref().zip(slug.as_ref());
-            let mut report = crate::stack::sync(&repo, github, &stack)?;
-            report.log.insert(0, "fetched".to_string());
-            let conflicted = report.restack.conflicted.is_some();
-            Ok((report.message(), report.log, conflicted))
+            current_stack(&repo, token.as_deref())?;
+            let report =
+                crate::stack::sync(&repo, token.as_deref()).map_err(|e| e.to_string())?;
+            Ok((report.message(), report.log, false))
         });
     }
 
@@ -4617,9 +4652,15 @@ const MAX_ZOOM: f32 = 2.0;
 /// chain the view happened to be showing: an action can start after a network
 /// round trip, a review, or a rebase in a terminal, and rebasing branches on
 /// the strength of a stale picture is how a stack loses commits.
-fn current_stack(repo: &crate::git::Repo) -> Result<crate::stack::Stack, String> {
+fn current_stack(
+    repo: &crate::git::Repo,
+    auth: Option<&str>,
+) -> Result<crate::stack::Stack, String> {
     let branch = repo.current_branch();
-    let stack = crate::stack::stack_for(repo, &branch).map_err(|e| e.to_string())?;
+    let stack = crate::stack::stack_for(repo, &branch, auth).map_err(|e| e.to_string())?;
+    if !stack.tracked {
+        return Err(format!("{branch} is not in a stack. Track it first."));
+    }
     if stack.is_empty() {
         return Err(format!("{branch} is not part of a stack."));
     }
@@ -5485,6 +5526,10 @@ mod tests {
     /// The stack view shows the chain, and its actions really move branches.
     #[test]
     fn the_stack_view_renders_the_chain_and_restacks_it() {
+        if !crate::stack::available() {
+            eprintln!("skipped: gh stack is not installed ({})", crate::stack::INSTALL_HINT);
+            return;
+        }
         let (tmp, mut app, _file) = app_with_repo();
         let root = tmp.path();
         git(root, &["add", "-A"]);
@@ -5496,12 +5541,19 @@ mod tests {
         std::fs::write(root.join("lower.txt"), "l\n").unwrap();
         git(root, &["add", "-A"]);
         git(root, &["commit", "-m", "feat: lower"]);
-        git(root, &["config", "branch.lower.devdock-parent", "main"]);
         git(root, &["checkout", "-b", "upper"]);
         std::fs::write(root.join("upper.txt"), "u\n").unwrap();
         git(root, &["add", "-A"]);
         git(root, &["commit", "-m", "feat: upper"]);
-        git(root, &["config", "branch.upper.devdock-parent", "lower"]);
+        // Adopted into a stack the way `gh stack init` does it, which is
+        // what the app itself calls.
+        let gh = crate::stack::gh_program().unwrap();
+        let out = Command::new(gh)
+            .args(["stack", "init", "--base", "main", "lower", "upper"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         git(root, &["checkout", "lower"]);
         std::fs::write(root.join("lower2.txt"), "l2\n").unwrap();
         git(root, &["add", "-A"]);
@@ -5574,13 +5626,12 @@ mod tests {
             entries: vec![crate::stack::StackEntry {
                 branch: "upper".into(),
                 parent: "lower".into(),
-                commits: Vec::new(),
-                pr: None,
                 needs_restack: true,
-                merged: false,
+                ..Default::default()
             }],
             current: Some(0),
-            forks: Vec::new(),
+            tracked: true,
+            ..Default::default()
         });
 
         app.perform(GatedAction::SubmitStack);

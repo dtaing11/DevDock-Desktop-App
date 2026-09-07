@@ -1,7 +1,7 @@
-//! The stacked-pull-request flow against real GitHub.
+//! The stacked-pull-request flow against real GitHub, through `gh stack`.
 //!
 //! Ignored by default, like the other live tests: it needs a token, it makes
-//! network calls, and it creates and deletes a repository.
+//! network calls, and it creates a repository.
 //!
 //! ```
 //! cargo test --test stack_live -- --ignored --nocapture
@@ -39,20 +39,14 @@ fn commit(repo: &Repo, name: &str, content: &str, message: &str) {
     repo.commit(message, "", false).unwrap();
 }
 
-fn branch_on(repo: &Repo, name: &str, parent: &str) {
-    repo.checkout(parent).unwrap();
-    repo.create_branch(name, true).unwrap();
-    stack::set_parent(repo, name, parent).unwrap();
-}
-
-/// The body of one pull request, from GitHub.
-fn body_of(client: &Client, slug: &RepoSlug, number: u64) -> String {
-    client.pull_request(slug, number).unwrap().body
+fn current(repo: &Repo, auth: Option<&str>) -> stack::Stack {
+    stack::stack_for(repo, &repo.current_branch(), auth).unwrap()
 }
 
 #[test]
 #[ignore = "creates a repository on GitHub"]
 fn a_stack_is_submitted_merged_and_synced() {
+    assert!(stack::available(), "gh stack is not installed: {}", stack::INSTALL_HINT);
     let Some(token) = token() else {
         panic!("no GitHub token: set GITHUB_TOKEN or sign in through the app");
     };
@@ -94,26 +88,29 @@ fn run(client: &Client, slug: &RepoSlug, token: &str) {
     commit(&repo, "README.md", "# scratch\n", "chore: root");
     repo.push_branch("main", false, auth).unwrap();
 
-    // main → one → two → three. The bottom branch gets two commits, so the
-    // squash merge below produces one commit whose patch matches neither of
-    // them — the case where nothing local can tell that it landed.
-    branch_on(&repo, "one", "main");
+    // main → one → two → three, built the way the app builds them. The
+    // bottom branch gets two commits, so the squash merge below produces one
+    // commit whose patch matches neither of them — the case where nothing
+    // local can tell that it landed.
+    let stack0 = current(&repo, auth);
+    stack::branch_on_tip(&repo, &stack0, "one", auth).unwrap();
     commit(&repo, "one.txt", "one\n", "feat: the first piece");
     commit(&repo, "one-more.txt", "and more\n", "feat: the first piece, continued");
-    branch_on(&repo, "two", "one");
+    stack::branch_on_tip(&repo, &current(&repo, auth), "two", auth).unwrap();
     commit(&repo, "two.txt", "two\n", "feat: the second piece");
-    branch_on(&repo, "three", "two");
+    stack::branch_on_tip(&repo, &current(&repo, auth), "three", auth).unwrap();
     commit(&repo, "three.txt", "three\n", "feat: the third piece");
 
     // -- submit -------------------------------------------------------------
 
-    let built = stack::stack_for(&repo, "three").unwrap();
-    let report = stack::submit(&repo, client, slug, &built, auth).expect("submit failed");
+    let built = current(&repo, auth);
+    let report = stack::submit(&repo, &built, true, auth).expect("submit failed");
     println!("submit: {}", report.message());
     for line in &report.log {
         println!("  {line}");
     }
     assert_eq!(report.opened, 3, "three pull requests, one per branch");
+    assert_eq!(report.total, 3);
 
     let open = client.pull_requests(slug).unwrap();
     let find = |head: &str| {
@@ -140,28 +137,15 @@ fn run(client: &Client, slug: &RepoSlug, token: &str) {
     paths.sort();
     assert_eq!(paths, ["one-more.txt", "one.txt"]);
 
-    // The stack map is in every body, marked where it is.
-    for (pr, branch) in [(&pr_one, "one"), (&pr_two, "two"), (&pr_three, "three")] {
-        let body = body_of(client, slug, pr.number);
-        assert!(body.contains(stack::NAV_START), "#{} has no stack block", pr.number);
-        assert!(
-            body.contains(&format!("`{branch}`  ⬅ **this PR**")),
-            "#{} is not marked as itself:\n{body}",
-            pr.number
-        );
-        for other in ["one", "two", "three"] {
-            assert!(body.contains(&format!("`{other}`")), "#{} lost {other}", pr.number);
-        }
-    }
-    // The numbers were remembered, so a later sync can ask about them.
-    assert_eq!(stack::pr_of(&repo, "one"), Some(pr_one.number));
+    // gh remembered the numbers, so the view shows them.
+    let submitted = current(&repo, auth);
+    assert_eq!(submitted.entry("one").unwrap().pr, Some(pr_one.number));
+    assert_eq!(submitted.entry("three").unwrap().pr, Some(pr_three.number));
 
-    // Re-submitting must not open anything again or duplicate the block.
-    let again = stack::stack_for(&repo, "three").unwrap();
-    let report = stack::submit(&repo, client, slug, &again, auth).expect("re-submit failed");
+    // Re-submitting must not open anything again.
+    let report = stack::submit(&repo, &submitted, true, auth).expect("re-submit failed");
     assert_eq!(report.opened, 0, "a second submit opened more pull requests");
-    let body = body_of(client, slug, pr_two.number);
-    assert_eq!(body.matches(stack::NAV_START).count(), 1, "the block piled up:\n{body}");
+    assert_eq!(client.pull_requests(slug).unwrap().len(), 3);
 
     // -- merge the bottom one -----------------------------------------------
 
@@ -171,54 +155,30 @@ fn run(client: &Client, slug: &RepoSlug, token: &str) {
         .merge_pull_request(slug, pr_one.number, "squash")
         .expect("could not squash-merge the bottom PR");
     println!("squash-merged #{}", pr_one.number);
-
-    repo.fetch(auth).unwrap();
     sh(&work, &["checkout", "three"]);
-    sh(&work, &["branch", "-f", "main", "origin/main"]);
-
-    let before = stack::stack_for(&repo, "three").unwrap();
-    assert!(!before.entry("one").unwrap().merged, "a squash should be invisible locally");
 
     // -- sync ---------------------------------------------------------------
 
-    let sync = stack::sync(&repo, Some((client, slug)), &before).expect("sync failed");
+    let sync = stack::sync(&repo, auth).expect("sync failed");
     println!("sync: {}", sync.message());
     for line in &sync.log {
         println!("  {line}");
     }
-    assert_eq!(sync.dropped, ["one"], "GitHub's answer is what caught the squash");
-    assert_eq!(sync.restack.conflicted, None);
+    assert_eq!(sync.merged, ["one"], "GitHub's answer is what caught the squash");
 
-    let after = stack::stack_for(&repo, "three").unwrap();
-    let names: Vec<&str> = after.entries.iter().map(|e| e.branch.as_str()).collect();
-    assert_eq!(names, ["two", "three"]);
-    assert_eq!(after.entry("two").unwrap().parent, "main", "two moved down to the trunk");
+    let after = current(&repo, auth);
+    assert!(after.entry("one").unwrap().merged);
+    assert_eq!(after.entry("two").unwrap().parent, "main", "two now sits on the trunk");
+    assert!(after.stale().is_empty(), "sync rebased what was left: {:?}", after.entries);
     // Each branch still carries only its own commit: nothing was replayed.
     for (branch, subject) in
         [("two", "feat: the second piece"), ("three", "feat: the third piece")]
     {
         let commits = after.entry(branch).unwrap().commits.clone();
         let subjects: Vec<&str> = commits.iter().map(|c| c.subject.as_str()).collect();
-        assert_eq!(subjects, [subject], "{branch} carried {subjects:?}");
+        assert_eq!(subjects, [subject], "{branch} carries {subjects:?}");
     }
-
-    // -- submit again, so the remote matches --------------------------------
-
-    let report = stack::submit(&repo, client, slug, &after, auth).expect("re-submit failed");
-    println!("resubmit: {}", report.message());
-    for line in &report.log {
-        println!("  {line}");
-    }
-    assert_eq!(report.opened, 0, "nothing new should be opened");
-
-    let open = client.pull_requests(slug).unwrap();
-    let two = open.iter().find(|pr| pr.head == "two").expect("#two closed itself");
-    assert_eq!(two.base, "main", "the PR above the merged one was not retargeted");
-    let three = open.iter().find(|pr| pr.head == "three").unwrap();
-    assert_eq!(three.base, "two");
-
-    // The map in the remaining bodies no longer lists the merged branch.
-    let body = body_of(client, slug, two.number);
-    assert!(body.contains("`two`"), "{body}");
-    assert!(!body.contains("`one`"), "the merged branch is still in the map:\n{body}");
+    // And GitHub agrees: the pull request above the merged one targets main.
+    let two = client.pull_request(slug, pr_two.number).unwrap();
+    assert_eq!(two.pr.base, "main", "#{} was not retargeted", pr_two.number);
 }

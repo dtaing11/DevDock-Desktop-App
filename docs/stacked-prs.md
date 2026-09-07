@@ -6,12 +6,28 @@ own branch and its own pull request, and **each PR targets the branch below it**
 rather than the trunk. Reviewers see one focused diff per PR, because everything
 underneath is already in its base.
 
-GitHub has no "stack" object. A stack *is* the chain of base branches — which is
-why a stack made here is a perfectly ordinary set of pull requests to everyone
-else, readable in the GitHub UI with no extension and no account anywhere.
+DevDock drives GitHub's own tooling for this — the
+[`gh stack`](https://github.com/github/gh-stack) extension to the GitHub CLI —
+rather than keeping a chain of its own. The stack you build here is the same
+stack `gh stack view` shows in a terminal, and the same **Stack** GitHub shows
+on each pull request; anyone on the team can pick it up with `gh stack checkout`
+whether or not they use this app.
 
 Open it from **Stack** in the toolbar, **Stack…** in the pull request dialog, or
 the command palette (`Stacked pull requests`).
+
+## Setup
+
+The GitHub CLI and the extension have to be on the machine:
+
+```sh
+brew install gh                              # or your package manager
+gh extension install github/gh-stack
+```
+
+If either is missing the stack dialog says so, with that command. No
+`gh auth login` is needed: DevDock hands `gh` the token it is already signed in
+with, for the API and for the pushes and fetches `gh` runs underneath.
 
 ## The model
 
@@ -22,74 +38,68 @@ the command palette (`Stacked pull requests`).
   main                        trunk
 ```
 
-Each branch records what it is stacked on in the repository's git config:
+`gh stack` records the chain in `.git/gh-stack`, per repository and never
+committed. DevDock reads it back through `gh stack view --json` and adds what
+the view needs: the commits each branch carries on top of its parent, and
+whether every one of them is already in the trunk.
 
-```
-branch.feat/validate.devdock-parent = feat/parser
-branch.feat/validate.devdock-pr     = 11
-```
-
-That is the whole state. It is per-repository, survives everything git does to
-your branches, and is invisible to anyone who does not use this app. Nothing is
-stored in a service, a lockfile, or a commit message.
-
-A stack is one straight chain. Branches can share a parent, and the view says so
-when they do, but they are not folded into the chain: restacking a tree in one
-action is a good way to lose track of what moved where.
+A stack is one straight chain. A branch has one parent; a merged branch stays in
+the chain, marked, so what sat on it is still known to sit on it — its pull
+request is retargeted to the trunk by GitHub and the view shows it as based
+there.
 
 ## Building a stack
 
-Start from any branch. An untracked branch is already a stack of one based on
-the trunk, so there is no step that "starts" a stack.
+Start from any branch. An untracked branch is not a stack yet, and the dialog
+says so:
 
-**New branch on `<tip>`** creates the next branch on top of the highest one and
-records the link. Commit into it as usual.
+- **Track this branch** makes it a stack of one, based on the trunk
+  (`gh stack init`).
+- **New branch on `<tip>`** creates the next branch on top of the highest one,
+  checks it out, and records the link (`gh stack add`). On an untracked branch
+  it tracks that branch and the new one together. Commit into it as usual.
+- **Import DevDock's stack** appears when an earlier version of DevDock
+  recorded a chain for this branch in git config. It hands the chain to
+  `gh stack` and forgets the old record.
 
-**Base…** on any entry changes what it is stacked on — moving a branch up or
-down the chain, or re-pointing it at the trunk. The change is recorded
-immediately; **Restack** is what applies it to the commits.
-
-**Untrack** takes a branch out of the stack and leaves the branch itself alone.
-Anything stacked on it moves down to what it was based on.
+Restructuring — reordering, dropping a branch from the middle, folding two
+together, inserting, renaming — is `gh stack modify`, which is a terminal UI.
+**Modify…** opens it in DevDock's terminal panel. **Untrack stack** forgets
+the stack locally (`gh stack unstack --local`) and leaves the branches alone.
 
 ## Restack
 
 When a branch low in the stack changes — a new commit, an amend, a rebase —
-everything above it is out of date. **Restack** rebases each branch back on top
-of its parent, bottom-up, so the chain is linear again.
+everything above it is out of date, and the view marks it **[behind]**.
+**Restack** runs `gh stack rebase`: it fetches the trunk, fast-forwards the
+local one if it is behind, and rebases each branch back on top of its parent,
+bottom-up. Without a remote it rebases the branches onto each other only.
 
-The subtlety is *which* commits get replayed. Once the bottom branch is rebased,
-its children point at commits whose parent no longer exists in the chain, and
-`git merge-base` then finds the trunk as the common ancestor — so a naive rebase
-replays the branch below's commits a second time. Every branch's tip is
-therefore recorded before anything moves, and each rebase replays exactly
-`<old parent tip>..<branch>`.
+`gh stack` remembers where each branch left its parent, so a rebase replays
+exactly that branch's own commits — never the branch below's a second time,
+even after that branch has been rewritten.
 
-Restacking needs a clean working tree, and it refuses rather than stashing on
-your behalf. If a rebase stops in conflict the restack stops there too, leaving
-the rebase in progress and opening the conflict resolver: finishing or aborting
-it is the same as any other conflict.
+Restacking needs a clean working tree (untracked files are fine), and it refuses
+rather than stashing on your behalf. If a rebase stops in conflict the restack
+stops there too, leaving the rebase in progress and the conflict resolver ready
+for it. Resolve and stage the files — in the resolver or by hand — then
+**Continue restack** carries on up the stack, or **Abort restack** puts every
+branch back where it was.
 
 ## Submit
 
-**Submit stack** does, in order:
+**Submit stack** is `gh stack submit --auto`. It:
 
 1. force-pushes every branch (with lease, so a branch someone else moved is
    refused rather than overwritten);
 2. opens a pull request for any branch that has none, based on its parent, with
-   a title and body drafted from the branch's own commits;
-3. retargets the base of any PR whose parent has changed;
-4. writes the stack map into every PR body, between markers, so re-submitting
-   replaces it rather than piling up another copy.
+   a title and body from the branch's commits;
+3. retargets the base of any pull request whose parent has changed;
+4. creates or updates the stack on GitHub, so each pull request shows where it
+   sits.
 
-The map looks like this, in each PR, marked where you are:
-
-> **Stack** (top first)
->
-> - #12 `feat/report`
-> - #11 `feat/validate`  ⬅ **this PR**
-> - #10 `feat/parser`
-> - `main`
+New pull requests are drafts unless **Ready for review** is ticked, which also
+marks existing drafts in the stack ready.
 
 Submitting is refused while any branch is behind its parent. Restack first: a
 stale branch's pull request shows the changes underneath it as its own, which is
@@ -98,28 +108,37 @@ exactly what a stack exists to avoid.
 Like any other pull request, submitting goes through the AI review gate when
 `[review] run = true`. The whole series is reviewed against the trunk.
 
-## Sync (after something merges)
+## Sync
 
-Merge from the bottom up. When the lowest PR lands, **Sync**:
+Merge from the bottom up. When the lowest PR lands, **Sync** runs
+`gh stack sync`:
 
-1. fetches;
-2. asks GitHub about each remembered pull request — a squash merge leaves no
-   trace in local history, so GitHub's answer is the one that counts, with a
-   patch-id comparison as the fallback for branches merged outside a PR;
-3. drops merged branches out of the chain, re-parenting what sat on them (the
-   branch above a merged one ends up based on the trunk);
-4. rebases what is left onto its new parent.
+1. fetches, and fast-forwards the trunk to match the remote;
+2. reads each pull request's state back — a squash merge leaves no trace in
+   local history, so GitHub's answer is the one that counts;
+3. rebases what is left onto its updated parent, the branch above a merged one
+   ending up on the trunk;
+4. pushes every branch (atomically, with lease) and links the open pull
+   requests into the stack on GitHub.
 
-Nothing is pushed and no branch is deleted: what the remote should look like
-afterwards is a separate decision, made by submitting again. If GitHub cannot be
-reached, the branch stays in the stack and the activity log says why — an
-unreachable service must not silently drop work out of a stack.
+Nothing is deleted: a merged branch stays in the list, marked **[merged]**,
+and pruning it is `gh stack sync --prune` in a terminal. A conflict during sync
+restores every branch and reports it — resolving conflicts is what **Restack**
+is for.
+
+## Push all
+
+**Push all** is `gh stack push`: every active branch force-pushed with lease,
+nothing opened.
 
 ## Checking it yourself
 
-`tests/stack.rs` covers the git side offline — the parent chain, restacking
-(including the case where a rebase would otherwise replay a branch's commits
-twice), merge detection, and the PR body block.
+`tests/stack.rs` covers the offline half against a bare repository on disk:
+reading the chain, growing it, restacking (including the case where a rebase
+would otherwise replay a branch's commits twice), a conflict continued and
+abandoned, pushing, untracking, and the import of a chain the previous
+implementation recorded. The tests need `gh` and the extension installed and
+say so when they are not.
 
 The GitHub half is exercised against the real API by an ignored test:
 
@@ -135,9 +154,11 @@ retargeted. The repository is left behind for you to delete.
 
 ## What it does not do
 
-- **Deleting merged branches.** Sync takes them out of the stack; removing the
-  branch is left to you.
+- **Deleting merged branches.** `gh stack sync --prune`, in a terminal.
+- **Restructuring in the dialog.** That is `gh stack modify`, a terminal UI,
+  reachable from **Modify…**.
 - **Forks.** A pull request is opened with the branch name as its head, so the
   branch has to live in the repository the PR is opened against.
 - **Splitting an existing branch into a stack.** Use **Split commits** (the AI
-  split of the working tree) or `git rebase -i` first, then stack the branches.
+  split of the working tree) or `git rebase -i` first, then adopt the branches
+  with `gh stack init a b c`.

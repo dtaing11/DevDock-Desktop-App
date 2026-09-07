@@ -94,6 +94,11 @@ pub struct Config {
     /// this is the one worth pointing at your strongest model.
     #[serde(default)]
     pub coding_ai: Option<AiSelection>,
+    /// Model that writes Jira tickets from a list. It reads the repository
+    /// to make each one specific, so it wants a model that can follow a
+    /// trail through code.
+    #[serde(default)]
+    pub tickets_ai: Option<AiSelection>,
     /// Use the light palette.
     #[serde(default)]
     pub light_theme: bool,
@@ -300,6 +305,8 @@ pub enum Dialog {
     TidyHistory,
     /// The stack of branches this one sits in, and its pull requests.
     Stack,
+    /// Turn a list of work into Jira tickets.
+    Tickets,
 }
 
 /// A destructive action awaiting user confirmation.
@@ -521,6 +528,60 @@ pub struct StackState {
     /// because submitting a stack touches several branches and pull requests
     /// and a one-line toast cannot say which.
     pub log: Vec<String>,
+}
+
+/// One drafted ticket, and what has happened to it.
+pub struct DraftedTicket {
+    pub draft: crate::agent::tickets::Draft,
+    /// Whether the user has ticked it for creating. On by default: unlike a
+    /// file write, creating a ticket is undoable and visible, and a list of
+    /// twenty with every box empty is a chore rather than a review.
+    pub accepted: bool,
+    /// Set once it exists in Jira, so a second Create cannot duplicate it.
+    pub created: Option<crate::jira::Issue>,
+    /// Why this one could not be created, if it could not.
+    pub error: Option<String>,
+}
+
+/// Turning a list of work into Jira tickets.
+#[derive(Default)]
+pub struct TicketsState {
+    /// The list being turned into tickets.
+    pub list: String,
+    pub drafting: bool,
+    pub error: Option<String>,
+    pub drafts: Vec<DraftedTicket>,
+    /// What the model says about the set as a whole.
+    pub notes: String,
+    /// What it did while drafting.
+    pub log: Vec<String>,
+
+    /// The connection form, and whether it has been verified.
+    pub creds: crate::jira::Credentials,
+    pub account: Option<String>,
+    pub connecting: bool,
+    pub connect_error: Option<String>,
+
+    pub projects: Vec<crate::jira::Project>,
+    /// Selected project key.
+    pub project: String,
+    pub types: Vec<crate::jira::IssueType>,
+    pub creating: bool,
+    /// Which draft's description is expanded for editing.
+    pub expanded: Option<usize>,
+}
+
+impl TicketsState {
+    /// Drafts ticked and not yet created.
+    pub fn pending(&self) -> usize {
+        self.drafts.iter().filter(|d| d.accepted && d.created.is_none()).count()
+    }
+
+    /// Issue type names the project accepts, excluding sub-tasks, which
+    /// cannot be created without a parent.
+    pub fn type_names(&self) -> Vec<String> {
+        self.types.iter().filter(|t| !t.subtask).map(|t| t.name.clone()).collect()
+    }
 }
 
 /// Conflict-resolver dialog state.
@@ -776,6 +837,8 @@ pub struct App {
     pub pr: PrState,
     /// The branch chain the current branch belongs to, and what it is doing.
     pub stack: StackState,
+    /// The list being turned into Jira tickets, and the drafts.
+    pub tickets: TicketsState,
     pub local_ci: LocalCiState,
     pub review: ReviewState,
     pub conflicts: ConflictState,
@@ -916,6 +979,7 @@ impl App {
             claude: Default::default(),
             pr: Default::default(),
             stack: Default::default(),
+            tickets: Default::default(),
             local_ci: Default::default(),
             review: Default::default(),
             conflicts: Default::default(),
@@ -1225,6 +1289,7 @@ impl App {
             worker::AiTarget::Conflict => self.config.conflict_ai.clone(),
             worker::AiTarget::Review => self.config.review_ai.clone(),
             worker::AiTarget::Coding => self.config.coding_ai.clone(),
+            worker::AiTarget::Tickets => self.config.tickets_ai.clone(),
         };
         explicit.or_else(|| {
             let provider = self.config.ai_provider.clone().unwrap_or_else(|| "ollama".into());
@@ -1245,6 +1310,7 @@ impl App {
             worker::AiTarget::Conflict => self.config.conflict_ai = Some(sel),
             worker::AiTarget::Review => self.config.review_ai = Some(sel),
             worker::AiTarget::Coding => self.config.coding_ai = Some(sel),
+            worker::AiTarget::Tickets => self.config.tickets_ai = Some(sel),
         }
         self.config.save();
     }
@@ -1303,6 +1369,8 @@ impl App {
             // which is where a project already describes how its code should
             // be written; see `coding_instructions`.
             worker::AiTarget::Coding => return None,
+            // Ticket wording is the team's business, not the repository's.
+            worker::AiTarget::Tickets => return None,
         };
         let mut parts: Vec<String> = Vec::new();
         let inline = inline.trim();
@@ -1701,6 +1769,96 @@ impl App {
                 }
             }
 
+            Msg::JiraConnected(result) => {
+                self.tickets.connecting = false;
+                match result {
+                    Ok((account, projects)) => {
+                        self.tickets.connect_error = None;
+                        self.tickets.account = Some(account);
+                        // Keep whatever was chosen if it still exists; the
+                        // first project otherwise, since one is needed before
+                        // anything can be filed.
+                        if !projects.iter().any(|p| p.key == self.tickets.project) {
+                            self.tickets.project =
+                                projects.first().map(|p| p.key.clone()).unwrap_or_default();
+                        }
+                        self.tickets.projects = projects;
+                        let project = self.tickets.project.clone();
+                        if !project.is_empty() {
+                            self.load_issue_types(project);
+                        }
+                    }
+                    Err(e) => {
+                        self.tickets.account = None;
+                        self.tickets.connect_error = Some(e);
+                    }
+                }
+            }
+            Msg::JiraTypes { project, types } => {
+                // A late answer for a project the user has moved on from
+                // would replace the right list with the wrong one.
+                if project != self.tickets.project {
+                    return;
+                }
+                match types {
+                    Ok(types) => self.tickets.types = types,
+                    Err(e) => {
+                        self.tickets.types.clear();
+                        self.tickets.connect_error = Some(e);
+                    }
+                }
+            }
+            Msg::TicketDrafts(result) => {
+                self.tickets.drafting = false;
+                match result {
+                    Ok(proposal) => {
+                        self.tickets.notes = proposal.notes;
+                        self.tickets.drafts = proposal
+                            .drafts
+                            .into_iter()
+                            .map(|draft| DraftedTicket {
+                                draft,
+                                accepted: true,
+                                created: None,
+                                error: None,
+                            })
+                            .collect();
+                        self.tickets.error = None;
+                        self.toast(
+                            format!("Drafted {} ticket(s).", self.tickets.drafts.len()),
+                            false,
+                        );
+                    }
+                    Err(e) => {
+                        self.tickets.error = Some(e.clone());
+                        self.toast(e, true);
+                    }
+                }
+            }
+            Msg::TicketCreated { index, result } => {
+                if let Some(drafted) = self.tickets.drafts.get_mut(index) {
+                    match result {
+                        Ok(issue) => {
+                            drafted.error = None;
+                            drafted.created = Some(issue);
+                        }
+                        Err(e) => drafted.error = Some(e),
+                    }
+                }
+                // The last one back turns the button on again.
+                if self.tickets.drafts.iter().all(|d| d.created.is_some() || !d.accepted || d.error.is_some())
+                {
+                    self.tickets.creating = false;
+                    let made = self.tickets.drafts.iter().filter(|d| d.created.is_some()).count();
+                    let failed = self.tickets.drafts.iter().filter(|d| d.error.is_some()).count();
+                    if failed > 0 {
+                        self.toast(format!("{made} created, {failed} failed."), true);
+                    } else if made > 0 {
+                        self.toast(format!("Created {made} ticket(s) in Jira."), false);
+                    }
+                }
+            }
+
             Msg::Stack(result) => {
                 self.stack.loading = false;
                 match result {
@@ -1947,12 +2105,15 @@ impl App {
             }
             Msg::AgentPlan { kind, steps } => match kind {
                 AgentKind::Coding => self.coding.plan = steps,
+                // The ticket writer has no plan panel; its progress is a log.
+                AgentKind::Tickets => {}
                 // The conflict resolver's progress is its log, not a plan.
                 AgentKind::Conflict => {}
             },
             Msg::AgentEvent { kind, line } => match kind {
                 AgentKind::Conflict => self.agent.log.push(line),
                 AgentKind::Coding => self.coding.log.push(line),
+                AgentKind::Tickets => self.tickets.log.push(line),
             },
             Msg::AgentDone { kind: AgentKind::Coding, result } => {
                 self.finish_coding_run(result)
@@ -2017,7 +2178,8 @@ impl App {
                     (
                         worker::AiTarget::Conflict
                         | worker::AiTarget::Review
-                        | worker::AiTarget::Coding,
+                        | worker::AiTarget::Coding
+                        | worker::AiTarget::Tickets,
                         Ok(_),
                     ) => {}
                     (_, Err(e)) => self.toast(e, true),
@@ -2461,6 +2623,188 @@ impl App {
             })();
             Msg::GhPrs(result)
         });
+    }
+
+    // -- Jira tickets -------------------------------------------------------
+
+    /// Opens the ticket writer, connecting with the stored credentials if
+    /// there are any.
+    pub fn open_tickets(&mut self) {
+        self.dialog = Dialog::Tickets;
+        if self.tickets.creds.site.is_empty() {
+            if let Some(creds) = crate::jira::CredentialStore::load() {
+                self.tickets.creds = creds;
+            }
+        }
+        if self.tickets.account.is_none() && self.tickets.creds.is_complete() {
+            self.connect_jira();
+        }
+    }
+
+    /// Verifies the credentials and loads the projects behind them.
+    ///
+    /// One round trip proves the token works and gives the user something to
+    /// pick a project from; a "connected" that has not asked Jira anything is
+    /// a promise made on the client's word alone.
+    pub fn connect_jira(&mut self) {
+        let creds = crate::jira::Credentials::new(
+            &self.tickets.creds.site,
+            &self.tickets.creds.email,
+            &self.tickets.creds.token,
+        );
+        if !creds.is_complete() {
+            self.tickets.connect_error =
+                Some("A site, an email address, and an API token are all needed.".into());
+            return;
+        }
+        self.tickets.creds = creds.clone();
+        self.tickets.connecting = true;
+        self.tickets.connect_error = None;
+        self.worker.spawn(move || {
+            let result = (|| -> Result<(String, Vec<crate::jira::Project>), String> {
+                let client = crate::jira::Client::new(creds.clone());
+                let account = client.myself().map_err(|e| e.to_string())?;
+                let projects = client.projects().map_err(|e| e.to_string())?;
+                // Only stored once Jira has accepted them, so a typo is not
+                // written to disk to fail again on the next launch.
+                crate::jira::CredentialStore::save(&creds).map_err(|e| e.to_string())?;
+                let who = if account.display_name.is_empty() {
+                    account.email
+                } else {
+                    account.display_name
+                };
+                Ok((who, projects))
+            })();
+            Msg::JiraConnected(result)
+        });
+    }
+
+    /// Forgets the stored credentials.
+    pub fn disconnect_jira(&mut self) {
+        let _ = crate::jira::CredentialStore::clear();
+        self.tickets.account = None;
+        self.tickets.projects.clear();
+        self.tickets.types.clear();
+        self.tickets.creds.token.clear();
+        self.toast("Signed out of Jira.", false);
+    }
+
+    /// Loads the issue types a project accepts.
+    pub fn load_issue_types(&mut self, project: String) {
+        self.tickets.project = project.clone();
+        self.tickets.types.clear();
+        self.worker.spawn(move || {
+            let types = crate::jira::Client::from_store()
+                .ok_or_else(|| "Not connected to Jira.".to_string())
+                .and_then(|c| c.issue_types(&project).map_err(|e| e.to_string()));
+            Msg::JiraTypes { project, types }
+        });
+    }
+
+    /// Puts the current review's findings in the list box.
+    ///
+    /// A review is already a list of work, and retyping it into a ticket
+    /// writer is the sort of copying a tool exists to remove.
+    pub fn tickets_from_review(&mut self) {
+        let Some(outcome) = self.review.outcome.clone() else { return };
+        let list: Vec<String> = outcome
+            .findings
+            .iter()
+            .map(|f| {
+                let where_ = match (f.file.is_empty(), f.line) {
+                    (true, _) => String::new(),
+                    (false, Some(line)) => format!(" ({}:{line})", f.file),
+                    (false, None) => format!(" ({})", f.file),
+                };
+                format!("- [{}] {}{where_}", f.severity.label(), f.title)
+            })
+            .collect();
+        if list.is_empty() {
+            self.toast("The review found nothing to file.", true);
+            return;
+        }
+        self.tickets.list = list.join("\n");
+        self.open_tickets();
+    }
+
+    /// Drafts tickets for the list, with the repository open to the model.
+    pub fn draft_tickets(&mut self) {
+        let Some(repo) = self.repo.clone() else {
+            self.toast("Open a repository first.", true);
+            return;
+        };
+        if crate::agent::tickets::parse_list(&self.tickets.list).is_empty() {
+            self.toast("Put a list of work in the box first.", true);
+            return;
+        }
+        let Some(sel) = self.ai_selection(worker::AiTarget::Tickets) else {
+            self.toast("Pick a model first.", true);
+            return;
+        };
+        let list = self.tickets.list.clone();
+        let types = self.tickets.type_names();
+        let url = self.effective_ollama_url();
+        let ctx = self.ctx.clone();
+        let tx = self.worker.sender();
+
+        self.tickets.drafting = true;
+        self.tickets.error = None;
+        self.tickets.log.clear();
+        self.worker.spawn(move || {
+            let result = (|| -> Result<crate::agent::tickets::Proposal, String> {
+                let provider = agent_provider(&sel, &url)?;
+                let tracked = strerr(repo.tracked_files())?;
+                let mut workspace = crate::agent::Workspace::new(
+                    repo.path(),
+                    tracked,
+                    crate::agent::Access::ReadOnly,
+                )?;
+                crate::agent::tickets::run(
+                    provider.as_ref(),
+                    &mut workspace,
+                    &list,
+                    &types,
+                    None,
+                    &mut |event| {
+                        let _ = tx.send(Msg::AgentEvent {
+                            kind: worker::AgentKind::Tickets,
+                            line: event.line(),
+                        });
+                        ctx.request_repaint();
+                    },
+                )
+            })();
+            Msg::TicketDrafts(result)
+        });
+    }
+
+    /// Creates every ticked draft in the chosen project.
+    pub fn create_tickets(&mut self) {
+        let project = self.tickets.project.clone();
+        if project.is_empty() {
+            self.toast("Pick a project first.", true);
+            return;
+        }
+        let todo: Vec<(usize, crate::jira::NewIssue)> = self
+            .tickets
+            .drafts
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.accepted && d.created.is_none())
+            .map(|(i, d)| (i, d.draft.to_issue(&project)))
+            .collect();
+        if todo.is_empty() {
+            return;
+        }
+        self.tickets.creating = true;
+        for (index, issue) in todo {
+            self.worker.spawn(move || {
+                let result = crate::jira::Client::from_store()
+                    .ok_or_else(|| "Not connected to Jira.".to_string())
+                    .and_then(|c| c.create_issue(&issue).map_err(|e| e.to_string()));
+                Msg::TicketCreated { index, result }
+            });
+        }
     }
 
     // -- stacked pull requests ----------------------------------------------
@@ -3964,7 +4308,8 @@ impl App {
                 // overwritten and this gate never fires for them.
                 worker::AiTarget::Conflict
                 | worker::AiTarget::Review
-                | worker::AiTarget::Coding => {}
+                | worker::AiTarget::Coding
+                | worker::AiTarget::Tickets => {}
             }
             return;
         }
@@ -5002,6 +5347,141 @@ mod tests {
     /// Their paths are repo-relative, so an unapplied proposal that survived
     /// a repository switch would be written into the *new* project — one
     /// repo's edits landing in another's files.
+    /// The ticket writer draws, in both of its states.
+    #[test]
+    fn the_ticket_dialog_renders() {
+        let (_tmp, mut app, _file) = app_with_repo();
+        // Not connected: the credentials form.
+        app.dialog = Dialog::Tickets;
+        theme::run_test_ctx(|ctx| dialogs::show(&mut app, ctx));
+
+        // Connected, with drafts.
+        app.tickets.account = Some("Someone".into());
+        app.tickets.creds.site = "https://acme.atlassian.net".into();
+        app.tickets.projects = vec![crate::jira::Project {
+            id: "1".into(),
+            key: "DEV".into(),
+            name: "DevDock".into(),
+        }];
+        app.tickets.project = "DEV".into();
+        app.tickets.types = vec![crate::jira::IssueType {
+            id: "1".into(),
+            name: "Task".into(),
+            subtask: false,
+        }];
+        app.tickets.list = "- do the thing".into();
+        app.tickets.drafts = vec![DraftedTicket {
+            draft: crate::agent::tickets::Draft {
+                summary: "Do the thing".into(),
+                description: "Because.".into(),
+                issue_type: "Task".into(),
+                labels: vec!["cli".into()],
+                source: vec!["do the thing".into()],
+            },
+            accepted: true,
+            created: None,
+            error: None,
+        }];
+        app.tickets.expanded = Some(0);
+        theme::run_test_ctx(|ctx| dialogs::show(&mut app, ctx));
+    }
+
+    /// A sub-task cannot be created without a parent, so it is not offered.
+    #[test]
+    fn subtask_types_are_not_offered() {
+        let (_tmp, mut app, _file) = app_with_repo();
+        app.tickets.types = vec![
+            crate::jira::IssueType { id: "1".into(), name: "Task".into(), subtask: false },
+            crate::jira::IssueType { id: "2".into(), name: "Sub-task".into(), subtask: true },
+        ];
+        assert_eq!(app.tickets.type_names(), ["Task"]);
+    }
+
+    /// Nothing is sent to Jira without a project, and nothing is sent twice.
+    #[test]
+    fn creating_tickets_needs_a_project_and_never_repeats_one() {
+        let (_tmp, mut app, _file) = app_with_repo();
+        let draft = |summary: &str| crate::agent::tickets::Draft {
+            summary: summary.into(),
+            description: String::new(),
+            issue_type: "Task".into(),
+            labels: vec![],
+            source: vec![],
+        };
+        app.tickets.drafts = vec![
+            DraftedTicket {
+                draft: draft("one"),
+                accepted: true,
+                created: None,
+                error: None,
+            },
+            // Already filed: ticked or not, it must not be created again.
+            DraftedTicket {
+                draft: draft("two"),
+                accepted: true,
+                created: Some(crate::jira::Issue {
+                    id: "1".into(),
+                    key: "DEV-1".into(),
+                    url: "u".into(),
+                }),
+                error: None,
+            },
+            DraftedTicket {
+                draft: draft("three"),
+                accepted: false,
+                created: None,
+                error: None,
+            },
+        ];
+        assert_eq!(app.tickets.pending(), 1, "only the ticked, uncreated one");
+
+        // No project: refused, and nothing starts.
+        app.tickets.project.clear();
+        app.create_tickets();
+        assert!(!app.tickets.creating);
+        assert!(app.toast.as_ref().is_some_and(|t| t.error));
+    }
+
+    /// A review is a list of work; the ticket writer takes it as one.
+    #[test]
+    fn review_findings_become_the_list() {
+        let (_tmp, mut app, _file) = app_with_repo();
+        app.review.outcome = Some(crate::review::ReviewOutcome {
+            summary: "two things".into(),
+            findings: vec![
+                crate::review::Finding {
+                    file: "src/a.rs".into(),
+                    line: Some(12),
+                    severity: crate::review::Severity::High,
+                    title: "unchecked index".into(),
+                    detail: String::new(),
+                    evidence: String::new(),
+                    verified: true,
+                },
+                crate::review::Finding {
+                    file: String::new(),
+                    line: None,
+                    severity: crate::review::Severity::Low,
+                    title: "no test for the new flag".into(),
+                    detail: String::new(),
+                    evidence: String::new(),
+                    verified: true,
+                },
+            ],
+            ..Default::default()
+        });
+
+        app.tickets_from_review();
+
+        assert_eq!(app.dialog, Dialog::Tickets);
+        let items = crate::agent::tickets::parse_list(&app.tickets.list);
+        assert_eq!(items.len(), 2, "{:?}", app.tickets.list);
+        assert!(items[0].contains("unchecked index"), "{:?}", items[0]);
+        assert!(items[0].contains("src/a.rs:12"), "the location travels: {:?}", items[0]);
+        // A finding about the change as a whole has no location to add.
+        assert!(items[1].contains("no test for the new flag"));
+    }
+
     /// The stack view shows the chain, and its actions really move branches.
     #[test]
     fn the_stack_view_renders_the_chain_and_restacks_it() {

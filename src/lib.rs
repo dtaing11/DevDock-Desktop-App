@@ -10,6 +10,8 @@
 //!   merge/rebase, conflict resolution, and remote sync.
 //! - [`github`]: GitHub device-flow sign-in, token storage, and the pull
 //!   request subset of the REST API.
+//! - [`jira`]: Jira Cloud credentials and issue creation, for turning a list
+//!   of work into tickets.
 //! - [`stack`]: stacked pull requests — the chain of parent branches that
 //!   turns one large change into a reviewable series, and the restack /
 //!   submit / sync operations that keep it in order.
@@ -23,6 +25,7 @@ pub mod cli;
 pub mod cli_style;
 pub mod git;
 pub mod github;
+pub mod jira;
 pub mod local_ci;
 pub mod lsp;
 pub mod ollama;

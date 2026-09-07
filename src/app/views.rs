@@ -1543,7 +1543,8 @@ pub fn ai_controls(
                 // panels; these controls only drive text generation.
                 crate::app::worker::AiTarget::Conflict
                 | crate::app::worker::AiTarget::Review
-                | crate::app::worker::AiTarget::Coding => {}
+                | crate::app::worker::AiTarget::Coding
+                | crate::app::worker::AiTarget::Tickets => {}
             }
         }
         ai_model_picker(app, ui, target);

@@ -425,6 +425,17 @@ fn branch_menu(app: &mut App, ui: &mut egui::Ui) {
                 ui.close();
             }
         });
+        if ui
+            .button("Worktrees…")
+            .on_hover_text(
+                "Check a branch out in its own directory, to work on two at once \
+                 or run an agent on each.",
+            )
+            .clicked()
+        {
+            app.open_worktrees();
+            ui.close();
+        }
         ui.separator();
 
         // Filter + branch lists

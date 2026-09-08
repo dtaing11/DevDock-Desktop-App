@@ -48,6 +48,11 @@ macOS/Windows since egui is cross-platform).
   after any branch changes, push and open every PR in one action, and sync
   after something merges. Needs `gh extension install github/gh-stack`.
   See [docs/stacked-prs.md](docs/stacked-prs.md).
+- **Worktrees**: check a branch out in its own directory and open it in a
+  second window — its own working tree, agent, and terminal — so two branches
+  can be worked on at once, or a coding agent run on each of several branches
+  at the same time. `devdock <dir>` opens the app on any checkout.
+  See [docs/worktrees.md](docs/worktrees.md).
 
 ## Install
 
@@ -181,6 +186,7 @@ src/
     markdown.rs  Markdown rendering for reviews, agent summaries, and .md files
     views.rs   Toolbar, sidebar, diff panel
     dialogs.rs Repo picker, GitHub, PRs, stacks, conflicts, settings
+    worktrees.rs Worktrees: a branch per directory, a window per worktree
     editor.rs  Code editor: buffers, highlighting, LSP interactions
     agent_tab.rs The coding agent's task panel and change review
     worker.rs  Background thread runner

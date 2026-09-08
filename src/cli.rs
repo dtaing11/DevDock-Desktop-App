@@ -25,6 +25,7 @@ pub fn run(args: &[String]) -> Option<ExitCode> {
         "hook" => cmd_hook(rest),
         "resolve" => cmd_resolve(rest),
         "tickets" => cmd_tickets(rest),
+        "worktree" | "worktrees" => cmd_worktree(rest),
         "help" | "--help" | "-h" => {
             print_help();
             ExitCode::SUCCESS
@@ -49,6 +50,7 @@ fn print_help() {
     );
     println!("{}", style::header("usage"));
     println!("  devdock              {}", style::dim("launch the GUI"));
+    println!("  devdock <dir>        {}", style::dim("launch the GUI on that repository"));
     println!("  devdock <command>    {}\n", style::dim("run a command headlessly"));
     println!("{}", style::header("commands"));
     let rows: &[(&str, &str)] = &[
@@ -67,6 +69,9 @@ fn print_help() {
         ("pr --ai", "AI-generated PR title and body"),
         ("tickets FILE", "draft Jira tickets from a list of work"),
         ("tickets FILE --create", "…and create them in Jira"),
+        ("worktree", "every checkout of this repository"),
+        ("worktree add BRANCH [PATH] [--from BASE]", "check a branch out in its own directory"),
+        ("worktree remove PATH [--force]", "delete a worktree's directory, keeping the branch"),
         ("resolve", "interactive conflict resolver with AI proposals"),
         ("resolve --agent", "AI reads the repo and proposes every fix, you confirm each"),
         ("ci", "run all local CI jobs (.git-manage-ci.toml)"),
@@ -564,6 +569,134 @@ fn cmd_branches() -> ExitCode {
             eprintln!("devdock: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// `devdock worktree [list | add BRANCH [PATH] [--from BASE] | remove PATH [--force]]`
+///
+/// A branch in its own directory, so two of them can be worked on at once —
+/// or an agent run on each. `devdock <path>` opens the app there.
+fn cmd_worktree(rest: &[String]) -> ExitCode {
+    let repo = match repo() {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+    let fail = |e: String| {
+        eprintln!("devdock: {e}");
+        ExitCode::FAILURE
+    };
+    match rest.first().map(String::as_str) {
+        Some("list") | None => match repo.worktrees() {
+            Ok(list) => {
+                let here = repo.path().to_path_buf();
+                for wt in &list {
+                    let name = wt.branch.clone().unwrap_or_else(|| {
+                        format!("(detached at {})", &wt.head[..wt.head.len().min(7)])
+                    });
+                    let marker = if wt.path == here { style::ember("»") } else { " ".into() };
+                    let mut notes = Vec::new();
+                    if wt.main {
+                        notes.push("main");
+                    }
+                    if wt.locked {
+                        notes.push("locked");
+                    }
+                    if wt.prunable {
+                        notes.push("missing");
+                    }
+                    let notes = if notes.is_empty() {
+                        String::new()
+                    } else {
+                        style::dim(&format!("  ({})", notes.join(", ")))
+                    };
+                    println!(
+                        "{marker} {}  {}{notes}",
+                        style::bold(&name),
+                        style::dim(&wt.path.display().to_string())
+                    );
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(e.to_string()),
+        },
+        Some("add") => {
+            let from = match flag_value(&rest[1..], "--from") {
+                Ok(v) => v.map(str::to_string),
+                Err(e) => return fail(e),
+            };
+            // Positional arguments: the branch, then an optional path. The
+            // flag's value is neither.
+            let mut positional: Vec<&str> = Vec::new();
+            let mut skip = false;
+            for arg in &rest[1..] {
+                if skip {
+                    skip = false;
+                    continue;
+                }
+                if arg == "--from" {
+                    skip = true;
+                    continue;
+                }
+                if arg.starts_with("--") {
+                    continue;
+                }
+                positional.push(arg);
+            }
+            let Some(branch) = positional.first().map(|s| s.to_string()) else {
+                return fail(
+                    "worktree add needs a branch: devdock worktree add BRANCH [PATH] [--from BASE]"
+                        .into(),
+                );
+            };
+            let path = positional
+                .get(1)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| repo.worktree_default_path(&branch));
+            let exists = repo
+                .branches()
+                .map(|b| b.local.iter().any(|br| br.name == branch))
+                .unwrap_or(false);
+            let create_from = match (exists, from) {
+                (true, Some(_)) => {
+                    return fail(format!(
+                        "{branch} already exists; --from only applies to a new branch"
+                    ));
+                }
+                (true, None) => None,
+                (false, Some(base)) => Some(base),
+                (false, None) => Some("HEAD".to_string()),
+            };
+            match repo.worktree_add(&path, &branch, create_from.as_deref()) {
+                Ok(wt) => {
+                    let verb = if exists { "checked out" } else { "created" };
+                    println!("{} {branch} {verb} in {}", style::green("✓"), wt.path.display());
+                    println!(
+                        "{}",
+                        style::dim(&format!("open the app there: devdock {}", wt.path.display()))
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => fail(e.to_string()),
+            }
+        }
+        Some("remove") | Some("rm") => {
+            let force = rest.iter().any(|a| a == "--force" || a == "-f");
+            let Some(path) = rest[1..].iter().find(|a| !a.starts_with('-')) else {
+                return fail("worktree remove needs a path".into());
+            };
+            match repo.worktree_remove(std::path::Path::new(path), force) {
+                Ok(()) => {
+                    println!("{} removed {path}", style::green("✓"));
+                    ExitCode::SUCCESS
+                }
+                Err(e) => fail(e.to_string()),
+            }
+        }
+        Some("prune") => match repo.worktree_prune() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(e.to_string()),
+        },
+        Some(other) => fail(format!("unknown worktree command \"{other}\"")),
     }
 }
 

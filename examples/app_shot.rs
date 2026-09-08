@@ -4,7 +4,8 @@
 //! `cargo run --example app_shot -- <repo> <tab> <out.rgba> [width] [height]`
 //! where tab is one of: changes, history, checks, editor, agent.
 //!
-//! `DIALOG=stack` opens a dialog over the app before the picture is taken.
+//! `DIALOG=stack|worktrees|pr|tickets` opens a dialog over the app before the
+//! picture is taken.
 //! `AGENT_DEMO=running|changes` fills the coding agent with state, since a
 //! real run needs a model and a screenshot needs neither.
 
@@ -36,6 +37,7 @@ impl eframe::App for Shot {
             }
             match std::env::var("DIALOG").as_deref() {
                 Ok("stack") => self.app.open_stack(),
+                Ok("worktrees") => self.app.open_worktrees(),
                 Ok("pr") => self.app.dialog = git_manage::app::Dialog::PullRequests,
                 Ok("tickets") => {
                     seed_tickets(&mut self.app);

@@ -1743,3 +1743,77 @@ fn grep_searches_tracked_files_and_honours_its_options() {
     let regex = GrepOptions { regex: true, ..Default::default() };
     assert_eq!(repo.grep("let [A-Za-z]+ = 3", regex).unwrap().len(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Worktrees
+// ---------------------------------------------------------------------------
+
+#[test]
+fn worktrees_are_listed_added_and_removed() {
+    let (tmp, repo) = setup();
+    commit_file(&repo, "a.txt", "a\n", "chore: root");
+
+    let list = repo.worktrees().unwrap();
+    assert_eq!(list.len(), 1);
+    assert!(list[0].main);
+    assert_eq!(list[0].branch.as_deref(), Some("main"));
+    assert!(!repo.is_linked_worktree());
+
+    // A new branch, in a directory of our choosing.
+    let dir = tmp.path().join("feature-wt");
+    let wt = repo.worktree_add(&dir, "feature", Some("HEAD")).unwrap();
+    assert_eq!(wt.branch.as_deref(), Some("feature"));
+    assert!(!wt.main);
+    assert!(dir.join("a.txt").exists(), "the worktree has the files");
+
+    let linked = Repo::open(&dir).unwrap();
+    assert_eq!(linked.current_branch(), "feature");
+    assert!(linked.is_linked_worktree());
+    assert_eq!(
+        fs::canonicalize(linked.main_worktree()).unwrap(),
+        fs::canonicalize(repo.path()).unwrap(),
+        "it knows where it came from"
+    );
+    assert_eq!(repo.current_branch(), "main", "the main checkout did not move");
+
+    let list = repo.worktrees().unwrap();
+    assert_eq!(list.len(), 2);
+    assert!(list.iter().any(|w| w.branch.as_deref() == Some("feature")));
+
+    // A branch checked out somewhere cannot be checked out again.
+    let twice = tmp.path().join("feature-twice");
+    assert!(repo.worktree_add(&twice, "feature", None).is_err());
+    // An existing branch that is free can.
+    repo.create_branch("spare", false).unwrap();
+    let spare = repo.worktree_add(&tmp.path().join("spare-wt"), "spare", None).unwrap();
+    assert_eq!(spare.branch.as_deref(), Some("spare"));
+
+    // Uncommitted work protects a worktree from removal, unless forced.
+    fs::write(dir.join("wip.txt"), "not committed\n").unwrap();
+    assert!(repo.worktree_remove(&dir, false).is_err());
+    assert!(dir.exists());
+    repo.worktree_remove(&dir, true).unwrap();
+    assert!(!dir.exists());
+    let list = repo.worktrees().unwrap();
+    assert_eq!(list.len(), 2, "main and spare");
+    // The branch survives its worktree.
+    assert!(repo.branches().unwrap().local.iter().any(|b| b.name == "feature"));
+
+    // A directory deleted by hand is reported, then pruned.
+    fs::remove_dir_all(tmp.path().join("spare-wt")).unwrap();
+    let list = repo.worktrees().unwrap();
+    assert!(list.iter().any(|w| w.prunable), "{list:?}");
+    repo.worktree_prune().unwrap();
+    assert_eq!(repo.worktrees().unwrap().len(), 1);
+}
+
+#[test]
+fn a_worktree_default_path_sits_next_to_the_main_one() {
+    let (tmp, repo) = setup();
+    let path = repo.worktree_default_path("feat/search v2");
+    assert_eq!(
+        fs::canonicalize(path.parent().unwrap()).unwrap(),
+        fs::canonicalize(tmp.path()).unwrap()
+    );
+    assert_eq!(path.file_name().unwrap(), "work-feat-search-v2");
+}

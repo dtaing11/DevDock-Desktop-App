@@ -27,6 +27,7 @@ pub enum Cmd {
     Pull,
     Fetch,
     Branches,
+    Worktrees,
     PullRequests,
     Stack,
     Tickets,
@@ -84,6 +85,11 @@ pub fn commands() -> Vec<Command> {
         c("Fetch", "update remote refs without merging", Cmd::Fetch),
         c("Refresh", "reload status and branches", Cmd::Refresh),
         c("Branches", "switch create delete branches", Cmd::Branches),
+        c(
+            "Worktrees",
+            "worktree checkout a branch in its own directory parallel agents new window",
+            Cmd::Worktrees,
+        ),
         c("Pull requests", "github open create review", Cmd::PullRequests),
         c(
             "Stacked pull requests",
@@ -182,6 +188,7 @@ pub fn run(app: &mut App, cmd: Cmd) {
         Cmd::Pull => app.shortcut_sync("pull"),
         Cmd::Fetch => app.shortcut_sync("fetch"),
         Cmd::Branches => app.tab = Tab::Changes,
+        Cmd::Worktrees => app.open_worktrees(),
         Cmd::PullRequests => app.dialog = Dialog::PullRequests,
         Cmd::Stack => app.open_stack(),
         Cmd::Tickets => app.open_tickets(),

@@ -87,6 +87,15 @@ pub enum Msg {
     /// One ticket created, or not.
     TicketCreated { index: usize, result: Result<crate::jira::Issue, String> },
 
+    /// Every checkout of the repository.
+    Worktrees(Result<Vec<crate::git::Worktree>, String>),
+    /// A worktree was added or removed. `open` names one to open afterwards,
+    /// and whether in a new window.
+    WorktreeDone {
+        message: Result<String, String>,
+        open: Option<(std::path::PathBuf, bool)>,
+    },
+
     /// The branch chain the current branch sits in.
     Stack(Result<crate::stack::Stack, String>),
     /// A stack operation finished: a toast message, the per-branch log the

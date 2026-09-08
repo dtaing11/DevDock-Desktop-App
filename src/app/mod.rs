@@ -24,6 +24,7 @@ pub mod textdiff;
 pub mod theme;
 pub mod views;
 pub mod worker;
+pub mod worktrees;
 
 use crate::git::{BranchList, Commit, ConflictFile, Repo, Status};
 use crate::github;
@@ -37,6 +38,12 @@ use worker::{strerr, AgentKind, LspReply, Msg, Worker};
 
 /// Runs the desktop app. Blocks until the window closes.
 pub fn run() -> eframe::Result<()> {
+    run_with(None)
+}
+
+/// Runs the desktop app on `start` rather than on the last repository. This
+/// is how a second window on a worktree is opened: `devdock <path>`.
+pub fn run_with(start: Option<std::path::PathBuf>) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 820.0])
@@ -53,7 +60,7 @@ pub fn run() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             theme::apply(&cc.egui_ctx);
-            Ok(Box::new(App::new(&cc.egui_ctx)))
+            Ok(Box::new(App::new(&cc.egui_ctx, start)))
         }),
     )
 }
@@ -307,6 +314,8 @@ pub enum Dialog {
     Stack,
     /// Turn a list of work into Jira tickets.
     Tickets,
+    /// Every checkout of the repository, and a form for one more.
+    Worktrees,
 }
 
 /// A destructive action awaiting user confirmation.
@@ -339,6 +348,8 @@ pub enum ConfirmAction {
     OverwriteAiText(worker::AiTarget),
     /// Move the branch back to a commit from the reflog.
     UndoTo { sha: String, short: String, what: String },
+    /// Delete a worktree's directory. `force` discards uncommitted changes.
+    RemoveWorktree { path: String, force: bool },
 }
 
 impl ConfirmAction {
@@ -361,6 +372,8 @@ impl ConfirmAction {
             // Only the text-generating tasks can overwrite a field.
             Self::OverwriteAiText(_) => "Overwrite generated text?",
             Self::UndoTo { .. } => "Go back to this commit?",
+            Self::RemoveWorktree { force: false, .. } => "Remove worktree?",
+            Self::RemoveWorktree { force: true, .. } => "Remove worktree and its changes?",
         }
     }
 
@@ -422,6 +435,19 @@ impl ConfirmAction {
             Self::OverwriteAiText(_) => {
                 "The field already has text. Generating replaces it.".into()
             }
+            Self::RemoveWorktree { path, force } => {
+                if *force {
+                    format!(
+                        "The directory {path} is deleted, including any uncommitted \
+                         changes in it. The branch is kept."
+                    )
+                } else {
+                    format!(
+                        "The directory {path} is deleted. Refused if it has uncommitted \
+                         changes. The branch is kept."
+                    )
+                }
+            }
             Self::UndoTo { short, what, .. } => format!(
                 "The branch moves back to {short} ({what}).\n\n\
                  Nothing is deleted: the changes from the commits you are undoing stay \
@@ -447,6 +473,8 @@ impl ConfirmAction {
             }
             Self::OverwriteAiText(_) => "Overwrite and generate",
             Self::UndoTo { .. } => "Go back",
+            Self::RemoveWorktree { force: false, .. } => "Remove",
+            Self::RemoveWorktree { force: true, .. } => "Remove and discard changes",
         }
     }
 }
@@ -842,6 +870,7 @@ pub struct App {
     pub pr: PrState,
     /// The branch chain the current branch belongs to, and what it is doing.
     pub stack: StackState,
+    pub worktrees: worktrees::WorktreeState,
     /// The list being turned into Jira tickets, and the drafts.
     pub tickets: TicketsState,
     pub local_ci: LocalCiState,
@@ -883,13 +912,13 @@ pub struct App {
 }
 
 impl App {
-    fn new(ctx: &egui::Context) -> Self {
+    fn new(ctx: &egui::Context, start: Option<std::path::PathBuf>) -> Self {
         let mut app = Self::bare(ctx);
         // The stored appearance, before the first frame is drawn.
         theme::set_light(app.config.light_theme);
         theme::apply(ctx);
         ctx.set_zoom_factor(app.config.zoom.clamp(MIN_ZOOM, MAX_ZOOM));
-        app.startup();
+        app.startup(start);
         app.claude.auth_label = claude::Client::auth_label();
         app.load_claude_models();
         app
@@ -984,6 +1013,7 @@ impl App {
             claude: Default::default(),
             pr: Default::default(),
             stack: Default::default(),
+            worktrees: Default::default(),
             tickets: Default::default(),
             local_ci: Default::default(),
             review: Default::default(),
@@ -1010,9 +1040,12 @@ impl App {
         }
     }
 
-    fn startup(&mut self) {
-        // Reopen the last repository, or ask for one.
-        if let Some(path) = self.config.recent_repos.first().cloned() {
+    fn startup(&mut self, start: Option<std::path::PathBuf>) {
+        // The repository named on the command line, else the last one, else
+        // ask for one.
+        if let Some(path) = start {
+            self.open_repo(&path.display().to_string());
+        } else if let Some(path) = self.config.recent_repos.first().cloned() {
             self.open_repo(&path);
         } else {
             self.dialog = Dialog::RepoPicker;
@@ -1863,6 +1896,9 @@ impl App {
                     }
                 }
             }
+
+            Msg::Worktrees(result) => self.on_worktrees(result),
+            Msg::WorktreeDone { message, open } => self.on_worktree_done(message, open),
 
             Msg::Stack(result) => {
                 self.stack.loading = false;
@@ -4374,6 +4410,9 @@ impl App {
                     refresh: true,
                 });
             }
+            ConfirmAction::RemoveWorktree { path, force } => {
+                self.worktree_remove_confirmed(path, force);
+            }
             ConfirmAction::DeleteBranch(name) => {
                 self.worker.spawn(move || Msg::Done {
                     message: strerr(
@@ -5614,6 +5653,58 @@ mod tests {
             ["feat: upper", "feat: lower again", "feat: lower"],
             "upper was replayed onto the new lower, once"
         );
+    }
+
+    /// Creating a worktree from the dialog puts the branch in its own
+    /// directory and, without a second window, switches this one to it.
+    #[test]
+    fn the_worktree_dialog_creates_one_and_switches_to_it() {
+        let (tmp, mut app, _file) = app_with_repo();
+        let root = tmp.path();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-m", "chore: root"]);
+
+        let settle = |app: &mut App, done: &dyn Fn(&App) -> bool, what: &str| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline {
+                app.handle_messages_for_test();
+                if done(app) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("{what} never finished");
+        };
+
+        app.open_worktrees();
+        assert_eq!(app.dialog, Dialog::Worktrees);
+        settle(&mut app, &|a| !a.worktrees.loading, "listing worktrees");
+        assert_eq!(app.worktrees.list.len(), 1, "just the main worktree");
+        assert!(app.worktrees.list[0].main);
+        theme::run_test_ctx(|ctx| dialogs::show(&mut app, ctx));
+
+        let dir = tmp.path().join("elsewhere");
+        app.worktrees.branch = "feature".into();
+        app.worktrees.path = dir.display().to_string();
+        app.worktrees.new_window = false;
+        app.worktree_create();
+        settle(
+            &mut app,
+            &|a| {
+                !a.worktrees.busy
+                    && a.repo.as_ref().map(|r| r.path().ends_with("elsewhere")) == Some(true)
+                    && !a.worktrees.loading
+                    && a.worktrees.list.len() == 2
+            },
+            "creating the worktree and switching to it",
+        );
+        let repo = app.repo.as_ref().unwrap();
+        assert_eq!(repo.current_branch(), "feature", "the new branch is checked out there");
+        assert!(dir.join("notes.txt").exists(), "the worktree has the files");
+        assert!(app.worktrees.branch.is_empty(), "the form was cleared");
+        // The main checkout is untouched.
+        let main = crate::git::Repo::open(root).unwrap();
+        assert_eq!(main.current_branch(), "main");
     }
 
     /// Submitting is refused while any branch is behind its parent: the pull

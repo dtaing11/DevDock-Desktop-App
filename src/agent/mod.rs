@@ -253,7 +253,7 @@ pub fn run(
     let mut log: Vec<String> = Vec::new();
     let mut truncated = false;
     let mut nudged = false;
-    let mut nudged_code = false;
+    let mut nudged_code = 0u8;
     let mut nudged_giveup = false;
     let mut usage = Usage::default();
     let mut turns;
@@ -298,21 +298,33 @@ pub fn run(
             // the classic small-model failure, and one every model shows now
             // and then — is sent back once to use the tools it was given.
             if !withhold_tools
-                && !nudged_code
+                && nudged_code < 2
                 && workspace.can_edit()
                 && workspace.edits().is_empty()
                 && looks_like_unapplied_code(&reply.text)
             {
-                nudged_code = true;
+                nudged_code += 1;
                 let why = "your answer contains code, but no file was changed".to_string();
                 emit(Event::Nudge(why.clone()), &mut log, on_event);
                 messages.push(Message::Assistant { text: reply.text, calls: Vec::new() });
-                messages.push(Message::User(format!(
-                    "Not yet: {why}. Writing code in the answer does nothing — apply it \
-                     to the repository with write_file, edit_file, or replace_lines \
-                     (repository-relative paths), verify it, and then answer. If no change \
-                     is actually needed, say so plainly without a code block."
-                )));
+                // The second time, spell out the exact call.
+                let instruction = match (nudged_code, workspace.last_read()) {
+                    (1, _) => "Writing code in the answer does nothing — apply it to the \
+                               repository with write_file, edit_file, or replace_lines \
+                               (repository-relative paths), verify it, and then answer. If no \
+                               change is actually needed, say so plainly without a code block."
+                        .to_string(),
+                    (_, Some(path)) => format!(
+                        "Do not write the code in your answer again. Make one tool call now: \
+                         write_file with path \"{path}\" and content set to the complete new \
+                         text of that file. Then verify and answer."
+                    ),
+                    (_, None) => "Do not write the code in your answer again. Make one tool \
+                                  call now: write_file with the repository-relative path of the \
+                                  file and its complete new content. Then verify and answer."
+                        .to_string(),
+                };
+                messages.push(Message::User(format!("Not yet: {why}. {instruction}")));
                 continue;
             }
             // A model that gives up and asks the developer a question — on
@@ -446,6 +458,13 @@ fn looks_like_giving_up(text: &str) -> bool {
         "unable to locate",
         "could not find the file",
         "couldn't find the file",
+        "cannot be completed",
+        "can't be completed",
+        "was not found in the repository",
+        "does not exist in the repository",
+        "doesn't exist in the repository",
+        "no file named",
+        "there is no file",
     ];
     ASKS.iter().any(|a| lower.contains(a))
 }
@@ -754,6 +773,13 @@ mod tests {
         let mut ws = workspace(tmp.path(), &[("a.py", "x = 1\n")], Access::ReadWrite);
         let prose_with_code = "Here is the fix:\n```python\nx = 1\ny = 2\nz = 3\nw = 4\nq = 5\n```\n";
         let provider = Scripted::new(vec![
+            Reply {
+                text: String::new(),
+                calls: vec![call("0", "read_file", serde_json::json!({"path": "a.py"}))],
+                ..Default::default()
+            },
+            Reply { text: prose_with_code.into(), ..Default::default() },
+            // Twice: the second nudge names the file it just read.
             Reply { text: prose_with_code.into(), ..Default::default() },
             Reply {
                 text: String::new(),
@@ -773,7 +799,7 @@ mod tests {
         .unwrap();
         assert_eq!(run.text, "applied");
         assert_eq!(run.edits.len(), 1);
-        assert!(events.iter().any(|l| l.contains("no file was changed")), "{events:?}");
+        assert_eq!(events.iter().filter(|l| l.contains("no file was changed")).count(), 2, "{events:?}");
 
         // A read-only run, or an answer with only a short snippet, is left alone.
         let mut ro = workspace(tmp.path(), &[("a.py", "x = 1\n")], Access::ReadOnly);

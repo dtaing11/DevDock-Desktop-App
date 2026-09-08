@@ -137,6 +137,8 @@ pub struct Workspace {
     check_runs: usize,
     /// Files edited since the model last asked for their diagnostics.
     undiagnosed: BTreeSet<String>,
+    /// The file most recently read, for a nudge that needs to name one.
+    last_read: Option<String>,
     /// An edit happened after the last check run (or no check ran at all).
     edited_since_check: bool,
 }
@@ -169,6 +171,7 @@ impl Workspace {
             checks: Vec::new(),
             check_runs: 0,
             undiagnosed: BTreeSet::new(),
+            last_read: None,
             edited_since_check: false,
         })
     }
@@ -215,6 +218,11 @@ impl Workspace {
 
     pub fn check_runs(&self) -> usize {
         self.check_runs
+    }
+
+    /// The file most recently read in this run, if any.
+    pub fn last_read(&self) -> Option<&str> {
+        self.last_read.as_deref()
     }
 
     /// Restores every file this run changed to its pre-run content. Used
@@ -681,6 +689,66 @@ impl Workspace {
 
     // -- tools --------------------------------------------------------------
 
+    /// The tracked files under `path` when it names a directory (or the
+    /// root), formatted as a listing; `None` when it does not.
+    fn directory_listing(&self, path: &str) -> Option<String> {
+        let trimmed = path.trim().trim_end_matches('/');
+        let prefix = if trimmed.is_empty() || trimmed == "." {
+            String::new()
+        } else {
+            let rel = self.normalize(trimmed).ok()?;
+            if self.tracked.contains(&rel) || self.overlay.contains_key(&rel) {
+                return None;
+            }
+            format!("{rel}/")
+        };
+        let matches: Vec<&str> = self
+            .visible_paths()
+            .into_iter()
+            .filter(|p| p.starts_with(&prefix))
+            .map(String::as_str)
+            .collect();
+        if matches.is_empty() {
+            return None;
+        }
+        let shown: Vec<&str> = matches.iter().copied().take(MAX_LIST_ENTRIES).collect();
+        let mut out = format!(
+            "{} is a directory with {} tracked file(s):\n{}",
+            if prefix.is_empty() { "The repository root" } else { trimmed },
+            matches.len(),
+            shown.join("\n")
+        );
+        if matches.len() > shown.len() {
+            out.push_str(&format!("\n[{} more; use list_files with a glob]", matches.len() - shown.len()));
+        }
+        Some(out)
+    }
+
+    /// Tracked (or proposed) paths that share `path`'s file name, most
+    /// specific first: an exact suffix match, then the same base name.
+    fn similar_paths(&self, path: &str) -> Vec<String> {
+        let wanted = path.trim().trim_start_matches("./");
+        let base = Path::new(wanted).file_name().and_then(|n| n.to_str()).unwrap_or(wanted);
+        if base.is_empty() {
+            return Vec::new();
+        }
+        let mut suffix: Vec<String> = Vec::new();
+        let mut same_name: Vec<String> = Vec::new();
+        for p in self.visible_paths() {
+            if p.ends_with(&format!("/{wanted}")) {
+                suffix.push(p.clone());
+            } else if Path::new(p).file_name().and_then(|n| n.to_str()) == Some(base) {
+                same_name.push(p.clone());
+            }
+        }
+        if !suffix.is_empty() {
+            suffix
+        } else {
+            same_name.truncate(6);
+            same_name
+        }
+    }
+
     fn list_files(&self, input: &serde_json::Value) -> Result<String, String> {
         let glob = input.get("glob").and_then(|g| g.as_str());
         let matches: Vec<&String> = self
@@ -705,10 +773,35 @@ impl Workspace {
         Ok(out)
     }
 
-    fn read_file(&self, input: &serde_json::Value) -> Result<String, String> {
+    fn read_file(&mut self, input: &serde_json::Value) -> Result<String, String> {
         let path = self.arg_str(input, "path")?;
-        let rel = self.resolve_readable(&path)?;
+        // A directory, asked for the way a person would: answer with what
+        // is in it rather than an error about it not being a file.
+        if let Some(listing) = self.directory_listing(&path) {
+            return Ok(listing);
+        }
+        // A wrong directory for the right file name is the commonest bad
+        // path a model produces. When there is exactly one file by that
+        // name, read it and say so; otherwise name the candidates.
+        let mut note = String::new();
+        let rel = match self.resolve_readable(&path) {
+            Ok(rel) => rel,
+            Err(e) => {
+                let similar = self.similar_paths(&path);
+                match similar.as_slice() {
+                    [only] => {
+                        note = format!("[{path} is not tracked; reading {only}, the only file by that name]\n");
+                        only.clone()
+                    }
+                    [] => return Err(e),
+                    many => {
+                        return Err(format!("{e} Did you mean one of: {}?", many.join(", ")));
+                    }
+                }
+            }
+        };
         let content = self.current_content(&rel)?;
+        self.last_read = Some(rel.clone());
 
         let start = input
             .get("start_line")
@@ -743,7 +836,7 @@ impl Workspace {
         if out.is_empty() {
             return Ok(format!("{rel} is empty."));
         }
-        let mut header = format!("{rel} (lines {start}-{last} of {})\n", lines.len());
+        let mut header = format!("{note}{rel} (lines {start}-{last} of {})\n", lines.len());
         if last < lines.len() {
             header.push_str("[truncated; read on with start_line]\n");
         }
@@ -848,6 +941,18 @@ impl Workspace {
         let path = self.arg_str(input, "path")?;
         let content = self.arg_str(input, "content")?;
         let rel = self.resolve_writable(&path)?;
+        // A new file where one by that name already exists elsewhere is
+        // nearly always a wrong directory, not a second copy.
+        if !self.tracked.contains(&rel) && !self.overlay.contains_key(&rel) {
+            let similar = self.similar_paths(&path);
+            if !similar.is_empty() && !self.root.join(&rel).exists() {
+                return Err(format!(
+                    "{rel} does not exist, but {} does. Edit that one, or use a different \
+                     name if you really mean a new file.",
+                    similar.join(" and ")
+                ));
+            }
+        }
         self.remember_original(&rel);
         let lines = content.lines().count();
         self.overlay.insert(rel.clone(), content);
@@ -868,8 +973,9 @@ impl Workspace {
         let new = self.arg_str(input, "new_text")?;
         let all = input.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
         let rel = self.resolve_writable(&path)?;
-        let current = self.current_content(&rel).map_err(|e| {
-            format!("{e} Use write_file to propose a new file.")
+        let current = self.current_content(&rel).map_err(|e| match self.similar_paths(&path).as_slice() {
+            [] => format!("{e} Use write_file to propose a new file."),
+            similar => format!("{e} Did you mean {}?", similar.join(" or ")),
         })?;
 
         if old.is_empty() {
@@ -985,7 +1091,10 @@ impl Workspace {
             .and_then(|v| v.as_u64())
             .ok_or("Missing required integer argument \"end_line\".")? as usize;
         let rel = self.resolve_writable(&path)?;
-        let current = self.current_content(&rel)?;
+        let current = self.current_content(&rel).map_err(|e| match self.similar_paths(&path).as_slice() {
+            [] => e,
+            similar => format!("{e} Did you mean {}?", similar.join(" or ")),
+        })?;
         let lines: Vec<&str> = current.lines().collect();
         if start == 0 || end < start {
             return Err(format!("Bad range {start}-{end}: lines are 1-based and end >= start."));
@@ -1133,14 +1242,21 @@ impl Workspace {
 
     /// Records the model's plan.
     fn update_plan(&mut self, input: &serde_json::Value) -> Result<String, String> {
-        let steps = input
-            .get("steps")
-            .and_then(|s| s.as_array())
+        // `steps` is the documented shape; `plan` and `items`, and a bare
+        // string per step, are what models send often enough to accept.
+        let steps = ["steps", "plan", "items"]
+            .iter()
+            .find_map(|k| input.get(k).and_then(|s| s.as_array()))
             .ok_or("Missing required array argument \"steps\".")?;
         let plan: Vec<super::PlanStep> = steps
             .iter()
             .filter_map(|step| {
-                let text = step.get("text")?.as_str()?.trim();
+                if let Some(text) = step.as_str() {
+                    let text = text.trim();
+                    return (!text.is_empty())
+                        .then(|| super::PlanStep { text: text.to_string(), done: false });
+                }
+                let text = step.get("text").or_else(|| step.get("step"))?.as_str()?.trim();
                 (!text.is_empty()).then(|| super::PlanStep {
                     text: text.to_string(),
                     done: step.get("done").and_then(|d| d.as_bool()).unwrap_or(false),
@@ -1735,6 +1851,57 @@ mod tests {
         )
         .unwrap();
         (tmp, ws)
+    }
+
+    #[test]
+    fn a_wrong_directory_for_the_right_file_is_resolved() {
+        let (_tmp, mut ws) = fixture(Access::ReadWrite);
+        let out = ws.dispatch(&call("read_file", serde_json::json!({"path": "lib/main.rs"})), 10);
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.starts_with("[lib/main.rs is not tracked; reading src/main.rs"), "{}", out.content);
+        assert!(out.content.contains("1  fn main() {"));
+
+        let edit = ws.dispatch(
+            &call("edit_file", serde_json::json!({"path": "main.rs", "old_text": "x", "new_text": "y"})),
+            10,
+        );
+        assert!(edit.is_error && edit.content.contains("Did you mean src/main.rs"), "{}", edit.content);
+
+        let write = ws.dispatch(
+            &call("write_file", serde_json::json!({"path": "app/main.rs", "content": "fn main() {}\n"})),
+            10,
+        );
+        assert!(write.is_error && write.content.contains("src/main.rs does"), "{}", write.content);
+        assert!(ws.edits().is_empty(), "nothing was created in the wrong place");
+
+        // A genuinely new name is still allowed.
+        let fresh = ws.dispatch(
+            &call("write_file", serde_json::json!({"path": "src/new.rs", "content": "// new\n"})),
+            10,
+        );
+        assert!(!fresh.is_error, "{}", fresh.content);
+    }
+
+    #[test]
+    fn reading_a_directory_lists_it() {
+        let (_tmp, mut ws) = fixture(Access::ReadOnly);
+        let root = ws.dispatch(&call("read_file", serde_json::json!({"path": "."})), 10);
+        assert!(!root.is_error, "{}", root.content);
+        assert!(root.content.contains("2 tracked file(s)"), "{}", root.content);
+        let dir = ws.dispatch(&call("read_file", serde_json::json!({"path": "src/"})), 10);
+        assert!(!dir.is_error, "{}", dir.content);
+        assert!(dir.content.contains("src/main.rs") && dir.content.contains("src/lib.rs"));
+        let missing = ws.dispatch(&call("read_file", serde_json::json!({"path": "nope/"})), 10);
+        assert!(missing.is_error);
+    }
+
+    #[test]
+    fn the_plan_accepts_plain_strings() {
+        let (_tmp, mut ws) = fixture(Access::ReadOnly);
+        let out = ws.dispatch(&call("update_plan", serde_json::json!({"plan": ["read", "edit"]})), 10);
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(ws.plan().len(), 2);
+        assert!(!ws.plan()[0].done);
     }
 
     #[test]

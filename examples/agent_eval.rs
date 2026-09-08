@@ -766,7 +766,7 @@ fn main() {
             )
             .unwrap();
             // Build output must not count as a change the agent made.
-            fs::write(dir.join(".gitignore"), "target/\n__pycache__/\n.pytest_cache/\n").unwrap();
+            fs::write(dir.join(".gitignore"), "target/\nCargo.lock\n__pycache__/\n.pytest_cache/\n").unwrap();
             git(&dir, &["init", "-q", "-b", "main"]);
             git(&dir, &["config", "user.email", "eval@example.invalid"]);
             git(&dir, &["config", "user.name", "eval"]);

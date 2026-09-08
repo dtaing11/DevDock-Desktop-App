@@ -210,12 +210,45 @@ gate use, with a wider toolset.
 Pick the provider and model next to the task box, exactly like commit
 messages — this is the one worth pointing at your strongest model.
 
+### What it is told
+
+Before the task, the agent gets an overview of the repository — how many
+files, which top-level directories, what languages, which project files exist
+— and what is going on in it: the last few commits and any uncommitted
+changes. That is what lets it search in the right place on its first turn
+instead of its third.
+
+If the repository has an `AGENTS.md` (or `CLAUDE.md`, or
+`.github/copilot-instructions.md`), its contents are put in front of the
+agent as the project's own instructions, ahead of the review guidance from
+`.git-manage-ci.toml`. Only a tracked file counts.
+
 ### The plan
 
 The agent writes down what it intends to do before it starts, and ticks each
 step off as it finishes. That checklist is what the sidebar shows while it
 works — a far better answer to "what is it doing" than a scrolling log of
 tool calls, which is still there underneath if you want it.
+
+### It is not allowed to skip the check
+
+The harness knows what the agent verified, so it does not have to take the
+summary's word for it. Three things get a model sent back, once each, with a
+note saying exactly what it skipped — the log shows them as
+`not finished yet: …`:
+
+- finishing with edited files but no check run (in iterate mode, when the
+  repository declares one) or no diagnostics on what it changed (when a
+  language server is available);
+- answering with the code in a code block instead of applying it — the
+  classic small-model failure, and one every model shows now and then;
+- handing the task back with a question for the developer, on a run where
+  reading the file or running the check would have answered it. Nobody is
+  there to answer mid-run; the note says which tool to use.
+
+Long runs do not drown in their own reads: once the transcript passes a
+budget, old tool output is replaced with a one-line note saying what it was.
+The model can call the tool again if it still needs it.
 
 ### Two modes: propose, or let it iterate
 
@@ -244,8 +277,9 @@ has a definition of done the machine can check — "make the tests pass",
 
 | Tool | What it does |
 |------|--------------|
-| `list_files`, `read_file`, `search` | Read every file **git tracks** |
-| `write_file`, `edit_file` | Propose or write changes |
+| `list_files`, `read_file`, `search` | Read every file **git tracks**; search is literal or regex, with context lines |
+| `write_file`, `edit_file`, `replace_lines` | Propose or write changes. An edit whose snippet differs from the file only in whitespace, or is over 90% similar to exactly one region, still applies and says so; one that does not match quotes the region it was probably aiming at, numbered. `replace_lines` edits by the line numbers `read_file` showed, for text that is awkward to reproduce (escapes, tabs). A no-op edit is reported as one, not as an error |
+| `show_changes` | The diff of everything it has changed so far, as you will see it |
 | `diagnostics` | Errors and warnings from the language server |
 | `definition`, `references`, `find_symbol` | Navigate like you do |
 | `run_check` | Run one of your declared checks |
@@ -263,6 +297,36 @@ Three limits are structural, not prompt instructions:
 Budgets bound each run (turns, tool calls, bytes read, check runs). When one
 runs out the agent is asked to finish with what it has, and the panel says
 the run was cut short.
+
+When it is done, the strip above the summary shows how many turns it took and
+what it cost in tokens — what the model read fresh, what came from the prompt
+cache (the system prompt, the tools, and the transcript so far are cached
+between turns, so most of a long run is served at a fraction of the price),
+and what it wrote.
+
+### Measuring it
+
+`examples/agent_eval.rs` runs the agent on suites of checkable tasks in
+Python and Rust — implement from tests, fix a bug, a feature across files,
+a rename, a question over a repository, an exact edit in an awkward file
+(`EVAL_SET` unset); regressions only the whole suite reveals, a trait change
+across a crate, a 150-file repository, a spec in the docs, a test-tampering
+trap (`EVAL_SET=hard`); a cache with interacting rules, three bugs at once, a
+lifetime refactor, a performance fix under a timer, ten callers, a config
+migration, a CRLF file (`EVAL_SET=brutal`); and twenty-five files that all
+have to change consistently (`EVAL_SET=marathon`). Each run is graded by
+rerunning the repository's check afterwards, and by checking that the test
+files are byte-for-byte unchanged.
+
+```sh
+cargo run --release --example agent_eval                      # the basic suite, Haiku
+EVAL_SET=hard EVAL_REPEATS=2 cargo run --release --example agent_eval
+EVAL_PROVIDER=ollama EVAL_MODEL=qwen2.5-coder:7b cargo run --release --example agent_eval
+```
+
+It prints a row per run — pass/fail, turns, tool calls, tool errors, bytes
+sent, the size of the diff, seconds, tokens — and writes `agent-eval.json`,
+so two versions of the agent can be compared on the same tasks.
 
 ### Reviewing its work
 

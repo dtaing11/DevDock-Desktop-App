@@ -64,6 +64,10 @@ pub struct CodingState {
     /// How long the last finished run took, kept so the strip can say so
     /// after the fact rather than resetting to nothing.
     pub took: Option<std::time::Duration>,
+    /// Model turns the last run took, and what it cost in tokens when the
+    /// provider reports that.
+    pub turns: usize,
+    pub usage: Option<crate::agent::Usage>,
 }
 
 impl CodingState {
@@ -309,6 +313,16 @@ fn harness(app: &mut App, ui: &mut egui::Ui) {
                                 .monospace()
                                 .size(theme::SMALL)
                                 .color(theme::fg_dim()),
+                        );
+                    }
+                    if let Some(cost) = cost_line(app) {
+                        ui.label(
+                            RichText::new(cost).size(theme::SMALL).color(theme::fg_dim()),
+                        )
+                        .on_hover_text(
+                            "Turns the model took, and tokens: what it read fresh, what \
+                             came from the prompt cache at a fraction of the price, and \
+                             what it wrote.",
                         );
                     }
                     if !log.is_empty() {
@@ -567,6 +581,32 @@ fn elapsed(app: &App) -> Option<String> {
     };
     let secs = d.as_secs();
     Some(format!("{}:{:02}", secs / 60, secs % 60))
+}
+
+/// Turns and tokens of the last run, once it is done.
+fn cost_line(app: &App) -> Option<String> {
+    if app.coding.running || app.coding.turns == 0 {
+        return None;
+    }
+    let k = |n: u64| -> String {
+        if n >= 10_000 {
+            format!("{}k", n / 1000)
+        } else if n >= 1_000 {
+            format!("{:.1}k", n as f64 / 1000.0)
+        } else {
+            n.to_string()
+        }
+    };
+    let mut line = format!("{} turn(s)", app.coding.turns);
+    if let Some(u) = app.coding.usage {
+        line.push_str(&format!(
+            " · {} in, {} cached, {} out",
+            k(u.input_tokens + u.cache_write_tokens),
+            k(u.cache_read_tokens),
+            k(u.output_tokens)
+        ));
+    }
+    Some(line)
 }
 
 /// The task box and the controls that decide how the run behaves.

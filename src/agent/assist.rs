@@ -85,7 +85,7 @@ const EDIT_NOTE: &str = r#"
 write_file and edit_file propose changes. Nothing reaches disk: the developer reviews every change as a diff and accepts or rejects it, so propose the change you believe is right and say what it does."#;
 
 pub fn limits() -> Limits {
-    Limits { max_turns: 14, max_tool_calls: 24, max_read_bytes: 200_000, max_tokens: 4096 }
+    Limits { max_turns: 14, max_tool_calls: 24, max_read_bytes: 200_000, max_tokens: 4096, max_transcript_bytes: 400_000 }
 }
 
 /// Builds the task turn: where we are, what is selected, what is wrong.
@@ -225,9 +225,9 @@ mod tests {
                     id: "1".into(),
                     name: "write_file".into(),
                     input: serde_json::json!({"path": "lib.rs", "content": "nope"}),
-                }],
+                }], ..Default::default()
             },
-            Reply { text: "It halves a number.".into(), calls: vec![] },
+            Reply { text: "It halves a number.".into(), calls: vec![], ..Default::default() },
         ]);
 
         let run = run(
@@ -269,9 +269,9 @@ mod tests {
                     input: serde_json::json!({
                         "path": "lib.rs", "old_text": "n / 0", "new_text": "n / 2"
                     }),
-                }],
+                }], ..Default::default()
             },
-            Reply { text: "Divided by two, not zero.".into(), calls: vec![] },
+            Reply { text: "Divided by two, not zero.".into(), calls: vec![], ..Default::default() },
         ]);
 
         let diagnostics = [diagnostic("this operation will panic at runtime")];

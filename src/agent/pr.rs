@@ -29,7 +29,7 @@ Read what you need and no more; a handful of targeted reads beats crawling the t
 /// Budgets for one pull request run. Smaller than a review's: this is a
 /// description, not an audit, and the commits already say most of it.
 pub fn limits() -> Limits {
-    Limits { max_turns: 10, max_tool_calls: 16, max_read_bytes: 150_000, max_tokens: 2048 }
+    Limits { max_turns: 10, max_tool_calls: 16, max_read_bytes: 150_000, max_tokens: 2048, max_transcript_bytes: 400_000 }
 }
 
 /// Writes a pull request title and body, with the repository open.
@@ -133,12 +133,12 @@ mod tests {
                         id: "1".into(),
                         name: "read_file".into(),
                         input: serde_json::json!({"path": "lib.rs"}),
-                    }],
+                    }], ..Default::default()
                 },
                 Reply {
                     text: r#"{"summary": "Add halve()", "description": "Halves a number."}"#
                         .into(),
-                    calls: vec![],
+                    calls: vec![], ..Default::default()
                 },
             ]),
             systems: RefCell::new(Vec::new()),
@@ -180,7 +180,7 @@ mod tests {
         let provider = Scripted {
             replies: RefCell::new(vec![Reply {
                 text: "Add halve()\n\nHalves a number, with a test.".into(),
-                calls: vec![],
+                calls: vec![], ..Default::default()
             }]),
             systems: RefCell::new(Vec::new()),
         };
@@ -194,7 +194,7 @@ mod tests {
     fn an_empty_reply_is_an_error() {
         let (_tmp, mut ws, summary) = fixture();
         let provider = Scripted {
-            replies: RefCell::new(vec![Reply { text: "   ".into(), calls: vec![] }]),
+            replies: RefCell::new(vec![Reply { text: "   ".into(), calls: vec![], ..Default::default() }]),
             systems: RefCell::new(Vec::new()),
         };
         let err = run(&provider, &mut ws, &summary, None, 10_000, &mut |_| {}).unwrap_err();

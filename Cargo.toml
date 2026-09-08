@@ -27,6 +27,7 @@ base64 = "0.22"
 sha2 = "0.10"
 toml = "0.8"
 aes-gcm = "0.10"
+regex = "1"
 
 # The integrated terminal needs a pty: openpty, ioctl(TIOCSWINSZ), waitpid.
 [target.'cfg(unix)'.dependencies]

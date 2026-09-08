@@ -526,26 +526,7 @@ impl Client {
         tools: &[crate::agent::ToolSpec],
         max_tokens: u32,
     ) -> std::result::Result<serde_json::Value, RequestError> {
-        let mut payload = serde_json::json!({
-            "model": model,
-            "max_tokens": max_tokens,
-            "system": system,
-            "messages": messages,
-        });
-        if !tools.is_empty() {
-            payload["tools"] = serde_json::Value::Array(
-                tools
-                    .iter()
-                    .map(|t| {
-                        serde_json::json!({
-                            "name": t.name,
-                            "description": t.description,
-                            "input_schema": t.schema,
-                        })
-                    })
-                    .collect(),
-            );
-        }
+        let payload = payload(model, system, messages, tools, max_tokens);
         let mut req = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(120))
             .build()
@@ -617,6 +598,77 @@ impl crate::agent::Provider for Client {
     }
 }
 
+/// The body of one Messages API call, with prompt-cache breakpoints.
+///
+/// An agentic run sends the same system prompt and tool definitions on
+/// every turn, and every turn's transcript is the previous one plus a
+/// little. Marking the system prompt, the last tool, and the last message
+/// as cache breakpoints lets the API serve all of that from cache — the
+/// bulk of every turn after the first, at a fraction of the price and
+/// latency. The one-shot paths get the same treatment; it costs nothing
+/// when nothing repeats.
+fn payload(
+    model: &str,
+    system: &str,
+    mut messages: serde_json::Value,
+    tools: &[crate::agent::ToolSpec],
+    max_tokens: u32,
+) -> serde_json::Value {
+    let cache = serde_json::json!({"type": "ephemeral"});
+    let mut payload = serde_json::json!({
+        "model": model,
+        "max_tokens": max_tokens,
+        "system": [{"type": "text", "text": system, "cache_control": cache}],
+    });
+    if !tools.is_empty() {
+        let mut wire: Vec<serde_json::Value> = tools
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.schema,
+                })
+            })
+            .collect();
+        if let Some(last) = wire.last_mut() {
+            last["cache_control"] = cache.clone();
+        }
+        payload["tools"] = serde_json::Value::Array(wire);
+    }
+    // The breakpoint on the last message is what makes the next turn a
+    // cache hit for everything up to here.
+    if let Some(last) = messages.as_array_mut().and_then(|m| m.last_mut()) {
+        match last.get_mut("content") {
+            Some(serde_json::Value::String(text)) => {
+                let text = std::mem::take(text);
+                last["content"] = serde_json::json!([
+                    {"type": "text", "text": text, "cache_control": cache}
+                ]);
+            }
+            Some(serde_json::Value::Array(blocks)) => {
+                if let Some(block) = blocks.last_mut() {
+                    block["cache_control"] = cache.clone();
+                }
+            }
+            _ => {}
+        }
+    }
+    payload["messages"] = messages;
+    payload
+}
+
+/// Tokens the response reports having cost.
+fn parse_usage(value: &serde_json::Value) -> crate::agent::Usage {
+    let field = |name: &str| value.pointer(&format!("/usage/{name}")).and_then(|v| v.as_u64()).unwrap_or(0);
+    crate::agent::Usage {
+        input_tokens: field("input_tokens"),
+        output_tokens: field("output_tokens"),
+        cache_read_tokens: field("cache_read_input_tokens"),
+        cache_write_tokens: field("cache_creation_input_tokens"),
+    }
+}
+
 /// Rewrites the harness transcript into Anthropic's wire format.
 ///
 /// Tool results go back as a user message of `tool_result` blocks, and the
@@ -668,7 +720,7 @@ fn wire_messages(messages: &[crate::agent::Message]) -> serde_json::Value {
 /// Pulls text and tool calls out of a Messages API response.
 fn parse_reply(value: &serde_json::Value) -> crate::agent::Reply {
     use crate::agent::{Reply, ToolCall};
-    let mut reply = Reply::default();
+    let mut reply = Reply { usage: parse_usage(value), ..Default::default() };
     let Some(blocks) = value.get("content").and_then(|c| c.as_array()) else {
         return reply;
     };
@@ -753,6 +805,49 @@ fn urlencode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_payload_marks_cache_breakpoints() {
+        let tools = vec![
+            crate::agent::ToolSpec { name: "a", description: "a", schema: serde_json::json!({}) },
+            crate::agent::ToolSpec { name: "b", description: "b", schema: serde_json::json!({}) },
+        ];
+        let messages = serde_json::json!([
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "1", "content": "x"},
+                {"type": "tool_result", "tool_use_id": "2", "content": "y"}
+            ]}
+        ]);
+        let p = super::payload("m", "sys", messages, &tools, 10);
+        assert_eq!(p["system"][0]["cache_control"]["type"], "ephemeral");
+        assert!(p["tools"][0].get("cache_control").is_none(), "only the last tool");
+        assert_eq!(p["tools"][1]["cache_control"]["type"], "ephemeral");
+        let last = &p["messages"][2]["content"];
+        assert!(last[0].get("cache_control").is_none());
+        assert_eq!(last[1]["cache_control"]["type"], "ephemeral");
+        // A plain-string user message becomes a text block so it can carry one.
+        let p = super::payload("m", "sys", serde_json::json!([{"role": "user", "content": "q"}]), &[], 10);
+        assert_eq!(p["messages"][0]["content"][0]["text"], "q");
+        assert_eq!(p["messages"][0]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert!(p.get("tools").is_none());
+    }
+
+    #[test]
+    fn usage_is_read_from_the_response() {
+        let value = serde_json::json!({
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {"input_tokens": 5, "output_tokens": 7, "cache_read_input_tokens": 100, "cache_creation_input_tokens": 20}
+        });
+        let reply = super::parse_reply(&value);
+        assert_eq!(reply.text, "ok");
+        assert_eq!(reply.usage.input_tokens, 5);
+        assert_eq!(reply.usage.output_tokens, 7);
+        assert_eq!(reply.usage.cache_read_tokens, 100);
+        assert_eq!(reply.usage.cache_write_tokens, 20);
+        assert_eq!(reply.usage.total_input(), 125);
+    }
+
     use super::*;
 
     #[test]

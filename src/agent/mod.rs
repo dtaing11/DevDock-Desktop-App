@@ -82,11 +82,43 @@ pub enum Message {
     ToolResults(Vec<ToolResult>),
 }
 
+/// Tokens one turn cost, as the provider reports them. Zero for providers
+/// that do not say (Ollama).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// Input tokens served from the provider's prompt cache: paid at a
+    /// fraction of the price and not re-read by the model.
+    pub cache_read_tokens: u64,
+    /// Input tokens written to the cache this turn.
+    pub cache_write_tokens: u64,
+}
+
+impl Usage {
+    pub fn add(&mut self, other: &Usage) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_read_tokens += other.cache_read_tokens;
+        self.cache_write_tokens += other.cache_write_tokens;
+    }
+
+    pub fn is_zero(&self) -> bool {
+        *self == Usage::default()
+    }
+
+    /// Everything the model was given, cached or not.
+    pub fn total_input(&self) -> u64 {
+        self.input_tokens + self.cache_read_tokens + self.cache_write_tokens
+    }
+}
+
 /// What a provider returned for one turn: prose, tool calls, or both.
 #[derive(Debug, Clone, Default)]
 pub struct Reply {
     pub text: String,
     pub calls: Vec<ToolCall>,
+    pub usage: Usage,
 }
 
 /// A model that can be driven in a tool-use loop.
@@ -102,6 +134,15 @@ pub trait Provider {
         tools: &[ToolSpec],
         max_tokens: u32,
     ) -> Result<Reply, String>;
+
+    /// How many bytes of transcript this model can actually hold, when the
+    /// provider knows it is less than a run's budget. A local model with a
+    /// fixed context window drops the oldest messages silently once it is
+    /// full; eliding old tool output on purpose, before that happens, is
+    /// what keeps it remembering the task. `None` means no such limit.
+    fn transcript_budget(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Bounds on one run. The defaults are sized for a desktop app where the
@@ -113,11 +154,20 @@ pub struct Limits {
     pub max_tool_calls: usize,
     pub max_read_bytes: usize,
     pub max_tokens: u32,
+    /// Above this many bytes of transcript, old tool results are elided so
+    /// the run can keep going instead of drowning in its own reads.
+    pub max_transcript_bytes: usize,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { max_turns: 12, max_tool_calls: 40, max_read_bytes: 240_000, max_tokens: 8192 }
+        Self {
+            max_turns: 12,
+            max_tool_calls: 40,
+            max_read_bytes: 240_000,
+            max_tokens: 8192,
+            max_transcript_bytes: 400_000,
+        }
     }
 }
 
@@ -139,6 +189,11 @@ pub enum Event {
     Thought(String),
     /// A budget ran out; the model was asked to conclude.
     BudgetExhausted(String),
+    /// The model tried to finish without checking its work; it was sent
+    /// back to do so. Once per run.
+    Nudge(String),
+    /// Old tool output was elided to keep the transcript within budget.
+    Compacted { freed: usize },
 }
 
 impl Event {
@@ -158,6 +213,8 @@ impl Event {
             }
             Self::Thought(t) => format!("… {}", first_line(t)),
             Self::BudgetExhausted(why) => format!("! {why}"),
+            Self::Nudge(why) => format!("! not finished yet: {}", first_line(why)),
+            Self::Compacted { freed } => format!("· trimmed {freed} bytes of old tool output"),
         }
     }
 }
@@ -174,6 +231,10 @@ pub struct Run {
     pub log: Vec<String>,
     /// Whether a budget cut the run short.
     pub truncated: bool,
+    /// Model turns taken.
+    pub turns: usize,
+    /// Tokens across every turn, when the provider reports them.
+    pub usage: Usage,
 }
 
 /// Runs the loop to a final answer.
@@ -191,6 +252,11 @@ pub fn run(
     let mut messages = vec![Message::User(task.to_string())];
     let mut log: Vec<String> = Vec::new();
     let mut truncated = false;
+    let mut nudged = false;
+    let mut nudged_code = false;
+    let mut nudged_giveup = false;
+    let mut usage = Usage::default();
+    let mut turns;
 
     let emit = |event: Event, log: &mut Vec<String>, on_event: &mut dyn FnMut(Event)| {
         log.push(event.line());
@@ -221,12 +287,87 @@ pub fn run(
 
         let tools: Vec<ToolSpec> = if withhold_tools { Vec::new() } else { workspace.tools() };
         let reply = provider.turn(system, &messages, &tools, limits.max_tokens)?;
+        turns = turn + 1;
+        usage.add(&reply.usage);
 
         if reply.calls.is_empty() {
             if reply.text.trim().is_empty() {
                 return Err(format!("{} returned an empty answer.", provider.label()));
             }
-            return Ok(Run { text: reply.text, edits: workspace.edits(), log, truncated });
+            // A model that answers with the code instead of applying it —
+            // the classic small-model failure, and one every model shows now
+            // and then — is sent back once to use the tools it was given.
+            if !withhold_tools
+                && !nudged_code
+                && workspace.can_edit()
+                && workspace.edits().is_empty()
+                && looks_like_unapplied_code(&reply.text)
+            {
+                nudged_code = true;
+                let why = "your answer contains code, but no file was changed".to_string();
+                emit(Event::Nudge(why.clone()), &mut log, on_event);
+                messages.push(Message::Assistant { text: reply.text, calls: Vec::new() });
+                messages.push(Message::User(format!(
+                    "Not yet: {why}. Writing code in the answer does nothing — apply it \
+                     to the repository with write_file, edit_file, or replace_lines \
+                     (repository-relative paths), verify it, and then answer. If no change \
+                     is actually needed, say so plainly without a code block."
+                )));
+                continue;
+            }
+            // A model that gives up and asks the developer a question — on
+            // a run where it could have read the file or run the check that
+            // would have answered it — is sent back once. Nobody is there to
+            // answer; the tools are.
+            if !withhold_tools
+                && !nudged_giveup
+                && workspace.can_edit()
+                && workspace.edits().is_empty()
+                && looks_like_giving_up(&reply.text)
+            {
+                nudged_giveup = true;
+                let checks = workspace.checks_available();
+                let hint = if !checks.is_empty() && workspace.check_runs() == 0 {
+                    format!(
+                        "Run the check first (run_check: {}) to see exactly what fails, read \
+                         the files it names, and fix the cause.",
+                        checks.join(", ")
+                    )
+                } else {
+                    "Find the files with list_files, read them, and make the change.".to_string()
+                };
+                let why = "you asked the developer instead of using the tools".to_string();
+                emit(Event::Nudge(why.clone()), &mut log, on_event);
+                messages.push(Message::Assistant { text: reply.text, calls: Vec::new() });
+                messages.push(Message::User(format!(
+                    "Not yet: {why}. Nobody can answer questions during a run; decide for \
+                     yourself and state your assumptions in the summary. {hint}"
+                )));
+                continue;
+            }
+            // A model that edited files and then stopped without checking
+            // them is sent back once. The harness knows what was checked;
+            // the model only knows what it remembers doing.
+            if !withhold_tools && !nudged {
+                if let Some(gap) = workspace.verification_gap() {
+                    nudged = true;
+                    emit(Event::Nudge(gap.clone()), &mut log, on_event);
+                    messages.push(Message::Assistant { text: reply.text, calls: Vec::new() });
+                    messages.push(Message::User(format!(
+                        "Not yet. Before you finish: {gap} Do that now, fix anything it \
+                         turns up, then give your final answer."
+                    )));
+                    continue;
+                }
+            }
+            return Ok(Run {
+                text: reply.text,
+                edits: workspace.edits(),
+                log,
+                truncated,
+                turns,
+                usage,
+            });
         }
 
         if !reply.text.trim().is_empty() {
@@ -241,11 +382,16 @@ pub fn run(
             if call.name == "update_plan" && !result.is_error {
                 emit(Event::Plan(workspace.plan()), &mut log, on_event);
             } else {
+                // A failure says why, on the same line: the log is where a
+                // developer finds out that an edit did not match, and a
+                // bare "!" tells them nothing.
+                let mut summary = workspace::summarize(call);
+                if result.is_error {
+                    summary.push_str(": ");
+                    summary.push_str(&first_line(&result.content));
+                }
                 emit(
-                    Event::Tool {
-                        summary: workspace::summarize(call),
-                        is_error: result.is_error,
-                    },
+                    Event::Tool { summary, is_error: result.is_error },
                     &mut log,
                     on_event,
                 );
@@ -254,6 +400,21 @@ pub fn run(
         }
         messages.push(Message::Assistant { text: reply.text, calls: reply.calls });
         messages.push(Message::ToolResults(results));
+
+        let budget = provider
+            .transcript_budget()
+            .map_or(limits.max_transcript_bytes, |b| b.min(limits.max_transcript_bytes));
+        if transcript_bytes(&messages) > budget {
+            // Keep two turns of results whole; if that is still too much for
+            // the window, keep one.
+            let mut freed = compact(&mut messages, 2);
+            if transcript_bytes(&messages) > budget {
+                freed += compact(&mut messages, 1);
+            }
+            if freed > 0 {
+                emit(Event::Compacted { freed }, &mut log, on_event);
+            }
+        }
     }
 
     Err(format!(
@@ -261,6 +422,104 @@ pub fn run(
         provider.label(),
         limits.max_turns
     ))
+}
+
+/// An answer that hands the task back — a question to the developer, or a
+/// request for information the tools could have found.
+fn looks_like_giving_up(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    const ASKS: &[&str] = &[
+        "could you please",
+        "can you please",
+        "please provide",
+        "please clarify",
+        "please let me know",
+        "let me know which",
+        "let me know if you",
+        "would you like me to",
+        "do you want me to",
+        "which file should",
+        "more details about",
+        "more information so",
+        "i'm not able to locate",
+        "i am not able to locate",
+        "unable to locate",
+        "could not find the file",
+        "couldn't find the file",
+    ];
+    ASKS.iter().any(|a| lower.contains(a))
+}
+
+/// An answer that carries a substantial fenced code block: several lines of
+/// what is probably the change the model meant to make. A one-line snippet
+/// quoted in an explanation does not count.
+fn looks_like_unapplied_code(text: &str) -> bool {
+    let mut in_block = false;
+    let mut lines_in_block = 0;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            if in_block && lines_in_block >= 4 {
+                return true;
+            }
+            in_block = !in_block;
+            lines_in_block = 0;
+        } else if in_block {
+            lines_in_block += 1;
+        }
+    }
+    false
+}
+
+/// How much of the transcript the provider is sent each turn.
+fn transcript_bytes(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .map(|m| match m {
+            Message::User(t) => t.len(),
+            Message::Assistant { text, calls } => {
+                text.len() + calls.iter().map(|c| c.input.to_string().len()).sum::<usize>()
+            }
+            Message::ToolResults(results) => results.iter().map(|r| r.content.len()).sum(),
+        })
+        .sum()
+}
+
+/// Elided-result marker, so a result is not elided twice.
+const ELIDED: &str = "[elided]";
+
+/// Replaces large tool results, except those from the most recent
+/// `keep_recent` tool turns, with a note saying what they were. The model
+/// has already acted on them; if it needs one again it can call the tool
+/// again, which costs one call instead of carrying every file it ever read
+/// through every remaining turn. Returns the bytes freed.
+pub fn compact(messages: &mut [Message], keep_recent: usize) -> usize {
+    /// Results shorter than this are cheap to keep and often load-bearing
+    /// (an error, a plan acknowledgement).
+    const MIN_ELIDE: usize = 400;
+    let result_turns: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| matches!(m, Message::ToolResults(_)))
+        .map(|(i, _)| i)
+        .collect();
+    let elidable = result_turns.len().saturating_sub(keep_recent);
+    let mut freed = 0;
+    for &index in &result_turns[..elidable] {
+        let Message::ToolResults(results) = &mut messages[index] else { continue };
+        for result in results.iter_mut() {
+            if result.content.len() < MIN_ELIDE || result.content.starts_with(ELIDED) {
+                continue;
+            }
+            let was = result.content.len();
+            result.content = format!(
+                "{ELIDED} earlier {} output, {was} bytes, removed to save context. Call the \
+                 tool again if you still need it.",
+                result.name
+            );
+            freed += was - result.content.len();
+        }
+    }
+    freed
 }
 
 fn first_line(text: &str) -> String {
@@ -305,7 +564,7 @@ mod tests {
             self.offered.borrow_mut().push(!tools.is_empty());
             let mut replies = self.replies.borrow_mut();
             if replies.is_empty() {
-                return Ok(Reply { text: "done".into(), calls: Vec::new() });
+                return Ok(Reply { text: "done".into(), calls: Vec::new(), ..Default::default() });
             }
             Ok(replies.remove(0))
         }
@@ -333,7 +592,7 @@ mod tests {
     fn returns_final_text_when_no_tools_are_called() {
         let tmp = tempfile::tempdir().unwrap();
         let mut ws = workspace(tmp.path(), &[("a.txt", "hi\n")], Access::ReadOnly);
-        let provider = Scripted::new(vec![Reply { text: "verdict".into(), calls: vec![] }]);
+        let provider = Scripted::new(vec![Reply { text: "verdict".into(), calls: vec![], ..Default::default() }]);
         let run = run(&provider, &mut ws, "sys", "task", Limits::default(), &mut |_| {}).unwrap();
         assert_eq!(run.text, "verdict");
         assert!(run.edits.is_empty());
@@ -347,9 +606,9 @@ mod tests {
         let provider = Scripted::new(vec![
             Reply {
                 text: "looking".into(),
-                calls: vec![call("1", "read_file", serde_json::json!({"path": "a.txt"}))],
+                calls: vec![call("1", "read_file", serde_json::json!({"path": "a.txt"}))], ..Default::default()
             },
-            Reply { text: "final".into(), calls: vec![] },
+            Reply { text: "final".into(), calls: vec![], ..Default::default() },
         ]);
         let mut events = Vec::new();
         let run = run(&provider, &mut ws, "sys", "task", Limits::default(), &mut |e| {
@@ -368,9 +627,9 @@ mod tests {
         let provider = Scripted::new(vec![
             Reply {
                 text: String::new(),
-                calls: vec![call("1", "read_file", serde_json::json!({"path": "a.txt"}))],
+                calls: vec![call("1", "read_file", serde_json::json!({"path": "a.txt"}))], ..Default::default()
             },
-            Reply { text: "wrapping up".into(), calls: vec![] },
+            Reply { text: "wrapping up".into(), calls: vec![], ..Default::default() },
         ]);
         let limits = Limits { max_tool_calls: 1, ..Limits::default() };
         let run = run(&provider, &mut ws, "sys", "task", limits, &mut |_| {}).unwrap();
@@ -389,13 +648,211 @@ mod tests {
                     &i.to_string(),
                     "read_file",
                     serde_json::json!({"path": "a.txt"}),
-                )],
+                )], ..Default::default()
             })
             .collect();
         let provider = Scripted::new(looping);
         let limits = Limits { max_turns: 3, ..Limits::default() };
         let err = run(&provider, &mut ws, "sys", "task", limits, &mut |_| {}).unwrap_err();
         assert!(err.contains("without producing an answer"), "{err}");
+    }
+
+    #[test]
+    fn old_tool_output_is_elided_once_the_transcript_is_large() {
+        let tmp = tempfile::tempdir().unwrap();
+        let big = "x".repeat(2_000) + "\n";
+        let mut ws = workspace(tmp.path(), &[("a.txt", &big)], Access::ReadOnly);
+        let read = |id: &str| Reply {
+            text: String::new(),
+            calls: vec![call(id, "read_file", serde_json::json!({"path": "a.txt"}))],
+            ..Default::default()
+        };
+        let provider = Scripted::new(vec![read("1"), read("2"), read("3"), read("4")]);
+        let limits = Limits { max_transcript_bytes: 5_000, ..Limits::default() };
+        let mut events = Vec::new();
+        let run = run(&provider, &mut ws, "sys", "task", limits, &mut |e| events.push(e.line()))
+            .unwrap();
+        assert_eq!(run.text, "done");
+        assert_eq!(run.turns, 5);
+        assert!(events.iter().any(|l| l.contains("trimmed")), "{events:?}");
+    }
+
+    #[test]
+    fn a_provider_with_a_small_window_gets_compacted_sooner() {
+        struct Small(Scripted);
+        impl Provider for Small {
+            fn label(&self) -> String {
+                self.0.label()
+            }
+            fn turn(
+                &self,
+                s: &str,
+                m: &[Message],
+                t: &[ToolSpec],
+                x: u32,
+            ) -> Result<Reply, String> {
+                self.0.turn(s, m, t, x)
+            }
+            fn transcript_budget(&self) -> Option<usize> {
+                Some(3_000)
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let big = "x".repeat(2_000) + "\n";
+        let mut ws = workspace(tmp.path(), &[("a.txt", &big)], Access::ReadOnly);
+        let read = |id: &str| Reply {
+            text: String::new(),
+            calls: vec![call(id, "read_file", serde_json::json!({"path": "a.txt"}))],
+            ..Default::default()
+        };
+        let provider = Small(Scripted::new(vec![read("1"), read("2"), read("3")]));
+        let mut events = Vec::new();
+        // The run's own budget is huge; the provider's window is what bites.
+        run(&provider, &mut ws, "sys", "task", Limits::default(), &mut |e| events.push(e.line()))
+            .unwrap();
+        assert!(events.iter().any(|l| l.contains("trimmed")), "{events:?}");
+    }
+
+    #[test]
+    fn compaction_keeps_recent_results_and_small_ones() {
+        let big = "y".repeat(1_000);
+        let result = |id: &str, content: &str| {
+            Message::ToolResults(vec![ToolResult {
+                id: id.into(),
+                name: "read_file".into(),
+                content: content.into(),
+                is_error: false,
+            }])
+        };
+        let mut messages = vec![
+            Message::User("task".into()),
+            result("1", &big),
+            result("2", "short error"),
+            result("3", &big),
+            result("4", &big),
+        ];
+        let freed = compact(&mut messages, 1);
+        assert!(freed > 1_500, "{freed}");
+        let contents: Vec<String> = messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::ToolResults(r) => Some(r[0].content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(contents[0].starts_with(ELIDED));
+        assert_eq!(contents[1], "short error", "small results are kept");
+        assert!(contents[2].starts_with(ELIDED));
+        assert_eq!(contents[3], big, "the most recent turn is kept whole");
+        // Running again frees nothing more.
+        assert_eq!(compact(&mut messages, 1), 0);
+    }
+
+    #[test]
+    fn an_answer_with_unapplied_code_is_sent_back_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ws = workspace(tmp.path(), &[("a.py", "x = 1\n")], Access::ReadWrite);
+        let prose_with_code = "Here is the fix:\n```python\nx = 1\ny = 2\nz = 3\nw = 4\nq = 5\n```\n";
+        let provider = Scripted::new(vec![
+            Reply { text: prose_with_code.into(), ..Default::default() },
+            Reply {
+                text: String::new(),
+                calls: vec![call(
+                    "1",
+                    "write_file",
+                    serde_json::json!({"path": "a.py", "content": "x = 1\ny = 2\n"}),
+                )],
+                ..Default::default()
+            },
+            Reply { text: "applied".into(), ..Default::default() },
+        ]);
+        let mut events = Vec::new();
+        let run = run(&provider, &mut ws, "sys", "task", Limits::default(), &mut |e| {
+            events.push(e.line())
+        })
+        .unwrap();
+        assert_eq!(run.text, "applied");
+        assert_eq!(run.edits.len(), 1);
+        assert!(events.iter().any(|l| l.contains("no file was changed")), "{events:?}");
+
+        // A read-only run, or an answer with only a short snippet, is left alone.
+        let mut ro = workspace(tmp.path(), &[("a.py", "x = 1\n")], Access::ReadOnly);
+        let provider = Scripted::new(vec![Reply { text: prose_with_code.into(), ..Default::default() }]);
+        let ro_run = super::run(&provider, &mut ro, "sys", "task", Limits::default(), &mut |_| {}).unwrap();
+        assert_eq!(ro_run.text, prose_with_code);
+        assert!(!looks_like_unapplied_code("Use `x = 1`.\n```\nx = 1\n```\n"));
+    }
+
+    #[test]
+    fn asking_the_developer_gets_the_model_sent_back_to_the_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ws = workspace(tmp.path(), &[("a.py", "x = 1\n")], Access::ReadWrite)
+            .with_write_mode(WriteMode::Live)
+            .with_checks(vec![crate::local_ci::Job {
+                name: "tests".into(),
+                commands: vec!["true".into()],
+                ..Default::default()
+            }]);
+        let provider = Scripted::new(vec![
+            Reply {
+                text: "I could not find the file. Could you please provide more details?".into(),
+                ..Default::default()
+            },
+            Reply {
+                text: String::new(),
+                calls: vec![call("1", "run_check", serde_json::json!({"name": "tests"}))],
+                ..Default::default()
+            },
+            Reply { text: "Nothing fails; no change needed.".into(), ..Default::default() },
+        ]);
+        let mut events = Vec::new();
+        let run = run(&provider, &mut ws, "sys", "task", Limits::default(), &mut |e| {
+            events.push(e.line())
+        })
+        .unwrap();
+        assert!(run.text.contains("no change needed"));
+        assert!(events.iter().any(|l| l.contains("asked the developer")), "{events:?}");
+        assert_eq!(run.turns, 3);
+    }
+
+    #[test]
+    fn a_live_run_that_skips_its_checks_is_sent_back_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ws = workspace(tmp.path(), &[("a.txt", "old\n")], Access::ReadWrite)
+            .with_write_mode(WriteMode::Live)
+            .with_checks(vec![crate::local_ci::Job {
+                name: "tests".into(),
+                commands: vec!["true".into()],
+                ..Default::default()
+            }]);
+        let provider = Scripted::new(vec![
+            Reply {
+                text: String::new(),
+                calls: vec![call(
+                    "1",
+                    "write_file",
+                    serde_json::json!({"path": "a.txt", "content": "new\n"}),
+                )],
+                ..Default::default()
+            },
+            // Tries to finish without running anything.
+            Reply { text: "all done".into(), ..Default::default() },
+            // Sent back, it runs the check.
+            Reply {
+                text: String::new(),
+                calls: vec![call("2", "run_check", serde_json::json!({"name": "tests"}))],
+                ..Default::default()
+            },
+            Reply { text: "verified".into(), ..Default::default() },
+        ]);
+        let mut events = Vec::new();
+        let run = run(&provider, &mut ws, "sys", "task", Limits::default(), &mut |e| {
+            events.push(e.line())
+        })
+        .unwrap();
+        assert_eq!(run.text, "verified");
+        assert!(events.iter().any(|l| l.contains("not finished yet")), "{events:?}");
+        assert_eq!(run.turns, 4);
     }
 
     #[test]
@@ -409,9 +866,9 @@ mod tests {
                     "1",
                     "write_file",
                     serde_json::json!({"path": "a.txt", "content": "new\n"}),
-                )],
+                )], ..Default::default()
             },
-            Reply { text: "merged".into(), calls: vec![] },
+            Reply { text: "merged".into(), calls: vec![], ..Default::default() },
         ]);
         let run = run(&provider, &mut ws, "sys", "task", Limits::default(), &mut |_| {}).unwrap();
         assert_eq!(run.edits.len(), 1);

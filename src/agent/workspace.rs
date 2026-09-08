@@ -18,7 +18,7 @@
 //! to the caller for the user to confirm, file by file.
 
 use super::{ToolCall, ToolResult, ToolSpec};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -101,6 +101,17 @@ const MAX_SEARCH_HITS: usize = 80;
 /// thousands of files would otherwise turn every search into a full read of
 /// the tree, and the user is watching a spinner.
 const MAX_SEARCH_SCAN_BYTES: usize = 8_000_000;
+/// A hard stop on a model that would otherwise run the test suite after
+/// every edit.
+const MAX_CHECK_RUNS: usize = 12;
+/// Cap on a diff of the run's own changes.
+const MAX_CHANGES_BYTES: usize = 40_000;
+/// Cap on a project instructions file (AGENTS.md and friends).
+const MAX_INSTRUCTIONS_BYTES: usize = 12_000;
+/// Files named by convention that tell an agent how a project wants to be
+/// worked on. First one tracked wins.
+const INSTRUCTION_FILES: &[&str] =
+    &["AGENTS.md", "CLAUDE.md", ".github/copilot-instructions.md", ".cursorrules"];
 
 /// One repository, its tracked files, and the edits proposed so far.
 pub struct Workspace {
@@ -124,6 +135,10 @@ pub struct Workspace {
     /// The project's own checks, the only commands that may be run.
     checks: Vec<crate::local_ci::Job>,
     check_runs: usize,
+    /// Files edited since the model last asked for their diagnostics.
+    undiagnosed: BTreeSet<String>,
+    /// An edit happened after the last check run (or no check ran at all).
+    edited_since_check: bool,
 }
 
 impl Workspace {
@@ -153,6 +168,8 @@ impl Workspace {
             epochs: BTreeMap::new(),
             checks: Vec::new(),
             check_runs: 0,
+            undiagnosed: BTreeSet::new(),
+            edited_since_check: false,
         })
     }
 
@@ -180,6 +197,24 @@ impl Workspace {
 
     pub fn write_mode(&self) -> WriteMode {
         self.write_mode
+    }
+
+    /// Whether this run may change files at all.
+    pub fn can_edit(&self) -> bool {
+        self.access == Access::ReadWrite
+    }
+
+    /// Checks this run can run, by name, and how many times it has.
+    pub fn checks_available(&self) -> Vec<String> {
+        if self.write_mode == WriteMode::Live {
+            self.checks.iter().map(|c| c.name.clone()).collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn check_runs(&self) -> usize {
+        self.check_runs
     }
 
     /// Restores every file this run changed to its pre-run content. Used
@@ -240,14 +275,136 @@ impl Workspace {
         self.current_content(&rel).ok()
     }
 
+    /// What the model changed but never checked, if anything: the reason the
+    /// harness sends it back once before accepting a final answer.
+    ///
+    /// Checks come first — they are the definition of done a repository
+    /// declares — then diagnostics on files edited since they were last
+    /// looked at. Nothing is asked for that the run cannot do: no check
+    /// without a live tree, no diagnostics without a language server, and
+    /// no check once the check budget is spent.
+    pub fn verification_gap(&self) -> Option<String> {
+        if self.edits().is_empty() {
+            return None;
+        }
+        let changed = self.edits().len();
+        if self.write_mode == WriteMode::Live
+            && !self.checks.is_empty()
+            && self.edited_since_check
+            && self.check_runs < MAX_CHECK_RUNS
+        {
+            let names: Vec<&str> = self.checks.iter().map(|c| c.name.as_str()).collect();
+            return Some(format!(
+                "you changed {changed} file(s) but have not run a check since your last \
+                 edit. Run the relevant one with run_check ({}).",
+                names.join(", ")
+            ));
+        }
+        if self.lsp.is_some() && !self.undiagnosed.is_empty() {
+            let files: Vec<&str> = self.undiagnosed.iter().map(String::as_str).collect();
+            return Some(format!(
+                "you have not asked for diagnostics on {} since editing it. Call \
+                 diagnostics for each changed file.",
+                files.join(", ")
+            ));
+        }
+        None
+    }
+
+    /// A few lines about the repository for the opening prompt: how big it
+    /// is, where the code lives, what it is written in, and which project
+    /// files exist — enough to search in the right place on the first turn
+    /// instead of the third.
+    pub fn overview(&self) -> String {
+        let total = self.tracked.len();
+        let mut dirs: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut exts: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut root_files = 0;
+        for path in &self.tracked {
+            match path.split_once('/') {
+                Some((dir, _)) => *dirs.entry(dir).or_default() += 1,
+                None => root_files += 1,
+            }
+            if let Some(ext) = Path::new(path).extension().and_then(|e| e.to_str()) {
+                *exts.entry(ext).or_default() += 1;
+            }
+        }
+        let mut dirs: Vec<(&str, usize)> = dirs.into_iter().collect();
+        dirs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        let mut exts: Vec<(&str, usize)> = exts.into_iter().collect();
+        exts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+
+        let mut out = format!("{total} tracked file(s).");
+        if !dirs.is_empty() {
+            let shown: Vec<String> =
+                dirs.iter().take(12).map(|(d, n)| format!("{d}/ ({n})")).collect();
+            out.push_str(&format!(" Top-level: {}", shown.join(", ")));
+            if dirs.len() > 12 {
+                out.push_str(&format!(", and {} more", dirs.len() - 12));
+            }
+            if root_files > 0 {
+                out.push_str(&format!("; {root_files} file(s) at the root"));
+            }
+            out.push('.');
+        }
+        if !exts.is_empty() {
+            let shown: Vec<String> =
+                exts.iter().take(8).map(|(e, n)| format!(".{e} {n}")).collect();
+            out.push_str(&format!(" By type: {}.", shown.join(", ")));
+        }
+        const PROJECT_FILES: &[&str] = &[
+            "Cargo.toml",
+            "package.json",
+            "pyproject.toml",
+            "setup.py",
+            "requirements.txt",
+            "go.mod",
+            "pom.xml",
+            "build.gradle",
+            "Makefile",
+            "CMakeLists.txt",
+            "Gemfile",
+            "mix.exs",
+            "Dockerfile",
+            ".git-manage-ci.toml",
+            "README.md",
+        ];
+        let present: Vec<&str> = PROJECT_FILES
+            .iter()
+            .copied()
+            .filter(|f| self.tracked.iter().any(|t| t == f))
+            .collect();
+        if !present.is_empty() {
+            out.push_str(&format!(" Project files: {}.", present.join(", ")));
+        }
+        out
+    }
+
+    /// The repository's own instructions for agents, if it has a file for
+    /// them (`AGENTS.md`, `CLAUDE.md`, …): its name and its text, capped.
+    pub fn project_instructions(&self) -> Option<(String, String)> {
+        let name = INSTRUCTION_FILES.iter().find(|f| self.tracked.iter().any(|t| t == *f))?;
+        let text = self.current_content(name).ok()?;
+        let text = if text.len() > MAX_INSTRUCTIONS_BYTES {
+            let end = (0..=MAX_INSTRUCTIONS_BYTES)
+                .rev()
+                .find(|i| text.is_char_boundary(*i))
+                .unwrap_or(0);
+            format!("{}\n[truncated]", &text[..end])
+        } else {
+            text
+        };
+        (!text.trim().is_empty()).then(|| (name.to_string(), text))
+    }
+
     /// The tools available at this access level.
     pub fn tools(&self) -> Vec<ToolSpec> {
         let mut tools = vec![
             ToolSpec {
                 name: "list_files",
                 description: "List the repository's tracked files. Optionally filter with a \
-                              glob such as \"src/*.rs\" or \"*/tests/*\". Use this first to \
-                              learn the layout before reading anything.",
+                              glob such as \"src/*.rs\" or \"*/tests/*\". This is how to find a \
+                              file by name; search looks inside files, not at their names.",
                 schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -276,14 +433,18 @@ impl Workspace {
             },
             ToolSpec {
                 name: "search",
-                description: "Case-insensitive plain-text search across tracked files. \
-                              Returns path:line: matching text. Use it to find definitions, \
-                              callers, and other uses of a symbol.",
+                description: "Case-insensitive search across tracked files: literal text by \
+                              default, a regular expression with regex=true. Returns \
+                              path:line: matching text, with surrounding lines when context \
+                              is set. Use it to find definitions, callers, and other uses of \
+                              a symbol before reading whole files.",
                 schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "query": {"type": "string", "description": "Literal text to find (not a regex)."},
+                        "query": {"type": "string", "description": "Text that appears in the code — an identifier, a string, a line — not a description of what you are looking for, and not a file name (use list_files for that). A regex when regex is true."},
+                        "regex": {"type": "boolean", "description": "Treat query as a regular expression (Rust regex syntax)."},
                         "glob": {"type": "string", "description": "Optional glob to restrict which files are searched."},
+                        "context": {"type": "integer", "description": "Lines of context to show around each hit (0-5)."},
                         "max_results": {"type": "integer", "description": "Cap on hits returned."}
                     },
                     "required": ["query"]
@@ -431,6 +592,37 @@ impl Workspace {
                     "required": ["path", "old_text", "new_text"]
                 }),
             });
+            tools.push(ToolSpec {
+                name: "replace_lines",
+                description: "Replace a range of lines, by the line numbers read_file showed, \
+                              with new text. Use this instead of edit_file when the text is \
+                              hard to reproduce exactly — escapes, tabs, long lines — or \
+                              when edit_file could not find its snippet. Read the file first \
+                              so the numbers are current; the reply shows the result.",
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Repo-relative path."},
+                        "start_line": {"type": "integer", "description": "1-based first line to replace."},
+                        "end_line": {"type": "integer", "description": "1-based last line to replace, inclusive. Equal to start_line for one line."},
+                        "new_text": {"type": "string", "description": "Replacement lines; empty deletes the range."},
+                        "expect_first_line": {"type": "string", "description": "Optional: what start_line currently says (whitespace-insensitive), as a guard against stale numbers."}
+                    },
+                    "required": ["path", "start_line", "end_line", "new_text"]
+                }),
+            });
+            tools.push(ToolSpec {
+                name: "show_changes",
+                description: "The diff of everything you have changed so far in this run, \
+                              against the files as they were when it started. Review it \
+                              before you report: it is what the developer will see.",
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "One file, or omit for all of them."}
+                    }
+                }),
+            });
         }
         tools
     }
@@ -450,12 +642,14 @@ impl Workspace {
             "search" => self.search(&call.input),
             "write_file" if self.access == Access::ReadWrite => self.write_file(&call.input),
             "edit_file" if self.access == Access::ReadWrite => self.edit_file(&call.input),
+            "replace_lines" if self.access == Access::ReadWrite => self.replace_lines(&call.input),
+            "show_changes" if self.access == Access::ReadWrite => self.show_changes(&call.input),
             "diagnostics" if self.lsp.is_some() => self.diagnostics(&call.input),
             "definition" if self.lsp.is_some() => self.locate(&call.input, false),
             "references" if self.lsp.is_some() => self.locate(&call.input, true),
             "find_symbol" if self.lsp.is_some() => self.find_symbol(&call.input),
             "run_check" if !self.checks.is_empty() => self.run_check(&call.input),
-            "write_file" | "edit_file" => {
+            "write_file" | "edit_file" | "replace_lines" => {
                 Err("This run is read-only: you can inspect the repository but not change \
                      it. Report what you found instead."
                     .to_string())
@@ -561,13 +755,34 @@ impl Workspace {
         if query.trim().is_empty() {
             return Err("query must not be empty.".into());
         }
-        let needle = query.to_lowercase();
         let glob = input.get("glob").and_then(|g| g.as_str());
         let cap = input
             .get("max_results")
             .and_then(|v| v.as_u64())
             .unwrap_or(MAX_SEARCH_HITS as u64)
             .min(MAX_SEARCH_HITS as u64) as usize;
+        let context = input.get("context").and_then(|v| v.as_u64()).unwrap_or(0).min(5) as usize;
+        let use_regex = input.get("regex").and_then(|v| v.as_bool()).unwrap_or(false);
+        let pattern = if use_regex {
+            regex::RegexBuilder::new(&query)
+                .case_insensitive(true)
+                .size_limit(1 << 20)
+                .build()
+                .map_err(|e| format!("Invalid regex: {e}"))?
+        } else {
+            regex::RegexBuilder::new(&regex::escape(&query))
+                .case_insensitive(true)
+                .build()
+                .map_err(|e| format!("Invalid query: {e}"))?
+        };
+        let clip = |line: &str| -> String {
+            let text = line.trim_end();
+            if text.chars().count() > 200 {
+                text.chars().take(200).collect::<String>() + "…"
+            } else {
+                text.to_string()
+            }
+        };
 
         let mut hits = Vec::new();
         let mut more = 0usize;
@@ -583,21 +798,28 @@ impl Workspace {
             }
             let Ok(content) = self.current_content(rel) else { continue };
             scanned += content.len();
-            for (i, line) in content.lines().enumerate() {
-                if !line.to_lowercase().contains(&needle) {
+            let lines: Vec<&str> = content.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if !pattern.is_match(line) {
                     continue;
                 }
                 if hits.len() >= cap {
                     more += 1;
                     continue;
                 }
-                let text = line.trim_end();
-                let text: String = if text.chars().count() > 200 {
-                    text.chars().take(200).collect::<String>() + "…"
-                } else {
-                    text.to_string()
-                };
-                hits.push(format!("{rel}:{}: {text}", i + 1));
+                if context == 0 {
+                    hits.push(format!("{rel}:{}: {}", i + 1, clip(line)));
+                    continue;
+                }
+                let from = i.saturating_sub(context);
+                let to = (i + context + 1).min(lines.len());
+                let mut block = String::new();
+                for (j, l) in lines[from..to].iter().enumerate() {
+                    let n = from + j + 1;
+                    let mark = if from + j == i { ':' } else { '-' };
+                    block.push_str(&format!("{rel}{mark}{n}{mark} {}\n", clip(l)));
+                }
+                hits.push(block.trim_end().to_string());
             }
         }
         if hits.is_empty() {
@@ -609,7 +831,7 @@ impl Workspace {
                 ),
             });
         }
-        let mut out = hits.join("\n");
+        let mut out = hits.join(if context > 0 { "\n--\n" } else { "\n" });
         if more > 0 {
             out.push_str(&format!("\n\n[{more} more matches; narrow the query or glob]"));
         }
@@ -630,7 +852,14 @@ impl Workspace {
         let lines = content.lines().count();
         self.overlay.insert(rel.clone(), content);
         self.persist(&rel)?;
+        self.note_edit(&rel);
         Ok(format!("Wrote {rel} ({lines} lines). {}", self.write_note()))
+    }
+
+    /// Bookkeeping for [`Self::verification_gap`].
+    fn note_edit(&mut self, rel: &str) {
+        self.undiagnosed.insert(rel.to_string());
+        self.edited_since_check = true;
     }
 
     fn edit_file(&mut self, input: &serde_json::Value) -> Result<String, String> {
@@ -643,33 +872,223 @@ impl Workspace {
             format!("{e} Use write_file to propose a new file.")
         })?;
 
-        let count = current.matches(old.as_str()).count();
-        if count == 0 {
-            return Err(format!(
-                "old_text does not appear in {rel}. Read the file again and copy the text \
-                 exactly, including indentation."
-            ));
+        if old.is_empty() {
+            return Err("old_text must not be empty; use write_file for a new file.".into());
         }
-        if count > 1 && !all {
+
+        let count = current.matches(old.as_str()).count();
+        let mut approximate: Option<(String, usize)> = None;
+        let (updated, replaced) = if count == 0 {
+            // Trailing whitespace and line endings are the usual reason an
+            // otherwise exact snippet fails; a unique match modulo those is
+            // what the model meant.
+            match flexible_match(&current, &old) {
+                Ok(Some((start, end))) => {
+                    let mut updated = String::with_capacity(current.len() + new.len());
+                    updated.push_str(&current[..start]);
+                    updated.push_str(&new);
+                    updated.push_str(&current[end..]);
+                    (updated, 1)
+                }
+                Ok(None) => match approximate_match(&current, &old) {
+                    // Close enough, and only one place it could mean: apply
+                    // it there and say so, with the result, so a wrong guess
+                    // is visible immediately rather than in the diff at the
+                    // end.
+                    Some((start, end, score)) => {
+                        let mut updated = String::with_capacity(current.len() + new.len());
+                        updated.push_str(&current[..start]);
+                        updated.push_str(&new);
+                        updated.push_str(&current[end..]);
+                        let first_line = current[..start].matches('\n').count() + 1;
+                        let last_line = first_line + old.lines().count().max(1) - 1;
+                        let note = format!(
+                            "old_text did not match exactly but was {:.0}% similar to lines \
+                             {first_line}-{last_line}, the only close match, so the edit was \
+                             applied there. Check the result below; use replace_lines if it \
+                             is not what you meant.",
+                            score * 100.0
+                        );
+                        approximate = Some((note, first_line));
+                        (updated, 1)
+                    }
+                    None => {
+                        return Err(format!(
+                            "old_text does not appear in {rel}.{} If the text is hard to \
+                             reproduce exactly (escapes, tabs), use replace_lines with the \
+                             line numbers instead.",
+                            nearest_hint(&current, &old)
+                        ));
+                    }
+                },
+                Err(n) => {
+                    return Err(format!(
+                        "old_text appears {n} times in {rel} (ignoring trailing whitespace). \
+                         Include more surrounding context to make it unique, or pass \
+                         replace_all."
+                    ));
+                }
+            }
+        } else if count > 1 && !all {
             return Err(format!(
                 "old_text appears {count} times in {rel}. Include more surrounding context \
                  to make it unique, or pass replace_all."
             ));
-        }
-        let updated = if all {
-            current.replace(old.as_str(), &new)
+        } else if all {
+            (current.replace(old.as_str(), &new), count)
         } else {
-            current.replacen(old.as_str(), &new, 1)
+            (current.replacen(old.as_str(), &new, 1), 1)
         };
+        if updated == current {
+            // Already the case — usually because the same edit was made a
+            // turn ago and the model did not notice. Not an error: an error
+            // here gets retried, which is the loop this line exists to end.
+            return Ok(format!(
+                "No change: {rel} already reads that way, so there was nothing to edit. \
+                 If you meant something else, read the file again."
+            ));
+        }
         self.remember_original(&rel);
-        self.overlay.insert(rel.clone(), updated);
+        self.overlay.insert(rel.clone(), updated.clone());
         self.persist(&rel)?;
+        self.note_edit(&rel);
+        let mut reply = format!(
+            "Edited {rel} ({replaced} replacement{}). {}",
+            if replaced != 1 { "s" } else { "" },
+            self.write_note()
+        );
+        if let Some((note, first_line)) = approximate {
+            let lines: Vec<&str> = updated.lines().collect();
+            let from = first_line.saturating_sub(2);
+            let to = (first_line - 1 + new.lines().count().max(1) + 1).min(lines.len());
+            let echo: Vec<String> =
+                lines[from..to].iter().enumerate().map(|(i, l)| format!("{:>6}  {l}", from + i + 1)).collect();
+            reply = format!("{note}\n{reply}\nNow:\n{}", echo.join("\n"));
+        }
+        Ok(reply)
+    }
+
+    /// Replaces lines `start_line..=end_line` with `new_text`.
+    ///
+    /// Line numbers are what [`Self::read_file`] showed, so a model that has
+    /// just read a region can change it without reproducing its exact text —
+    /// the thing that goes wrong with escapes, tabs, and long lines.
+    fn replace_lines(&mut self, input: &serde_json::Value) -> Result<String, String> {
+        let path = self.arg_str(input, "path")?;
+        let new_text = self.arg_str(input, "new_text")?;
+        let start = input
+            .get("start_line")
+            .and_then(|v| v.as_u64())
+            .ok_or("Missing required integer argument \"start_line\".")? as usize;
+        let end = input
+            .get("end_line")
+            .and_then(|v| v.as_u64())
+            .ok_or("Missing required integer argument \"end_line\".")? as usize;
+        let rel = self.resolve_writable(&path)?;
+        let current = self.current_content(&rel)?;
+        let lines: Vec<&str> = current.lines().collect();
+        if start == 0 || end < start {
+            return Err(format!("Bad range {start}-{end}: lines are 1-based and end >= start."));
+        }
+        if end > lines.len() {
+            return Err(format!("{rel} has {} lines; there is no line {end}.", lines.len()));
+        }
+        if let Some(expect) = input.get("expect_first_line").and_then(|v| v.as_str()) {
+            let actual = lines[start - 1];
+            if actual.split_whitespace().collect::<String>()
+                != expect.split_whitespace().collect::<String>()
+            {
+                return Err(format!(
+                    "Line {start} of {rel} is {actual:?}, not {expect:?}. Read the file again; \
+                     the numbers may have moved."
+                ));
+            }
+        }
+        let mut updated = String::with_capacity(current.len() + new_text.len());
+        for line in &lines[..start - 1] {
+            updated.push_str(line);
+            updated.push('\n');
+        }
+        let replacement: Vec<&str> = if new_text.is_empty() {
+            Vec::new()
+        } else {
+            new_text.trim_end_matches('\n').lines().collect()
+        };
+        for line in &replacement {
+            updated.push_str(line);
+            updated.push('\n');
+        }
+        for line in &lines[end..] {
+            updated.push_str(line);
+            updated.push('\n');
+        }
+        if !current.ends_with('\n') && end == lines.len() && !replacement.is_empty() {
+            // Keep a file that had no final newline that way.
+            updated.pop();
+        }
+        if updated == current {
+            return Ok(format!(
+                "No change: lines {start}-{end} of {rel} already read exactly like new_text. \
+                 If you meant something else, read the file again."
+            ));
+        }
+        self.remember_original(&rel);
+        self.overlay.insert(rel.clone(), updated.clone());
+        self.persist(&rel)?;
+        self.note_edit(&rel);
+        // Echo the result with a line of context either side, numbered as
+        // read_file would number it, so the next edit starts from the truth.
+        let after: Vec<&str> = updated.lines().collect();
+        let from = start.saturating_sub(2);
+        let to = (start - 1 + replacement.len() + 1).min(after.len());
+        let mut echo = String::new();
+        for (i, line) in after[from..to].iter().enumerate() {
+            echo.push_str(&format!("{:>6}  {line}\n", from + i + 1));
+        }
         Ok(format!(
-            "Edited {rel} ({} replacement{}). {}",
-            if all { count } else { 1 },
-            if all && count != 1 { "s" } else { "" },
+            "Replaced lines {start}-{end} of {rel} with {} line(s). {}\nNow:\n{echo}",
+            replacement.len(),
             self.write_note()
         ))
+    }
+
+    /// The diff of the run's changes so far, as the developer will see it.
+    fn show_changes(&self, input: &serde_json::Value) -> Result<String, String> {
+        let only = match input.get("path").and_then(|p| p.as_str()) {
+            Some(path) => Some(self.normalize(path)?),
+            None => None,
+        };
+        let edits = self.edits();
+        let mut out = String::new();
+        for edit in edits.iter().filter(|e| only.as_deref().is_none_or(|p| p == e.path)) {
+            let before = edit.before.clone().unwrap_or_default();
+            out.push_str(&format!(
+                "--- {}\n+++ {}\n",
+                if edit.before.is_some() { edit.path.as_str() } else { "/dev/null" },
+                edit.path
+            ));
+            for line in crate::app::textdiff::diff(&before, &edit.after) {
+                use crate::app::textdiff::Line;
+                match line {
+                    Line::Context(l) => out.push_str(&format!(" {l}\n")),
+                    Line::Added(l) => out.push_str(&format!("+{l}\n")),
+                    Line::Removed(l) => out.push_str(&format!("-{l}\n")),
+                    Line::Skipped(n) => out.push_str(&format!("@@ {n} unchanged line(s) @@\n")),
+                }
+            }
+            out.push('\n');
+            if out.len() > MAX_CHANGES_BYTES {
+                out.push_str("[diff truncated; ask for one file at a time]\n");
+                break;
+            }
+        }
+        if out.is_empty() {
+            return Ok(match only {
+                Some(p) => format!("No changes to {p} in this run."),
+                None => "No changes yet in this run.".into(),
+            });
+        }
+        Ok(out)
     }
 
     /// What just happened to the file, which differs by write mode and is
@@ -745,6 +1164,7 @@ impl Workspace {
         let lsp = self.lsp.clone().ok_or("no language server support in this run")?;
 
         let Some(path) = input.get("path").and_then(|p| p.as_str()) else {
+            self.undiagnosed.clear();
             let all = lsp.all_diagnostics();
             if all.is_empty() {
                 return Ok(
@@ -765,6 +1185,7 @@ impl Workspace {
         };
 
         let rel = self.normalize(path)?;
+        self.undiagnosed.remove(&rel);
         let full = self.root.join(&rel);
         let client = lsp
             .ensure_for(&full)
@@ -897,9 +1318,6 @@ impl Workspace {
 
     /// Runs one of the repository's declared checks.
     fn run_check(&mut self, input: &serde_json::Value) -> Result<String, String> {
-        /// A hard stop on a model that would otherwise run the test suite
-        /// after every edit.
-        const MAX_CHECK_RUNS: usize = 8;
         /// Enough output to diagnose a failure without burying the context.
         const MAX_OUTPUT: usize = 8_000;
 
@@ -934,6 +1352,7 @@ impl Workspace {
         }
 
         self.check_runs += 1;
+        self.edited_since_check = false;
         let result = crate::local_ci::run_job(&self.root, &job);
         let mut output = result.output;
         if output.len() > MAX_OUTPUT {
@@ -1105,8 +1524,176 @@ pub fn summarize(call: &ToolCall) -> String {
         "search" => format!("search \"{}\"", arg("query")),
         "write_file" => format!("propose new content for {}", arg("path")),
         "edit_file" => format!("propose an edit to {}", arg("path")),
+        "replace_lines" => format!(
+            "replace lines {}-{} of {}",
+            call.input.get("start_line").and_then(|v| v.as_u64()).unwrap_or(0),
+            call.input.get("end_line").and_then(|v| v.as_u64()).unwrap_or(0),
+            arg("path")
+        ),
+        "show_changes" => "review the diff so far".to_string(),
+        "diagnostics" => match call.input.get("path").and_then(|v| v.as_str()) {
+            Some(path) => format!("diagnostics for {path}"),
+            None => "diagnostics for every open file".into(),
+        },
+        "definition" => format!("definition of {}", arg("symbol")),
+        "references" => format!("references to {}", arg("symbol")),
+        "find_symbol" => format!("find symbol {}", arg("query")),
+        "run_check" => format!("run check {}", arg("name")),
         other => other.to_string(),
     }
+}
+
+/// A unique match of `old` in `current` ignoring trailing whitespace on each
+/// line and CRLF line endings: the byte range in `current` to replace. `Ok(None)`
+/// when there is none, `Err(n)` when there are several.
+fn flexible_match(current: &str, old: &str) -> Result<Option<(usize, usize)>, usize> {
+    let wanted: Vec<&str> = old.lines().map(str::trim_end).collect();
+    if wanted.is_empty() || wanted.iter().all(|l| l.is_empty()) {
+        return Ok(None);
+    }
+    // Byte offsets of each line start in `current`, so a match of lines can
+    // be turned back into a range of bytes.
+    let mut starts = Vec::new();
+    let mut offset = 0;
+    for line in current.split_inclusive('\n') {
+        starts.push(offset);
+        offset += line.len();
+    }
+    let lines: Vec<&str> = current.lines().map(str::trim_end).collect();
+    let mut found: Vec<(usize, usize)> = Vec::new();
+    for i in 0..lines.len() {
+        if i + wanted.len() > lines.len() {
+            break;
+        }
+        if lines[i..i + wanted.len()] == wanted[..] {
+            let start = starts[i];
+            let last = i + wanted.len() - 1;
+            // The end of the last matched line, without its line ending.
+            let end = starts[last] + current[starts[last]..].lines().next().unwrap_or("").len();
+            found.push((start, end));
+        }
+    }
+    match found.len() {
+        0 => Ok(None),
+        1 => Ok(Some(found[0])),
+        n => Err(n),
+    }
+}
+
+/// The one region of `current` that is nearly `old`, if there is exactly
+/// one: its byte range and how similar it is.
+///
+/// "Nearly" is a normalized edit distance over the same number of lines as
+/// `old`, compared with trailing whitespace stripped. The bar is high on
+/// purpose — an edit landing on the wrong region is the one outcome worse
+/// than a failed edit — and a second candidate above the bar means no match
+/// at all rather than a guess between them.
+fn approximate_match(current: &str, old: &str) -> Option<(usize, usize, f64)> {
+    /// Below this similarity the snippet is not the same code with a typo,
+    /// it is different code.
+    const MIN_SCORE: f64 = 0.9;
+    /// Files past this are searched no further: the scan is quadratic in the
+    /// snippet and linear in the file, and the model can use line numbers.
+    const MAX_LINES: usize = 20_000;
+
+    let wanted: Vec<&str> = old.lines().map(str::trim_end).collect();
+    if wanted.is_empty() || wanted.iter().all(|l| l.trim().is_empty()) {
+        return None;
+    }
+    let target = wanted.join("\n");
+    if target.len() < 12 {
+        // Too short to be nearly anything in particular.
+        return None;
+    }
+    let mut starts = Vec::new();
+    let mut offset = 0;
+    for line in current.split_inclusive('\n') {
+        starts.push(offset);
+        offset += line.len();
+    }
+    let lines: Vec<&str> = current.lines().map(str::trim_end).collect();
+    if lines.len() > MAX_LINES || lines.len() < wanted.len() {
+        return None;
+    }
+    let mut best: Option<(usize, f64)> = None;
+    let mut runner_up = 0.0_f64;
+    for i in 0..=lines.len() - wanted.len() {
+        let window = lines[i..i + wanted.len()].join("\n");
+        // Cheap pre-filter: lengths within 20% of each other.
+        let (a, b) = (window.len() as f64, target.len() as f64);
+        if (a - b).abs() > 0.2 * a.max(b) {
+            continue;
+        }
+        let score = 1.0 - levenshtein(&window, &target) as f64 / a.max(b).max(1.0);
+        match best {
+            Some((_, s)) if score <= s => runner_up = runner_up.max(score),
+            Some((_, s)) => {
+                runner_up = runner_up.max(s);
+                best = Some((i, score));
+            }
+            None => best = Some((i, score)),
+        }
+    }
+    let (i, score) = best?;
+    if score < MIN_SCORE || runner_up >= MIN_SCORE {
+        return None;
+    }
+    let start = starts[i];
+    let last = i + wanted.len() - 1;
+    let end = starts[last] + current[starts[last]..].lines().next().unwrap_or("").len();
+    Some((start, end, score))
+}
+
+/// Edit distance in bytes, single-row dynamic programming.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0; b.len() + 1];
+    for (i, &ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// Where the first line of a failed `old_text` does occur, so the model can
+/// re-read the right place instead of the whole file.
+fn nearest_hint(current: &str, old: &str) -> String {
+    let Some(probe) = old.lines().map(str::trim).find(|l| l.len() >= 8) else {
+        return String::new();
+    };
+    let lines: Vec<&str> = current.lines().collect();
+    let hits: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.contains(probe))
+        .map(|(i, _)| i)
+        .take(3)
+        .collect();
+    if hits.is_empty() {
+        return String::new();
+    }
+    // Quote the region the model was probably aiming at, verbatim and
+    // numbered, so it can copy from here or switch to replace_lines.
+    let span = old.lines().count().max(1);
+    let first = hits[0];
+    let to = (first + span + 1).min(lines.len());
+    let region: Vec<String> =
+        lines[first..to].iter().enumerate().map(|(i, l)| format!("{:>6}  {l}", first + i + 1)).collect();
+    let others = if hits.len() > 1 {
+        format!(
+            " (its first line also appears at line(s) {})",
+            hits[1..].iter().map(|i| (i + 1).to_string()).collect::<Vec<_>>().join(", ")
+        )
+    } else {
+        String::new()
+    };
+    format!(" The file actually says{others}:\n{}\n", region.join("\n"))
 }
 
 /// Glob match over a whole repo-relative path. `*` matches any run of
@@ -1241,6 +1828,218 @@ mod tests {
         );
         assert!(!out.is_error, "{}", out.content);
         assert_eq!(ws.edits()[0].after, "x = 2;\nx = 2;\n");
+    }
+
+    #[test]
+    fn an_edit_that_differs_only_in_trailing_whitespace_still_applies() {
+        let (_tmp, mut ws) = fixture(Access::ReadWrite);
+        // The file has trailing spaces the model did not see.
+        ws.dispatch(
+            &call(
+                "write_file",
+                serde_json::json!({"path": "src/main.rs", "content": "fn main() {   \n    run();\n}\n"}),
+            ),
+            10,
+        );
+        let out = ws.dispatch(
+            &call(
+                "edit_file",
+                serde_json::json!({"path": "src/main.rs", "old_text": "fn main() {\n    run();", "new_text": "fn main() {\n    go();"}),
+            ),
+            10,
+        );
+        assert!(!out.is_error, "{}", out.content);
+        let after = ws.edits().into_iter().find(|e| e.path == "src/main.rs").unwrap().after;
+        assert_eq!(after, "fn main() {\n    go();\n}\n");
+    }
+
+    #[test]
+    fn a_nearly_matching_edit_is_applied_and_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = "fn keep() {}\n\nfn go() {\n    while value.ends_with('\\\\') {\n        value.pop();\n    }\n}\n";
+        std::fs::write(tmp.path().join("a.rs"), body).unwrap();
+        let mut ws = Workspace::new(tmp.path(), vec!["a.rs".into()], Access::ReadWrite).unwrap();
+        // The model lost a backslash: one character off over four lines.
+        let out = ws.dispatch(
+            &call(
+                "edit_file",
+                serde_json::json!({
+                    "path": "a.rs",
+                    "old_text": "    while value.ends_with('\\') {\n        value.pop();\n    }",
+                    "new_text": "    while value.ends_with('\\\\') {\n        value.pop();\n        value.push(' ');\n    }"
+                }),
+            ),
+            10,
+        );
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("similar to lines 4-6"), "{}", out.content);
+        assert!(out.content.contains("value.push"), "{}", out.content);
+        let after = ws.edits()[0].after.clone();
+        assert!(after.contains("value.push(' ');"), "{after}");
+        assert!(after.starts_with("fn keep() {}"), "the rest is untouched");
+
+        // Something genuinely different is still refused.
+        let out = ws.dispatch(
+            &call(
+                "edit_file",
+                serde_json::json!({"path": "a.rs", "old_text": "fn something_else() {\n    entirely();\n}", "new_text": "x"}),
+            ),
+            10,
+        );
+        assert!(out.is_error, "{}", out.content);
+    }
+
+    #[test]
+    fn a_failed_edit_quotes_the_region_it_was_aiming_at() {
+        let (_tmp, mut ws) = fixture(Access::ReadWrite);
+        let out = ws.dispatch(
+            &call(
+                "edit_file",
+                serde_json::json!({"path": "src/main.rs", "old_text": "fn main() {\n    stop();\n}", "new_text": "x"}),
+            ),
+            10,
+        );
+        assert!(out.is_error);
+        assert!(out.content.contains("     1  fn main() {"), "{}", out.content);
+        assert!(out.content.contains("     2      run();"), "{}", out.content);
+        assert!(out.content.contains("replace_lines"), "{}", out.content);
+    }
+
+    #[test]
+    fn replace_lines_edits_by_number_and_echoes_the_result() {
+        let (_tmp, mut ws) = fixture(Access::ReadWrite);
+        let out = ws.dispatch(
+            &call(
+                "replace_lines",
+                serde_json::json!({"path": "src/main.rs", "start_line": 2, "end_line": 2, "new_text": "    go();\n    go();", "expect_first_line": "run();"}),
+            ),
+            10,
+        );
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("Replaced lines 2-2"), "{}", out.content);
+        assert!(out.content.contains("     3      go();"), "{}", out.content);
+        let after = ws.edits().into_iter().find(|e| e.path == "src/main.rs").unwrap().after;
+        assert_eq!(after, "fn main() {\n    go();\n    go();\n}\n");
+
+        // A stale guard is refused, and the range is checked.
+        let stale = ws.dispatch(
+            &call(
+                "replace_lines",
+                serde_json::json!({"path": "src/main.rs", "start_line": 2, "end_line": 2, "new_text": "x", "expect_first_line": "run();"}),
+            ),
+            10,
+        );
+        assert!(stale.is_error && stale.content.contains("not"), "{}", stale.content);
+        let past = ws.dispatch(
+            &call(
+                "replace_lines",
+                serde_json::json!({"path": "src/main.rs", "start_line": 3, "end_line": 9, "new_text": "x"}),
+            ),
+            10,
+        );
+        assert!(past.is_error, "{}", past.content);
+        // Deleting a range.
+        let del = ws.dispatch(
+            &call(
+                "replace_lines",
+                serde_json::json!({"path": "src/main.rs", "start_line": 2, "end_line": 3, "new_text": ""}),
+            ),
+            10,
+        );
+        assert!(!del.is_error, "{}", del.content);
+        let after = ws.edits().into_iter().find(|e| e.path == "src/main.rs").unwrap().after;
+        assert_eq!(after, "fn main() {\n}\n");
+    }
+
+    #[test]
+    fn search_takes_a_regex_and_context() {
+        let (_tmp, mut ws) = fixture(Access::ReadOnly);
+        let out = ws.dispatch(
+            &call("search", serde_json::json!({"query": "fn (main|run)", "regex": true})),
+            10,
+        );
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("src/main.rs:1:"), "{}", out.content);
+        assert!(out.content.contains("src/lib.rs:1:"), "{}", out.content);
+
+        let bad = ws.dispatch(&call("search", serde_json::json!({"query": "(", "regex": true})), 10);
+        assert!(bad.is_error && bad.content.contains("regex"), "{}", bad.content);
+
+        let ctx = ws.dispatch(
+            &call("search", serde_json::json!({"query": "run();", "context": 1})),
+            10,
+        );
+        assert!(ctx.content.contains("src/main.rs-1- fn main() {"), "{}", ctx.content);
+        assert!(ctx.content.contains("src/main.rs:2:     run();"), "{}", ctx.content);
+    }
+
+    #[test]
+    fn show_changes_renders_the_run_diff() {
+        let (_tmp, mut ws) = fixture(Access::ReadWrite);
+        let none = ws.dispatch(&call("show_changes", serde_json::json!({})), 10);
+        assert!(none.content.contains("No changes yet"));
+        ws.dispatch(
+            &call(
+                "edit_file",
+                serde_json::json!({"path": "src/lib.rs", "old_text": "pub fn run() {}", "new_text": "pub fn run() { work() }"}),
+            ),
+            10,
+        );
+        let out = ws.dispatch(&call("show_changes", serde_json::json!({})), 10);
+        assert!(out.content.contains("--- src/lib.rs"), "{}", out.content);
+        assert!(out.content.contains("-pub fn run() {}"), "{}", out.content);
+        assert!(out.content.contains("+pub fn run() { work() }"), "{}", out.content);
+    }
+
+    #[test]
+    fn the_overview_describes_the_layout() {
+        let (_tmp, ws) = fixture(Access::ReadOnly);
+        let text = ws.overview();
+        assert!(text.starts_with("2 tracked file(s)."), "{text}");
+        assert!(text.contains("src/ (2)"), "{text}");
+        assert!(text.contains(".rs 2"), "{text}");
+    }
+
+    #[test]
+    fn project_instructions_come_from_a_tracked_agents_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("AGENTS.md"), "Run cargo test.\n").unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "").unwrap();
+        let ws = Workspace::new(tmp.path(), vec!["a.rs".into()], Access::ReadOnly).unwrap();
+        assert!(ws.project_instructions().is_none(), "untracked files are invisible");
+        let ws = Workspace::new(tmp.path(), vec!["a.rs".into(), "AGENTS.md".into()], Access::ReadOnly)
+            .unwrap();
+        let (name, text) = ws.project_instructions().unwrap();
+        assert_eq!(name, "AGENTS.md");
+        assert_eq!(text, "Run cargo test.\n");
+    }
+
+    #[test]
+    fn the_verification_gap_tracks_checks_and_diagnostics() {
+        let (_tmp, mut ws) = fixture(Access::ReadWrite);
+        assert!(ws.verification_gap().is_none(), "nothing changed yet");
+        ws.dispatch(
+            &call("write_file", serde_json::json!({"path": "src/lib.rs", "content": "pub fn run() { 1 }\n"})),
+            10,
+        );
+        assert!(ws.verification_gap().is_none(), "no way to verify in an overlay run without a server");
+
+        let (tmp, mut ws) = fixture(Access::ReadWrite);
+        ws = ws.with_write_mode(WriteMode::Live).with_checks(vec![crate::local_ci::Job {
+            name: "tests".into(),
+            commands: vec!["true".into()],
+            ..Default::default()
+        }]);
+        ws.dispatch(
+            &call("write_file", serde_json::json!({"path": "src/lib.rs", "content": "pub fn run() { 1 }\n"})),
+            10,
+        );
+        let gap = ws.verification_gap().expect("an unchecked live edit is a gap");
+        assert!(gap.contains("run_check"), "{gap}");
+        let out = ws.dispatch(&call("run_check", serde_json::json!({"name": "tests"})), 10);
+        assert!(!out.is_error, "{}", out.content);
+        assert!(ws.verification_gap().is_none(), "checked since the last edit");
+        drop(tmp);
     }
 
     #[test]

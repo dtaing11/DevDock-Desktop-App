@@ -1,66 +1,81 @@
-//! Stacked pull requests: a chain of branches, each based on the one below.
+//! Stacked pull requests, driven by GitHub's own `gh stack` extension.
 //!
 //! A stack is how one large change gets reviewed as several small ones. Rather
 //! than a single branch off `main` carrying twelve commits, each self-contained
 //! piece gets its own branch and its own pull request, and each PR targets the
-//! branch below it instead of the trunk. Reviewers see one focused diff per PR;
-//! GitHub shows each PR the changes it actually introduces, because the ones
-//! underneath are already in its base.
+//! branch below it instead of the trunk. Reviewers see one focused diff per PR.
 //!
-//! GitHub has no "stack" object — a stack *is* the chain of base branches, and
-//! that is exactly what this module manages:
+//! GitHub now has a first-class stack object and a CLI extension that manages
+//! it — [`github/gh-stack`](https://github.com/github/gh-stack). This module is
+//! a thin, typed wrapper over that extension rather than a second
+//! implementation of the same idea:
 //!
-//! - the parent of each branch, recorded in git config as
-//!   `branch.<name>.devdock-parent` (per-repository, survives everything, and
-//!   is invisible to anyone who does not use this app);
-//! - restacking: when a branch low in the stack changes, everything above it
-//!   is rebased back on top, bottom-up, so the chain stays linear;
-//! - submitting: pushing every branch and opening each PR against its parent
-//!   (the [`nav_section`] block that goes in each PR body is built here too);
-//! - syncing after a merge: the merged branch drops out and its children are
-//!   re-parented onto what it was based on.
+//! - the chain itself lives in `.git/gh-stack`, written and read by `gh`;
+//! - [`stack_for`] reads it through `gh stack view --json` and decorates each
+//!   branch with its commits, so the view can say what a branch carries;
+//! - every operation — [`branch_on_tip`], [`restack`], [`push_stack`],
+//!   [`submit`], [`sync`] — is one `gh stack` command run non-interactively,
+//!   with the app's GitHub token handed over so nobody has to `gh auth login`
+//!   separately.
 //!
-//! Stacks are modelled as a straight line. Branches can of course fork off the
-//! same parent, and [`Stack::forks`] reports it when they do, but the chain
-//! itself is linear — restacking a tree in one action is a good way to lose
-//! track of what moved where.
+//! The one thing `gh stack` only does interactively is restructuring a stack
+//! (`gh stack modify`, a TUI). The app opens that in its terminal panel rather
+//! than reimplementing it against the extension's private state file.
+//!
+//! If `gh` or the extension is missing, every operation fails with the install
+//! command in the message; see [`INSTALL_HINT`].
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
-use crate::git::{Commit, GitError, Repo, Result};
+use serde::Deserialize;
 
-/// Config key suffix under `branch.<name>.` holding the parent branch.
-const PARENT_KEY: &str = "devdock-parent";
+use crate::git::{Commit, FileStatus, GitError, Repo, Result};
+
+/// How to get the tooling this module needs.
+pub const INSTALL_HINT: &str =
+    "Install the GitHub CLI, then run: gh extension install github/gh-stack";
 
 /// How many commits of one entry are loaded for display.
 const MAX_ENTRY_COMMITS: u32 = 100;
 
-/// Marker opening the generated stack block in a PR body.
-pub const NAV_START: &str = "<!-- devdock-stack -->";
-/// Marker closing the generated stack block in a PR body.
-pub const NAV_END: &str = "<!-- /devdock-stack -->";
+/// The file `gh stack rebase` leaves behind while it is stopped on a conflict.
+const REBASE_STATE: &str = "gh-stack-rebase-state";
+
+/// The exit status `gh stack rebase` uses for "stopped on a conflict".
+const EXIT_CONFLICT: i32 = 3;
+
+/// Config key suffixes the previous, built-in implementation used for the
+/// parent link and the pull request number. Read once to migrate; never
+/// written.
+const LEGACY_PARENT_KEY: &str = "devdock-parent";
+const LEGACY_PR_KEY: &str = "devdock-pr";
 
 // ---------------------------------------------------------------------------
 // Model
 // ---------------------------------------------------------------------------
 
 /// One branch in a stack, together with the branch it sits on.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct StackEntry {
     pub branch: String,
-    /// The branch this one is based on: the base of its pull request.
+    /// The branch this one is based on: the base of its pull request. The
+    /// nearest branch below that has not merged, or the trunk.
     pub parent: String,
     /// Commits this entry adds on top of its parent (`parent..branch`).
     pub commits: Vec<Commit>,
-    /// Number of the open pull request for this branch, once one exists.
-    /// Filled in by the caller from GitHub; the model itself is offline.
+    /// Number of the pull request for this branch, once one exists.
     pub pr: Option<u64>,
+    pub pr_url: Option<String>,
     /// The parent has commits this branch does not: it must be rebased
     /// before its pull request shows the right diff.
     pub needs_restack: bool,
-    /// Every commit of this entry is already in the trunk (by patch id), so
-    /// the entry has landed and can leave the stack.
+    /// Its pull request merged, or every one of its commits is already in the
+    /// trunk by patch id. Either way it has landed.
     pub merged: bool,
+    /// Its pull request is in a merge queue.
+    pub queued: bool,
 }
 
 impl StackEntry {
@@ -80,13 +95,19 @@ impl StackEntry {
 pub struct Stack {
     /// The branch the bottom entry is based on, usually `main`.
     pub trunk: String,
-    /// Entries ordered bottom → top.
+    /// Entries ordered bottom → top. Empty when the branch is not tracked.
     pub entries: Vec<StackEntry>,
     /// Index of the checked-out branch within `entries`, if it is in the stack.
     pub current: Option<usize>,
-    /// Branches that share a parent with an entry, so are not part of this
-    /// chain. Reported rather than silently swallowed.
-    pub forks: Vec<String>,
+    /// `gh stack` knows this branch. When false the entries are empty and the
+    /// branch can be tracked with [`track`] or [`branch_on_tip`].
+    pub tracked: bool,
+    /// A restack stopped on a conflict and is waiting to be continued or
+    /// aborted.
+    pub restacking: bool,
+    /// A chain recorded by the previous, built-in implementation (in git
+    /// config) that `gh stack` does not know about yet. Bottom first.
+    pub legacy: Vec<String>,
 }
 
 impl Stack {
@@ -110,111 +131,238 @@ impl Stack {
 }
 
 // ---------------------------------------------------------------------------
-// Parent bookkeeping
+// Running gh
 // ---------------------------------------------------------------------------
 
-fn parent_key(branch: &str) -> String {
-    format!("branch.{branch}.{PARENT_KEY}")
-}
-
-/// The branch `branch` is stacked on, if it has been tracked.
-pub fn parent_of(repo: &Repo, branch: &str) -> Option<String> {
-    repo.git(&["config", "--get", &parent_key(branch)])
-        .ok()
-        .map(|out| out.trim().to_string())
-        .filter(|p| !p.is_empty())
-}
-
-/// Records `parent` as the branch `branch` is stacked on.
+/// Where the GitHub CLI is.
 ///
-/// Refuses to close a loop: a stack whose parent links cycle would make
-/// restacking rebase forever.
-pub fn set_parent(repo: &Repo, branch: &str, parent: &str) -> Result<()> {
-    if branch == parent {
-        return Err(GitError::Command(format!("{branch} cannot be based on itself")));
-    }
-    let links = parents(repo);
-    let mut walk = Some(parent.to_string());
-    let mut seen = HashSet::new();
-    while let Some(cur) = walk {
-        if cur == branch {
-            return Err(GitError::Command(format!(
-                "{parent} is already stacked on {branch}; that would make a loop"
-            )));
+/// `PATH` first. A GUI app started from the Dock does not get the shell's
+/// `PATH`, so the places package managers put `gh` are tried after it.
+pub fn gh_program() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join("gh");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
-        if !seen.insert(cur.clone()) {
-            break;
-        }
-        walk = links.get(&cur).cloned();
     }
-    repo.git(&["config", &parent_key(branch), parent]).map(drop)
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut candidates: Vec<PathBuf> = vec![
+        "/opt/homebrew/bin/gh".into(),
+        "/usr/local/bin/gh".into(),
+        "/home/linuxbrew/.linuxbrew/bin/gh".into(),
+        "/usr/bin/gh".into(),
+    ];
+    if let Some(home) = home {
+        candidates.push(home.join(".local/bin/gh"));
+        candidates.push(home.join(".nix-profile/bin/gh"));
+    }
+    candidates.into_iter().find(|p| p.is_file())
 }
 
-/// Removes `branch` from the stack it was tracked in.
-pub fn clear_parent(repo: &Repo, branch: &str) -> Result<()> {
-    // `--unset` exits 5 when the key is already absent, which is not a failure
-    // for a caller that just wants the branch untracked.
-    match repo.git(&["config", "--unset", &parent_key(branch)]) {
-        Ok(_) | Err(GitError::Command(_)) => Ok(()),
-        Err(e) => Err(e),
+/// Whether `gh` and the stack extension can be run at all.
+pub fn available() -> bool {
+    let Some(program) = gh_program() else { return false };
+    Command::new(program)
+        .args(["stack", "--version"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// What one `gh stack` invocation produced.
+struct Run {
+    code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+impl Run {
+    /// Progress lines, for the activity log: stdout then stderr, blank lines
+    /// and gh's "what's next" advice dropped.
+    fn log(&self) -> Vec<String> {
+        self.stdout
+            .lines()
+            .chain(self.stderr.lines())
+            .map(str::trim_end)
+            .filter(|l| !l.trim().is_empty())
+            .filter(|l| !is_advice(l))
+            .map(|l| l.to_string())
+            .collect()
+    }
+
+    /// The error, from whatever gh printed, with its glyphs stripped.
+    fn error(&self) -> String {
+        let mut lines: Vec<&str> = self
+            .stderr
+            .lines()
+            .chain(self.stdout.lines())
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !is_advice(l))
+            .collect();
+        // gh puts the actual failure on a ✗ line; prefer those.
+        let failures: Vec<&str> = lines.iter().copied().filter(|l| l.starts_with('✗')).collect();
+        if !failures.is_empty() {
+            lines = failures;
+        }
+        let text = lines
+            .iter()
+            .map(|l| l.trim_start_matches(['✗', '⚠', ' ']).trim())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.is_empty() {
+            format!("gh stack exited with status {}", self.code)
+        } else {
+            text
+        }
     }
 }
 
-/// Every recorded parent link in the repository, child → parent.
-pub fn parents(repo: &Repo) -> BTreeMap<String, String> {
-    let pattern = format!("^branch\\..*\\.{PARENT_KEY}$");
-    let Ok(out) = repo.git(&["config", "--get-regexp", &pattern]) else {
-        return BTreeMap::new(); // exit 1 == no matches
+/// Lines gh prints to tell a person what to type next. Right in a terminal,
+/// noise in a log with buttons above it.
+fn is_advice(line: &str) -> bool {
+    let l = line.trim();
+    l.starts_with('•')
+        || l.starts_with("What's next")
+        || l.starts_with("To push up")
+        || l.starts_with("To create PRs")
+        || l.starts_with("Run `gh stack")
+        || l.starts_with("Or abort")
+        || l.starts_with("Resolve conflicts on")
+        || l.starts_with("To resolve:")
+        || l.starts_with("Checkout an existing stack")
+}
+
+/// Runs `gh stack <args>` in the repository, non-interactively.
+///
+/// `auth` is the app's GitHub token. It goes to gh as `GH_TOKEN`, and to the
+/// git commands gh spawns as an HTTP header via `GIT_CONFIG_*` — the same
+/// mechanism [`Repo`] uses, so nothing is written to disk or shown in `ps`.
+fn run(repo: &Repo, args: &[&str], auth: Option<&str>) -> Result<Run> {
+    let Some(program) = gh_program() else {
+        return Err(GitError::Command(format!("The GitHub CLI (gh) was not found. {INSTALL_HINT}")));
     };
-    out.lines()
-        .filter_map(|line| {
-            let (key, parent) = line.split_once(' ')?;
-            let child = key
-                .strip_prefix("branch.")?
-                .strip_suffix(&format!(".{PARENT_KEY}"))?;
-            (!child.is_empty() && !parent.is_empty())
-                .then(|| (child.to_string(), parent.trim().to_string()))
-        })
-        .collect()
-}
-
-/// Config key suffix under `branch.<name>.` holding the pull request number.
-const PR_KEY: &str = "devdock-pr";
-
-fn pr_key(branch: &str) -> String {
-    format!("branch.{branch}.{PR_KEY}")
-}
-
-/// The pull request opened for `branch`, if this app opened one.
-///
-/// Remembering the number is what makes a merge visible: GitHub's list
-/// endpoint returns open pull requests only, so a stack that has forgotten
-/// the number of the PR at its bottom cannot tell "merged" from "never
-/// existed", and both look the same from the branch alone.
-pub fn pr_of(repo: &Repo, branch: &str) -> Option<u64> {
-    repo.git(&["config", "--get", &pr_key(branch)])
-        .ok()
-        .and_then(|out| out.trim().parse().ok())
-}
-
-/// Records the pull request opened for `branch`.
-pub fn set_pr(repo: &Repo, branch: &str, number: u64) -> Result<()> {
-    repo.git(&["config", &pr_key(branch), &number.to_string()]).map(drop)
-}
-
-/// Forgets the pull request recorded for `branch`.
-pub fn clear_pr(repo: &Repo, branch: &str) -> Result<()> {
-    match repo.git(&["config", "--unset", &pr_key(branch)]) {
-        Ok(_) | Err(GitError::Command(_)) => Ok(()),
-        Err(e) => Err(e),
+    let mut cmd = Command::new(&program);
+    cmd.arg("stack")
+        .args(args)
+        .current_dir(repo.path())
+        .stdin(Stdio::null())
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1")
+        .env("NO_COLOR", "1")
+        .env("CLICOLOR", "0")
+        .env("GIT_EDITOR", "true")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    if let Some(token) = auth {
+        cmd.env("GH_TOKEN", token);
+        if origin_is_github(repo) {
+            use base64::Engine as _;
+            let basic = base64::engine::general_purpose::STANDARD
+                .encode(format!("x-access-token:{token}"));
+            cmd.env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
+                .env("GIT_CONFIG_VALUE_0", format!("AUTHORIZATION: basic {basic}"));
+        }
     }
+    let out = cmd.output().map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => {
+            GitError::Command(format!("Could not run {}. {INSTALL_HINT}", program.display()))
+        }
+        _ => GitError::Io(e),
+    })?;
+    let run = Run {
+        code: out.status.code().unwrap_or(-1),
+        stdout: strip_ansi(&String::from_utf8_lossy(&out.stdout)),
+        stderr: strip_ansi(&String::from_utf8_lossy(&out.stderr)),
+    };
+    if run.stderr.contains("unknown command \"stack\"") {
+        return Err(GitError::Command(format!(
+            "The gh-stack extension is not installed. {INSTALL_HINT}"
+        )));
+    }
+    Ok(run)
 }
 
-/// The repository's trunk: what a stack is ultimately based on.
-///
-/// `origin/HEAD` is the remote's own answer to the question, so it wins when
-/// it is set. Otherwise fall back to the conventional names, and finally to
-/// whatever is checked out, so a repository with neither still works.
+/// Runs a command that is expected to succeed, turning any other exit into
+/// an error carrying what gh said.
+fn run_ok(repo: &Repo, args: &[&str], auth: Option<&str>) -> Result<Run> {
+    let run = run(repo, args, auth)?;
+    if run.code != 0 {
+        return Err(GitError::Command(run.error()));
+    }
+    Ok(run)
+}
+
+/// gh honours `NO_COLOR`, but a stray escape in a log line is worse than a
+/// few lines of belt and braces.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn origin_is_github(repo: &Repo) -> bool {
+    repo.git(&["remote", "get-url", "origin"])
+        .map(|url| url.trim().starts_with("https://github.com/"))
+        .unwrap_or(false)
+}
+
+fn has_remote(repo: &Repo) -> bool {
+    repo.remotes().map(|r| !r.is_empty()).unwrap_or(false)
+}
+
+/// The path git resolves for a file inside `.git`, worktrees included.
+fn git_path(repo: &Repo, name: &str) -> Option<PathBuf> {
+    let rel = repo.git(&["rev-parse", "--git-path", name]).ok()?;
+    let rel = rel.trim();
+    if rel.is_empty() {
+        return None;
+    }
+    let path = Path::new(rel);
+    Some(if path.is_absolute() { path.to_path_buf() } else { repo.path().join(path) })
+}
+
+/// Whether `gh stack rebase` is stopped, waiting for a conflict to be resolved.
+pub fn restack_in_progress(repo: &Repo) -> bool {
+    git_path(repo, REBASE_STATE).map(|p| p.exists()).unwrap_or(false)
+}
+
+/// The branch a stopped restack is stuck on, from gh's own state file.
+fn conflict_branch(repo: &Repo) -> Option<String> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct State {
+        conflict_branch: Option<String>,
+    }
+    let path = git_path(repo, REBASE_STATE)?;
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<State>(&text).ok()?.conflict_branch.filter(|b| !b.is_empty())
+}
+
+// ---------------------------------------------------------------------------
+// Reading the stack
+// ---------------------------------------------------------------------------
+
+/// The repository's default branch: `origin/HEAD` when it is known, else the
+/// first of the usual names that exists, else whatever is checked out.
 pub fn default_branch(repo: &Repo) -> String {
     if let Ok(out) = repo.git(&["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]) {
         if let Some(name) = out.trim().strip_prefix("origin/") {
@@ -238,106 +386,129 @@ fn local_branches(repo: &Repo) -> Vec<String> {
         .unwrap_or_default()
 }
 
-// ---------------------------------------------------------------------------
-// Building a stack
-// ---------------------------------------------------------------------------
+/// `gh stack view --json`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct View {
+    trunk: String,
+    #[serde(default)]
+    current_branch: String,
+    #[serde(default)]
+    branches: Vec<ViewBranch>,
+}
 
-/// The stack `branch` belongs to, bottom-first.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ViewBranch {
+    name: String,
+    #[serde(default)]
+    is_current: bool,
+    #[serde(default)]
+    is_merged: bool,
+    #[serde(default)]
+    is_queued: bool,
+    #[serde(default)]
+    needs_rebase: bool,
+    #[serde(default)]
+    pr: Option<ViewPr>,
+}
+
+#[derive(Deserialize)]
+struct ViewPr {
+    number: u64,
+    #[serde(default)]
+    url: Option<String>,
+}
+
+/// gh's ways of saying "this branch is not in a stack", none of which is an
+/// error for the view — an untracked branch is a normal thing to look at.
+fn is_untracked_message(msg: &str) -> bool {
+    msg.contains("is not part of a stack")
+        || msg.contains("belongs to multiple stacks")
+        || msg.contains("no stacks found")
+        || msg.contains("No stacks")
+}
+
+/// The stack `branch` belongs to, bottom-first, as `gh stack` sees it.
 ///
-/// An untracked branch is a stack of one based on the trunk: that is what it
-/// is, and it means "add a branch on top" works without a separate step to
-/// start a stack.
-pub fn stack_for(repo: &Repo, branch: &str) -> Result<Stack> {
-    let trunk = default_branch(repo);
-    let locals: HashSet<String> = local_branches(repo).into_iter().collect();
-    let mut stack = Stack { trunk: trunk.clone(), ..Default::default() };
-    // The trunk is not an entry; it is what entries are based on. Neither is
-    // a detached HEAD or a repository with no commits — `current_branch`
-    // describes those in words, and there is no branch to stack.
-    if branch.is_empty() || branch == trunk || !locals.contains(branch) {
-        return Ok(stack);
-    }
-    let links = parents(repo);
-
-    // Down to the trunk.
-    let mut chain = vec![branch.to_string()];
-    let mut seen: HashSet<String> = chain.iter().cloned().collect();
-    let mut cur = branch.to_string();
-    while let Some(parent) = links.get(&cur) {
-        if parent == &trunk || !locals.contains(parent) || !seen.insert(parent.clone()) {
-            break;
+/// An untracked branch comes back as an empty, untracked stack based on the
+/// default branch — with the chain the previous implementation recorded, if
+/// there is one, so it can be imported.
+pub fn stack_for(repo: &Repo, branch: &str, auth: Option<&str>) -> Result<Stack> {
+    let mut stack = Stack {
+        trunk: default_branch(repo),
+        restacking: restack_in_progress(repo),
+        ..Default::default()
+    };
+    let run = run(repo, &["view", "--json"], auth)?;
+    if run.code != 0 {
+        let msg = run.error();
+        // Mid-restack, HEAD is detached on the conflicted commit and gh
+        // cannot say which stack that is. The stopped restack is the whole
+        // story until it is continued or abandoned.
+        if stack.restacking {
+            stack.tracked = true;
+            return Ok(stack);
         }
-        chain.push(parent.clone());
-        cur = parent.clone();
-    }
-    chain.reverse();
-
-    // Up through children. A branch with two children forks the chain; the
-    // fork is reported and the walk stops rather than picking one at random.
-    let mut cur = branch.to_string();
-    loop {
-        let children: Vec<String> = links
-            .iter()
-            .filter(|(child, parent)| **parent == cur && locals.contains(*child))
-            .map(|(child, _)| child.clone())
-            .collect();
-        match children.len() {
-            1 => {
-                let child = children.into_iter().next().unwrap();
-                if !seen.insert(child.clone()) {
-                    break;
-                }
-                chain.push(child.clone());
-                cur = child;
-            }
-            0 => break,
-            _ => {
-                stack.forks = children;
-                stack.forks.sort();
-                break;
-            }
+        if is_untracked_message(&msg) {
+            stack.legacy = legacy_chain(repo, branch);
+            return Ok(stack);
         }
+        return Err(GitError::Command(msg));
     }
+    let view: View = serde_json::from_str(run.stdout.trim()).map_err(|e| {
+        GitError::Command(format!("Could not read `gh stack view --json`: {e}"))
+    })?;
+    if !view.trunk.is_empty() {
+        stack.trunk = view.trunk.clone();
+    }
+    stack.tracked = true;
 
-    let current = repo.current_branch();
-    for (i, name) in chain.iter().enumerate() {
-        let parent =
-            if i == 0 { trunk.clone() } else { chain[i - 1].clone() };
-        stack.entries.push(entry(repo, name, &parent, &trunk)?);
-        if *name == current {
+    let current = if view.current_branch.is_empty() {
+        repo.current_branch()
+    } else {
+        view.current_branch.clone()
+    };
+    // A merged branch stays in gh's list (marked) until it is pruned. What
+    // sits on it is, for every purpose that matters here, based on the
+    // nearest branch below that has not merged — that is where GitHub
+    // retargets its pull request, and what its diff is against.
+    let mut parent = stack.trunk.clone();
+    for (i, b) in view.branches.iter().enumerate() {
+        let range = format!("{parent}..{}", b.name);
+        let commits = repo.log(MAX_ENTRY_COMMITS, Some(&range)).unwrap_or_default();
+        let merged = b.is_merged || landed(repo, &stack.trunk, &b.name, &parent);
+        stack.entries.push(StackEntry {
+            branch: b.name.clone(),
+            parent: parent.clone(),
+            commits,
+            pr: b.pr.as_ref().map(|p| p.number),
+            pr_url: b.pr.as_ref().and_then(|p| p.url.clone()),
+            needs_restack: b.needs_rebase && !merged,
+            merged,
+            queued: b.is_queued,
+        });
+        if b.is_current || b.name == current {
             stack.current = Some(i);
+        }
+        if !merged {
+            parent = b.name.clone();
         }
     }
     Ok(stack)
 }
 
-fn entry(repo: &Repo, branch: &str, parent: &str, trunk: &str) -> Result<StackEntry> {
-    let range = format!("{parent}..{branch}");
-    let commits = repo.log(MAX_ENTRY_COMMITS, Some(&range)).unwrap_or_default();
-    let needs_restack =
-        repo.git(&["merge-base", "--is-ancestor", parent, branch]).is_err();
-    Ok(StackEntry {
-        branch: branch.to_string(),
-        parent: parent.to_string(),
-        merged: landed(repo, trunk, branch, parent),
-        commits,
-        pr: pr_of(repo, branch),
-        needs_restack,
-    })
-}
-
 /// Whether everything this branch carries is already in the trunk.
 ///
-/// Two ways that happens. A merge or fast-forward leaves the branch an
-/// ancestor of the trunk, so `trunk..branch` is empty. A rebase or
-/// cherry-pick gives the same changes new shas, and only `git cherry` sees
-/// through that: it compares patch ids, marking with `-` every commit whose
-/// change is upstream already. Passing `parent` as the limit confines the
-/// comparison to this entry's own commits.
+/// A merge or fast-forward leaves the branch an ancestor of the trunk, so
+/// `trunk..branch` is empty. A rebase or cherry-pick gives the same changes
+/// new shas, and only `git cherry` sees through that: it compares patch ids,
+/// marking with `-` every commit whose change is upstream already. Passing
+/// `parent` as the limit confines the comparison to this entry's own commits.
 ///
 /// A squash merge defeats both — one upstream commit whose patch matches no
-/// single commit here — so a caller that knows the pull request's state
-/// should trust that over this.
+/// single commit here — which is why gh's own answer, from the pull request,
+/// is consulted first.
 fn landed(repo: &Repo, trunk: &str, branch: &str, parent: &str) -> bool {
     let range = format!("{trunk}..{branch}");
     if let Ok(out) = repo.git(&["rev-list", "--count", &range]) {
@@ -359,314 +530,226 @@ fn landed(repo: &Repo, trunk: &str, branch: &str, parent: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Building a stack
+// ---------------------------------------------------------------------------
+
+/// Puts the checked-out branch under `gh stack`'s care as a stack of one.
+pub fn track(repo: &Repo, stack: &Stack, auth: Option<&str>) -> Result<String> {
+    let current = repo.current_branch();
+    if current.is_empty() || current == stack.trunk {
+        return Err(GitError::Command(format!(
+            "`{}` is the trunk. Check out a branch to track, or start one on top of it.",
+            stack.trunk
+        )));
+    }
+    run_ok(repo, &["init", "--base", &stack.trunk, &current], auth)?;
+    Ok(format!("{current} is now a stack on {}.", stack.trunk))
+}
+
+/// Starts `name` on top of the stack and records it there.
+///
+/// On a tracked stack that is `gh stack add`, which only works from the top,
+/// so the top is checked out first. On an untracked branch the branch and the
+/// new one become a stack together; on the trunk the new branch starts one.
+/// Either way the new branch ends up checked out.
+pub fn branch_on_tip(
+    repo: &Repo,
+    stack: &Stack,
+    name: &str,
+    auth: Option<&str>,
+) -> Result<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(GitError::Command("A branch needs a name.".into()));
+    }
+    if local_branches(repo).iter().any(|b| b == name) {
+        return Err(GitError::Command(format!(
+            "A branch called {name} already exists. Start a new one, or restructure \
+             the stack with `gh stack modify` to adopt it."
+        )));
+    }
+    let parent;
+    if stack.tracked {
+        parent = stack.tip();
+        if repo.current_branch() != parent {
+            repo.checkout(&parent)?;
+        }
+        run_ok(repo, &["add", name], auth)?;
+    } else {
+        let current = repo.current_branch();
+        if current.is_empty() || current == stack.trunk {
+            parent = stack.trunk.clone();
+            run_ok(repo, &["init", "--base", &stack.trunk, name], auth)?;
+        } else {
+            parent = current.clone();
+            run_ok(repo, &["init", "--base", &stack.trunk, &current, name], auth)?;
+        }
+    }
+    Ok(format!("Started {name} on top of {parent}."))
+}
+
+/// Forgets the stack locally. The branches, and any stack on GitHub, are left
+/// alone.
+pub fn untrack(repo: &Repo, auth: Option<&str>) -> Result<Vec<String>> {
+    Ok(run_ok(repo, &["unstack", "--local"], auth)?.log())
+}
+
+// ---------------------------------------------------------------------------
 // Restacking
 // ---------------------------------------------------------------------------
 
-/// What one branch did during a restack.
-#[derive(Debug, Clone)]
-pub struct RestackStep {
-    pub branch: String,
-    /// False when the branch was already on top of its parent.
-    pub moved: bool,
-}
-
-/// The outcome of restacking a whole stack.
+/// What a restack did.
 #[derive(Debug, Clone, Default)]
 pub struct RestackReport {
-    pub steps: Vec<RestackStep>,
-    /// The branch whose rebase stopped in conflict, if one did. The rebase is
-    /// left in progress so the conflict resolver can finish it.
+    pub log: Vec<String>,
+    /// Branches whose tip changed.
+    pub moved: Vec<String>,
+    /// Set when a rebase stopped on a conflict, naming the branch. The rebase
+    /// is left in progress for the conflict resolver; finish with
+    /// [`restack_continue`] or give up with [`restack_abort`].
     pub conflicted: Option<String>,
 }
 
 impl RestackReport {
-    pub fn moved(&self) -> Vec<&str> {
-        self.steps.iter().filter(|s| s.moved).map(|s| s.branch.as_str()).collect()
-    }
-
     pub fn message(&self) -> String {
         if let Some(branch) = &self.conflicted {
-            return format!("Restack stopped: {branch} has conflicts.");
+            return format!(
+                "Restack stopped on {branch} with conflicts. Resolve them, then continue \
+                 the restack."
+            );
         }
-        match self.moved().len() {
+        match self.moved.len() {
             0 => "Stack is already in order.".to_string(),
-            n => format!("Restacked {n} branch(es): {}.", self.moved().join(", ")),
+            n => format!("Restacked {n} branch(es): {}.", self.moved.join(", ")),
         }
     }
-}
-
-/// One branch to move: rebase `branch` onto `parent`, replaying only the
-/// commits in `upstream..branch`.
-#[derive(Debug, Clone)]
-struct Move {
-    branch: String,
-    parent: String,
-    upstream: String,
 }
 
 /// Rebases every branch in the stack back on top of its parent, bottom-up.
-pub fn restack(repo: &Repo, stack: &Stack) -> Result<RestackReport> {
+///
+/// `gh stack rebase` — which also fetches the trunk and fast-forwards it when
+/// there is a remote to fetch from. Without one, only the branches are
+/// rebased onto each other.
+///
+/// Refuses a dirty working tree rather than stashing on the user's behalf:
+/// rebasing every branch in a stack is not the moment to find out what an
+/// automatic stash did with a half-finished change. Untracked files are fine.
+pub fn restack(repo: &Repo, stack: &Stack, auth: Option<&str>) -> Result<RestackReport> {
+    if restack_in_progress(repo) {
+        return Err(GitError::Command(
+            "A restack is already stopped on a conflict. Continue or abort it first.".into(),
+        ));
+    }
     if stack.entries.is_empty() {
         return Ok(RestackReport::default());
     }
-    apply_moves(repo, &plan(repo, stack, &[])?)
-}
-
-/// Works out what to rebase onto what, and — the part that matters — which
-/// commits each rebase should replay.
-///
-/// The subtlety is that a branch's own commits cannot be identified after the
-/// branch below it moves. Once the bottom branch is rebased its children point
-/// at commits whose parent is no longer in the chain, and `git merge-base` then
-/// finds the *trunk* as the common ancestor, so a naive rebase replays the
-/// branch below's commits a second time. Every branch's tip is therefore read
-/// here, before anything moves, and each rebase replays exactly
-/// `<the tip the branch below had>..<branch>`.
-///
-/// `merged` names branches that are leaving the stack. They still count for
-/// the tips: the branch above a squash-merged one must replay from where that
-/// branch *ended*, not from the trunk — the squash gave its changes a new
-/// commit whose patch matches none of the originals, so replaying from the
-/// trunk would apply them a second time and conflict.
-fn plan(repo: &Repo, stack: &Stack, merged: &[String]) -> Result<Vec<Move>> {
-    let mut tips: Vec<String> = Vec::new();
-    for e in &stack.entries {
-        tips.push(rev_parse(repo, &e.branch)?);
-    }
-    let mut moves = Vec::new();
-    // The nearest branch below that is staying, or the trunk.
-    let mut parent = stack.trunk.clone();
-    for (i, e) in stack.entries.iter().enumerate() {
-        if merged.contains(&e.branch) {
-            continue;
-        }
-        let upstream = match i {
-            0 => fork_point(repo, &parent, &e.branch),
-            _ => tips[i - 1].clone(),
-        };
-        moves.push(Move { branch: e.branch.clone(), parent: parent.clone(), upstream });
-        parent = e.branch.clone();
-    }
-    Ok(moves)
-}
-
-/// Runs the rebases, bottom-up, and puts the original branch back.
-fn apply_moves(repo: &Repo, moves: &[Move]) -> Result<RestackReport> {
-    let mut report = RestackReport::default();
-    if moves.is_empty() {
-        return Ok(report);
-    }
-    if !repo.status()?.files.is_empty() {
+    if has_uncommitted_changes(repo)? {
         return Err(GitError::Command(
             "The working tree has uncommitted changes. Commit or stash them before \
              restacking: rebasing every branch in the stack needs a clean tree."
                 .into(),
         ));
     }
-    let start = repo.current_branch();
+    let tips = tips(repo, stack);
+    let args: &[&str] = if has_remote(repo) { &["rebase"] } else { &["rebase", "--no-trunk"] };
+    let run = run(repo, args, auth)?;
+    finish_restack(repo, run, &tips)
+}
 
-    for mv in moves {
-        // Already contains its parent: nothing to replay.
-        if repo.git(&["merge-base", "--is-ancestor", &mv.parent, &mv.branch]).is_ok() {
-            report.steps.push(RestackStep { branch: mv.branch.clone(), moved: false });
-            continue;
-        }
-        match repo.git(&["rebase", "--onto", &mv.parent, &mv.upstream, &mv.branch]) {
-            Ok(_) => report.steps.push(RestackStep { branch: mv.branch.clone(), moved: true }),
-            Err(err) => {
-                // Leave the rebase in progress: the conflict resolver picks it
-                // up from here, and aborting would throw away the work.
-                if repo.git(&["rev-parse", "--verify", "--quiet", "REBASE_HEAD"]).is_ok() {
-                    report.conflicted = Some(mv.branch.clone());
-                    return Ok(report);
-                }
-                let _ = repo.checkout(&start);
-                return Err(err);
-            }
-        }
+/// Resumes a restack after its conflicts were resolved and staged.
+///
+/// Works whether the underlying `git rebase` was already continued (the
+/// conflict resolver does that) or is still sitting on the conflict.
+pub fn restack_continue(repo: &Repo, auth: Option<&str>) -> Result<RestackReport> {
+    if !restack_in_progress(repo) {
+        return Err(GitError::Command("No restack is waiting to be continued.".into()));
     }
-    if repo.current_branch() != start {
-        repo.checkout(&start)?;
+    let run = run(repo, &["rebase", "--continue"], auth)?;
+    finish_restack(repo, run, &BTreeMap::new())
+}
+
+/// Gives up on a stopped restack, putting every branch back where it was.
+pub fn restack_abort(repo: &Repo, auth: Option<&str>) -> Result<Vec<String>> {
+    Ok(run_ok(repo, &["rebase", "--abort"], auth)?.log())
+}
+
+fn finish_restack(
+    repo: &Repo,
+    run: Run,
+    before: &BTreeMap<String, String>,
+) -> Result<RestackReport> {
+    let mut report = RestackReport { log: run.log(), ..Default::default() };
+    if run.code == EXIT_CONFLICT || (run.code != 0 && restack_in_progress(repo)) {
+        report.conflicted = conflict_branch(repo).or_else(|| Some("a branch".to_string()));
+        return Ok(report);
+    }
+    if run.code != 0 {
+        return Err(GitError::Command(run.error()));
+    }
+    for (branch, sha) in before {
+        if rev_parse(repo, branch).ok().as_deref() != Some(sha.as_str()) {
+            report.moved.push(branch.clone());
+        }
     }
     Ok(report)
+}
+
+fn tips(repo: &Repo, stack: &Stack) -> BTreeMap<String, String> {
+    stack
+        .entries
+        .iter()
+        .filter_map(|e| rev_parse(repo, &e.branch).ok().map(|sha| (e.branch.clone(), sha)))
+        .collect()
 }
 
 fn rev_parse(repo: &Repo, rev: &str) -> Result<String> {
     repo.git(&["rev-parse", rev]).map(|o| o.trim().to_string())
 }
 
-/// Where `branch` left `parent`, preferring the reflog-aware answer.
-///
-/// `--fork-point` knows about a parent that has itself been rewritten; plain
-/// `merge-base` is the fallback when the reflog has been pruned or the branch
-/// arrived by fetch.
-fn fork_point(repo: &Repo, parent: &str, branch: &str) -> String {
-    repo.git(&["merge-base", "--fork-point", parent, branch])
-        .ok()
-        .map(|o| o.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .or_else(|| repo.git(&["merge-base", parent, branch]).ok().map(|o| o.trim().to_string()))
-        .unwrap_or_else(|| parent.to_string())
-}
-
-// ---------------------------------------------------------------------------
-// Merging out of the stack
-// ---------------------------------------------------------------------------
-
-/// Takes landed branches out of the stack, re-parenting what sat on them.
-///
-/// `merged` names the branches known to have landed — from the pull request's
-/// state where that is known, since a squash merge is invisible to a patch-id
-/// comparison. Their children inherit their parent, so the branch above a
-/// merged one ends up based on the trunk and its PR retargets cleanly.
-///
-/// The branches themselves are left alone. Deleting them is the user's call.
-pub fn drop_merged(repo: &Repo, stack: &Stack, merged: &[String]) -> Result<Vec<String>> {
-    let mut dropped = Vec::new();
-    for e in &stack.entries {
-        if !merged.contains(&e.branch) {
-            continue;
-        }
-        // Re-parent this entry's children onto what it was based on.
-        for (child, parent) in parents(repo) {
-            if parent == e.branch {
-                set_parent(repo, &child, &e.parent)?;
-            }
-        }
-        clear_parent(repo, &e.branch)?;
-        clear_pr(repo, &e.branch)?;
-        dropped.push(e.branch.clone());
-    }
-    Ok(dropped)
+/// Anything staged or modified. Untracked files do not count: a rebase
+/// carries them along untouched.
+fn has_uncommitted_changes(repo: &Repo) -> Result<bool> {
+    Ok(repo.status()?.files.iter().any(|f| {
+        f.conflicted
+            || f.index_status.is_some_and(|s| s != FileStatus::Untracked)
+            || f.work_status.is_some_and(|s| s != FileStatus::Untracked)
+    }))
 }
 
 // ---------------------------------------------------------------------------
 // Publishing
 // ---------------------------------------------------------------------------
 
-/// Pushes every branch in the stack, newest state wins.
-///
-/// Restacking rewrites history, so this force-pushes — with a lease, so a
-/// branch someone else moved is refused rather than overwritten.
-pub fn push_stack(repo: &Repo, stack: &Stack, auth: Option<&str>) -> Result<Vec<String>> {
-    let mut pushed = Vec::new();
-    for e in &stack.entries {
-        repo.push_branch(&e.branch, true, auth)?;
-        pushed.push(e.branch.clone());
-    }
-    Ok(pushed)
+/// Pushes every active branch in the stack, force-with-lease.
+pub fn push_stack(repo: &Repo, auth: Option<&str>) -> Result<Vec<String>> {
+    Ok(run_ok(repo, &["push"], auth)?.log())
 }
 
-/// One row of the navigation block: a branch and the PR that carries it.
-#[derive(Debug, Clone)]
-pub struct NavRow {
-    pub branch: String,
-    pub pr: Option<u64>,
-}
-
-impl Stack {
-    /// The rows [`nav_section`] renders, bottom-first.
-    pub fn nav_rows(&self) -> Vec<NavRow> {
-        self.entries
-            .iter()
-            .map(|e| NavRow { branch: e.branch.clone(), pr: e.pr })
-            .collect()
-    }
-}
-
-/// The stack map that goes in each pull request's body.
-///
-/// Top of the stack first, the way the branches sit — a reviewer reading a PR
-/// wants to know what is underneath it. `current` is marked so the same block
-/// can be posted to every PR in the stack and still say where you are.
-pub fn nav_section(rows: &[NavRow], trunk: &str, current: &str) -> String {
-    let mut out = String::from(NAV_START);
-    out.push_str("\n\n**Stack** (top first)\n\n");
-    for row in rows.iter().rev() {
-        let label = match row.pr {
-            Some(n) => format!("#{n}"),
-            None => "(not submitted)".to_string(),
-        };
-        let here = if row.branch == current { "  ⬅ **this PR**" } else { "" };
-        out.push_str(&format!("- {label} `{}`{here}\n", row.branch));
-    }
-    out.push_str(&format!("- `{trunk}`\n"));
-    out.push_str("\n<sub>Managed by DevDock. Merge from the bottom up.</sub>\n");
-    out.push_str(NAV_END);
-    out
-}
-
-/// Puts `nav` into `body`, replacing any block already there.
-///
-/// Idempotent on purpose: every submit rewrites the block, and a PR body that
-/// accumulated one stack map per push would be unreadable within a day.
-pub fn with_nav(body: &str, nav: &str) -> String {
-    if let (Some(start), Some(end)) = (body.find(NAV_START), body.find(NAV_END)) {
-        if start < end {
-            let mut out = String::with_capacity(body.len());
-            out.push_str(&body[..start]);
-            out.push_str(nav);
-            out.push_str(&body[end + NAV_END.len()..]);
-            return out;
-        }
-    }
-    let trimmed = body.trim_end();
-    if trimmed.is_empty() {
-        return nav.to_string();
-    }
-    format!("{trimmed}\n\n{nav}")
-}
-
-/// A title and body for the pull request of one entry, from its commits.
-///
-/// The oldest commit names the change; the rest become the checklist a
-/// reviewer reads before the diff. A PR opened from a stack is small by
-/// construction, so this is usually all the description it needs.
-pub fn draft_pr(entry: &StackEntry) -> (String, String) {
-    let oldest = entry.commits.last();
-    let title = oldest.map(|c| c.subject.clone()).unwrap_or_else(|| entry.branch.clone());
-    let mut body = String::new();
-    if let Some(c) = oldest {
-        if !c.body.trim().is_empty() {
-            body.push_str(c.body.trim());
-            body.push_str("\n\n");
-        }
-    }
-    if entry.commits.len() > 1 {
-        body.push_str("**Commits**\n\n");
-        for c in entry.commits.iter().rev() {
-            body.push_str(&format!("- `{}` {}\n", c.short_sha, c.subject));
-        }
-    }
-    (title, body)
-}
-
-// ---------------------------------------------------------------------------
-// Submit and sync (the GitHub half)
-// ---------------------------------------------------------------------------
-
-/// What [`submit`] did, for the toast and the activity log.
+/// What [`submit`] did.
 #[derive(Debug, Clone, Default)]
 pub struct SubmitReport {
-    /// One line per branch and pull request touched.
     pub log: Vec<String>,
-    /// Pull requests opened (as opposed to updated).
+    /// Pull requests that did not exist before this submit.
     pub opened: usize,
-    /// The stack as it now stands, with each branch's pull request number.
-    pub rows: Vec<NavRow>,
+    /// Branches with a pull request afterwards.
+    pub total: usize,
 }
 
 impl SubmitReport {
     pub fn message(&self) -> String {
         match self.opened {
-            0 => format!("Stack submitted: {} pull request(s) updated.", self.rows.len()),
-            n => format!("Stack submitted: {n} opened, {} in the stack.", self.rows.len()),
+            0 => format!("Stack submitted: {} pull request(s) up to date.", self.total),
+            n => format!("Stack submitted: {n} opened, {} in the stack.", self.total),
         }
     }
 }
 
-/// Publishes the stack: every branch pushed, every branch's pull request open
-/// and pointed at its parent, and the stack map written into every body.
+/// Publishes the stack: every branch pushed, a pull request for each branch
+/// pointed at the one below it, and the stack linked on GitHub.
+///
+/// `gh stack submit --auto`: titles from the branches' commits, no editor.
+/// New pull requests are drafts unless `ready` is set, which also flips
+/// existing drafts in the stack to ready for review.
 ///
 /// Refuses a stale stack outright. A branch that is behind its parent would
 /// open a pull request whose diff includes the branch below it, which is the
@@ -674,79 +757,32 @@ impl SubmitReport {
 /// the user's decision, not something to slip into a submit.
 pub fn submit(
     repo: &Repo,
-    client: &crate::github::Client,
-    slug: &crate::github::RepoSlug,
     stack: &Stack,
+    ready: bool,
     auth: Option<&str>,
-) -> std::result::Result<SubmitReport, String> {
+) -> Result<SubmitReport> {
     if let Some(e) = stack.entries.iter().find(|e| e.needs_restack) {
-        return Err(format!(
+        return Err(GitError::Command(format!(
             "Restack first: {} is behind {}. Its pull request would show the \
              changes below it as its own.",
             e.branch, e.parent
-        ));
+        )));
     }
-    let mut report = SubmitReport::default();
-
-    // The bases have to exist on the remote before a pull request can name one.
-    push_stack(repo, stack, auth).map_err(|e| e.to_string())?;
-    report.log.push(format!("pushed {} branch(es)", stack.entries.len()));
-
-    let open = client.pull_requests(slug).map_err(|e| e.to_string())?;
-    for entry in &stack.entries {
-        let existing = open.iter().find(|pr| pr.head == entry.branch);
-        // A branch whose changes are already in the trunk has nothing to open a
-        // pull request about. GitHub would refuse it with "no commits between",
-        // which says less than this does.
-        if existing.is_none() && entry.merged {
-            report.log.push(format!("{}: already in {}, skipped", entry.branch, stack.trunk));
-            continue;
-        }
-        let number = match existing {
-            Some(pr) => {
-                if pr.base != entry.parent {
-                    client
-                        .update_pull_request(slug, pr.number, Some(&entry.parent), None, None)
-                        .map_err(|e| e.to_string())?;
-                    report.log.push(format!(
-                        "#{} {}: base retargeted to {}",
-                        pr.number, entry.branch, entry.parent
-                    ));
-                } else {
-                    report.log.push(format!("#{} {}: up to date", pr.number, entry.branch));
-                }
-                pr.number
-            }
-            None => {
-                let (title, body) = draft_pr(entry);
-                let created = client
-                    .create_pull_request(slug, &title, &body, &entry.branch, &entry.parent)
-                    .map_err(|e| e.to_string())?;
+    let mut args = vec!["submit", "--auto"];
+    if ready {
+        args.push("--open");
+    }
+    let run = run_ok(repo, &args, auth)?;
+    let mut report = SubmitReport { log: run.log(), ..Default::default() };
+    // Counted from the stack as it now stands rather than parsed out of the
+    // output: gh's wording is its own to change.
+    let after = stack_for(repo, &repo.current_branch(), auth)?;
+    for e in &after.entries {
+        if e.pr.is_some() {
+            report.total += 1;
+            if stack.entry(&e.branch).is_none_or(|b| b.pr.is_none()) {
                 report.opened += 1;
-                report.log.push(format!(
-                    "#{} {}: opened into {}",
-                    created.number, entry.branch, entry.parent
-                ));
-                created.number
             }
-        };
-        // Remembered so a later sync can ask GitHub whether this one merged:
-        // the list endpoint only ever returns open pull requests.
-        let _ = set_pr(repo, &entry.branch, number);
-        report.rows.push(NavRow { branch: entry.branch.clone(), pr: Some(number) });
-    }
-
-    // Every body gets the same map of the stack, marked where it is. Done last,
-    // so the pull requests opened a moment ago are in it too.
-    for row in &report.rows {
-        let Some(number) = row.pr else { continue };
-        let nav = nav_section(&report.rows, &stack.trunk, &row.branch);
-        let detail = client.pull_request(slug, number).map_err(|e| e.to_string())?;
-        let body = with_nav(&detail.body, &nav);
-        if body != detail.body {
-            client
-                .update_pull_request(slug, number, None, None, Some(&body))
-                .map_err(|e| e.to_string())?;
         }
     }
     Ok(report)
@@ -756,99 +792,123 @@ pub fn submit(
 #[derive(Debug, Clone, Default)]
 pub struct SyncReport {
     pub log: Vec<String>,
-    /// Branches that landed and left the stack.
-    pub dropped: Vec<String>,
-    /// The rebase of what was left, if anything was dropped.
-    pub restack: RestackReport,
+    /// Branches now known to have merged.
+    pub merged: Vec<String>,
 }
 
 impl SyncReport {
     pub fn message(&self) -> String {
-        if self.restack.conflicted.is_some() {
-            return self.restack.message();
-        }
-        match self.dropped.len() {
-            0 => "Nothing has merged yet; the stack is unchanged.".to_string(),
-            n => format!(
-                "{n} merged branch(es) left the stack. Submit to update the \
-                 remaining pull requests."
-            ),
+        match self.merged.len() {
+            0 => "Stack synced with the remote.".to_string(),
+            n => format!("Stack synced: {n} branch(es) merged ({}).", self.merged.join(", ")),
         }
     }
 }
 
-/// Brings the stack back in line with the remote after something merged.
+/// Brings the stack back in line with the remote.
 ///
-/// Nothing is pushed and no branch is deleted: what the remote should look
-/// like afterwards is a separate decision, made by submitting again.
+/// `gh stack sync`: fetches, fast-forwards the trunk, rebases the branches
+/// onto their updated parents, pushes them (atomically, with lease), reads
+/// each pull request's state back, and links the open ones into the stack on
+/// GitHub. A merged branch stays in the list, marked, so what sat on it is
+/// still known to be based on it; nothing is deleted.
 ///
-/// `github` is optional so this still does something useful offline — but a
-/// pull request that cannot be checked is never assumed merged. Silently
-/// dropping a branch out of a stack because a request timed out would be a way
-/// to lose work.
-pub fn sync(
-    repo: &Repo,
-    github: Option<(&crate::github::Client, &crate::github::RepoSlug)>,
-    stack: &Stack,
-) -> std::result::Result<SyncReport, String> {
-    let mut report = SyncReport::default();
-
-    // A squash merge leaves no trace in the local history, so GitHub's answer
-    // is the one that counts; the patch-id check is the fallback for a branch
-    // merged outside a pull request entirely.
-    let mut merged: Vec<String> = Vec::new();
-    for entry in &stack.entries {
-        let landed = match (github, entry.pr) {
-            (Some((client, slug)), Some(number)) => match client.pull_request(slug, number) {
-                Ok(detail) => detail.merged,
-                Err(e) => {
-                    report.log.push(format!("#{number}: could not check ({e})"));
-                    false
-                }
-            },
-            _ => false,
-        };
-        if landed || entry.merged {
-            merged.push(entry.branch.clone());
-        }
-    }
-    if merged.is_empty() {
-        return Ok(report);
-    }
-    let rest = drop_and_restack(repo, stack, &merged).map_err(|e| e.to_string())?;
-    report.log.extend(rest.log);
-    report.dropped = rest.dropped;
-    report.restack = rest.restack;
+/// A rebase conflict here restores every branch and reports it: resolving
+/// conflicts is what [`restack`] is for.
+pub fn sync(repo: &Repo, auth: Option<&str>) -> Result<SyncReport> {
+    let run = run_ok(repo, &["sync"], auth)?;
+    let mut report = SyncReport { log: run.log(), ..Default::default() };
+    let after = stack_for(repo, &repo.current_branch(), auth)?;
+    report.merged = after.entries.iter().filter(|e| e.merged).map(|e| e.branch.clone()).collect();
     Ok(report)
 }
 
-/// Takes the named branches out of the stack and rebases what is left.
-///
-/// Split out from [`sync`] because deciding *what* merged needs GitHub and
-/// doing something about it does not — and because the rebase below is the
-/// part with the sharp edge, so it is worth being able to test on its own.
-pub fn drop_and_restack(
-    repo: &Repo,
-    stack: &Stack,
-    merged: &[String],
-) -> Result<SyncReport> {
-    let mut report = SyncReport::default();
-    // The plan is built from the stack as it was, before the merged branches
-    // are unlinked: the branch above a squash-merged one has to replay from
-    // where that branch ended, and once it is dropped there is no way to know
-    // where that was.
-    let moves = plan(repo, stack, merged)?;
+// ---------------------------------------------------------------------------
+// Migration from the built-in implementation
+// ---------------------------------------------------------------------------
 
-    report.dropped = drop_merged(repo, stack, merged)?;
-    for branch in &report.dropped {
-        report.log.push(format!("{branch}: merged, left the stack"));
+/// The chain the previous implementation recorded for `branch`, bottom
+/// first, from `branch.<name>.devdock-parent` in git config. Empty when
+/// `branch` was never stacked that way.
+pub fn legacy_chain(repo: &Repo, branch: &str) -> Vec<String> {
+    let links = legacy_parents(repo);
+    if links.is_empty() || branch.is_empty() {
+        return Vec::new();
     }
+    let trunk = default_branch(repo);
+    let locals = local_branches(repo);
+    let in_chain = links.contains_key(branch) || links.values().any(|p| p == branch);
+    if !in_chain || branch == trunk {
+        return Vec::new();
+    }
+    let mut chain = vec![branch.to_string()];
+    let mut cur = branch.to_string();
+    while let Some(parent) = links.get(&cur) {
+        if parent == &trunk || !locals.contains(parent) || chain.contains(parent) {
+            break;
+        }
+        chain.push(parent.clone());
+        cur = parent.clone();
+    }
+    chain.reverse();
+    let mut cur = branch.to_string();
+    loop {
+        let children: Vec<&String> = links
+            .iter()
+            .filter(|(child, parent)| **parent == cur && locals.contains(child))
+            .map(|(child, _)| child)
+            .collect();
+        // A fork was never a stack; the chain stops there.
+        let [child] = children[..] else { break };
+        if chain.contains(child) {
+            break;
+        }
+        chain.push(child.clone());
+        cur = child.clone();
+    }
+    chain
+}
 
-    report.restack = apply_moves(repo, &moves)?;
-    for step in &report.restack.steps {
-        if step.moved {
-            report.log.push(format!("{}: rebased onto its new parent", step.branch));
+fn legacy_parents(repo: &Repo) -> BTreeMap<String, String> {
+    let pattern = format!(r"^branch\..*\.{LEGACY_PARENT_KEY}$");
+    let Ok(out) = repo.git(&["config", "--get-regexp", &pattern]) else {
+        return BTreeMap::new();
+    };
+    let mut links = BTreeMap::new();
+    for line in out.lines() {
+        let Some((key, value)) = line.split_once(' ') else { continue };
+        let Some(inner) = key.strip_prefix("branch.") else { continue };
+        let Some(child) = inner.strip_suffix(&format!(".{LEGACY_PARENT_KEY}")) else { continue };
+        if !child.is_empty() && !value.trim().is_empty() {
+            links.insert(child.to_string(), value.trim().to_string());
         }
     }
-    Ok(report)
+    links
+}
+
+/// Hands a chain the previous implementation recorded over to `gh stack`,
+/// then forgets the old record. The checked-out branch stays checked out.
+pub fn import_legacy(repo: &Repo, stack: &Stack, auth: Option<&str>) -> Result<String> {
+    if stack.legacy.is_empty() {
+        return Err(GitError::Command("Nothing to import.".into()));
+    }
+    let start = repo.current_branch();
+    let mut args = vec!["init", "--base", stack.trunk.as_str()];
+    args.extend(stack.legacy.iter().map(String::as_str));
+    run_ok(repo, &args, auth)?;
+    for branch in &stack.legacy {
+        for key in [LEGACY_PARENT_KEY, LEGACY_PR_KEY] {
+            let _ = repo.git(&["config", "--unset", &format!("branch.{branch}.{key}")]);
+        }
+    }
+    // `init` checks out the top of the stack.
+    if !start.is_empty() && repo.current_branch() != start {
+        repo.checkout(&start)?;
+    }
+    Ok(format!("Imported {} branch(es) into gh stack.", stack.legacy.len()))
+}
+
+/// The command to restructure the stack by hand, for the terminal panel.
+pub fn modify_command() -> &'static str {
+    "gh stack modify"
 }

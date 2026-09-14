@@ -43,9 +43,10 @@ macOS/Windows since egui is cross-platform).
   before anything is created. See [docs/jira-tickets.md](docs/jira-tickets.md).
 - **Stacked pull requests**: split one large change into a chain of branches,
   each PR targeting the branch below it so every reviewer sees one focused
-  diff. DevDock keeps the chain in order — restack after any branch changes,
-  push and open every PR in one action, write a stack map into each body, and
-  drop merged branches out of the stack after they land.
+  diff. Built on GitHub's own `gh stack` extension, so the stack is the one
+  GitHub shows on each PR and the one `gh stack` shows in a terminal — restack
+  after any branch changes, push and open every PR in one action, and sync
+  after something merges. Needs `gh extension install github/gh-stack`.
   See [docs/stacked-prs.md](docs/stacked-prs.md).
 
 ## Install
@@ -169,7 +170,7 @@ src/
   jira.rs      Jira Cloud: credentials, projects, issue creation, ADF
   ollama.rs    Commit-message generation client (library, reusable)
   review.rs    The AI review gate: config, prompts, findings, thresholds
-  stack.rs     Stacked pull requests: the parent chain, restack, submit, sync
+  stack.rs     Stacked pull requests: a typed wrapper over `gh stack`
   agent/       Tool-use harness: read, edit, language server, and check
                tools; the conflict resolver and the coding agent run on it
   lsp/         Language server client: JSON-RPC over stdio, one process per
@@ -185,7 +186,7 @@ src/
     worker.rs  Background thread runner
 tests/
   workflow.rs  End-to-end git workflow tests against throwaway repos
-  stack.rs     Stacked PRs: parent links, restacking, merge detection
+  stack.rs     Stacked PRs through gh stack (skipped when it is not installed)
   stack_live.rs  The same flow against real GitHub (ignored by default)
   agent.rs     Harness tests: sandbox limits, proposals, applied merges,
                and the coding agent against a real server and real checks

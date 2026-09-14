@@ -8,8 +8,11 @@
 //! produced nothing, or whose changes failed the repository's checks, leaves
 //! nothing behind but its log — no branch, no worktree.
 //!
-//! Nothing here touches Jira. The ticket is read; the developer decides what
-//! to do with the pull request.
+//! Jira is written to only through a [`Claimer`], and only if the caller
+//! gives one: assigning the ticket to the developer, putting it in the
+//! active sprint, moving it to In Progress when the agent starts, and
+//! commenting with the pull request — or with why it gave up — at the end.
+//! None of that can fail the fix; it is logged and carried on from.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -55,6 +58,67 @@ pub struct Fixed {
     pub turns: usize,
 }
 
+/// Marks a ticket as taken while an agent works on it, and says how it
+/// went. Every method returns lines for the log; a failure is one of them.
+pub trait Claimer: Sync {
+    /// The agent has started: assign, sprint, In Progress.
+    fn start(&self, key: &str) -> Vec<String>;
+    /// The agent has finished, with a pull request or a reason.
+    fn finish(&self, key: &str, outcome: Result<&PullRequest, &str>) -> Vec<String>;
+}
+
+/// Claims tickets in Jira on the developer's behalf.
+pub struct JiraClaim {
+    pub client: crate::jira::Client,
+    /// The developer's Jira account, from `myself`.
+    pub account_id: String,
+    /// The project's active sprint, when it has one.
+    pub sprint: Option<crate::jira::Sprint>,
+}
+
+impl Claimer for JiraClaim {
+    fn start(&self, key: &str) -> Vec<String> {
+        let mut lines = Vec::new();
+        lines.push(match self.client.assign(key, &self.account_id) {
+            Ok(()) => format!("{key} assigned to you"),
+            Err(e) => format!("could not assign {key}: {e}"),
+        });
+        if let Some(sprint) = &self.sprint {
+            lines.push(match self.client.move_to_sprint(sprint.id, &[key]) {
+                Ok(()) => format!("{key} moved to {}", sprint.name),
+                Err(e) => format!("could not move {key} to {}: {e}", sprint.name),
+            });
+        } else {
+            lines.push("no active sprint to move it to".into());
+        }
+        lines.push(match self.client.start_progress(key) {
+            Ok(Some(step)) => format!("{key}: {step}"),
+            Ok(None) => format!("{key}: no In Progress step in this workflow"),
+            Err(e) => format!("could not move {key} to In Progress: {e}"),
+        });
+        lines
+    }
+
+    fn finish(&self, key: &str, outcome: Result<&PullRequest, &str>) -> Vec<String> {
+        let comment = match outcome {
+            Ok(pr) => format!(
+                "A draft pull request for this ticket is ready for review: [#{} {}]({})\n\n\
+                 Opened by DevDock's coding agent.",
+                pr.number, pr.title, pr.html_url
+            ),
+            Err(reason) => format!(
+                "DevDock's coding agent tried this ticket and could not finish it:\n\n{}\n\n\
+                 It is still assigned to you.",
+                reason.lines().take(8).collect::<Vec<_>>().join("\n")
+            ),
+        };
+        vec![match self.client.add_comment(key, &comment) {
+            Ok(()) => format!("commented on {key}"),
+            Err(e) => format!("could not comment on {key}: {e}"),
+        }]
+    }
+}
+
 /// What the fix needs from the outside.
 pub struct Job<'a> {
     pub issue: &'a BacklogIssue,
@@ -69,6 +133,8 @@ pub struct Job<'a> {
     /// /work, so a build or a test suite the agent triggers cannot touch
     /// the machine. Checks that already name an image keep theirs.
     pub sandbox_image: Option<&'a str>,
+    /// Marks the ticket as taken in Jira, when the developer wants that.
+    pub claim: Option<&'a dyn Claimer>,
 }
 
 /// The branch a ticket's fix lives on: `fix/abc-7-crash-on-empty-repo`.
@@ -185,8 +251,22 @@ pub fn fix(
         repo.worktree_add(&dir, &branch, Some(job.base)).map_err(|e| e.to_string())?;
     }
     on_event(format!("worktree {}", dir.display()));
+    if let Some(claim) = job.claim {
+        for line in claim.start(&job.issue.key) {
+            on_event(line);
+        }
+    }
 
     let result = work(engine, job, &branch, &dir, publish, on_event);
+    if let Some(claim) = job.claim {
+        let lines = match &result {
+            Ok(fixed) => claim.finish(&job.issue.key, Ok(&fixed.pr)),
+            Err(e) => claim.finish(&job.issue.key, Err(e)),
+        };
+        for line in lines {
+            on_event(line);
+        }
+    }
 
     // The worktree is temporary whatever happened.
     {
@@ -460,7 +540,7 @@ mod tests {
         let fixed = fix(
             &repo,
             &engine,
-            &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None },
+            &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None, claim: None },
             &fake_pr,
             &mut |line| log.push(line),
         )
@@ -496,7 +576,7 @@ mod tests {
         let err = fix(
             &repo,
             &engine,
-            &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None },
+            &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None, claim: None },
             &fake_pr,
             &mut |line| log.push(line),
         )
@@ -513,7 +593,7 @@ mod tests {
         let err = fix(
             &repo,
             &engine,
-            &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None },
+            &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None, claim: None },
             &fake_pr,
             &mut |_| {},
         )
@@ -524,12 +604,57 @@ mod tests {
         assert!(!repo.branches().unwrap().local.iter().any(|b| b.name.starts_with("fix/")));
     }
 
+    /// What a claimer was told, in order.
+    struct Recording(std::sync::Mutex<Vec<String>>);
+    impl Claimer for Recording {
+        fn start(&self, key: &str) -> Vec<String> {
+            self.0.lock().unwrap().push(format!("start {key}"));
+            vec![format!("{key} assigned to you")]
+        }
+        fn finish(&self, key: &str, outcome: Result<&PullRequest, &str>) -> Vec<String> {
+            let what = match outcome {
+                Ok(pr) => format!("pr #{}", pr.number),
+                Err(e) => format!("err {}", e.lines().next().unwrap_or("")),
+            };
+            self.0.lock().unwrap().push(format!("finish {key} {what}"));
+            vec![format!("commented on {key}")]
+        }
+    }
+
+    #[test]
+    fn a_claimed_ticket_is_taken_when_the_agent_starts_and_told_how_it_went() {
+        let (_tmp, repo) = setup("true");
+        let claim = Recording(std::sync::Mutex::new(Vec::new()));
+        let engine = Engine::Harness(Box::new(fixing_provider()));
+        let mut log = Vec::new();
+        fix(
+            &repo,
+            &engine,
+            &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None, claim: Some(&claim) },
+            &fake_pr,
+            &mut |line| log.push(line),
+        )
+        .unwrap();
+        assert_eq!(claim.0.lock().unwrap().as_slice(), ["start ABC-7", "finish ABC-7 pr #42"]);
+        let start = log.iter().position(|l| l == "ABC-7 assigned to you").unwrap();
+        let worktree = log.iter().position(|l| l.starts_with("worktree /")).unwrap();
+        assert!(start > worktree, "claimed once the worktree exists, not before: {log:?}");
+        assert_eq!(log.last().map(String::as_str), Some("commented on ABC-7"));
+
+        // A failure is reported to the claimer too.
+        let (_tmp, repo) = setup("true");
+        let claim = Recording(std::sync::Mutex::new(Vec::new()));
+        let engine = Engine::Harness(Box::new(Scripted(RefCell::new(vec![Reply { text: "Needs a person.".into(), ..Default::default() }]))));
+        let _ = fix(&repo, &engine, &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None, claim: Some(&claim) }, &fake_pr, &mut |_| {});
+        assert!(claim.0.lock().unwrap()[1].starts_with("finish ABC-7 err the agent changed nothing"));
+    }
+
     #[test]
     fn a_leftover_branch_is_refused_rather_than_reused() {
         let (_tmp, repo) = setup("true");
         repo.create_branch("fix/abc-7-total-is-off-by-one", false).unwrap();
         let engine = Engine::Harness(Box::new(Scripted(RefCell::new(vec![]))));
-        let err = fix(&repo, &engine, &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None }, &fake_pr, &mut |_| {}).unwrap_err();
+        let err = fix(&repo, &engine, &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None, claim: None }, &fake_pr, &mut |_| {}).unwrap_err();
         assert!(err.contains("already exists"), "{err}");
     }
 
@@ -544,7 +669,7 @@ mod tests {
         let err = fix(
             &repo,
             &engine,
-            &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: Some("alpine:3") },
+            &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: Some("alpine:3"), claim: None },
             &fake_pr,
             &mut |_| {},
         )

@@ -94,6 +94,7 @@ See [jira-tickets.md](jira-tickets.md#working-the-backlog).
 devdock backlog --project ABC                 # list + judge (the only project needs no flag)
 devdock backlog fix ABC-7 ABC-12              # one agent each, in parallel worktrees
 devdock backlog fix ABC-7 --parallel 2 --sandbox rust:1-bookworm
+devdock backlog fix ABC-7 --claim                 # assign to me, active sprint, In Progress, comment
 ```
 
 `fix` prints every line each agent logs, prefixed with its ticket key, and

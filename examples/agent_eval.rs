@@ -10,14 +10,15 @@
 //! ```sh
 //! cargo run --release --example agent_eval -- [task ...]
 //! EVAL_MODEL=claude-sonnet-5 EVAL_REPEATS=2 EVAL_OUT=results.json cargo run --example agent_eval
+//! EVAL_PROVIDER=claude-code cargo run --example agent_eval        # the claude CLI as the engine
 //! ```
 //!
 //! Needs Claude sign-in (the app's), `python3`, and `cargo`. Prints one row
 //! per run and a summary, and writes JSON so two versions can be compared.
 
-use git_manage::agent::{coding, Access, Event, Message, Provider, Reply, ToolSpec, Workspace, WriteMode};
+use git_manage::agent::coding::{self, Engine};
+use git_manage::agent::{Access, Event, Message, Provider, Reply, ToolSpec, Workspace, WriteMode};
 use git_manage::git::Repo;
-use std::cell::Cell;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -649,15 +650,21 @@ fn marathon_tasks() -> Vec<Task> {
     all
 }
 
-/// Counts what the model was sent, provider-independently.
-struct Metered<'a> {
-    inner: &'a dyn Provider,
-    turns: Cell<usize>,
-    prompt_bytes: Cell<usize>,
-    output_bytes: Cell<usize>,
+/// What a run sent and got back, shared with the engine that wraps it.
+#[derive(Default)]
+struct Stats {
+    turns: std::sync::atomic::AtomicUsize,
+    prompt_bytes: std::sync::atomic::AtomicUsize,
+    output_bytes: std::sync::atomic::AtomicUsize,
 }
 
-impl Provider for Metered<'_> {
+/// Counts what the model was sent, provider-independently.
+struct Metered {
+    inner: Box<dyn Provider>,
+    stats: std::sync::Arc<Stats>,
+}
+
+impl Provider for Metered {
     fn label(&self) -> String {
         self.inner.label()
     }
@@ -668,7 +675,8 @@ impl Provider for Metered<'_> {
         tools: &[ToolSpec],
         max_tokens: u32,
     ) -> Result<Reply, String> {
-        self.turns.set(self.turns.get() + 1);
+        use std::sync::atomic::Ordering::Relaxed;
+        self.stats.turns.fetch_add(1, Relaxed);
         let sent: usize = system.len()
             + messages
                 .iter()
@@ -681,12 +689,11 @@ impl Provider for Metered<'_> {
                 })
                 .sum::<usize>()
             + tools.iter().map(|t| t.description.len() + t.schema.to_string().len()).sum::<usize>();
-        self.prompt_bytes.set(self.prompt_bytes.get() + sent);
+        self.stats.prompt_bytes.fetch_add(sent, Relaxed);
         let reply = self.inner.turn(system, messages, tools, max_tokens)?;
-        self.output_bytes.set(
-            self.output_bytes.get()
-                + reply.text.len()
-                + reply.calls.iter().map(|c| c.input.to_string().len()).sum::<usize>(),
+        self.stats.output_bytes.fetch_add(
+            reply.text.len() + reply.calls.iter().map(|c| c.input.to_string().len()).sum::<usize>(),
+            Relaxed,
         );
         Ok(reply)
     }
@@ -724,16 +731,29 @@ fn main() {
     let only: Vec<String> = std::env::args().skip(1).collect();
     let verbose = std::env::var("EVAL_VERBOSE").is_ok();
 
-    let client: Box<dyn Provider> = if std::env::var("EVAL_PROVIDER").as_deref() == Ok("ollama") {
-        let url = std::env::var("OLLAMA_URL").unwrap_or_else(|_| "http://localhost:11434".into());
-        Box::new(git_manage::ollama::Client::new(&url).agent(model.clone()))
-    } else {
-        match git_manage::claude::Client::from_store(model.clone()) {
-            Some(c) => Box::new(c),
-            None => {
-                eprintln!("Claude is not signed in; sign in through the app first.");
-                std::process::exit(2);
+    let provider_name = std::env::var("EVAL_PROVIDER").unwrap_or_else(|_| "claude".into());
+    // Claude Code is an engine of its own; the others are models behind
+    // the built-in harness, metered so the rows can say what was sent.
+    let make_engine = |stats: std::sync::Arc<Stats>| -> Engine {
+        match provider_name.as_str() {
+            "claude-code" => Engine::ClaudeCode(git_manage::agent::claude_code::Config {
+                model: if model.starts_with("claude-haiku") { "default".into() } else { model.clone() },
+                ..Default::default()
+            }),
+            "ollama" => {
+                let url = std::env::var("OLLAMA_URL").unwrap_or_else(|_| "http://localhost:11434".into());
+                Engine::Harness(Box::new(Metered {
+                    inner: Box::new(git_manage::ollama::Client::new(&url).agent(model.clone())),
+                    stats,
+                }))
             }
+            _ => match git_manage::claude::Client::from_store(model.clone()) {
+                Some(c) => Engine::Harness(Box::new(Metered { inner: Box::new(c), stats })),
+                None => {
+                    eprintln!("Claude is not signed in; sign in through the app first.");
+                    std::process::exit(2);
+                }
+            },
         }
     };
     let base = tempfile::tempdir().expect("tempdir");
@@ -779,16 +799,12 @@ fn main() {
                 .with_write_mode(WriteMode::Live)
                 .with_checks(jobs);
 
-            let metered = Metered {
-                inner: client.as_ref(),
-                turns: Cell::new(0),
-                prompt_bytes: Cell::new(0),
-                output_bytes: Cell::new(0),
-            };
+            let stats = std::sync::Arc::new(Stats::default());
+            let engine = make_engine(stats.clone());
             let started = Instant::now();
             let mut tool_errors = 0usize;
-            let result = coding::run(
-                &metered,
+            let result = coding::run_with(
+                &engine,
                 &mut ws,
                 coding::Request { branch: Some("main"), ..coding::Request::new(task.task) },
                 &mut |event: Event| {
@@ -846,14 +862,20 @@ fn main() {
                 lines_removed += r;
                 files_changed += 1;
             }
+            use std::sync::atomic::Ordering::Relaxed;
+            // Claude Code reports its own turns; the harness is metered here.
+            let turns = match &result {
+                Ok(run) if engine.needs_live_tree() => run.turns,
+                _ => stats.turns.load(Relaxed),
+            };
             let row = Row {
                 task: task.name.into(),
                 repeat,
                 success,
-                turns: metered.turns.get(),
+                turns,
                 tool_calls: ws.calls_used(),
-                prompt_bytes: metered.prompt_bytes.get(),
-                output_bytes: metered.output_bytes.get(),
+                prompt_bytes: stats.prompt_bytes.load(Relaxed),
+                output_bytes: stats.output_bytes.load(Relaxed),
                 seconds,
                 truncated,
                 error,

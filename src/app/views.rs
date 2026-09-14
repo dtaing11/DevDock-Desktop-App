@@ -1572,9 +1572,22 @@ pub fn ai_model_picker(app: &mut App, ui: &mut egui::Ui, target: crate::app::wor
     let current = app.ai_selection(target);
     let selected = match &current {
         Some(sel) if sel.provider == "claude" => format!("Claude: {}", sel.model),
+        Some(sel) if sel.provider == crate::agent::claude_code::PROVIDER => {
+            if sel.model.is_empty() || sel.model == "default" {
+                "Claude Code".to_string()
+            } else {
+                format!("Claude Code: {}", sel.model)
+            }
+        }
         Some(sel) => format!("Ollama: {}", sel.model),
         None => "Select a model…".into(),
     };
+    // Claude Code is an engine, not a model: it does the whole job itself,
+    // so only the tasks that are a whole job can pick it.
+    let offers_claude_code = matches!(
+        target,
+        crate::app::worker::AiTarget::Coding | crate::app::worker::AiTarget::Backlog
+    ) && crate::agent::claude_code::available();
 
     // A bounded width, so a long model name cannot decide how wide the panel
     // this sits in has to be — and so a wrapped row can place it at all,
@@ -1622,6 +1635,31 @@ pub fn ai_model_picker(app: &mut App, ui: &mut egui::Ui, target: crate::app::wor
                     app.set_ai_selection(
                         target,
                         AiSelection { provider: "claude".into(), model: name.clone() },
+                    );
+                }
+            }
+        }
+
+        if offers_claude_code {
+            ui.separator();
+            ui.label(theme::overline("CLAUDE CODE (THIS MACHINE)"));
+            ui.label(
+                RichText::new("The claude command, run in the tree. Needs \"Let it iterate\".")
+                    .size(theme::SMALL)
+                    .color(theme::fg_dim()),
+            );
+            for alias in crate::agent::claude_code::MODELS {
+                let is_selected = current.as_ref().is_some_and(|s| {
+                    s.provider == crate::agent::claude_code::PROVIDER
+                        && (s.model == *alias || (s.model.is_empty() && *alias == "default"))
+                });
+                if ui.selectable_label(is_selected, *alias).clicked() {
+                    app.set_ai_selection(
+                        target,
+                        AiSelection {
+                            provider: crate::agent::claude_code::PROVIDER.into(),
+                            model: alias.to_string(),
+                        },
                     );
                 }
             }

@@ -129,6 +129,13 @@ The backlog fixer has its own model setting — **Settings → Models per task
 running unattended, so point it at the strongest model you have. It falls
 back to the coding agent's model until one is chosen.
 
+**Claude Code** is an option too, when the `claude` command is installed:
+the fix then runs Anthropic's own agent headless in the worktree, with its
+commands limited to the repository's checks, and everything else — the
+verification, the commit, the draft pull request, the worktree removal — is
+unchanged. Judging the backlog is a read-only harness run, so it uses the
+nearest task's model (Jira tickets, the coding agent, …) instead.
+
 ### The sandbox
 
 **Run checks in a sandbox** runs every check the agent triggers, and the

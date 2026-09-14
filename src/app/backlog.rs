@@ -202,8 +202,15 @@ impl App {
         if self.backlog.issues.is_empty() || self.backlog.triaging {
             return;
         }
-        let Some(sel) = self.ai_selection(worker::AiTarget::Backlog) else {
-            self.backlog.error = Some("Pick a model for the backlog fixer first.".into());
+        // Judging is a read-only harness run, so it needs a model, not
+        // Claude Code; when the fixer is Claude Code, the nearest task's
+        // model judges.
+        let Some(sel) = self.triage_selection() else {
+            self.backlog.error = Some(
+                "Judging the backlog needs a Claude or Ollama model: pick one for Jira \
+                 tickets or the coding agent."
+                    .into(),
+            );
             return;
         };
         let issues = self.backlog.issues.clone();
@@ -227,6 +234,21 @@ impl App {
             })();
             Msg::BacklogTriage(result)
         });
+    }
+
+    /// A model for judging: the fixer's, unless that is Claude Code, then
+    /// the first other task with a model.
+    fn triage_selection(&self) -> Option<super::AiSelection> {
+        [
+            worker::AiTarget::Backlog,
+            worker::AiTarget::Tickets,
+            worker::AiTarget::Coding,
+            worker::AiTarget::Review,
+            worker::AiTarget::Commit,
+        ]
+        .into_iter()
+        .filter_map(|t| self.ai_selection(t))
+        .find(|s| s.provider != crate::agent::claude_code::PROVIDER)
     }
 
     /// Ticks every ticket triage suggested.
@@ -290,7 +312,7 @@ impl App {
         let done_key = key.clone();
         self.worker.spawn(move || {
             let result = (|| -> Result<crate::backlog::Fixed, String> {
-                let provider = super::agent_provider(&sel, &url)?;
+                let engine = super::agent_engine(&sel, &url)?;
                 let client = crate::github::Client::from_store().ok_or("Not signed in to GitHub")?;
                 let slug = super::views::origin_slug(&repo).ok_or("No github.com remote found")?;
                 let base = crate::stack::default_branch(&repo);
@@ -311,7 +333,7 @@ impl App {
                     sandbox_image: sandbox.as_deref(),
                 };
                 let key = issue.key.clone();
-                crate::backlog::fix(&repo, provider.as_ref(), &job, &publish, &mut |line| {
+                crate::backlog::fix(&repo, &engine, &job, &publish, &mut |line| {
                     progress.send(Msg::BacklogProgress { key: key.clone(), line });
                 })
             })();

@@ -96,7 +96,7 @@ pub enum Msg {
     /// One line from a ticket's fix: a tool call, a check, a push.
     BacklogProgress { key: String, line: String },
     /// A ticket's fix finished, one way or the other.
-    BacklogDone { key: String, result: Result<crate::backlog::Fixed, String> },
+    BacklogDone { key: String, result: Result<Box<crate::backlog::Fixed>, String> },
 
     /// Every checkout of the repository.
     Worktrees(Result<Vec<crate::git::Worktree>, String>),

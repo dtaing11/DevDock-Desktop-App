@@ -204,6 +204,69 @@ pub struct LoadedConfigs {
 /// publishes the whole repository, so a per-directory push gate has no
 /// coherent meaning; nested ones are reported in
 /// [`LoadedConfigs::ignored_gates`].
+/// Checks for a repository that declares none, from its toolchain: what a
+/// developer would run before pushing. Used by the coding agent and the
+/// backlog fixer so "no config" never means "nothing was tested"; the log
+/// says they were inferred. An empty list means nothing recognisable.
+pub fn inferred_jobs(repo_root: &Path) -> Vec<Job> {
+    let has = |name: &str| repo_root.join(name).exists();
+    let read = |name: &str| std::fs::read_to_string(repo_root.join(name)).unwrap_or_default();
+    let job = |name: &str, commands: &[&str]| Job {
+        name: name.to_string(),
+        commands: commands.iter().map(|c| c.to_string()).collect(),
+        ..Default::default()
+    };
+    let mut jobs = Vec::new();
+    if has("pubspec.yaml") {
+        let pubspec = read("pubspec.yaml");
+        if pubspec.contains("sdk: flutter") || pubspec.contains("flutter:") {
+            jobs.push(job("analyze", &["flutter analyze"]));
+            if has("test") {
+                jobs.push(job("test", &["flutter test"]));
+            }
+        } else {
+            jobs.push(job("analyze", &["dart analyze"]));
+            if has("test") {
+                jobs.push(job("test", &["dart test"]));
+            }
+        }
+    } else if has("Cargo.toml") {
+        jobs.push(job("build", &["cargo build"]));
+        jobs.push(job("test", &["cargo test"]));
+    } else if has("go.mod") {
+        jobs.push(job("vet", &["go vet ./..."]));
+        jobs.push(job("test", &["go test ./..."]));
+    } else if has("package.json") {
+        let package: serde_json::Value = serde_json::from_str(&read("package.json")).unwrap_or_default();
+        let script = |name: &str| package.pointer(&format!("/scripts/{name}")).is_some();
+        let runner = if has("pnpm-lock.yaml") {
+            "pnpm"
+        } else if has("yarn.lock") {
+            "yarn"
+        } else {
+            "npm"
+        };
+        if script("lint") {
+            jobs.push(job("lint", &[&format!("{runner} run lint")]));
+        }
+        if script("build") {
+            jobs.push(job("build", &[&format!("{runner} run build")]));
+        }
+        if script("test") {
+            jobs.push(job("test", &[&format!("{runner} test")]));
+        }
+    } else if has("pyproject.toml") || has("setup.py") || has("pytest.ini") || has("tests") {
+        jobs.push(job("test", &["python3 -m pytest -q"]));
+    } else if has("mix.exs") {
+        jobs.push(job("test", &["mix test"]));
+    } else if has("Gemfile") && has("spec") {
+        jobs.push(job("test", &["bundle exec rspec"]));
+    } else if has("Makefile") && read("Makefile").lines().any(|l| l.starts_with("test:")) {
+        jobs.push(job("test", &["make test"]));
+    }
+    jobs
+}
+
 pub fn discover_configs(repo_root: &Path) -> Result<LoadedConfigs> {
     let mut loaded = LoadedConfigs::default();
 
@@ -871,6 +934,29 @@ pub fn hook_installed(repo_root: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checks_are_inferred_from_the_toolchain() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(inferred_jobs(tmp.path()).is_empty(), "nothing recognisable");
+
+        std::fs::write(tmp.path().join("pubspec.yaml"), "name: app\ndependencies:\n  flutter:\n    sdk: flutter\n").unwrap();
+        std::fs::create_dir_all(tmp.path().join("test")).unwrap();
+        let jobs = inferred_jobs(tmp.path());
+        let commands: Vec<&str> = jobs.iter().flat_map(|j| j.commands.iter().map(String::as_str)).collect();
+        assert_eq!(commands, ["flutter analyze", "flutter test"]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("package.json"), r#"{"scripts": {"test": "jest", "lint": "eslint ."}}"#).unwrap();
+        std::fs::write(tmp.path().join("pnpm-lock.yaml"), "").unwrap();
+        let commands: Vec<String> = inferred_jobs(tmp.path()).iter().flat_map(|j| j.commands.clone()).collect();
+        assert_eq!(commands, ["pnpm run lint", "pnpm test"]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let names: Vec<String> = inferred_jobs(tmp.path()).iter().map(|j| j.name.clone()).collect();
+        assert_eq!(names, ["build", "test"]);
+    }
 
     #[test]
     fn parses_config_with_and_without_image() {

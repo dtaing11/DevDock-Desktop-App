@@ -95,6 +95,7 @@ devdock backlog --project ABC                 # list + judge (the only project n
 devdock backlog fix ABC-7 ABC-12              # one agent each, in parallel worktrees
 devdock backlog fix ABC-7 --parallel 2 --sandbox rust:1-bookworm
 devdock backlog fix ABC-7 --claim                 # assign to me, active sprint, In Progress, comment
+devdock backlog fix ABC-7 --rounds 5 --no-review  # more attempts, no second-agent review
 ```
 
 `fix` prints every line each agent logs, prefixed with its ticket key, and

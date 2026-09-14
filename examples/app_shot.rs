@@ -206,6 +206,8 @@ fn seed_backlog(app: &mut App) {
                 checks: vec![git_manage::backlog::CheckOutcome { name: "tests".into(), ok: true }],
                 turns: 14,
                 engine: "Claude Code".into(),
+                rounds: 2,
+                reviewed_by: Some("Claude (claude-opus-5)".into()),
             })),
             &["branch fix/dev-41-devdock-status-panics-on-a-repository from main", "checks run in the rust:1-bookworm sandbox", "· read src/cli.rs", "· propose an edit to src/cli.rs", "· run check tests", "verifying: tests", "tests passed", "committed: DEV-41: devdock status panics on a repository with no commits", "pushed fix/dev-41-devdock-status-panics-on-a-repository", "draft pull request #12 opened", "worktree removed"],
         ),

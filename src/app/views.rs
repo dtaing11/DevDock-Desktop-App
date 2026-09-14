@@ -1555,7 +1555,8 @@ pub fn ai_controls(
                 crate::app::worker::AiTarget::Conflict
                 | crate::app::worker::AiTarget::Review
                 | crate::app::worker::AiTarget::Coding
-                | crate::app::worker::AiTarget::Tickets => {}
+                | crate::app::worker::AiTarget::Tickets
+                | crate::app::worker::AiTarget::Backlog => {}
             }
         }
         ai_model_picker(app, ui, target);

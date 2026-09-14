@@ -42,6 +42,11 @@ pub struct CiError(pub String);
 
 pub type Result<T> = std::result::Result<T, CiError>;
 
+/// How long a job may run when its config does not say: half an hour, which
+/// is longer than any test suite worth running on every push and shorter
+/// than forever.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 1_800;
+
 /// One configured check.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct Job {
@@ -65,6 +70,11 @@ pub struct Job {
     /// Runner-specific target (e.g. SSH host). For Docker, `image` is used.
     #[serde(default)]
     pub runner_target: Option<String>,
+    /// Seconds the job may run before it is killed and fails. Defaults to
+    /// [`DEFAULT_TIMEOUT_SECS`]; a hung test must not hang the gate, or an
+    /// unattended agent, forever.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
     /// Directory of the config file this job came from, relative to the
     /// repository root; empty for the root config. The job's commands run
     /// here, so a monorepo package's `cargo test` runs in that package.
@@ -733,6 +743,9 @@ pub fn run_job_with(registry: &RunnerRegistry, repo_root: &Path, job: &Job) -> J
         script: &script,
         env: &env,
         target: job.target(),
+        timeout: Some(std::time::Duration::from_secs(
+            job.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
+        )),
     };
     match runner.exec(&request) {
         Ok(out) => {
@@ -891,6 +904,7 @@ env = { FOO = "bar" }
             secrets: Vec::new(),
             runner: None,
             runner_target: None,
+            timeout_secs: None,
             dir: String::new(),
         };
         let result = run_job(tmp.path(), &pass);
@@ -905,6 +919,7 @@ env = { FOO = "bar" }
             secrets: Vec::new(),
             runner: None,
             runner_target: None,
+            timeout_secs: None,
             dir: String::new(),
         };
         let result = run_job(tmp.path(), &fail);
@@ -927,6 +942,7 @@ env = { FOO = "bar" }
                 secrets: Vec::new(),
                 runner: None,
                 runner_target: None,
+            timeout_secs: None,
             dir: String::new(),
             };
         let result = run_job(tmp.path(), &job);
@@ -959,6 +975,7 @@ env = { FOO = "bar" }
             secrets: vec!["API_TOKEN".into()],
             runner: None,
             runner_target: None,
+            timeout_secs: None,
             dir: String::new(),
         };
         let result = run_job(tmp.path(), &job);
@@ -977,6 +994,7 @@ env = { FOO = "bar" }
             secrets: vec!["DEFINITELY_NOT_SET_ANYWHERE_XYZ".into()],
             runner: None,
             runner_target: None,
+            timeout_secs: None,
             dir: String::new(),
         };
         let result = run_job(tmp.path(), &job);

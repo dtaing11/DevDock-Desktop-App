@@ -1,10 +1,11 @@
 //! Jira Cloud: credentials, projects, and creating issues.
 //!
-//! Enough of the REST API to turn a list of work into tickets: check who you
-//! are, list the projects you can file into, list a project's issue types,
-//! and create issues. Reading and searching issues is deliberately absent —
-//! this exists to put work *into* Jira, and a client that also tried to be a
-//! Jira browser would be a worse version of the one in the browser.
+//! Enough of the REST API to turn a list of work into tickets and to work a
+//! backlog: check who you are, list the projects you can file into, list a
+//! project's issue types, create issues, and read the unassigned issues of a
+//! project. That last one exists for [`crate::backlog`], which picks tickets
+//! an agent can take; there is still no attempt to be a Jira browser — the
+//! one in the browser is better at it.
 //!
 //! # Authentication
 //!
@@ -155,6 +156,56 @@ pub struct Issue {
     pub url: String,
 }
 
+/// An issue read from a backlog: what a person would see at the top of it.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct BacklogIssue {
+    pub id: String,
+    pub key: String,
+    pub summary: String,
+    /// The description as plain text, from its Atlassian Document Format.
+    pub description: String,
+    pub issue_type: String,
+    pub priority: String,
+    pub status: String,
+    pub labels: Vec<String>,
+    /// ISO-8601, as Jira reports it.
+    pub updated: String,
+    pub url: String,
+}
+
+impl BacklogIssue {
+    /// The ticket as a block of text for a prompt: key, summary, and the
+    /// description, capped so one novel of a ticket cannot crowd out the
+    /// rest.
+    pub fn prompt_text(&self, max_description: usize) -> String {
+        let mut description = self.description.trim().to_string();
+        if description.len() > max_description {
+            let end = (0..=max_description).rev().find(|i| description.is_char_boundary(*i)).unwrap_or(0);
+            description.truncate(end);
+            description.push_str("\n[truncated]");
+        }
+        let mut text = format!("{}: {}", self.key, self.summary.trim());
+        let mut meta = Vec::new();
+        if !self.issue_type.is_empty() {
+            meta.push(format!("type: {}", self.issue_type));
+        }
+        if !self.priority.is_empty() {
+            meta.push(format!("priority: {}", self.priority));
+        }
+        if !self.labels.is_empty() {
+            meta.push(format!("labels: {}", self.labels.join(", ")));
+        }
+        if !meta.is_empty() {
+            text.push_str(&format!(" ({})", meta.join("; ")));
+        }
+        if !description.is_empty() {
+            text.push('\n');
+            text.push_str(&description);
+        }
+        text
+    }
+}
+
 /// An issue to create.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct NewIssue {
@@ -286,6 +337,37 @@ impl Client {
         Ok(Issue { id: string_at(&value, "id"), url: self.browse_url(&key), key })
     }
 
+    /// The unassigned, unresolved issues of a project: the backlog nobody has
+    /// picked up, highest priority first.
+    pub fn unassigned_backlog(&self, project: &str, max: usize) -> Result<Vec<BacklogIssue>> {
+        self.search(&backlog_jql(project), max)
+    }
+
+    /// Issues matching a JQL query, newest API first with the older one as a
+    /// fallback: Cloud sites moved to `/search/jql` in 2025 and the old
+    /// endpoint answers 404 or 410 once it is gone.
+    pub fn search(&self, jql: &str, max: usize) -> Result<Vec<BacklogIssue>> {
+        let fields = "summary,description,issuetype,priority,status,labels,updated";
+        let max = max.clamp(1, 100);
+        let query = format!(
+            "jql={}&maxResults={max}&fields={}",
+            percent_encode(jql),
+            percent_encode(fields)
+        );
+        let value = match self.get(&format!("/rest/api/3/search/jql?{query}")) {
+            Ok(v) => v,
+            Err(JiraError(e)) if e.contains("Jira error 404") || e.contains("Jira error 410") => {
+                self.get(&format!("/rest/api/3/search?{query}"))?
+            }
+            Err(e) => return Err(e),
+        };
+        Ok(value
+            .get("issues")
+            .and_then(|v| v.as_array())
+            .map(|issues| issues.iter().filter_map(|i| parse_backlog_issue(i, &self.creds.site)).collect())
+            .unwrap_or_default())
+    }
+
     fn get(&self, path: &str) -> Result<serde_json::Value> {
         let resp = agent()
             .get(&format!("{}{path}", self.creds.site))
@@ -307,6 +389,160 @@ impl Client {
 
 fn string_at(value: &serde_json::Value, key: &str) -> String {
     value.get(key).and_then(|v| v.as_str()).unwrap_or_default().to_string()
+}
+
+/// The query for a project's unassigned, open issues. Bounded by project,
+/// which the new search endpoint insists on.
+pub fn backlog_jql(project: &str) -> String {
+    let key = project.trim().replace('"', "");
+    format!(
+        "project = \"{key}\" AND assignee is EMPTY AND resolution = Unresolved AND \
+         statusCategory != Done ORDER BY priority DESC, created ASC"
+    )
+}
+
+/// Percent-encodes a query-string value: everything but the unreserved set.
+fn percent_encode(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() * 3);
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+fn parse_backlog_issue(value: &serde_json::Value, site: &str) -> Option<BacklogIssue> {
+    let key = value.get("key")?.as_str()?.to_string();
+    let fields = value.get("fields").cloned().unwrap_or(serde_json::Value::Null);
+    let named = |field: &str| {
+        fields.get(field).and_then(|v| v.get("name")).and_then(|n| n.as_str()).unwrap_or_default().to_string()
+    };
+    let description = match fields.get("description") {
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(doc) if doc.is_object() => adf_to_text(doc),
+        _ => String::new(),
+    };
+    Some(BacklogIssue {
+        id: string_at(value, "id"),
+        url: format!("{site}/browse/{key}"),
+        key,
+        summary: string_at(&fields, "summary"),
+        description,
+        issue_type: named("issuetype"),
+        priority: named("priority"),
+        status: named("status"),
+        labels: fields
+            .get("labels")
+            .and_then(|l| l.as_array())
+            .map(|l| l.iter().filter_map(|v| v.as_str()).map(String::from).collect())
+            .unwrap_or_default(),
+        updated: string_at(&fields, "updated"),
+    })
+}
+
+/// Renders an Atlassian Document Format tree as plain text, the inverse of
+/// [`to_adf`] as far as a prompt needs: paragraphs and headings become
+/// lines, list items get a dash, code blocks keep their fences, and every
+/// text node survives whatever it was wrapped in.
+pub fn adf_to_text(doc: &serde_json::Value) -> String {
+    let mut out = String::new();
+    adf_node_text(doc, &mut out, 0);
+    // Collapse the blank-line pile-up nesting leaves behind.
+    let mut text = String::new();
+    let mut blank = 0;
+    for line in out.lines() {
+        if line.trim().is_empty() {
+            blank += 1;
+            if blank > 1 {
+                continue;
+            }
+        } else {
+            blank = 0;
+        }
+        text.push_str(line.trim_end());
+        text.push('\n');
+    }
+    text.trim().to_string()
+}
+
+fn adf_node_text(node: &serde_json::Value, out: &mut String, depth: usize) {
+    let kind = node.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    let children = node.get("content").and_then(|c| c.as_array());
+    match kind {
+        "text" => out.push_str(node.get("text").and_then(|t| t.as_str()).unwrap_or("")),
+        "hardBreak" => out.push('\n'),
+        "mention" | "emoji" | "status" | "date" | "inlineCard" => {
+            let attrs = node.get("attrs");
+            let label = attrs
+                .and_then(|a| a.get("text").or_else(|| a.get("shortName")).or_else(|| a.get("url")))
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            out.push_str(label);
+        }
+        "codeBlock" => {
+            let language = node
+                .pointer("/attrs/language")
+                .and_then(|l| l.as_str())
+                .unwrap_or("");
+            out.push_str(&format!("```{language}\n"));
+            if let Some(children) = children {
+                for child in children {
+                    adf_node_text(child, out, depth);
+                }
+            }
+            out.push_str("\n```\n\n");
+        }
+        "listItem" | "taskItem" => {
+            out.push_str(&"  ".repeat(depth.saturating_sub(1)));
+            out.push_str("- ");
+            let mut inner = String::new();
+            if let Some(children) = children {
+                for child in children {
+                    adf_node_text(child, &mut inner, depth + 1);
+                }
+            }
+            out.push_str(inner.trim());
+            out.push('\n');
+        }
+        "paragraph" | "heading" | "blockquote" | "panel" | "tableRow" | "mediaSingle" => {
+            if let Some(children) = children {
+                for child in children {
+                    adf_node_text(child, out, depth);
+                }
+            }
+            out.push('\n');
+            if kind != "tableRow" {
+                out.push('\n');
+            }
+        }
+        "tableCell" | "tableHeader" => {
+            if let Some(children) = children {
+                for child in children {
+                    let mut cell = String::new();
+                    adf_node_text(child, &mut cell, depth);
+                    out.push_str(cell.trim());
+                }
+            }
+            out.push_str(" | ");
+        }
+        "rule" => out.push_str("---\n\n"),
+        _ => {
+            let is_list = kind.ends_with("List");
+            if let Some(children) = children {
+                for child in children {
+                    adf_node_text(child, out, depth + usize::from(is_list));
+                }
+            }
+            // A list is a block: what follows starts on its own paragraph.
+            if is_list && depth == 0 {
+                out.push('\n');
+            }
+        }
+    }
 }
 
 fn parse_project(value: &serde_json::Value) -> Option<Project> {
@@ -751,6 +987,73 @@ mod tests {
         // actionable rather than shown as a bare number.
         assert!(explain(401, "").contains("API token"));
         assert!(explain(404, "{}").contains("project"));
+    }
+
+    #[test]
+    fn a_document_becomes_readable_text() {
+        let doc = to_adf(
+            "Intro line.\n\n## Steps\n\n- first\n- second\n\n```rust\nfn x() {}\n```\n",
+        );
+        let text = adf_to_text(&doc);
+        assert_eq!(text, "Intro line.\n\nSteps\n\n- first\n- second\n\n```rust\nfn x() {}\n```");
+
+        // What Jira actually sends: mentions, hard breaks, a table.
+        let doc = serde_json::json!({"type": "doc", "version": 1, "content": [
+            {"type": "paragraph", "content": [
+                {"type": "text", "text": "Ask "},
+                {"type": "mention", "attrs": {"id": "1", "text": "@Ana"}},
+                {"type": "hardBreak"},
+                {"type": "text", "text": "then fix", "marks": [{"type": "strong"}]}]},
+            {"type": "table", "content": [{"type": "tableRow", "content": [
+                {"type": "tableCell", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "a"}]}]},
+                {"type": "tableCell", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "b"}]}]}]}]},
+            {"type": "orderedList", "content": [
+                {"type": "listItem", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "one"}]}]}]}
+        ]});
+        let text = adf_to_text(&doc);
+        assert!(text.starts_with("Ask @Ana\nthen fix"), "{text}");
+        assert!(text.contains("a | b |"), "{text}");
+        assert!(text.contains("- one"), "{text}");
+    }
+
+    #[test]
+    fn a_backlog_issue_is_read_from_the_search_shape() {
+        let value = serde_json::json!({
+            "id": "10001", "key": "ABC-7",
+            "fields": {
+                "summary": "Crash on empty repo",
+                "description": {"type": "doc", "version": 1, "content": [
+                    {"type": "paragraph", "content": [{"type": "text", "text": "It unwraps."}]}]},
+                "issuetype": {"name": "Bug"}, "priority": {"name": "High"},
+                "status": {"name": "To Do"}, "labels": ["cli", "crash"],
+                "updated": "2026-09-01T10:00:00.000+0000"
+            }
+        });
+        let issue = parse_backlog_issue(&value, "https://acme.atlassian.net").unwrap();
+        assert_eq!(issue.key, "ABC-7");
+        assert_eq!(issue.summary, "Crash on empty repo");
+        assert_eq!(issue.description, "It unwraps.");
+        assert_eq!(issue.issue_type, "Bug");
+        assert_eq!(issue.priority, "High");
+        assert_eq!(issue.labels, ["cli", "crash"]);
+        assert_eq!(issue.url, "https://acme.atlassian.net/browse/ABC-7");
+        let text = issue.prompt_text(1000);
+        assert!(text.starts_with("ABC-7: Crash on empty repo (type: Bug; priority: High; labels: cli, crash)\nIt unwraps."), "{text}");
+        // A description that is a plain string (older sites) is fine too.
+        let value = serde_json::json!({"key": "ABC-8", "fields": {"summary": "s", "description": "plain"}});
+        assert_eq!(parse_backlog_issue(&value, "x").unwrap().description, "plain");
+        // Truncation lands on a character boundary.
+        let long = BacklogIssue { key: "K".into(), summary: "s".into(), description: "é".repeat(50), ..Default::default() };
+        assert!(long.prompt_text(21).ends_with("[truncated]"));
+    }
+
+    #[test]
+    fn the_backlog_query_is_bounded_and_encoded() {
+        let jql = backlog_jql(" ABC ");
+        assert!(jql.starts_with("project = \"ABC\" AND assignee is EMPTY"), "{jql}");
+        assert!(jql.contains("resolution = Unresolved"));
+        assert_eq!(percent_encode("a b=\"c\""), "a%20b%3D%22c%22");
+        assert_eq!(percent_encode("ABC-7_x.y~"), "ABC-7_x.y~");
     }
 
     #[test]

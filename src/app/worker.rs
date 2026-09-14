@@ -87,6 +87,17 @@ pub enum Msg {
     /// One ticket created, or not.
     TicketCreated { index: usize, result: Result<crate::jira::Issue, String> },
 
+    /// The unassigned tickets of a Jira project.
+    BacklogIssues(Result<Vec<crate::jira::BacklogIssue>, String>),
+    /// What the model concluded about each of them.
+    BacklogTriage(Result<Vec<crate::agent::backlog::Triage>, String>),
+    /// One line of the triage run's progress.
+    BacklogTriageEvent(String),
+    /// One line from a ticket's fix: a tool call, a check, a push.
+    BacklogProgress { key: String, line: String },
+    /// A ticket's fix finished, one way or the other.
+    BacklogDone { key: String, result: Result<crate::backlog::Fixed, String> },
+
     /// Every checkout of the repository.
     Worktrees(Result<Vec<crate::git::Worktree>, String>),
     /// A worktree was added or removed. `open` names one to open afterwards,
@@ -180,9 +191,24 @@ pub enum AiTarget {
     Coding,
     /// The ticket writer, which reads the repository to draft them.
     Tickets,
+    /// The backlog fixer: the coding agent, unattended, one ticket per
+    /// worktree. Its own setting because it runs without anyone watching
+    /// and is worth the strongest model available.
+    Backlog,
 }
 
 impl AiTarget {
+    /// Every task, in the order Settings lists them.
+    pub const ALL: [AiTarget; 7] = [
+        AiTarget::Commit,
+        AiTarget::PullRequest,
+        AiTarget::Review,
+        AiTarget::Conflict,
+        AiTarget::Coding,
+        AiTarget::Tickets,
+        AiTarget::Backlog,
+    ];
+
     /// Label for the model picker.
     pub fn label(self) -> &'static str {
         match self {
@@ -192,6 +218,7 @@ impl AiTarget {
             Self::Review => "code review",
             Self::Coding => "the coding agent",
             Self::Tickets => "Jira tickets",
+            Self::Backlog => "the backlog fixer",
         }
     }
 }

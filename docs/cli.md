@@ -15,6 +15,7 @@ devdock <command>    # run headlessly
   - [log](#log)
   - [branches](#branches)
   - [worktree](#worktree)
+  - [backlog](#backlog)
   - [stash](#stash)
   - [commit](#commit)
   - [push](#push)
@@ -83,6 +84,23 @@ Without a path, the worktree goes next to the main one, named after the
 repository and the branch (`app` + `feat/search` → `app-feat-search`).
 `remove` is refused while the worktree has uncommitted changes unless
 `--force`; the branch is kept either way.
+
+### backlog
+
+Unassigned Jira tickets, judged for what an agent could fix, and the fixing.
+See [jira-tickets.md](jira-tickets.md#working-the-backlog).
+
+```
+devdock backlog --project ABC                 # list + judge (the only project needs no flag)
+devdock backlog fix ABC-7 ABC-12              # one agent each, in parallel worktrees
+devdock backlog fix ABC-7 --parallel 2 --sandbox rust:1-bookworm
+```
+
+`fix` prints every line each agent logs, prefixed with its ticket key, and
+ends with a draft pull request per ticket that passed the repository's
+checks. A ticket the agent could not fix leaves nothing behind. Needs the
+Jira connection and GitHub sign-in made in the GUI, and a model chosen for
+the backlog fixer (or the coding agent).
 
 ### stash
 

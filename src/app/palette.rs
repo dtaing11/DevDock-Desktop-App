@@ -31,6 +31,7 @@ pub enum Cmd {
     PullRequests,
     Stack,
     Tickets,
+    Backlog,
     Stash,
     History,
     SearchCommits,
@@ -100,6 +101,11 @@ pub fn commands() -> Vec<Command> {
             "Write Jira tickets",
             "jira tickets issues from a list backlog sprint atlassian",
             Cmd::Tickets,
+        ),
+        c(
+            "Work the Jira backlog",
+            "backlog unassigned tickets agent fix parallel worktrees draft pull requests",
+            Cmd::Backlog,
         ),
         c("Stashes", "shelve changes for later", Cmd::Stash),
         c("Commit graph", "visualise branches and merges", Cmd::Graph),
@@ -192,6 +198,7 @@ pub fn run(app: &mut App, cmd: Cmd) {
         Cmd::PullRequests => app.dialog = Dialog::PullRequests,
         Cmd::Stack => app.open_stack(),
         Cmd::Tickets => app.open_tickets(),
+        Cmd::Backlog => app.open_backlog(),
         Cmd::Stash => app.tab = Tab::Changes,
         Cmd::Graph => {
             app.graph_open = !app.graph_open;

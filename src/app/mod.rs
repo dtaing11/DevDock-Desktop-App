@@ -10,6 +10,7 @@
 //! back through [`worker::Msg`], keeping the UI responsive.
 
 pub mod agent_tab;
+pub mod backlog;
 pub mod dialogs;
 pub mod edits;
 pub mod editor;
@@ -106,6 +107,10 @@ pub struct Config {
     /// trail through code.
     #[serde(default)]
     pub tickets_ai: Option<AiSelection>,
+    /// Model that fixes Jira tickets unattended. Falls back to the coding
+    /// agent's model, which is the same harness.
+    #[serde(default)]
+    pub backlog_ai: Option<AiSelection>,
     /// Use the light palette.
     #[serde(default)]
     pub light_theme: bool,
@@ -320,6 +325,9 @@ pub enum Dialog {
     Tickets,
     /// Every checkout of the repository, and a form for one more.
     Worktrees,
+    /// The unassigned Jira tickets an agent could take, and the agents
+    /// taking them.
+    Backlog,
 }
 
 /// A destructive action awaiting user confirmation.
@@ -875,6 +883,7 @@ pub struct App {
     /// The branch chain the current branch belongs to, and what it is doing.
     pub stack: StackState,
     pub worktrees: worktrees::WorktreeState,
+    pub backlog: backlog::BacklogState,
     /// The list being turned into Jira tickets, and the drafts.
     pub tickets: TicketsState,
     pub local_ci: LocalCiState,
@@ -1018,6 +1027,7 @@ impl App {
             pr: Default::default(),
             stack: Default::default(),
             worktrees: Default::default(),
+            backlog: Default::default(),
             tickets: Default::default(),
             local_ci: Default::default(),
             review: Default::default(),
@@ -1332,6 +1342,11 @@ impl App {
             worker::AiTarget::Review => self.config.review_ai.clone(),
             worker::AiTarget::Coding => self.config.coding_ai.clone(),
             worker::AiTarget::Tickets => self.config.tickets_ai.clone(),
+            // The same harness as the coding agent, so its model is the
+            // natural default until one is chosen for the backlog itself.
+            worker::AiTarget::Backlog => {
+                self.config.backlog_ai.clone().or_else(|| self.config.coding_ai.clone())
+            }
         };
         explicit.or_else(|| {
             let provider = self.config.ai_provider.clone().unwrap_or_else(|| "ollama".into());
@@ -1353,6 +1368,7 @@ impl App {
             worker::AiTarget::Review => self.config.review_ai = Some(sel),
             worker::AiTarget::Coding => self.config.coding_ai = Some(sel),
             worker::AiTarget::Tickets => self.config.tickets_ai = Some(sel),
+            worker::AiTarget::Backlog => self.config.backlog_ai = Some(sel),
         }
         self.config.save();
     }
@@ -1413,6 +1429,8 @@ impl App {
             worker::AiTarget::Coding => return None,
             // Ticket wording is the team's business, not the repository's.
             worker::AiTarget::Tickets => return None,
+            // Same guidance as the coding agent; see `coding_instructions`.
+            worker::AiTarget::Backlog => return None,
         };
         let mut parts: Vec<String> = Vec::new();
         let inline = inline.trim();
@@ -1901,6 +1919,12 @@ impl App {
                 }
             }
 
+            Msg::BacklogIssues(result) => self.on_backlog_issues(result),
+            Msg::BacklogTriage(result) => self.on_backlog_triage(result),
+            Msg::BacklogTriageEvent(line) => self.backlog.triage_log.push(line),
+            Msg::BacklogProgress { key, line } => self.on_backlog_progress(key, line),
+            Msg::BacklogDone { key, result } => self.on_backlog_done(key, result),
+
             Msg::Worktrees(result) => self.on_worktrees(result),
             Msg::WorktreeDone { message, open } => self.on_worktree_done(message, open),
 
@@ -2227,7 +2251,8 @@ impl App {
                         worker::AiTarget::Conflict
                         | worker::AiTarget::Review
                         | worker::AiTarget::Coding
-                        | worker::AiTarget::Tickets,
+                        | worker::AiTarget::Tickets
+                        | worker::AiTarget::Backlog,
                         Ok(_),
                     ) => {}
                     (_, Err(e)) => self.toast(e, true),
@@ -4416,7 +4441,8 @@ impl App {
                 worker::AiTarget::Conflict
                 | worker::AiTarget::Review
                 | worker::AiTarget::Coding
-                | worker::AiTarget::Tickets => {}
+                | worker::AiTarget::Tickets
+                | worker::AiTarget::Backlog => {}
             }
             return;
         }
@@ -5689,6 +5715,67 @@ mod tests {
             ["feat: upper", "feat: lower again", "feat: lower"],
             "upper was replayed onto the new lower, once"
         );
+    }
+
+    /// The backlog dialog keeps one card per agent, moves it through its
+    /// states as messages arrive, and renders every state.
+    #[test]
+    fn the_backlog_tracks_every_agent_and_renders() {
+        use backlog::{RunState, TicketRun};
+        let (_tmp, mut app, _file) = app_with_repo();
+        app.tickets.account = Some("me".into());
+        app.backlog.issues = vec![
+            crate::jira::BacklogIssue { key: "T-1".into(), summary: "one".into(), ..Default::default() },
+            crate::jira::BacklogIssue { key: "T-2".into(), summary: "two".into(), ..Default::default() },
+        ];
+        app.handle(Msg::BacklogTriage(Ok(vec![crate::agent::backlog::Triage {
+            key: "T-1".into(),
+            in_scope: true,
+            area: "src".into(),
+            autonomous: true,
+            confidence: 80,
+            reason: "clear".into(),
+            plan: "edit".into(),
+        }])));
+        assert_eq!(app.backlog.suggested().len(), 1);
+        app.backlog_select_suggested();
+        assert!(app.backlog.selected.contains("T-1"));
+
+        // Two agents in flight, by hand: starting one for real needs a model.
+        app.backlog.runs.insert("T-1".into(), TicketRun { state: RunState::Running, log: Vec::new(), started: Some(Instant::now()), took: None });
+        app.backlog.runs.insert("T-2".into(), TicketRun { state: RunState::Running, log: Vec::new(), started: Some(Instant::now()), took: None });
+        app.handle(Msg::BacklogProgress { key: "T-1".into(), line: "· read a.rs".into() });
+        assert_eq!(app.backlog.runs["T-1"].log, ["· read a.rs"]);
+        assert_eq!(app.backlog.running(), 2);
+
+        app.handle(Msg::BacklogDone { key: "T-2".into(), result: Err("the agent changed nothing: needs a person".into()) });
+        assert!(matches!(app.backlog.runs["T-2"].state, RunState::Failed(_)));
+        assert!(app.backlog.runs["T-2"].took.is_some());
+        assert_eq!(app.backlog.failed(), 1);
+        assert_eq!(app.backlog.running(), 1);
+
+        let fixed = crate::backlog::Fixed {
+            key: "T-1".into(),
+            branch: "fix/t-1-one".into(),
+            pr: github::PullRequest { number: 7, title: "t".into(), html_url: "u".into(), state: "open".into(), head: "fix/t-1-one".into(), head_sha: String::new(), base: "main".into(), user: "me".into() },
+            summary: "- done".into(),
+            changes: vec![crate::backlog::ChangedFile { path: "a.rs".into(), added: 1, removed: 0, new: false }],
+            checks: vec![],
+            turns: 3,
+        };
+        app.handle(Msg::BacklogDone { key: "T-1".into(), result: Ok(fixed) });
+        assert_eq!(app.backlog.done(), 1);
+        assert_eq!(app.backlog.running(), 0);
+        assert!(app.backlog.runs["T-1"].log.last().unwrap().starts_with("done:"));
+        let toast = app.toast.as_ref().expect("the last agent finishing says so");
+        assert!(toast.text.contains("1 pull request(s) opened, 1 failed"), "{}", toast.text);
+
+        // Every state draws, with a log unfolded.
+        app.backlog.expanded = Some("T-1".into());
+        app.dialog = Dialog::Backlog;
+        theme::run_test_ctx(|ctx| dialogs::show(&mut app, ctx));
+        app.backlog_clear_finished();
+        assert!(app.backlog.runs.is_empty());
     }
 
     /// Creating a worktree from the dialog puts the branch in its own

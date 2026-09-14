@@ -119,8 +119,22 @@ now, and — on **Log** — everything it did: every file read, every edit, ever
 check, the commit, the push. A finished card lists the files it changed with
 line counts, its summary, and the pull request.
 
-**Nothing is written to Jira.** The ticket stays unassigned and open; the
-developer reviews the pull request and moves the ticket, or does not.
+### Claiming the ticket
+
+**Claim tickets I start** (on by default) does what you would do when you
+pick a ticket up: the moment an agent starts on it, the ticket is assigned
+to you, moved into the project's active sprint, and transitioned to In
+Progress — so it leaves the backlog while it is being worked, and the board
+shows who has it. When the agent finishes, a comment on the ticket links the
+draft pull request; when it gives up, the comment says why, and the ticket
+stays assigned to you. Each step is a line on the agent's card, and none of
+them can fail the fix.
+
+A kanban project has no sprints, and a workflow may have no In Progress
+step; both are skipped and said so. Untick the box and **nothing is written
+to Jira**: the ticket stays unassigned and open, and what happens to it is
+the developer's call after reviewing the pull request. On the command line
+the same is `--claim`, off unless given.
 
 ### The model
 
@@ -161,9 +175,9 @@ run; that is the price of a clean room.
 - **Browse Jira.** The backlog view reads one project's unassigned tickets
   and nothing else; a client that also tried to be a Jira browser would be
   a worse version of the one you have.
-- **Write to Jira from the backlog.** No assignment, no comment, no
-  transition. The pull request is the artefact; what happens to the ticket
-  is the developer's call.
+- **Resolve tickets.** Claiming assigns, sprints, starts, and comments;
+  it never closes. The pull request merging is a decision, and so is
+  closing the ticket.
 - **Epics, sprints, or estimates.** A ticket is created with a project, a
   type, a summary, a description and labels; the rest is a workflow question
   each team answers differently.

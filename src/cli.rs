@@ -74,7 +74,7 @@ fn print_help() {
         ("worktree add BRANCH [PATH] [--from BASE]", "check a branch out in its own directory"),
         ("worktree remove PATH [--force]", "delete a worktree's directory, keeping the branch"),
         ("backlog [--project KEY]", "unassigned Jira tickets, judged for what an agent could fix"),
-        ("backlog fix KEY... [--parallel N] [--sandbox IMAGE]", "fix tickets in parallel worktrees; each ends as a draft PR"),
+        ("backlog fix KEY... [--parallel N] [--sandbox IMAGE] [--claim]", "fix tickets in parallel worktrees; each ends as a draft PR"),
         ("resolve", "interactive conflict resolver with AI proposals"),
         ("resolve --agent", "AI reads the repo and proposes every fix, you confirm each"),
         ("ci", "run all local CI jobs (.git-manage-ci.toml)"),
@@ -639,6 +639,7 @@ fn cmd_backlog(rest: &[String]) -> ExitCode {
             Ok(v) => v.map(str::to_string),
             Err(e) => return fail(e),
         };
+        let claim = rest.iter().any(|a| a == "--claim");
         let jql = format!("key in ({})", keys.join(","));
         let issues = match jira.search(&jql, keys.len()) {
             Ok(i) => i,
@@ -657,6 +658,17 @@ fn cmd_backlog(rest: &[String]) -> ExitCode {
         let base = default_base(&repo);
         let token = crate::github::TokenStore::load();
         let _ = repo.fetch(token.as_deref());
+        let claimer = if claim {
+            let account_id = match jira.myself() {
+                Ok(me) => me.account_id,
+                Err(e) => return fail(format!("--claim needs your Jira account: {e}")),
+            };
+            let project_key = issues.first().and_then(|i| i.key.split('-').next()).unwrap_or_default().to_string();
+            let sprint = jira.active_sprint(&project_key).ok().flatten();
+            Some(crate::backlog::JiraClaim { client: jira, account_id, sprint })
+        } else {
+            None
+        };
         let instructions = crate::local_ci::discover_configs(repo.path())
             .ok()
             .and_then(|c| c.config.review.resolve_files(repo.path()).ok())
@@ -684,6 +696,7 @@ fn cmd_backlog(rest: &[String]) -> ExitCode {
                             auth: token.as_deref(),
                             instructions: instructions.as_deref(),
                             sandbox_image: sandbox.as_deref(),
+                            claim: claimer.as_ref().map(|c| c as &dyn crate::backlog::Claimer),
                         };
                         crate::backlog::fix(&repo, &engine, &job, &publish, &mut |line| {
                             println!("{} {}", style::dim(&format!("[{}]", issue.key)), line);

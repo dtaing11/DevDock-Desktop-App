@@ -474,9 +474,13 @@ fn mmss(d: Duration) -> String {
 /// The dialog.
 pub fn dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
     super::dialogs::modal(ctx, "Jira backlog", open, |ui| {
-        // Wide enough for a ticket row; every row below wraps rather than
-        // pushing the dialog past the modal's cap.
-        ui.set_min_width(620.0);
+        // A definite width, from the screen rather than from the content:
+        // rows and labels wrap to it, so the layout is the same every frame.
+        // Sizing to wrapped content instead oscillates — wider makes a row
+        // fit on one line, which makes the content narrower, which wraps the
+        // row again — and with a dropdown open that is visible as twitching.
+        let width = (ctx.screen_rect().width() * 0.85 - 48.0).clamp(460.0, 920.0);
+        ui.set_width(width);
 
         if app.tickets.account.is_none() {
             super::dialogs::jira_connect(app, ui);

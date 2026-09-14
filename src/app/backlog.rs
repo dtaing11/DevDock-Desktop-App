@@ -593,7 +593,11 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
     });
     ui.horizontal_wrapped(|ui| {
         ui.label("Fixer model");
-        super::views::ai_model_picker(app, ui, worker::AiTarget::Backlog);
+        // Two pickers in one dialog: each in its own id scope, or egui sees
+        // one widget twice and the second acts on the first.
+        ui.push_id("backlog-fixer-model", |ui| {
+            super::views::ai_model_picker(app, ui, worker::AiTarget::Backlog);
+        });
         ui.add_space(theme::UNIT);
         ui.label("At once");
         ui.add(egui::Slider::new(&mut app.backlog.parallel, 1..=6).show_value(true))
@@ -614,7 +618,9 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
         );
         if app.backlog.review {
             ui.label("Reviewer");
-            super::views::ai_model_picker(app, ui, worker::AiTarget::Review);
+            ui.push_id("backlog-reviewer-model", |ui| {
+                super::views::ai_model_picker(app, ui, worker::AiTarget::Review);
+            });
         }
     });
     ui.horizontal_wrapped(|ui| {

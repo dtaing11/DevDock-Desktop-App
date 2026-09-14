@@ -42,7 +42,7 @@ pub struct Proposal {
 }
 
 pub fn limits() -> Limits {
-    Limits { max_turns: 10, max_tool_calls: 16, max_read_bytes: 150_000, max_tokens: 4096 }
+    Limits { max_turns: 10, max_tool_calls: 16, max_read_bytes: 150_000, max_tokens: 4096, max_transcript_bytes: 400_000 }
 }
 
 /// The task prompt: every commit, oldest first, with its body.
@@ -172,7 +172,7 @@ mod tests {
             _: &[ToolSpec],
             _: u32,
         ) -> Result<Reply, String> {
-            Ok(Reply { text: self.0.borrow_mut().remove(0), calls: vec![] })
+            Ok(Reply { text: self.0.borrow_mut().remove(0), calls: vec![], ..Default::default() })
         }
     }
 

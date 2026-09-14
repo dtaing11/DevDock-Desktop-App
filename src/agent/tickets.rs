@@ -87,6 +87,7 @@ pub fn limits(items: usize) -> Limits {
         max_tool_calls: (8 * items).clamp(24, 120),
         max_read_bytes: 200_000,
         max_tokens: 8192,
+        max_transcript_bytes: 400_000,
     }
 }
 

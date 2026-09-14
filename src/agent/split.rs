@@ -54,7 +54,7 @@ pub struct Proposal {
 }
 
 pub fn limits() -> Limits {
-    Limits { max_turns: 10, max_tool_calls: 16, max_read_bytes: 150_000, max_tokens: 4096 }
+    Limits { max_turns: 10, max_tool_calls: 16, max_read_bytes: 150_000, max_tokens: 4096, max_transcript_bytes: 400_000 }
 }
 
 /// Checks a proposal covers exactly the changed files.
@@ -188,7 +188,7 @@ mod tests {
             "scripted".into()
         }
         fn turn(&self, _: &str, _: &[Message], _: &[ToolSpec], _: u32) -> Result<Reply, String> {
-            Ok(Reply { text: self.0.borrow_mut().remove(0), calls: vec![] })
+            Ok(Reply { text: self.0.borrow_mut().remove(0), calls: vec![], ..Default::default() })
         }
     }
 

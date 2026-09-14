@@ -96,7 +96,7 @@ fn call(id: &str, name: &str, input: serde_json::Value) -> ToolCall {
 }
 
 fn calls(text: &str, calls: Vec<ToolCall>) -> Reply {
-    Reply { text: text.into(), calls }
+    Reply { text: text.into(), calls, ..Default::default() }
 }
 
 #[test]

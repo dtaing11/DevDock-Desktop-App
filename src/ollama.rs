@@ -326,6 +326,12 @@ impl crate::agent::Provider for Agent {
         format!("Ollama ({})", self.model)
     }
 
+    /// Roughly three bytes per token of the window, less room for the
+    /// system prompt, the tools, and the reply.
+    fn transcript_budget(&self) -> Option<usize> {
+        Some(AGENT_NUM_CTX as usize * 3 * 2 / 3)
+    }
+
     fn turn(
         &self,
         system: &str,

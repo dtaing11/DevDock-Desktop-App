@@ -183,6 +183,10 @@ pub struct AgentReport {
     pub edits: Vec<crate::agent::PendingEdit>,
     /// Whether a budget cut the run short.
     pub truncated: bool,
+    /// Model turns taken.
+    pub turns: usize,
+    /// Tokens the run cost, when the provider says.
+    pub usage: crate::agent::Usage,
 }
 
 /// One proposed change plus the user's decision about it.
@@ -3781,6 +3785,8 @@ impl App {
                     summary: run.text,
                     edits: run.edits,
                     truncated: run.truncated,
+                    turns: run.turns,
+                    usage: run.usage,
                 })
             })();
             Msg::AgentDone { kind: AgentKind::Coding, result }
@@ -3977,6 +3983,29 @@ impl App {
             let result = (|| -> Result<AgentReport, String> {
                 let provider = agent_provider(&sel, &url)?;
                 let tracked = strerr(repo.tracked_files())?;
+                // What is going on in the repository, so the model does not
+                // have to discover it a tool call at a time.
+                let mut context = String::new();
+                if let Ok(log) = repo.log(6, None) {
+                    if !log.is_empty() {
+                        context.push_str("Recent commits:\n");
+                        for c in &log {
+                            context.push_str(&format!("- {} {}\n", c.short_sha, c.subject));
+                        }
+                    }
+                }
+                if let Ok(status) = repo.status() {
+                    if !status.files.is_empty() {
+                        let paths: Vec<&str> =
+                            status.files.iter().take(20).map(|f| f.path.as_str()).collect();
+                        context.push_str(&format!(
+                            "\nUncommitted changes in the working tree ({} file(s)): {}{}\n",
+                            status.files.len(),
+                            paths.join(", "),
+                            if status.files.len() > paths.len() { ", …" } else { "" }
+                        ));
+                    }
+                }
                 let mut workspace = crate::agent::Workspace::new(
                     repo.path(),
                     tracked,
@@ -3998,6 +4027,7 @@ impl App {
                         history: &history,
                         branch: branch.as_deref(),
                         instructions: instructions.as_deref(),
+                        context: (!context.trim().is_empty()).then_some(context.as_str()),
                         limits: crate::agent::coding::limits(),
                     },
                     &mut |event| match event {
@@ -4015,6 +4045,8 @@ impl App {
                     summary: run.text,
                     edits: run.edits,
                     truncated: run.truncated,
+                    turns: run.turns,
+                    usage: run.usage,
                 })
             })();
             Msg::AgentDone { kind: AgentKind::Coding, result }
@@ -4038,6 +4070,8 @@ impl App {
         match result {
             Ok(report) => {
                 self.coding.truncated = report.truncated;
+                self.coding.turns = report.turns;
+                self.coding.usage = (!report.usage.is_zero()).then_some(report.usage);
                 self.coding.summary = report.summary.clone();
                 self.coding.edits = report
                     .edits
@@ -4271,6 +4305,8 @@ impl App {
                     summary: run.text,
                     edits: run.edits,
                     truncated: run.truncated,
+                    turns: run.turns,
+                    usage: run.usage,
                 })
             })();
             Msg::AgentDone { kind: AgentKind::Conflict, result }

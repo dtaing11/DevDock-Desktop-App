@@ -274,6 +274,12 @@ The model under it is a Claude Code alias (`default`, `sonnet`, `opus`,
 `haiku`). The same choice is available for the backlog fixer; judging the
 backlog is a read-only harness run, so that still uses a model.
 
+**How to tell which harness ran.** Every run's log opens with an `engine:`
+line — `engine: Claude Code` or `engine: Claude (claude-sonnet-5)` — and
+the strip above the summary repeats it next to the turn count. A backlog
+card and its draft pull request say the same. While Claude Code is
+running, `claude -p …` is a child process of DevDock, which `ps` will show.
+
 ### Two modes: propose, or let it iterate
 
 **Propose** (default). The agent reads and edits, but its edits are held in

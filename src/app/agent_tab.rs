@@ -68,6 +68,8 @@ pub struct CodingState {
     /// provider reports that.
     pub turns: usize,
     pub usage: Option<crate::agent::Usage>,
+    /// Which harness ran the last task, as the run reported it.
+    pub engine: String,
 }
 
 impl CodingState {
@@ -597,7 +599,11 @@ fn cost_line(app: &App) -> Option<String> {
             n.to_string()
         }
     };
-    let mut line = format!("{} turn(s)", app.coding.turns);
+    let mut line = if app.coding.engine.is_empty() {
+        format!("{} turn(s)", app.coding.turns)
+    } else {
+        format!("{} · {} turn(s)", app.coding.engine, app.coding.turns)
+    };
     if let Some(u) = app.coding.usage {
         line.push_str(&format!(
             " · {} in, {} cached, {} out",

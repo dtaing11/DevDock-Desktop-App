@@ -197,6 +197,7 @@ pub fn run_with(
     request: Request<'_>,
     on_event: &mut dyn FnMut(Event),
 ) -> Result<Run, String> {
+    on_event(Event::Engine(engine.label()));
     match engine {
         Engine::Harness(provider) => run(provider.as_ref(), workspace, request, on_event),
         Engine::ClaudeCode(config) => run_claude_code(config, workspace, request, on_event),
@@ -335,8 +336,10 @@ mod tests {
         let engine = Engine::ClaudeCode(claude_code::Config::default());
         assert!(engine.needs_live_tree());
         assert_eq!(engine.label(), "Claude Code");
-        let err = run_with(&engine, &mut ws, Request::new("do it"), &mut |_| {}).unwrap_err();
+        let mut events = Vec::new();
+        let err = run_with(&engine, &mut ws, Request::new("do it"), &mut |e| events.push(e.line())).unwrap_err();
         assert!(err.contains("Let it iterate"), "{err}");
+        assert_eq!(events.first().map(String::as_str), Some("engine: Claude Code"), "announced first");
     }
 
     #[test]

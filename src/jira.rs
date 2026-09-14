@@ -2,10 +2,12 @@
 //!
 //! Enough of the REST API to turn a list of work into tickets and to work a
 //! backlog: check who you are, list the projects you can file into, list a
-//! project's issue types, create issues, and read the unassigned issues of a
-//! project. That last one exists for [`crate::backlog`], which picks tickets
-//! an agent can take; there is still no attempt to be a Jira browser — the
-//! one in the browser is better at it.
+//! project's issue types, create issues, read the unassigned issues of a
+//! project, and claim one — assign it, put it in the active sprint, move it
+//! to In Progress, comment on it. The reading and claiming exist for
+//! [`crate::backlog`], which picks tickets an agent can take; there is
+//! still no attempt to be a Jira browser — the one in the browser is
+//! better at it.
 //!
 //! # Authentication
 //!
@@ -206,6 +208,23 @@ impl BacklogIssue {
     }
 }
 
+/// A sprint on a scrum board.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Sprint {
+    pub id: u64,
+    pub name: String,
+}
+
+/// A workflow step an issue can take right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Transition {
+    pub id: String,
+    pub name: String,
+    /// The status category it leads to: "new", "indeterminate" (in
+    /// progress), or "done".
+    pub to_category: String,
+}
+
 /// An issue to create.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct NewIssue {
@@ -368,6 +387,80 @@ impl Client {
             .unwrap_or_default())
     }
 
+    /// Assigns an issue to an account.
+    pub fn assign(&self, key: &str, account_id: &str) -> Result<()> {
+        self.put_empty(
+            &format!("/rest/api/3/issue/{}/assignee", key.trim()),
+            serde_json::json!({ "accountId": account_id }),
+        )
+    }
+
+    /// The active sprint of the project's first scrum board, if it has one.
+    /// A kanban project has no sprints, which is `None`, not an error.
+    pub fn active_sprint(&self, project: &str) -> Result<Option<Sprint>> {
+        let boards = self.get(&format!(
+            "/rest/agile/1.0/board?projectKeyOrId={}&type=scrum&maxResults=20",
+            percent_encode(project.trim())
+        ))?;
+        let ids: Vec<u64> = boards
+            .get("values")
+            .and_then(|v| v.as_array())
+            .map(|b| b.iter().filter_map(|x| x.get("id").and_then(|i| i.as_u64())).collect())
+            .unwrap_or_default();
+        for id in ids {
+            let sprints = self.get(&format!("/rest/agile/1.0/board/{id}/sprint?state=active"))?;
+            if let Some(sprint) = sprints
+                .get("values")
+                .and_then(|v| v.as_array())
+                .and_then(|v| v.first())
+                .and_then(parse_sprint)
+            {
+                return Ok(Some(sprint));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Moves issues into a sprint.
+    pub fn move_to_sprint(&self, sprint: u64, keys: &[&str]) -> Result<()> {
+        self.post_empty(
+            &format!("/rest/agile/1.0/sprint/{sprint}/issue"),
+            serde_json::json!({ "issues": keys }),
+        )
+    }
+
+    /// The transitions an issue can take from where it is.
+    pub fn transitions(&self, key: &str) -> Result<Vec<Transition>> {
+        let value = self.get(&format!("/rest/api/3/issue/{}/transitions", key.trim()))?;
+        Ok(parse_transitions(&value))
+    }
+
+    /// Takes a transition.
+    pub fn transition(&self, key: &str, transition_id: &str) -> Result<()> {
+        self.post_empty(
+            &format!("/rest/api/3/issue/{}/transitions", key.trim()),
+            serde_json::json!({ "transition": { "id": transition_id } }),
+        )
+    }
+
+    /// Moves an issue to In Progress, if its workflow offers a step there.
+    /// Returns the step taken, or `None` when there was none.
+    pub fn start_progress(&self, key: &str) -> Result<Option<String>> {
+        let transitions = self.transitions(key)?;
+        let Some(step) = pick_in_progress(&transitions) else { return Ok(None) };
+        self.transition(key, &step.id)?;
+        Ok(Some(step.name.clone()))
+    }
+
+    /// Adds a comment, written in Markdown.
+    pub fn add_comment(&self, key: &str, markdown: &str) -> Result<()> {
+        self.post(
+            &format!("/rest/api/3/issue/{}/comment", key.trim()),
+            serde_json::json!({ "body": to_adf(markdown) }),
+        )
+        .map(drop)
+    }
+
     fn get(&self, path: &str) -> Result<serde_json::Value> {
         let resp = agent()
             .get(&format!("{}{path}", self.creds.site))
@@ -385,6 +478,62 @@ impl Client {
             .send_json(body);
         read_json(resp)
     }
+
+    /// A POST whose success is a 204 with no body.
+    fn post_empty(&self, path: &str, body: serde_json::Value) -> Result<()> {
+        let resp = agent()
+            .post(&format!("{}{path}", self.creds.site))
+            .set("Authorization", &self.creds.header())
+            .set("Accept", "application/json")
+            .send_json(body);
+        read_empty(resp)
+    }
+
+    /// A PUT whose success is a 204 with no body.
+    fn put_empty(&self, path: &str, body: serde_json::Value) -> Result<()> {
+        let resp = agent()
+            .put(&format!("{}{path}", self.creds.site))
+            .set("Authorization", &self.creds.header())
+            .set("Accept", "application/json")
+            .send_json(body);
+        read_empty(resp)
+    }
+}
+
+fn parse_sprint(value: &serde_json::Value) -> Option<Sprint> {
+    Some(Sprint { id: value.get("id")?.as_u64()?, name: string_at(value, "name") })
+}
+
+fn parse_transitions(value: &serde_json::Value) -> Vec<Transition> {
+    value
+        .get("transitions")
+        .and_then(|t| t.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|t| {
+                    Some(Transition {
+                        id: t.get("id")?.as_str()?.to_string(),
+                        name: string_at(t, "name"),
+                        to_category: t
+                            .pointer("/to/statusCategory/key")
+                            .and_then(|k| k.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The step that means "someone is on it": the first into the in-progress
+/// category, else one named like it. Workflows differ; the category is the
+/// part Jira keeps consistent.
+pub fn pick_in_progress(transitions: &[Transition]) -> Option<&Transition> {
+    transitions
+        .iter()
+        .find(|t| t.to_category == "indeterminate")
+        .or_else(|| transitions.iter().find(|t| t.name.to_lowercase().contains("progress")))
 }
 
 fn string_at(value: &serde_json::Value, key: &str) -> String {
@@ -567,6 +716,18 @@ fn read_json(
 ) -> Result<serde_json::Value> {
     match resp {
         Ok(r) => r.into_json().map_err(|e| JiraError(e.to_string())),
+        Err(ureq::Error::Status(code, r)) => {
+            let body = r.into_string().unwrap_or_default();
+            Err(JiraError(format!("Jira error {code}: {}", explain(code, &body))))
+        }
+        Err(e) => Err(JiraError(e.to_string())),
+    }
+}
+
+/// Reads a response that carries nothing on success.
+fn read_empty(resp: std::result::Result<ureq::Response, ureq::Error>) -> Result<()> {
+    match resp {
+        Ok(_) => Ok(()),
         Err(ureq::Error::Status(code, r)) => {
             let body = r.into_string().unwrap_or_default();
             Err(JiraError(format!("Jira error {code}: {}", explain(code, &body))))
@@ -1054,6 +1215,26 @@ mod tests {
         assert!(jql.contains("resolution = Unresolved"));
         assert_eq!(percent_encode("a b=\"c\""), "a%20b%3D%22c%22");
         assert_eq!(percent_encode("ABC-7_x.y~"), "ABC-7_x.y~");
+    }
+
+    #[test]
+    fn the_in_progress_step_is_picked_by_category_then_by_name() {
+        let value = serde_json::json!({"transitions": [
+            {"id": "11", "name": "Won't Do", "to": {"statusCategory": {"key": "done"}}},
+            {"id": "21", "name": "Start work", "to": {"statusCategory": {"key": "indeterminate"}}},
+            {"id": "31", "name": "In Progress", "to": {"statusCategory": {"key": "indeterminate"}}}
+        ]});
+        let transitions = parse_transitions(&value);
+        assert_eq!(transitions.len(), 3);
+        assert_eq!(pick_in_progress(&transitions).unwrap().id, "21", "the first into the category");
+
+        let by_name = vec![Transition { id: "5".into(), name: "Move to in progress".into(), to_category: String::new() }];
+        assert_eq!(pick_in_progress(&by_name).unwrap().id, "5");
+        let none = vec![Transition { id: "9".into(), name: "Done".into(), to_category: "done".into() }];
+        assert!(pick_in_progress(&none).is_none());
+
+        let sprint = parse_sprint(&serde_json::json!({"id": 42, "name": "Sprint 7", "state": "active"})).unwrap();
+        assert_eq!(sprint, Sprint { id: 42, name: "Sprint 7".into() });
     }
 
     #[test]

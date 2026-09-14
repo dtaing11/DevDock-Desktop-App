@@ -83,6 +83,9 @@ pub struct BacklogState {
     /// Run every check inside this Docker image, when set.
     pub sandbox: bool,
     pub sandbox_image: String,
+    /// Assign a ticket to me, move it to the active sprint, and mark it In
+    /// Progress when its agent starts; comment when it finishes.
+    pub claim: bool,
     /// Whose log is unfolded.
     pub expanded: Option<String>,
 }
@@ -105,6 +108,7 @@ impl Default for BacklogState {
             only_suggested: false,
             sandbox: false,
             sandbox_image: String::new(),
+            claim: true,
             expanded: None,
         }
     }
@@ -304,6 +308,8 @@ impl App {
         let token = self.gh_token();
         let instructions = self.coding_instructions();
         let sandbox = self.backlog.sandbox.then(|| self.backlog.sandbox_image.trim().to_string()).filter(|s| !s.is_empty());
+        let claim = self.backlog.claim;
+        let project = self.backlog.project.clone();
         let progress = self.worker.progress();
         if let Some(run) = self.backlog.runs.get_mut(&key) {
             run.state = RunState::Running;
@@ -324,6 +330,23 @@ impl App {
                         .create_draft_pull_request(&slug, title, body, head, &base)
                         .map_err(|e| e.to_string())
                 };
+                // Claiming needs who I am and where the sprint is; both
+                // best effort, and neither can stop the fix.
+                let claimer = if claim {
+                    crate::jira::Client::from_store().and_then(|client| {
+                        let account_id = client.myself().ok()?.account_id;
+                        let sprint = client.active_sprint(&project).ok().flatten();
+                        Some(crate::backlog::JiraClaim { client, account_id, sprint })
+                    })
+                } else {
+                    None
+                };
+                if claim && claimer.is_none() {
+                    progress.send(Msg::BacklogProgress {
+                        key: issue.key.clone(),
+                        line: "could not look up your Jira account; the ticket is not claimed".into(),
+                    });
+                }
                 let job = crate::backlog::Job {
                     issue: &issue,
                     triage: triage.as_ref(),
@@ -331,6 +354,7 @@ impl App {
                     auth: token.as_deref(),
                     instructions: instructions.as_deref(),
                     sandbox_image: sandbox.as_deref(),
+                    claim: claimer.as_ref().map(|c| c as &dyn crate::backlog::Claimer),
                 };
                 let key = issue.key.clone();
                 crate::backlog::fix(&repo, &engine, &job, &publish, &mut |line| {
@@ -537,6 +561,14 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
         ui.label("At once");
         ui.add(egui::Slider::new(&mut app.backlog.parallel, 1..=6).show_value(true))
             .on_hover_text("How many agents run in parallel, each in its own worktree");
+    });
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut app.backlog.claim, "Claim tickets I start").on_hover_text(
+            "When an agent starts on a ticket: assign it to you, move it into the \
+             active sprint, and mark it In Progress. When it finishes: a comment with \
+             the draft pull request, or with why it could not. Off means Jira is never \
+             written to.",
+        );
     });
     ui.horizontal(|ui| {
         ui.checkbox(&mut app.backlog.sandbox, "Run checks in a sandbox").on_hover_text(

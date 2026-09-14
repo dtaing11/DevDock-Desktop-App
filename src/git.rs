@@ -137,6 +137,70 @@ pub struct BranchList {
     pub remote: Vec<Branch>,
 }
 
+/// One checkout of the repository: a directory with a branch (or a detached
+/// commit) in it. The main worktree is where `.git` is a directory; linked
+/// ones point back to it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Worktree {
+    pub path: PathBuf,
+    /// The checked-out commit's full sha.
+    pub head: String,
+    /// The checked-out branch, or `None` when the head is detached.
+    pub branch: Option<String>,
+    /// The main worktree, listed first by git.
+    pub main: bool,
+    /// A lock keeps git from pruning it, for a worktree on removable media.
+    pub locked: bool,
+    /// Its directory is gone; `worktree prune` forgets it.
+    pub prunable: bool,
+}
+
+/// Parses `git worktree list --porcelain`: one block per worktree, blank
+/// line between, `worktree <path>` first, then `HEAD`, `branch`, and flags.
+fn parse_worktrees(out: &str) -> Vec<Worktree> {
+    let mut list = Vec::new();
+    let mut current: Option<Worktree> = None;
+    for line in out.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            if let Some(w) = current.take() {
+                list.push(w);
+            }
+            continue;
+        }
+        if let Some(path) = line.strip_prefix("worktree ") {
+            if let Some(w) = current.take() {
+                list.push(w);
+            }
+            current = Some(Worktree {
+                path: PathBuf::from(path),
+                head: String::new(),
+                branch: None,
+                main: list.is_empty(),
+                locked: false,
+                prunable: false,
+            });
+            continue;
+        }
+        let Some(w) = current.as_mut() else { continue };
+        if let Some(sha) = line.strip_prefix("HEAD ") {
+            w.head = sha.trim().to_string();
+        } else if let Some(r) = line.strip_prefix("branch ") {
+            w.branch = Some(r.trim().strip_prefix("refs/heads/").unwrap_or(r.trim()).to_string());
+        } else if line == "detached" {
+            w.branch = None;
+        } else if line == "locked" || line.starts_with("locked ") {
+            w.locked = true;
+        } else if line == "prunable" || line.starts_with("prunable ") {
+            w.prunable = true;
+        }
+    }
+    if let Some(w) = current.take() {
+        list.push(w);
+    }
+    list
+}
+
 /// What a commit search looks at.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SearchMode {
@@ -1281,6 +1345,92 @@ impl Repo {
     /// Deletes a local branch. `force` uses `-D`.
     pub fn delete_branch(&self, name: &str, force: bool) -> Result<()> {
         self.git(&["branch", if force { "-D" } else { "-d" }, name]).map(drop)
+    }
+
+    // -- worktrees ----------------------------------------------------------
+
+    /// Every checkout of this repository, the main worktree first.
+    pub fn worktrees(&self) -> Result<Vec<Worktree>> {
+        let out = self.git(&["worktree", "list", "--porcelain"])?;
+        Ok(parse_worktrees(&out))
+    }
+
+    /// The main worktree's root: the one whose `.git` is a directory, which
+    /// every linked worktree points back to.
+    pub fn main_worktree(&self) -> PathBuf {
+        let common = self
+            .git(&["rev-parse", "--path-format=absolute", "--git-common-dir"])
+            .map(|o| PathBuf::from(o.trim()))
+            .unwrap_or_else(|_| self.root.join(".git"));
+        common.parent().map(Path::to_path_buf).unwrap_or_else(|| self.root.clone())
+    }
+
+    /// Whether this is a linked worktree rather than the main one.
+    pub fn is_linked_worktree(&self) -> bool {
+        self.main_worktree() != self.root
+    }
+
+    /// Where a worktree for `branch` goes when nobody says otherwise: next
+    /// to the main worktree, named `<repo>-<branch>` with the slashes a
+    /// branch name may carry turned into dashes.
+    pub fn worktree_default_path(&self, branch: &str) -> PathBuf {
+        let main = self.main_worktree();
+        let name = main
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "repo".to_string());
+        let slug: String = branch
+            .trim()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' { c } else { '-' })
+            .collect();
+        let slug = slug.trim_matches('-');
+        let parent = main.parent().map(Path::to_path_buf).unwrap_or_else(|| main.clone());
+        parent.join(format!("{name}-{slug}"))
+    }
+
+    /// Checks `branch` out into a new directory at `path`.
+    ///
+    /// With `create_from`, the branch is created there, starting from that
+    /// commit (`HEAD` for the current one). Without it the branch must
+    /// exist, and git refuses if it is already checked out in another
+    /// worktree — two directories on one branch is how commits get lost.
+    pub fn worktree_add(
+        &self,
+        path: &Path,
+        branch: &str,
+        create_from: Option<&str>,
+    ) -> Result<Worktree> {
+        let path = if path.is_absolute() { path.to_path_buf() } else { self.root.join(path) };
+        let path_str = path.to_string_lossy().into_owned();
+        match create_from {
+            Some(base) => self.git(&["worktree", "add", "-b", branch, &path_str, base])?,
+            None => self.git(&["worktree", "add", &path_str, branch])?,
+        };
+        let wanted = std::fs::canonicalize(&path).unwrap_or(path.clone());
+        self.worktrees()?
+            .into_iter()
+            .find(|w| std::fs::canonicalize(&w.path).unwrap_or(w.path.clone()) == wanted)
+            .ok_or_else(|| {
+                GitError::Command(format!("git added the worktree at {} but does not list it", path.display()))
+            })
+    }
+
+    /// Removes the worktree at `path`, deleting its directory. Refused when
+    /// it has uncommitted changes unless `force`. The branch is kept.
+    pub fn worktree_remove(&self, path: &Path, force: bool) -> Result<()> {
+        let path_str = path.to_string_lossy().into_owned();
+        let args: &[&str] = if force {
+            &["worktree", "remove", "--force", &path_str]
+        } else {
+            &["worktree", "remove", &path_str]
+        };
+        self.git(args).map(drop)
+    }
+
+    /// Forgets worktrees whose directories no longer exist.
+    pub fn worktree_prune(&self) -> Result<()> {
+        self.git(&["worktree", "prune"]).map(drop)
     }
 
     // -- merge / rebase -----------------------------------------------------

@@ -35,6 +35,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         Dialog::TidyHistory => tidy_dialog(app, ctx, &mut open),
         Dialog::Stack => stack_dialog(app, ctx, &mut open),
         Dialog::Tickets => tickets_dialog(app, ctx, &mut open),
+        Dialog::Worktrees => super::worktrees::dialog(app, ctx, &mut open),
     }
     // Dismissing a gate with the X is a deferred decision, not an approval:
     // the modal closes but the held action stays available behind the
@@ -72,7 +73,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
 ///
 /// The window is constrained to the app viewport: on small windows the
 /// content scrolls inside the dialog instead of overflowing off-screen.
-fn modal(
+pub(super) fn modal(
     ctx: &egui::Context,
     title: &str,
     open: &mut bool,

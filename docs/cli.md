@@ -6,6 +6,7 @@ it works in terminals, scripts, and git hooks.
 
 ```
 devdock              # launch the GUI
+devdock <dir>        # launch the GUI on that repository (a worktree, say)
 devdock <command>    # run headlessly
 ```
 
@@ -13,6 +14,7 @@ devdock <command>    # run headlessly
   - [status](#status)
   - [log](#log)
   - [branches](#branches)
+  - [worktree](#worktree)
   - [stash](#stash)
   - [commit](#commit)
   - [push](#push)
@@ -61,6 +63,26 @@ $ devdock branches
   main
   origin/main (remote)
 ```
+
+### worktree
+
+A branch checked out in its own directory, so two can be worked on at once —
+or a coding agent run on each. See [worktrees.md](worktrees.md).
+
+```
+devdock worktree                              # list; » marks this one
+devdock worktree add feat/search              # existing branch, or new from HEAD
+devdock worktree add feat/search ~/code/x     # at a chosen directory
+devdock worktree add feat/search --from main  # a new branch from main
+devdock worktree remove ~/code/app-feat-search [--force]
+devdock worktree prune                        # forget deleted directories
+devdock ~/code/app-feat-search                # open the app there
+```
+
+Without a path, the worktree goes next to the main one, named after the
+repository and the branch (`app` + `feat/search` → `app-feat-search`).
+`remove` is refused while the worktree has uncommitted changes unless
+`--force`; the branch is kept either way.
 
 ### stash
 

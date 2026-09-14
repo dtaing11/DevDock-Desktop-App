@@ -32,4 +32,5 @@ pub mod ollama;
 pub mod review;
 pub mod secure_store;
 pub mod stack;
+pub mod backlog;
 pub mod terminal;

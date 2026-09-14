@@ -78,10 +78,85 @@ closest task — tickets, then the coding agent, the reviewer, pull request
 text, commit messages — rather than failing because one more per-task
 selection was unset.
 
+## Working the backlog
+
+The other direction: instead of putting work into Jira, take it out. **Work
+the backlog…** in the ticket dialog (or the command palette, `Work the Jira
+backlog`) lists a project's unassigned, unresolved tickets and asks a model
+to judge each one with the repository open to it:
+
+- **in scope** — is the ticket about code in this repository at all, and
+  which part of it (a monorepo has several);
+- **autonomous** — could an agent finish it without a person deciding
+  anything: a bug with a reproduction, a small addition with a clear
+  definition of done, yes; a design or product decision, visual judgement,
+  a system the agent cannot reach, no;
+- a confidence, a reason a developer can check, and a first-look plan.
+
+Tickets it could take say **I can fix this**. Tick any — those or others —
+and **Fix N selected** starts one agent per ticket, up to the number set
+under **At once**, the rest queued. Each agent:
+
+1. checks out a fresh branch (`fix/abc-7-crash-on-empty-repo`) from the
+   default branch in its **own worktree**, so agents cannot see each other's
+   half-written files;
+2. runs the coding agent on the ticket, live, with the repository's own
+   checks from `.git-manage-ci.toml`;
+3. runs those checks again itself once the agent says it is done — a draft
+   pull request is never opened on the agent's word that the tests passed;
+4. commits, pushes, and opens a **draft pull request** that quotes the
+   ticket, the agent's summary, and which checks passed;
+5. **removes the worktree**. The branch and the pull request are what
+   remain.
+
+A ticket the agent changed nothing for, or whose change fails a check,
+leaves nothing behind: the worktree is removed and the branch deleted. The
+card in the dialog says why.
+
+The dialog is the place to watch: every agent has a card with its state
+(queued, running, done, failed), how long it has run, what it is doing right
+now, and — on **Log** — everything it did: every file read, every edit, every
+check, the commit, the push. A finished card lists the files it changed with
+line counts, its summary, and the pull request.
+
+**Nothing is written to Jira.** The ticket stays unassigned and open; the
+developer reviews the pull request and moves the ticket, or does not.
+
+### The model
+
+The backlog fixer has its own model setting — **Settings → Models per task
+→ The backlog fixer**, or the picker in the dialog. It is the coding agent
+running unattended, so point it at the strongest model you have. It falls
+back to the coding agent's model until one is chosen.
+
+### The sandbox
+
+**Run checks in a sandbox** runs every check the agent triggers, and the
+verification afterwards, inside a Docker image with the worktree mounted at
+`/work`. A build or a test suite then cannot touch the machine. The image
+is guessed from the repository (`rust:1-bookworm` for a Cargo project,
+`node:22-bookworm`, `python:3.12-bookworm`, …) and can be changed; the
+setting is on by default when Docker is available and the repository has a
+recognisable toolchain. Checks that already name an `image` in
+`.git-manage-ci.toml` keep theirs.
+
+It does not accumulate: each container runs with `--rm`, so it and its
+anonymous volumes are deleted when it exits; build output goes into the
+mounted worktree, which is deleted with it; and every check has a timeout
+(`timeout_secs` per job, 30 minutes otherwise) after which the container is
+removed by name and the check fails. What stays is the image itself, which
+is the cache — `docker image prune` reclaims it. A fresh container has no
+dependency cache, so a Rust or Node build downloads its dependencies every
+run; that is the price of a clean room.
+
 ## What it does not do
 
-- **Read or search Jira.** This exists to put work in. A client that also
-  tried to be a Jira browser would be a worse version of the one you have.
+- **Browse Jira.** The backlog view reads one project's unassigned tickets
+  and nothing else; a client that also tried to be a Jira browser would be
+  a worse version of the one you have.
+- **Write to Jira from the backlog.** No assignment, no comment, no
+  transition. The pull request is the artefact; what happens to the ticket
+  is the developer's call.
 - **Epics, sprints, or estimates.** A ticket is created with a project, a
   type, a summary, a description and labels; the rest is a workflow question
   each team answers differently.

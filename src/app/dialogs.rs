@@ -36,6 +36,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         Dialog::Stack => stack_dialog(app, ctx, &mut open),
         Dialog::Tickets => tickets_dialog(app, ctx, &mut open),
         Dialog::Worktrees => super::worktrees::dialog(app, ctx, &mut open),
+        Dialog::Backlog => super::backlog::dialog(app, ctx, &mut open),
     }
     // Dismissing a gate with the X is a deferred decision, not an approval:
     // the modal closes but the held action stays available behind the
@@ -606,6 +607,16 @@ fn tickets_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
             {
                 app.tickets_from_review();
             }
+            if ui
+                .button("Work the backlog…")
+                .on_hover_text(
+                    "The tickets nobody has picked up, judged for what an agent could \
+                     fix unattended",
+                )
+                .clicked()
+            {
+                app.open_backlog();
+            }
         });
 
         if app.tickets.drafting && !app.tickets.log.is_empty() {
@@ -647,7 +658,7 @@ fn tickets_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
 }
 
 /// The connection form, shown until a token has been accepted by Jira.
-fn jira_connect(app: &mut App, ui: &mut egui::Ui) {
+pub(super) fn jira_connect(app: &mut App, ui: &mut egui::Ui) {
     ui.label(
         RichText::new(
             "Connect a Jira Cloud site to file tickets into. The token is stored \
@@ -2946,6 +2957,30 @@ fn settings(app: &mut App, ctx: &egui::Context, open: &mut bool) {
 
         ui.separator();
         claude_settings(app, ui);
+
+        ui.separator();
+        ui.label(theme::overline("MODELS PER TASK"));
+        ui.label(
+            RichText::new(
+                "Each task picks its own model. The backlog fixer runs the coding \
+                 agent unattended, so it is the one worth the strongest model.",
+            )
+            .size(theme::SMALL)
+            .color(theme::fg_dim()),
+        );
+        egui::Grid::new("models-per-task").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+            for target in crate::app::worker::AiTarget::ALL {
+                let mut label = target.label().to_string();
+                if let Some(first) = label.get_mut(0..1) {
+                    first.make_ascii_uppercase();
+                }
+                ui.label(label);
+                ui.push_id(target.label(), |ui| {
+                    super::views::ai_model_picker(app, ui, target);
+                });
+                ui.end_row();
+            }
+        });
 
         ui.separator();
         shortcut_settings(app, ui, ctx);

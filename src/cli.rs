@@ -26,6 +26,7 @@ pub fn run(args: &[String]) -> Option<ExitCode> {
         "resolve" => cmd_resolve(rest),
         "tickets" => cmd_tickets(rest),
         "worktree" | "worktrees" => cmd_worktree(rest),
+        "backlog" => cmd_backlog(rest),
         "help" | "--help" | "-h" => {
             print_help();
             ExitCode::SUCCESS
@@ -72,6 +73,8 @@ fn print_help() {
         ("worktree", "every checkout of this repository"),
         ("worktree add BRANCH [PATH] [--from BASE]", "check a branch out in its own directory"),
         ("worktree remove PATH [--force]", "delete a worktree's directory, keeping the branch"),
+        ("backlog [--project KEY]", "unassigned Jira tickets, judged for what an agent could fix"),
+        ("backlog fix KEY... [--parallel N] [--sandbox IMAGE]", "fix tickets in parallel worktrees; each ends as a draft PR"),
         ("resolve", "interactive conflict resolver with AI proposals"),
         ("resolve --agent", "AI reads the repo and proposes every fix, you confirm each"),
         ("ci", "run all local CI jobs (.git-manage-ci.toml)"),
@@ -570,6 +573,212 @@ fn cmd_branches() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The github.com repository `origin` points at.
+fn origin_slug(repo: &Repo) -> Option<crate::github::RepoSlug> {
+    let remotes = repo.remotes().ok()?;
+    remotes
+        .iter()
+        .find(|r| r.name == "origin")
+        .or_else(|| remotes.first())
+        .and_then(|r| crate::github::parse_remote(&r.url))
+}
+
+/// `devdock backlog [--project KEY] [--max N]` lists a project's unassigned
+/// tickets with the model's judgement of each; `devdock backlog fix KEY...
+/// [--parallel N] [--sandbox IMAGE]` fixes the named ones, each in its own
+/// worktree, and opens a draft pull request for each that passes the
+/// repository's checks. Nothing is written to Jira.
+fn cmd_backlog(rest: &[String]) -> ExitCode {
+    let repo = match repo() {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+    let fail = |e: String| {
+        eprintln!("devdock: {e}");
+        ExitCode::FAILURE
+    };
+    let Some(jira) = crate::jira::Client::from_store() else {
+        return fail("not connected to Jira (connect from the GUI's ticket dialog)".into());
+    };
+    let project = match flag_value(rest, "--project") {
+        Ok(v) => v.map(str::to_string),
+        Err(e) => return fail(e),
+    };
+    let config = crate::app::Config::load();
+    let explicit = config
+        .backlog_ai
+        .as_ref()
+        .or(config.coding_ai.as_ref())
+        .or(config.review_ai.as_ref())
+        .or(config.tickets_ai.as_ref());
+    let (provider_name, model) = ai_selection(&config, explicit);
+    let url = config.ollama_url.clone().unwrap_or_else(|| crate::ollama::DEFAULT_URL.into());
+    let sel = crate::app::AiSelection { provider: provider_name, model };
+
+    if rest.first().map(String::as_str) == Some("fix") {
+        let keys: Vec<String> = rest[1..]
+            .iter()
+            .filter(|a| !a.starts_with("--"))
+            .filter(|a| {
+                // Not the value of a flag.
+                let i = rest.iter().position(|x| x == *a).unwrap_or(0);
+                i == 0 || !matches!(rest[i - 1].as_str(), "--parallel" | "--sandbox" | "--project")
+            })
+            .map(|k| k.trim().to_uppercase())
+            .collect();
+        if keys.is_empty() {
+            return fail("backlog fix needs at least one ticket key".into());
+        }
+        let parallel: usize = match flag_value(rest, "--parallel") {
+            Ok(v) => v.and_then(|n| n.parse().ok()).unwrap_or(3),
+            Err(e) => return fail(e),
+        };
+        let sandbox = match flag_value(rest, "--sandbox") {
+            Ok(v) => v.map(str::to_string),
+            Err(e) => return fail(e),
+        };
+        let jql = format!("key in ({})", keys.join(","));
+        let issues = match jira.search(&jql, keys.len()) {
+            Ok(i) => i,
+            Err(e) => return fail(e.to_string()),
+        };
+        let missing: Vec<&String> = keys.iter().filter(|k| !issues.iter().any(|i| &i.key == *k)).collect();
+        if !missing.is_empty() {
+            return fail(format!("no such ticket(s): {}", missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
+        }
+        let Some(client) = crate::github::Client::from_store() else {
+            return fail("not signed in to GitHub (sign in from the GUI)".into());
+        };
+        let Some(slug) = origin_slug(&repo) else {
+            return fail("no github.com remote found".into());
+        };
+        let base = default_base(&repo);
+        let token = crate::github::TokenStore::load();
+        let _ = repo.fetch(token.as_deref());
+        let instructions = crate::local_ci::discover_configs(repo.path())
+            .ok()
+            .and_then(|c| c.config.review.resolve_files(repo.path()).ok())
+            .and_then(|c| c.instructions);
+
+        println!(
+            "{}",
+            style::dim(&format!("fixing {} ticket(s), {} at a time…", issues.len(), parallel.max(1)))
+        );
+        let outcomes = std::sync::Mutex::new(Vec::new());
+        let slots = std::sync::Mutex::new(issues.iter().collect::<std::collections::VecDeque<_>>());
+        std::thread::scope(|scope| {
+            for _ in 0..parallel.max(1).min(issues.len()) {
+                scope.spawn(|| loop {
+                    let Some(issue) = slots.lock().unwrap().pop_front() else { break };
+                    let result = (|| -> Result<crate::backlog::Fixed, String> {
+                        let provider = crate::app::agent_provider(&sel, &url)?;
+                        let publish = |title: &str, body: &str, head: &str| {
+                            client.create_draft_pull_request(&slug, title, body, head, &base).map_err(|e| e.to_string())
+                        };
+                        let job = crate::backlog::Job {
+                            issue,
+                            triage: None,
+                            base: &base,
+                            auth: token.as_deref(),
+                            instructions: instructions.as_deref(),
+                            sandbox_image: sandbox.as_deref(),
+                        };
+                        crate::backlog::fix(&repo, provider.as_ref(), &job, &publish, &mut |line| {
+                            println!("{} {}", style::dim(&format!("[{}]", issue.key)), line);
+                        })
+                    })();
+                    outcomes.lock().unwrap().push((issue.key.clone(), result));
+                });
+            }
+        });
+        let outcomes = outcomes.into_inner().unwrap();
+        let mut failed = 0;
+        println!();
+        for (key, result) in &outcomes {
+            match result {
+                Ok(fixed) => println!(
+                    "{} {key}: draft PR #{} {}",
+                    style::green("✓"),
+                    fixed.pr.number,
+                    style::teal(&fixed.pr.html_url)
+                ),
+                Err(e) => {
+                    failed += 1;
+                    println!("{} {key}: {}", style::red("✗"), e.lines().next().unwrap_or(""));
+                }
+            }
+        }
+        return if failed == outcomes.len() { ExitCode::FAILURE } else { ExitCode::SUCCESS };
+    }
+
+    // List and judge. Without --project, the account's only project is the
+    // obvious one; several means asking.
+    let project = match project {
+        Some(p) => p,
+        None => match jira.projects() {
+            Ok(projects) if projects.len() == 1 => projects[0].key.clone(),
+            Ok(projects) => {
+                return fail(format!(
+                    "say which project: devdock backlog --project KEY (one of: {})",
+                    projects.iter().map(|p| p.key.as_str()).collect::<Vec<_>>().join(", ")
+                ));
+            }
+            Err(e) => return fail(e.to_string()),
+        },
+    };
+    let max: usize = match flag_value(rest, "--max") {
+        Ok(v) => v.and_then(|n| n.parse().ok()).unwrap_or(40),
+        Err(e) => return fail(e),
+    };
+    let issues = match jira.unassigned_backlog(&project, max) {
+        Ok(i) => i,
+        Err(e) => return fail(e.to_string()),
+    };
+    if issues.is_empty() {
+        println!("no unassigned, open tickets in {project}");
+        return ExitCode::SUCCESS;
+    }
+    println!("{}", style::dim(&format!("judging {} ticket(s)…", issues.len())));
+    let triage = (|| -> Result<Vec<crate::agent::backlog::Triage>, String> {
+        let provider = crate::app::agent_provider(&sel, &url)?;
+        let tracked = repo.tracked_files().map_err(|e| e.to_string())?;
+        let mut workspace =
+            crate::agent::Workspace::new(repo.path(), tracked, crate::agent::Access::ReadOnly)?;
+        crate::agent::backlog::run(provider.as_ref(), &mut workspace, &issues, &mut |event| {
+            println!("  {}", style::dim(&event.line()));
+        })
+    })();
+    let triage = match triage {
+        Ok(t) => t,
+        Err(e) => return fail(e),
+    };
+    println!();
+    for issue in &issues {
+        let t = triage.iter().find(|t| t.key == issue.key);
+        let verdict = match t {
+            Some(t) if !t.in_scope => style::dim("not this repository"),
+            Some(t) if t.suggested() => style::green(&format!("can fix ({}%)", t.confidence)),
+            Some(t) => style::ember(&format!("needs a person ({}%)", t.confidence)),
+            None => style::dim("not judged"),
+        };
+        println!("{} {}  {verdict}", style::bold(&issue.key), issue.summary);
+        if let Some(t) = t {
+            if !t.reason.is_empty() {
+                println!("    {}", style::dim(&t.reason));
+            }
+            if !t.area.is_empty() {
+                println!("    {}", style::dim(&format!("in {}/", t.area)));
+            }
+        }
+    }
+    let can: Vec<&str> = triage.iter().filter(|t| t.suggested()).map(|t| t.key.as_str()).collect();
+    if !can.is_empty() {
+        println!();
+        println!("{}", style::dim(&format!("to fix them: devdock backlog fix {}", can.join(" "))));
+    }
+    ExitCode::SUCCESS
 }
 
 /// `devdock worktree [list | add BRANCH [PATH] [--from BASE] | remove PATH [--force]]`

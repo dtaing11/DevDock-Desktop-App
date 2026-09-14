@@ -90,6 +90,11 @@ secrets = ["API_TOKEN"]             # optional: secret names (values elsewhere)
 | `env`      | no       | Plain environment variables (committed, never put secrets here)    |
 | `secrets`  | no       | Names of secrets to inject; values come from the secrets file      |
 
+Every job has a timeout — `timeout_secs = 600` on the job, 30 minutes when
+unset — after which it is killed (the whole process group on the host; the
+container by name under Docker) and reported as failed. A hung test must not
+hang a push, or an unattended agent, forever.
+
 ## Per-directory configs (monorepos)
 
 A `.git-manage-ci.toml` in **any** directory contributes jobs, not just the one

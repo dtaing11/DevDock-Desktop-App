@@ -58,7 +58,9 @@
 //! and [`DockerRunner`] (`runner = "docker"`, or implied by `image = ...`).
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 /// Everything a runner needs to execute one job.
 pub struct ExecRequest<'a> {
@@ -74,6 +76,9 @@ pub struct ExecRequest<'a> {
     pub env: &'a [(String, String)],
     /// Runner-specific target: Docker image, SSH host, etc.
     pub target: Option<&'a str>,
+    /// How long the job may run before it is killed and reported as failed.
+    /// `None` waits forever, which is right for nothing an agent starts.
+    pub timeout: Option<Duration>,
 }
 
 impl ExecRequest<'_> {
@@ -141,14 +146,35 @@ impl Runner for HostRunner {
         for (key, value) in request.env {
             cmd.env(key, value);
         }
-        let out = cmd.output().map_err(|e| format!("failed to start: {e}"))?;
-        Ok(ExecOutput {
-            success: out.status.success(),
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        })
+        // Its own process group, so a timeout can take the whole tree —
+        // the test runner and the server it started — not just the shell.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            cmd.process_group(0);
+        }
+        let child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("failed to start: {e}"))?;
+        let pid = child.id();
+        wait_with_timeout(child, request.timeout, || kill_group(pid))
     }
 }
+
+/// Ends every process in `pid`'s group; on other platforms the child alone
+/// is killed by the caller.
+#[cfg(unix)]
+fn kill_group(pid: u32) {
+    // SAFETY: a plain signal to a process group this process created.
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_group(_pid: u32) {}
 
 // ---------------------------------------------------------------------------
 // Built-in: Docker
@@ -212,11 +238,16 @@ impl Runner for DockerRunner {
         let image = request
             .target
             .ok_or("docker runner needs an image (set `image = \"...\"` on the job)")?;
+        // Named, so a timeout can remove the container by name: killing the
+        // `docker run` client leaves the container running otherwise.
+        let name = container_name();
         let mut cmd = Command::new("docker");
         // The whole repository is mounted, with the workdir pointing at the
         // job's own directory, so a nested job can still reach sibling
-        // packages by relative path.
-        cmd.args(["run", "--rm", "-v"])
+        // packages by relative path. `--rm` removes the container and its
+        // anonymous volumes when it exits, so nothing accumulates between
+        // runs; `--init` gives it a real PID 1, so signals reach the build.
+        cmd.args(["run", "--rm", "--init", "--name", &name, "-v"])
             .arg(format!("{}:/work", request.repo_root.display()))
             .arg("-w")
             .arg(request.container_workdir("/work"));
@@ -227,13 +258,79 @@ impl Runner for DockerRunner {
             cmd.env(key, value);
         }
         cmd.arg(image).args(["sh", "-c", request.script]);
-        let out = cmd.output().map_err(|e| format!("failed to start docker: {e}"))?;
-        Ok(ExecOutput {
-            success: out.status.success(),
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        let child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("failed to start docker: {e}"))?;
+        wait_with_timeout(child, request.timeout, || {
+            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
         })
     }
+}
+
+/// A container name unique to this process and call.
+fn container_name() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    format!("devdock-ci-{}-{}", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Waits for a child, collecting its output, and kills it — through
+/// `teardown`, then directly — once `timeout` has passed. A timed-out job
+/// is a failed job whose stderr says so.
+fn wait_with_timeout(
+    mut child: Child,
+    timeout: Option<Duration>,
+    teardown: impl FnOnce(),
+) -> Result<ExecOutput, String> {
+    // Both pipes drained on their own threads: a child that fills one
+    // while this thread waits on the other deadlocks.
+    let stdout = child.stdout.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
+            buf
+        })
+    });
+    let stderr = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
+            buf
+        })
+    });
+    let deadline = timeout.map(|t| Instant::now() + t);
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(e) => return Err(format!("waiting for the job: {e}")),
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            timed_out = true;
+            teardown();
+            let _ = child.kill();
+            break child.wait().map_err(|e| format!("waiting for the job: {e}"))?;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let collect = |handle: Option<std::thread::JoinHandle<Vec<u8>>>| {
+        handle
+            .and_then(|h| h.join().ok())
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default()
+    };
+    let mut err = collect(stderr);
+    if timed_out {
+        let secs = timeout.map(|t| t.as_secs()).unwrap_or(0);
+        err.push_str(&format!("\n[killed: the job ran longer than {secs}s]"));
+    }
+    Ok(ExecOutput {
+        success: status.success() && !timed_out,
+        stdout: collect(stdout),
+        stderr: err,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -358,10 +455,32 @@ mod tests {
                 script: "echo from-host-runner",
                 env: &[],
                 target: None,
+                timeout: None,
             })
             .unwrap();
         assert!(out.success);
         assert!(out.stdout.contains("from-host-runner"));
+    }
+
+    #[test]
+    fn a_job_that_runs_too_long_is_killed_and_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let started = Instant::now();
+        let out = HostRunner
+            .exec(&ExecRequest {
+                work_subdir: "",
+                repo_root: tmp.path(),
+                script: "echo started; sleep 30; echo never",
+                env: &[],
+                target: None,
+                timeout: Some(Duration::from_millis(400)),
+            })
+            .unwrap();
+        assert!(!out.success);
+        assert!(out.stdout.contains("started"), "{}", out.stdout);
+        assert!(!out.stdout.contains("never"));
+        assert!(out.stderr.contains("ran longer than"), "{}", out.stderr);
+        assert!(started.elapsed() < Duration::from_secs(10), "the sleep was not killed");
     }
 
     #[test]
@@ -375,6 +494,7 @@ mod tests {
                 script: "anything",
                 env: &[],
                 target: Some("some-target"),
+                timeout: None,
             })
             .unwrap();
         assert!(out.stdout.contains("anything"));

@@ -38,6 +38,10 @@ impl eframe::App for Shot {
             match std::env::var("DIALOG").as_deref() {
                 Ok("stack") => self.app.open_stack(),
                 Ok("worktrees") => self.app.open_worktrees(),
+                Ok("backlog") => {
+                    seed_backlog(&mut self.app);
+                    self.app.dialog = git_manage::app::Dialog::Backlog;
+                }
                 Ok("pr") => self.app.dialog = git_manage::app::Dialog::PullRequests,
                 Ok("tickets") => {
                     seed_tickets(&mut self.app);
@@ -127,6 +131,97 @@ impl eframe::App for Shot {
 
 /// Puts the ticket writer into a state worth photographing: connected, with
 /// a list and the drafts a model wrote from it.
+/// A backlog mid-flight: judged tickets, one agent done, one running, one
+/// queued, one failed.
+fn seed_backlog(app: &mut App) {
+    use git_manage::agent::backlog::Triage;
+    use git_manage::app::backlog::{RunState, TicketRun};
+    use git_manage::jira::BacklogIssue;
+    app.tickets.account = Some("Dina Taing".into());
+    app.tickets.creds.site = "https://acme.atlassian.net".into();
+    app.tickets.projects = vec![git_manage::jira::Project { id: "1".into(), key: "DEV".into(), name: "DevDock".into() }];
+    app.backlog.project = "DEV".into();
+    app.backlog.sandbox = true;
+    app.backlog.sandbox_image = "rust:1-bookworm".into();
+    let issue = |key: &str, summary: &str, kind: &str, priority: &str| BacklogIssue {
+        key: key.into(),
+        summary: summary.into(),
+        issue_type: kind.into(),
+        priority: priority.into(),
+        url: format!("https://acme.atlassian.net/browse/{key}"),
+        ..Default::default()
+    };
+    app.backlog.issues = vec![
+        issue("DEV-41", "devdock status panics on a repository with no commits", "Bug", "High"),
+        issue("DEV-38", "Add --json to devdock branches", "Task", "Medium"),
+        issue("DEV-35", "Redesign the onboarding flow", "Story", "Medium"),
+        issue("DEV-29", "Mobile app: crash on rotate", "Bug", "High"),
+        issue("DEV-27", "Stash list shows the wrong date on Windows", "Bug", "Low"),
+    ];
+    let triage = |key: &str, in_scope: bool, area: &str, autonomous: bool, confidence: u8, reason: &str| Triage {
+        key: key.into(),
+        in_scope,
+        area: area.into(),
+        autonomous,
+        confidence,
+        reason: reason.into(),
+        plan: String::new(),
+    };
+    for t in [
+        triage("DEV-41", true, "src/cli", true, 85, "cmd_status unwraps repo.log() at cli.rs:412"),
+        triage("DEV-38", true, "src/cli", true, 70, "branches prints text; a --json flag mirrors status"),
+        triage("DEV-35", true, "src/app", false, 90, "a design decision; nothing here says what the flow should be"),
+        triage("DEV-29", false, "", false, 95, "there is no mobile app in this repository"),
+        triage("DEV-27", true, "src/git.rs", true, 55, "stash_list parses the date with a Unix-only format"),
+    ] {
+        app.backlog.triage.insert(t.key.clone(), t);
+    }
+    let run = |state: RunState, log: &[&str]| TicketRun {
+        state,
+        log: log.iter().map(|l| l.to_string()).collect(),
+        started: Some(std::time::Instant::now() - std::time::Duration::from_secs(94)),
+        took: None,
+    };
+    app.backlog.runs.insert(
+        "DEV-41".into(),
+        run(
+            RunState::Done(Box::new(git_manage::backlog::Fixed {
+                key: "DEV-41".into(),
+                branch: "fix/dev-41-devdock-status-panics-on-a-repository".into(),
+                pr: git_manage::github::PullRequest {
+                    number: 12,
+                    title: "DEV-41: devdock status panics on a repository with no commits".into(),
+                    html_url: "https://github.com/acme/devdock/pull/12".into(),
+                    state: "open".into(),
+                    head: "fix/dev-41".into(),
+                    head_sha: String::new(),
+                    base: "main".into(),
+                    user: "dina".into(),
+                },
+                summary: "- src/cli.rs: `cmd_status` handles an empty log instead of unwrapping it\n- tests/workflow.rs: a test for a repository with no commits\n\nVerified: tests passed".into(),
+                changes: vec![
+                    git_manage::backlog::ChangedFile { path: "src/cli.rs".into(), added: 6, removed: 2, new: false },
+                    git_manage::backlog::ChangedFile { path: "tests/workflow.rs".into(), added: 11, removed: 0, new: false },
+                ],
+                checks: vec![git_manage::backlog::CheckOutcome { name: "tests".into(), ok: true }],
+                turns: 14,
+            })),
+            &["branch fix/dev-41-devdock-status-panics-on-a-repository from main", "checks run in the rust:1-bookworm sandbox", "· read src/cli.rs", "· propose an edit to src/cli.rs", "· run check tests", "verifying: tests", "tests passed", "committed: DEV-41: devdock status panics on a repository with no commits", "pushed fix/dev-41-devdock-status-panics-on-a-repository", "draft pull request #12 opened", "worktree removed"],
+        ),
+    );
+    app.backlog.runs.insert(
+        "DEV-38".into(),
+        run(RunState::Running, &["branch fix/dev-38-add-json-to-devdock-branches from main", "· plan: 1/4 done", "· read src/cli.rs", "· search \"fn cmd_branches\"", "· propose an edit to src/cli.rs", "· diagnostics for src/cli.rs"]),
+    );
+    app.backlog.runs.insert("DEV-27".into(), run(RunState::Queued, &[]));
+    app.backlog.runs.insert(
+        "DEV-35".into(),
+        run(RunState::Failed("the agent changed nothing: This needs a design decision about what the onboarding flow should contain.".into()), &["branch fix/dev-35-redesign-the-onboarding-flow from main", "· read README.md", "worktree removed", "branch fix/dev-35-redesign-the-onboarding-flow deleted: nothing was kept", "failed: the agent changed nothing"]),
+    );
+    app.backlog.queue.push_back("DEV-27".into());
+    app.backlog.selected.insert("DEV-38".into());
+}
+
 fn seed_tickets(app: &mut App) {
     use git_manage::agent::tickets::Draft;
     use git_manage::app::DraftedTicket;

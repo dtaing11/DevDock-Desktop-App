@@ -431,9 +431,35 @@ impl Client {
         head: &str,
         base: &str,
     ) -> Result<PullRequest> {
+        self.open_pull_request(slug, title, body, head, base, false)
+    }
+
+    /// Opens a draft pull request: visible, reviewable, and not mergeable
+    /// until someone marks it ready. What an agent's work should arrive as.
+    pub fn create_draft_pull_request(
+        &self,
+        slug: &RepoSlug,
+        title: &str,
+        body: &str,
+        head: &str,
+        base: &str,
+    ) -> Result<PullRequest> {
+        self.open_pull_request(slug, title, body, head, base, true)
+    }
+
+    fn open_pull_request(
+        &self,
+        slug: &RepoSlug,
+        title: &str,
+        body: &str,
+        head: &str,
+        base: &str,
+        draft: bool,
+    ) -> Result<PullRequest> {
         let path = format!("/repos/{}/{}/pulls", slug.owner, slug.repo);
-        let payload =
-            serde_json::json!({ "title": title, "body": body, "head": head, "base": base });
+        let payload = serde_json::json!({
+            "title": title, "body": body, "head": head, "base": base, "draft": draft,
+        });
         let value = self.post(&path, payload)?;
         parse_pull_request(&value).ok_or_else(|| GhError("Unexpected PR response".into()))
     }

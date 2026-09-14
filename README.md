@@ -41,6 +41,14 @@ macOS/Windows since egui is cross-platform).
   open to it, so each one names the file and function rather than restating
   the bullet. Every item is checked to have ended up in a ticket. Editable
   before anything is created. See [docs/jira-tickets.md](docs/jira-tickets.md).
+- **Working the Jira backlog**: the unassigned tickets of a project, judged
+  by a model with the repository open — this repository or not, which part,
+  doable unattended or needs a person. Pick any; one agent per ticket runs
+  in its own worktree, in parallel, with the checks in a Docker sandbox, and
+  ends as a draft pull request. Every agent is tracked live: state, elapsed,
+  every tool call, the files it changed. Worktrees are removed when done;
+  Jira is never written to.
+  See [docs/jira-tickets.md](docs/jira-tickets.md#working-the-backlog).
 - **Stacked pull requests**: split one large change into a chain of branches,
   each PR targeting the branch below it so every reviewer sees one focused
   diff. Built on GitHub's own `gh stack` extension, so the stack is the one
@@ -172,7 +180,8 @@ Tokens are stored at `~/.config/git-manage/auth.json` (mode 600).
 src/
   git.rs       Typed wrapper around the git CLI (library, reusable)
   github.rs    Device-flow auth + PR REST API (library, reusable)
-  jira.rs      Jira Cloud: credentials, projects, issue creation, ADF
+  jira.rs      Jira Cloud: credentials, projects, issue creation, backlog, ADF
+  backlog.rs   Fixing a ticket unattended: worktree, agent, checks, draft PR
   ollama.rs    Commit-message generation client (library, reusable)
   review.rs    The AI review gate: config, prompts, findings, thresholds
   stack.rs     Stacked pull requests: a typed wrapper over `gh stack`
@@ -187,6 +196,7 @@ src/
     views.rs   Toolbar, sidebar, diff panel
     dialogs.rs Repo picker, GitHub, PRs, stacks, conflicts, settings
     worktrees.rs Worktrees: a branch per directory, a window per worktree
+    backlog.rs Jira backlog: judged tickets, and the agents fixing them
     editor.rs  Code editor: buffers, highlighting, LSP interactions
     agent_tab.rs The coding agent's task panel and change review
     worker.rs  Background thread runner

@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::agent::backlog::Triage;
-use crate::agent::{coding, Access, Event, Provider, Workspace, WriteMode};
+use crate::agent::coding::{self, Engine};
+use crate::agent::{Access, Event, Workspace, WriteMode};
 use crate::git::Repo;
 use crate::github::PullRequest;
 use crate::jira::BacklogIssue;
@@ -162,7 +163,7 @@ pub fn pull_request_text(fixed_summary: &str, issue: &BacklogIssue, checks: &[Ch
 /// 5. the pull request — the branch stays.
 pub fn fix(
     repo: &Repo,
-    provider: &dyn Provider,
+    engine: &Engine,
     job: &Job<'_>,
     publish: &dyn Fn(&str, &str, &str) -> Result<PullRequest, String>,
     on_event: &mut dyn FnMut(String),
@@ -185,7 +186,7 @@ pub fn fix(
     }
     on_event(format!("worktree {}", dir.display()));
 
-    let result = work(provider, job, &branch, &dir, publish, on_event);
+    let result = work(engine, job, &branch, &dir, publish, on_event);
 
     // The worktree is temporary whatever happened.
     {
@@ -204,7 +205,7 @@ pub fn fix(
 }
 
 fn work(
-    provider: &dyn Provider,
+    engine: &Engine,
     job: &Job<'_>,
     branch: &str,
     dir: &Path,
@@ -236,8 +237,9 @@ fn work(
         .with_write_mode(WriteMode::Live)
         .with_checks(jobs.clone());
     let task = task_text(job.issue, job.triage);
-    let run = coding::run(
-        provider,
+    on_event(format!("engine: {}", engine.label()));
+    let run = coding::run_with(
+        engine,
         &mut workspace,
         coding::Request {
             branch: Some(branch),
@@ -352,7 +354,7 @@ pub fn suggest_sandbox_image(tracked: &[String]) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{Message, Reply, ToolCall, ToolSpec};
+    use crate::agent::{Message, Provider, Reply, ToolCall, ToolSpec};
     use std::cell::RefCell;
     use std::fs;
     use std::process::Command;
@@ -453,11 +455,11 @@ mod tests {
     #[test]
     fn a_fix_ends_as_a_pushed_branch_and_a_pull_request_with_no_worktree_left() {
         let (_tmp, repo) = setup("grep -q 'return sum(xs)$' lib.py");
-        let provider = fixing_provider();
+        let engine = Engine::Harness(Box::new(fixing_provider()));
         let mut log = Vec::new();
         let fixed = fix(
             &repo,
-            &provider,
+            &engine,
             &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None },
             &fake_pr,
             &mut |line| log.push(line),
@@ -488,12 +490,12 @@ mod tests {
     fn a_change_that_fails_the_check_leaves_nothing_behind() {
         // The check wants something the fix does not do.
         let (_tmp, repo) = setup("grep -q 'return 0$' lib.py");
-        let provider = fixing_provider();
+        let engine = Engine::Harness(Box::new(fixing_provider()));
         // The agent's own run_check will fail too; it answers anyway.
         let mut log = Vec::new();
         let err = fix(
             &repo,
-            &provider,
+            &engine,
             &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None },
             &fake_pr,
             &mut |line| log.push(line),
@@ -507,10 +509,10 @@ mod tests {
     #[test]
     fn an_agent_that_changes_nothing_is_a_failure_not_a_pull_request() {
         let (_tmp, repo) = setup("true");
-        let provider = Scripted(RefCell::new(vec![Reply { text: "This needs a product decision.".into(), ..Default::default() }]));
+        let engine = Engine::Harness(Box::new(Scripted(RefCell::new(vec![Reply { text: "This needs a product decision.".into(), ..Default::default() }]))));
         let err = fix(
             &repo,
-            &provider,
+            &engine,
             &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None },
             &fake_pr,
             &mut |_| {},
@@ -526,8 +528,8 @@ mod tests {
     fn a_leftover_branch_is_refused_rather_than_reused() {
         let (_tmp, repo) = setup("true");
         repo.create_branch("fix/abc-7-total-is-off-by-one", false).unwrap();
-        let provider = Scripted(RefCell::new(vec![]));
-        let err = fix(&repo, &provider, &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None }, &fake_pr, &mut |_| {}).unwrap_err();
+        let engine = Engine::Harness(Box::new(Scripted(RefCell::new(vec![]))));
+        let err = fix(&repo, &engine, &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None }, &fake_pr, &mut |_| {}).unwrap_err();
         assert!(err.contains("already exists"), "{err}");
     }
 
@@ -538,10 +540,10 @@ mod tests {
             return;
         }
         let (_tmp, repo) = setup("true");
-        let provider = fixing_provider();
+        let engine = Engine::Harness(Box::new(fixing_provider()));
         let err = fix(
             &repo,
-            &provider,
+            &engine,
             &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: Some("alpine:3") },
             &fake_pr,
             &mut |_| {},

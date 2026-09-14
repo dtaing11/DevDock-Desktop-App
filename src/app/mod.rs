@@ -3978,6 +3978,14 @@ impl App {
             self.toast("No AI model selected. Pick one next to the task box.", true);
             return;
         };
+        if sel.provider == crate::agent::claude_code::PROVIDER && !self.coding.iterate {
+            self.toast(
+                "Claude Code writes to your working tree as it works: turn on \"Let it \
+                 iterate\", or pick a model for the built-in agent.",
+                true,
+            );
+            return;
+        }
 
         let live = self.coding.iterate;
         let history = self.coding.turns();
@@ -4006,7 +4014,7 @@ impl App {
         let run_task = task.clone();
         self.worker.spawn(move || {
             let result = (|| -> Result<AgentReport, String> {
-                let provider = agent_provider(&sel, &url)?;
+                let engine = agent_engine(&sel, &url)?;
                 let tracked = strerr(repo.tracked_files())?;
                 // What is going on in the repository, so the model does not
                 // have to discover it a tool call at a time.
@@ -4044,8 +4052,8 @@ impl App {
                 })
                 .with_checks(checks);
 
-                let run = crate::agent::coding::run(
-                    provider.as_ref(),
+                let run = crate::agent::coding::run_with(
+                    &engine,
                     &mut workspace,
                     crate::agent::coding::Request {
                         task: &run_task,
@@ -4773,12 +4781,37 @@ fn repaint_handle(ctx: &egui::Context) -> std::sync::Arc<dyn Fn() + Send + Sync>
     std::sync::Arc::new(move || ctx.request_repaint())
 }
 
+/// The engine for a coding run: Claude Code when that is what was picked,
+/// the built-in harness over a model otherwise.
+pub fn agent_engine(
+    sel: &AiSelection,
+    ollama_url: &str,
+) -> Result<crate::agent::coding::Engine, String> {
+    if sel.provider == crate::agent::claude_code::PROVIDER {
+        if !crate::agent::claude_code::available() {
+            return Err("Claude Code is not installed (the `claude` command was not found).".into());
+        }
+        return Ok(crate::agent::coding::Engine::ClaudeCode(crate::agent::claude_code::Config {
+            model: sel.model.clone(),
+            ..Default::default()
+        }));
+    }
+    agent_provider(sel, ollama_url).map(crate::agent::coding::Engine::Harness)
+}
+
 /// Builds the harness provider for a task's provider/model selection, the
 /// same pair the model picker writes.
 pub fn agent_provider(
     sel: &AiSelection,
     ollama_url: &str,
 ) -> Result<Box<dyn crate::agent::Provider>, String> {
+    if sel.provider == crate::agent::claude_code::PROVIDER {
+        return Err(
+            "Claude Code can only drive the coding agent and the backlog fixer. Pick a \
+             Claude or Ollama model for this task."
+                .into(),
+        );
+    }
     if sel.provider == "claude" {
         return claude::Client::from_store(sel.model.clone())
             .map(|c| Box::new(c) as Box<dyn crate::agent::Provider>)

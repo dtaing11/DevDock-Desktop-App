@@ -35,6 +35,7 @@
 
 pub mod assist;
 pub mod backlog;
+pub mod claude_code;
 pub mod coding;
 pub mod conflict;
 pub mod pr;

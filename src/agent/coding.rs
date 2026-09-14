@@ -18,7 +18,34 @@
 //! it works, so it can compile and test them, and the confirmation at the
 //! end is keep-or-revert.
 
-use super::{Event, Limits, Provider, Run, Workspace, WriteMode};
+use super::{claude_code, Event, Limits, Provider, Run, Workspace, WriteMode};
+
+/// What does the work: this crate's tool-use loop over a model, or Claude
+/// Code run headless in the tree. Same task, same events, same review.
+pub enum Engine {
+    Harness(Box<dyn Provider>),
+    ClaudeCode(claude_code::Config),
+}
+
+impl Engine {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Harness(p) => p.label(),
+            Self::ClaudeCode(c) => {
+                if c.model.is_empty() || c.model == "default" {
+                    "Claude Code".into()
+                } else {
+                    format!("Claude Code ({})", c.model)
+                }
+            }
+        }
+    }
+
+    /// Claude Code writes to disk as it goes; it cannot propose.
+    pub fn needs_live_tree(&self) -> bool {
+        matches!(self, Self::ClaudeCode(_))
+    }
+}
 
 /// One earlier exchange in the same session.
 #[derive(Debug, Clone)]
@@ -163,7 +190,58 @@ impl<'a> Request<'a> {
     }
 }
 
-/// Runs the coding agent.
+/// Runs the coding agent on whichever engine was chosen.
+pub fn run_with(
+    engine: &Engine,
+    workspace: &mut Workspace,
+    request: Request<'_>,
+    on_event: &mut dyn FnMut(Event),
+) -> Result<Run, String> {
+    match engine {
+        Engine::Harness(provider) => run(provider.as_ref(), workspace, request, on_event),
+        Engine::ClaudeCode(config) => run_claude_code(config, workspace, request, on_event),
+    }
+}
+
+/// The same request, handed to Claude Code. The tree has to be live —
+/// Claude Code edits files, it does not propose — and its commands are
+/// limited to the repository's own checks.
+fn run_claude_code(
+    config: &claude_code::Config,
+    workspace: &Workspace,
+    request: Request<'_>,
+    on_event: &mut dyn FnMut(Event),
+) -> Result<Run, String> {
+    if request.task.trim().is_empty() {
+        return Err("Describe what you want done first.".into());
+    }
+    if workspace.write_mode() != WriteMode::Live {
+        return Err(
+            "Claude Code writes to the working tree as it works, so it needs \"Let it \
+             iterate\" on. Turn it on, or pick a Claude or Ollama model for the built-in \
+             agent."
+                .into(),
+        );
+    }
+    let mut extra = String::from(
+        "You are working unattended for a developer who reviews every change afterwards. \
+         Keep changes to what the task asks; no unrelated refactors, no leftover debugging \
+         output. Run the repository's checks before you finish, and do not weaken a test \
+         to make it pass. If the task cannot be done without a decision from a person, say \
+         so and change nothing. Finish with a short summary: what you changed and why, one \
+         bullet per file, then a line starting \"Verified:\" naming what you ran.",
+    );
+    if let Some(instructions) = request.instructions.map(str::trim).filter(|s| !s.is_empty()) {
+        extra.push_str("\n\nProject-specific instructions:\n");
+        extra.push_str(instructions);
+    }
+    let overview = workspace.overview();
+    let prompt = task_prompt(request.task, request.history, request.branch, Some(&overview), request.context);
+    let config = claude_code::Config { max_turns: request.limits.max_turns, ..config.clone() };
+    claude_code::run(&config, workspace.root(), &prompt, Some(&extra), &workspace.check_commands(), on_event)
+}
+
+/// Runs the coding agent on the built-in harness.
 pub fn run(
     provider: &dyn Provider,
     workspace: &mut Workspace,
@@ -248,6 +326,17 @@ mod tests {
         assert!(prompt.contains("add a flag"));
         assert!(prompt.contains("added --verbose"));
         assert!(prompt.ends_with("now document it"));
+    }
+
+    #[test]
+    fn claude_code_needs_a_live_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ws = workspace(&tmp);
+        let engine = Engine::ClaudeCode(claude_code::Config::default());
+        assert!(engine.needs_live_tree());
+        assert_eq!(engine.label(), "Claude Code");
+        let err = run_with(&engine, &mut ws, Request::new("do it"), &mut |_| {}).unwrap_err();
+        assert!(err.contains("Let it iterate"), "{err}");
     }
 
     #[test]

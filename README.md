@@ -30,7 +30,9 @@ macOS/Windows since egui is cross-platform).
   gopls, clangd, and more) and can be configured per repository.
 - **Coding agent**: give it a task and it reads, edits, asks the language
   server what it broke, and runs your own checks until it works. Every change
-  it makes is reviewed as a diff and applied — or reverted — by you.
+  it makes is reviewed as a diff and applied — or reverted — by you. Or hand
+  the same task to **Claude Code**, run headless in the tree with its commands
+  limited to your checks, and review its work the same way.
 - **GitHub**: sign in via browser device flow or a personal access token,
   authenticated push/pull/fetch, list and **create pull requests**
   (with an AI-generated title and description written from **every commit on

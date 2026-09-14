@@ -207,6 +207,17 @@ impl Workspace {
         self.access == Access::ReadWrite
     }
 
+    /// The repository root this workspace is over.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Every command the repository's checks run, for an engine that needs
+    /// to be told which commands are allowed.
+    pub fn check_commands(&self) -> Vec<String> {
+        self.checks.iter().flat_map(|c| c.commands.iter().cloned()).collect()
+    }
+
     /// Checks this run can run, by name, and how many times it has.
     pub fn checks_available(&self) -> Vec<String> {
         if self.write_mode == WriteMode::Live {

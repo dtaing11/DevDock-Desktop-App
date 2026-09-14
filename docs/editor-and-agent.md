@@ -250,6 +250,30 @@ Long runs do not drown in their own reads: once the transcript passes a
 budget, old tool output is replaced with a one-line note saying what it was.
 The model can call the tool again if it still needs it.
 
+### The engine: the built-in harness, or Claude Code
+
+The picker next to the task box lists Ollama models and Claude models — and,
+when the `claude` command is installed on this machine, **Claude Code**.
+Picking it hands the task to Anthropic's own agent, run headless in the
+working tree (`claude -p … --output-format stream-json`), instead of this
+app's tool-use loop. Everything else is the same: its tool calls stream into
+the same log, its `TodoWrite` list is the plan the sidebar shows, and its
+changes end in the same Keep/Revert review.
+
+Two things follow from what Claude Code is:
+
+- It **writes to disk as it works**, so it needs **Let it iterate** on. The
+  changes are found afterwards by comparing the tree with a snapshot taken
+  before the run, which is what makes Revert exact.
+- Its `Bash` tool is **allowed only the repository's own checks** — the
+  commands `.git-manage-ci.toml` declares, as `Bash(cargo test:*)` and the
+  like — and its web tools are off. That is the rule the built-in harness
+  lives by, kept.
+
+The model under it is a Claude Code alias (`default`, `sonnet`, `opus`,
+`haiku`). The same choice is available for the backlog fixer; judging the
+backlog is a read-only harness run, so that still uses a model.
+
 ### Two modes: propose, or let it iterate
 
 **Propose** (default). The agent reads and edits, but its edits are held in

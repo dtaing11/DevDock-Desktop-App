@@ -673,7 +673,7 @@ fn cmd_backlog(rest: &[String]) -> ExitCode {
                 scope.spawn(|| loop {
                     let Some(issue) = slots.lock().unwrap().pop_front() else { break };
                     let result = (|| -> Result<crate::backlog::Fixed, String> {
-                        let provider = crate::app::agent_provider(&sel, &url)?;
+                        let engine = crate::app::agent_engine(&sel, &url)?;
                         let publish = |title: &str, body: &str, head: &str| {
                             client.create_draft_pull_request(&slug, title, body, head, &base).map_err(|e| e.to_string())
                         };
@@ -685,7 +685,7 @@ fn cmd_backlog(rest: &[String]) -> ExitCode {
                             instructions: instructions.as_deref(),
                             sandbox_image: sandbox.as_deref(),
                         };
-                        crate::backlog::fix(&repo, provider.as_ref(), &job, &publish, &mut |line| {
+                        crate::backlog::fix(&repo, &engine, &job, &publish, &mut |line| {
                             println!("{} {}", style::dim(&format!("[{}]", issue.key)), line);
                         })
                     })();
@@ -741,8 +741,22 @@ fn cmd_backlog(rest: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     println!("{}", style::dim(&format!("judging {} ticket(s)…", issues.len())));
+    // Judging is a harness run; Claude Code cannot do it, so the nearest
+    // task with a model does.
+    let judge = if sel.provider == crate::agent::claude_code::PROVIDER {
+        let fallback = config
+            .tickets_ai
+            .as_ref()
+            .or(config.review_ai.as_ref())
+            .or(config.commit_ai.as_ref())
+            .filter(|s| s.provider != crate::agent::claude_code::PROVIDER);
+        let (provider, model) = ai_selection(&config, fallback);
+        crate::app::AiSelection { provider, model }
+    } else {
+        sel.clone()
+    };
     let triage = (|| -> Result<Vec<crate::agent::backlog::Triage>, String> {
-        let provider = crate::app::agent_provider(&sel, &url)?;
+        let provider = crate::app::agent_provider(&judge, &url)?;
         let tracked = repo.tracked_files().map_err(|e| e.to_string())?;
         let mut workspace =
             crate::agent::Workspace::new(repo.path(), tracked, crate::agent::Access::ReadOnly)?;

@@ -693,7 +693,8 @@ fn agent_card(app: &mut App, ui: &mut egui::Ui, key: &str) {
                         ui.label(RichText::new(&fixed.branch).monospace().size(theme::SMALL).color(theme::fg_dim()));
                         ui.label(
                             RichText::new(format!(
-                                "{} turn(s) · {} file(s) · checks: {}",
+                                "{} · {} turn(s) · {} file(s) · checks: {}",
+                                fixed.engine,
                                 fixed.turns,
                                 fixed.changes.len(),
                                 if fixed.checks.is_empty() {

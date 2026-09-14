@@ -192,6 +192,8 @@ pub struct AgentReport {
     pub turns: usize,
     /// Tokens the run cost, when the provider says.
     pub usage: crate::agent::Usage,
+    /// Which harness did it.
+    pub engine: String,
 }
 
 /// One proposed change plus the user's decision about it.
@@ -3812,6 +3814,7 @@ impl App {
                     truncated: run.truncated,
                     turns: run.turns,
                     usage: run.usage,
+                    engine: String::new(),
                 })
             })();
             Msg::AgentDone { kind: AgentKind::Coding, result }
@@ -4052,6 +4055,7 @@ impl App {
                 })
                 .with_checks(checks);
 
+                let engine_label = engine.label();
                 let run = crate::agent::coding::run_with(
                     &engine,
                     &mut workspace,
@@ -4080,6 +4084,7 @@ impl App {
                     truncated: run.truncated,
                     turns: run.turns,
                     usage: run.usage,
+                    engine: engine_label,
                 })
             })();
             Msg::AgentDone { kind: AgentKind::Coding, result }
@@ -4104,6 +4109,7 @@ impl App {
             Ok(report) => {
                 self.coding.truncated = report.truncated;
                 self.coding.turns = report.turns;
+                self.coding.engine = report.engine.clone();
                 self.coding.usage = (!report.usage.is_zero()).then_some(report.usage);
                 self.coding.summary = report.summary.clone();
                 self.coding.edits = report
@@ -4340,6 +4346,7 @@ impl App {
                     truncated: run.truncated,
                     turns: run.turns,
                     usage: run.usage,
+                    engine: String::new(),
                 })
             })();
             Msg::AgentDone { kind: AgentKind::Conflict, result }
@@ -5795,6 +5802,7 @@ mod tests {
             changes: vec![crate::backlog::ChangedFile { path: "a.rs".into(), added: 1, removed: 0, new: false }],
             checks: vec![],
             turns: 3,
+            engine: "scripted".into(),
         };
         app.handle(Msg::BacklogDone { key: "T-1".into(), result: Ok(fixed) });
         assert_eq!(app.backlog.done(), 1);

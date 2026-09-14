@@ -196,6 +196,9 @@ pub enum Event {
     Nudge(String),
     /// Old tool output was elided to keep the transcript within budget.
     Compacted { freed: usize },
+    /// Which harness is doing the work, announced first so a log can never
+    /// leave the question open.
+    Engine(String),
 }
 
 impl Event {
@@ -217,6 +220,7 @@ impl Event {
             Self::BudgetExhausted(why) => format!("! {why}"),
             Self::Nudge(why) => format!("! not finished yet: {}", first_line(why)),
             Self::Compacted { freed } => format!("· trimmed {freed} bytes of old tool output"),
+            Self::Engine(label) => format!("engine: {label}"),
         }
     }
 }

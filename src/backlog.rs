@@ -56,6 +56,8 @@ pub struct Fixed {
     pub changes: Vec<ChangedFile>,
     pub checks: Vec<CheckOutcome>,
     pub turns: usize,
+    /// Which harness did it, as the log announced.
+    pub engine: String,
 }
 
 /// Marks a ticket as taken while an agent works on it, and says how it
@@ -185,7 +187,12 @@ pub fn task_text(issue: &BacklogIssue, triage: Option<&Triage>) -> String {
 }
 
 /// The pull request's title and body.
-pub fn pull_request_text(fixed_summary: &str, issue: &BacklogIssue, checks: &[CheckOutcome]) -> (String, String) {
+pub fn pull_request_text(
+    fixed_summary: &str,
+    issue: &BacklogIssue,
+    checks: &[CheckOutcome],
+    engine: &str,
+) -> (String, String) {
     let title = format!("{}: {}", issue.key, issue.summary.trim());
     let mut body = format!("Resolves [{}]({}).\n\n", issue.key, issue.url);
     if !issue.description.trim().is_empty() {
@@ -209,10 +216,10 @@ pub fn pull_request_text(fixed_summary: &str, issue: &BacklogIssue, checks: &[Ch
             body.push_str(&format!("- {} `{}`\n", if c.ok { "✅" } else { "❌" }, c.name));
         }
     }
-    body.push_str(
-        "\n---\n*Drafted by DevDock's coding agent from the Jira backlog. Review before \
-         marking ready.*\n",
-    );
+    body.push_str(&format!(
+        "\n---\n*Drafted from the Jira backlog by DevDock, engine: {engine}. Review before \
+         marking ready.*\n"
+    ));
     (title, body)
 }
 
@@ -318,7 +325,6 @@ fn work(
         .with_write_mode(WriteMode::Live)
         .with_checks(jobs.clone());
     let task = task_text(job.issue, job.triage);
-    on_event(format!("engine: {}", engine.label()));
     let run = coding::run_with(
         engine,
         &mut workspace,
@@ -369,7 +375,7 @@ fn work(
     on_event(format!("pushed {branch}"));
 
     // 5. The pull request.
-    let (title, pr_body) = pull_request_text(&run.text, job.issue, &checks);
+    let (title, pr_body) = pull_request_text(&run.text, job.issue, &checks, &engine.label());
     let pr = publish(&title, &pr_body, branch)?;
     on_event(format!("draft pull request #{} opened", pr.number));
 
@@ -381,6 +387,7 @@ fn work(
         changes,
         checks,
         turns: run.turns,
+        engine: engine.label(),
     })
 }
 
@@ -553,6 +560,9 @@ mod tests {
         assert_eq!(fixed.changes[0].path, "lib.py");
         assert_eq!(fixed.checks, [CheckOutcome { name: "tests".into(), ok: true }]);
         assert!(fixed.pr.title.starts_with("ABC-7: total() is off by one"));
+        assert_eq!(fixed.engine, "scripted");
+        assert_eq!(log.first().map(String::as_str), Some("branch fix/abc-7-total-is-off-by-one from main"));
+        assert!(log.iter().any(|l| l == "engine: scripted"), "{log:?}");
 
         // The branch is on the remote, the main checkout is untouched, and
         // the worktree is gone.
@@ -693,13 +703,14 @@ mod tests {
 
     #[test]
     fn the_pull_request_text_quotes_the_ticket_and_the_checks() {
-        let (title, body) = pull_request_text("- fixed it", &issue(), &[CheckOutcome { name: "tests".into(), ok: true }]);
+        let (title, body) = pull_request_text("- fixed it", &issue(), &[CheckOutcome { name: "tests".into(), ok: true }], "Claude Code");
         assert_eq!(title, "ABC-7: total() is off by one");
         assert!(body.contains("Resolves [ABC-7](https://acme.atlassian.net/browse/ABC-7)"));
         assert!(body.contains("> It adds 1."));
         assert!(body.contains("- fixed it"));
         assert!(body.contains("✅ `tests`"));
-        let (_, none) = pull_request_text("x", &issue(), &[]);
+        assert!(body.contains("engine: Claude Code"), "{body}");
+        let (_, none) = pull_request_text("x", &issue(), &[], "scripted");
         assert!(none.contains("declares no checks"));
     }
 

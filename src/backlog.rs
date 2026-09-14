@@ -258,15 +258,6 @@ pub fn fix(
     }
 
     let result = work(engine, job, &branch, &dir, publish, on_event);
-    if let Some(claim) = job.claim {
-        let lines = match &result {
-            Ok(fixed) => claim.finish(&job.issue.key, Ok(&fixed.pr)),
-            Err(e) => claim.finish(&job.issue.key, Err(e)),
-        };
-        for line in lines {
-            on_event(line);
-        }
-    }
 
     // The worktree is temporary whatever happened.
     {
@@ -280,6 +271,16 @@ pub fn fix(
     if result.is_err() && !branch_has_commits(repo, &branch, job.base) {
         let _ = repo.delete_branch(&branch, true);
         on_event(format!("branch {branch} deleted: nothing was kept"));
+    }
+    // The ticket hears how it went last, once everything else is settled.
+    if let Some(claim) = job.claim {
+        let lines = match &result {
+            Ok(fixed) => claim.finish(&job.issue.key, Ok(&fixed.pr)),
+            Err(e) => claim.finish(&job.issue.key, Err(e)),
+        };
+        for line in lines {
+            on_event(line);
+        }
     }
     result
 }

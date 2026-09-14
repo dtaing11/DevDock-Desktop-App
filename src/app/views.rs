@@ -1642,11 +1642,15 @@ pub fn ai_model_picker(app: &mut App, ui: &mut egui::Ui, target: crate::app::wor
 
         if offers_claude_code {
             ui.separator();
-            ui.label(theme::overline("CLAUDE CODE (THIS MACHINE)"));
+            ui.label(theme::overline("CLAUDE CODE AGENT (THIS MACHINE)"));
             ui.label(
-                RichText::new("The claude command, run in the tree. Needs \"Let it iterate\".")
-                    .size(theme::SMALL)
-                    .color(theme::fg_dim()),
+                RichText::new(
+                    "Claude Code's own agent — its tools, its loop — via the claude \
+                     command, run in the tree. Not a model for the built-in agent. \
+                     Needs \"Let it iterate\".",
+                )
+                .size(theme::SMALL)
+                .color(theme::fg_dim()),
             );
             for alias in crate::agent::claude_code::MODELS {
                 let is_selected = current.as_ref().is_some_and(|s| {

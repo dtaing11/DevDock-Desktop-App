@@ -452,6 +452,20 @@ impl App {
     }
 }
 
+/// A label that wraps to the width it has instead of widening the dialog.
+fn wrapped(ui: &mut egui::Ui, text: RichText) {
+    ui.add(egui::Label::new(text).wrap());
+}
+
+/// The first `max` characters of a line, with an ellipsis when cut.
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_string()
+    } else {
+        text.chars().take(max).collect::<String>() + "…"
+    }
+}
+
 fn mmss(d: Duration) -> String {
     let secs = d.as_secs();
     format!("{}:{:02}", secs / 60, secs % 60)
@@ -460,7 +474,9 @@ fn mmss(d: Duration) -> String {
 /// The dialog.
 pub fn dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
     super::dialogs::modal(ctx, "Jira backlog", open, |ui| {
-        ui.set_min_width(760.0);
+        // Wide enough for a ticket row; every row below wraps rather than
+        // pushing the dialog past the modal's cap.
+        ui.set_min_width(620.0);
 
         if app.tickets.account.is_none() {
             super::dialogs::jira_connect(app, ui);
@@ -473,7 +489,7 @@ pub fn dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         ui.add_space(theme::UNIT);
 
         if let Some(error) = app.backlog.error.clone() {
-            ui.label(RichText::new(error).color(theme::danger()));
+            wrapped(ui, RichText::new(error).color(theme::danger()));
             ui.add_space(theme::UNIT);
         }
         if app.backlog.loading {
@@ -575,7 +591,7 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
             app.triage_backlog();
         }
     });
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label("Fixer model");
         super::views::ai_model_picker(app, ui, worker::AiTarget::Backlog);
         ui.add_space(theme::UNIT);
@@ -583,7 +599,7 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
         ui.add(egui::Slider::new(&mut app.backlog.parallel, 1..=6).show_value(true))
             .on_hover_text("How many agents run in parallel, each in its own worktree");
     });
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label("Rounds");
         ui.add(egui::Slider::new(&mut app.backlog.rounds, 1..=5).show_value(true)).on_hover_text(
             "How many attempts a ticket gets. A failed check, or a reviewer asking for \
@@ -601,7 +617,7 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
             super::views::ai_model_picker(app, ui, worker::AiTarget::Review);
         }
     });
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.checkbox(&mut app.backlog.claim, "Claim tickets I start").on_hover_text(
             "When an agent starts on a ticket: assign it to you, move it into the \
              active sprint, and mark it In Progress. When it finishes: a comment with \
@@ -609,7 +625,7 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
              written to.",
         );
     });
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.checkbox(&mut app.backlog.sandbox, "Run checks in a sandbox").on_hover_text(
             "Every build and test the agent triggers runs inside this Docker image with \
              the worktree mounted at /work, so it cannot touch the machine.",
@@ -654,7 +670,7 @@ fn agents(app: &mut App, ui: &mut egui::Ui) {
     ui.add_space(theme::UNIT);
 
     let keys: Vec<String> = app.backlog.runs.keys().cloned().collect();
-    ScrollArea::vertical().max_height(320.0).id_salt("backlog-agents").show(ui, |ui| {
+    ScrollArea::vertical().max_height(260.0).id_salt("backlog-agents").show(ui, |ui| {
         for key in keys {
             agent_card(app, ui, &key);
             ui.add_space(theme::UNIT);
@@ -687,13 +703,15 @@ fn agent_card(app: &mut App, ui: &mut egui::Ui, key: &str) {
         _ => None,
     };
 
+    let width = ui.available_width();
     egui::Frame::new()
         .fill(theme::panel2())
         .stroke(egui::Stroke::new(1.0_f32, theme::border()))
         .corner_radius(theme::RADIUS_MD as f32)
         .inner_margin(egui::Margin::symmetric(10, 8))
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.set_width(width - 20.0);
+            ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(format!("[{state_label}]")).color(color).monospace().small());
                 ui.label(RichText::new(key).monospace().strong());
                 ui.label(RichText::new(&summary).color(theme::fg()));
@@ -708,7 +726,7 @@ fn agent_card(app: &mut App, ui: &mut egui::Ui, key: &str) {
                 });
             });
             if !expanded && !last.is_empty() {
-                ui.label(RichText::new(last).monospace().size(theme::SMALL).color(theme::fg_dim()));
+                wrapped(ui, RichText::new(clip(&last, 240)).monospace().size(theme::SMALL).color(theme::fg_dim()));
             }
             if expanded {
                 ScrollArea::vertical().max_height(180.0).id_salt(("backlog-log", key)).stick_to_bottom(true).show(ui, |ui| {
@@ -718,14 +736,14 @@ fn agent_card(app: &mut App, ui: &mut egui::Ui, key: &str) {
                         } else {
                             theme::fg_dim()
                         };
-                        ui.label(RichText::new(line).monospace().size(theme::SMALL).color(color));
+                        wrapped(ui, RichText::new(clip(line, 400)).monospace().size(theme::SMALL).color(color));
                     }
                 });
             }
             match outcome {
                 Some(Ok(fixed)) => {
                     ui.add_space(4.0);
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         if ui.link(RichText::new(format!("Draft PR #{}", fixed.pr.number)).color(theme::teal())).clicked() {
                             let _ = open::that(&fixed.pr.html_url);
                         }
@@ -757,11 +775,11 @@ fn agent_card(app: &mut App, ui: &mut egui::Ui, key: &str) {
                         );
                     }
                     let summary_short: String = fixed.summary.lines().take(6).collect::<Vec<_>>().join("\n");
-                    ui.label(RichText::new(summary_short).size(theme::SMALL));
+                    wrapped(ui, RichText::new(summary_short).size(theme::SMALL));
                 }
                 Some(Err(e)) => {
                     ui.add_space(4.0);
-                    ui.label(RichText::new(e.lines().take(6).collect::<Vec<_>>().join("\n")).size(theme::SMALL).color(theme::danger()));
+                    wrapped(ui, RichText::new(e.lines().take(6).collect::<Vec<_>>().join("\n")).size(theme::SMALL).color(theme::danger()));
                 }
                 None => {}
             }
@@ -815,7 +833,7 @@ fn tickets(app: &mut App, ui: &mut egui::Ui) {
         .filter(|i| !app.backlog.only_suggested || app.backlog.triage.get(&i.key).is_some_and(Triage::suggested))
         .cloned()
         .collect();
-    ScrollArea::vertical().max_height(360.0).id_salt("backlog-tickets").show(ui, |ui| {
+    ScrollArea::vertical().max_height(300.0).id_salt("backlog-tickets").show(ui, |ui| {
         for issue in &issues {
             ticket_row(app, ui, issue);
             ui.add_space(theme::UNIT);
@@ -827,7 +845,7 @@ fn ticket_row(app: &mut App, ui: &mut egui::Ui, issue: &BacklogIssue) {
     let triage = app.backlog.triage.get(&issue.key).cloned();
     let taken = !app.backlog.selectable(&issue.key);
     let mut ticked = app.backlog.selected.contains(&issue.key);
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if ui.add_enabled(!taken, egui::Checkbox::without_text(&mut ticked)).changed() {
             if ticked {
                 app.backlog.selected.insert(issue.key.clone());
@@ -853,7 +871,7 @@ fn ticket_row(app: &mut App, ui: &mut egui::Ui, issue: &BacklogIssue) {
             ui.label(RichText::new("[agent]").size(theme::SMALL).color(theme::ember()));
         }
     });
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.add_space(22.0);
         match triage {
             Some(t) => {
@@ -871,7 +889,7 @@ fn ticket_row(app: &mut App, ui: &mut egui::Ui, issue: &BacklogIssue) {
                     ui.label(RichText::new(format!("in {}/", t.area)).monospace().size(theme::SMALL).color(theme::fg_dim()));
                 }
                 if !t.reason.is_empty() {
-                    ui.label(RichText::new(&t.reason).size(theme::SMALL).color(theme::fg_dim()));
+                    ui.label(RichText::new(clip(&t.reason, 200)).size(theme::SMALL).color(theme::fg_dim()));
                 }
             }
             None => {

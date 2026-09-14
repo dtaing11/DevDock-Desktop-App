@@ -1586,7 +1586,9 @@ pub fn ai_model_picker(app: &mut App, ui: &mut egui::Ui, target: crate::app::wor
     // so only the tasks that are a whole job can pick it.
     let offers_claude_code = matches!(
         target,
-        crate::app::worker::AiTarget::Coding | crate::app::worker::AiTarget::Backlog
+        crate::app::worker::AiTarget::Coding
+            | crate::app::worker::AiTarget::Backlog
+            | crate::app::worker::AiTarget::Review
     ) && crate::agent::claude_code::available();
 
     // A bounded width, so a long model name cannot decide how wide the panel

@@ -33,6 +33,67 @@ Answer with JSON only:
 {"tickets": [{"key": "ABC-7", "in_scope": true, "area": "src/cli", "autonomous": true,
               "confidence": 80, "reason": "…", "plan": "…"}]}"#;
 
+const REVIEW_SYSTEM_PROMPT: &str = r#"You are reviewing a change an unattended coding agent made for a Jira ticket, before it becomes a pull request. You have read-only access to the repository with the change applied; the diff is in the message. Read whatever you need to judge it.
+
+Decide:
+- Does the change do what the ticket asks — all of it, and only that?
+- Is it correct? Look for the bug the ticket describes and check the fix actually removes it; look for edge cases the change ignores; check callers and tests.
+- Does it fit the code around it, and leave no debugging output, TODOs, or unrelated edits?
+- Is it verified: does the repository's own test or check cover it, and if the ticket is a bug, is there a test that would have caught it?
+
+Be strict. "revise" when anything above is not so, with feedback the agent can act on: what is wrong, where, and what to do. "approve" only when you would merge it.
+
+Answer with JSON only:
+{"verdict": "approve" | "revise", "feedback": "…"}"#;
+
+/// A reviewer's answer about a change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verdict {
+    pub approve: bool,
+    pub feedback: String,
+}
+
+/// The reviewer's task: the ticket and the diff, capped.
+pub fn review_task(issue: &BacklogIssue, diff: &str) -> String {
+    const MAX_DIFF: usize = 60_000;
+    let mut diff = diff.to_string();
+    if diff.len() > MAX_DIFF {
+        let end = (0..=MAX_DIFF).rev().find(|i| diff.is_char_boundary(*i)).unwrap_or(0);
+        diff.truncate(end);
+        diff.push_str("\n[diff truncated; read the files for the rest]");
+    }
+    format!(
+        "The ticket:\n{}\n\nThe change, as a diff against the branch it started from:\n```diff\n{diff}\n```\n\nRead the repository as needed, then give your verdict.",
+        issue.prompt_text(MAX_DESCRIPTION)
+    )
+}
+
+/// Parses a reviewer's reply; a reply that is not a verdict is a revise
+/// with the reply as feedback, so a confused reviewer cannot approve by
+/// accident.
+pub fn parse_verdict(text: &str) -> Verdict {
+    let json = text.find('{').and_then(|start| text.rfind('}').map(|end| &text[start..=end]));
+    if let Some(value) = json.and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok()) {
+        let verdict = value.get("verdict").and_then(|v| v.as_str()).unwrap_or("").trim().to_lowercase();
+        let feedback = value.get("feedback").and_then(|f| f.as_str()).unwrap_or("").trim().to_string();
+        return Verdict { approve: verdict == "approve", feedback };
+    }
+    Verdict { approve: false, feedback: text.trim().to_string() }
+}
+
+/// Reviews a change with the built-in harness over a read-only workspace
+/// on the tree that has it applied.
+pub fn review(
+    provider: &dyn Provider,
+    workspace: &mut Workspace,
+    issue: &BacklogIssue,
+    diff: &str,
+    on_event: &mut dyn FnMut(Event),
+) -> Result<Verdict, String> {
+    let run = super::run(provider, workspace, REVIEW_SYSTEM_PROMPT, &review_task(issue, diff), limits(2), on_event)?;
+    Ok(parse_verdict(&run.text))
+}
+
 /// What the model concluded about one ticket.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Triage {
@@ -222,6 +283,20 @@ mod tests {
         assert_eq!(out.len(), 2);
 
         assert!(check(&[Triage { key: "Z-9".into(), in_scope: true, area: String::new(), autonomous: true, confidence: 1, reason: String::new(), plan: String::new() }], &["B-1"]).is_err());
+    }
+
+    #[test]
+    fn a_verdict_is_parsed_and_anything_else_is_a_revise() {
+        let v = parse_verdict(r#"Sure. {"verdict": "Approve", "feedback": "clean"}"#);
+        assert!(v.approve);
+        assert_eq!(v.feedback, "clean");
+        let v = parse_verdict(r#"{"verdict": "revise", "feedback": "missing a test"}"#);
+        assert!(!v.approve);
+        let v = parse_verdict("I could not decide.");
+        assert!(!v.approve, "no verdict is not an approval");
+        assert_eq!(v.feedback, "I could not decide.");
+        let task = review_task(&issue("B-1", "x"), &"+line\n".repeat(100_000));
+        assert!(task.contains("[diff truncated"));
     }
 
     #[test]

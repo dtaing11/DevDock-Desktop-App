@@ -3994,9 +3994,23 @@ impl App {
         let history = self.coding.turns();
         let branch = self.status.as_ref().map(|s| s.branch.clone());
         let instructions = self.coding_instructions();
-        // Only the checks this repository already declares, and only when
-        // there is something on disk for them to check.
-        let checks = if live { self.local_ci.jobs.clone() } else { Vec::new() };
+        // The checks this repository declares — or, when it declares none,
+        // the ones its toolchain implies — and only when there is something
+        // on disk for them to check.
+        let checks = if live {
+            if self.local_ci.jobs.is_empty() {
+                let inferred = crate::local_ci::inferred_jobs(repo.path());
+                if !inferred.is_empty() {
+                    let names: Vec<String> = inferred.iter().flat_map(|j| j.commands.clone()).collect();
+                    self.coding.log.push(format!("no checks declared; inferred: {}", names.join(", ")));
+                }
+                inferred
+            } else {
+                self.local_ci.jobs.clone()
+            }
+        } else {
+            Vec::new()
+        };
         let url = self.effective_ollama_url();
         let lsp = self.lsp.clone();
 
@@ -5803,8 +5817,10 @@ mod tests {
             checks: vec![],
             turns: 3,
             engine: "scripted".into(),
+            rounds: 1,
+            reviewed_by: None,
         };
-        app.handle(Msg::BacklogDone { key: "T-1".into(), result: Ok(fixed) });
+        app.handle(Msg::BacklogDone { key: "T-1".into(), result: Ok(Box::new(fixed)) });
         assert_eq!(app.backlog.done(), 1);
         assert_eq!(app.backlog.running(), 0);
         assert!(app.backlog.runs["T-1"].log.last().unwrap().starts_with("done:"));

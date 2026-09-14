@@ -58,6 +58,10 @@ pub struct Fixed {
     pub turns: usize,
     /// Which harness did it, as the log announced.
     pub engine: String,
+    /// Rounds it took: one means the first attempt passed and was approved.
+    pub rounds: usize,
+    /// Who reviewed it, when someone did.
+    pub reviewed_by: Option<String>,
 }
 
 /// Marks a ticket as taken while an agent works on it, and says how it
@@ -137,6 +141,12 @@ pub struct Job<'a> {
     pub sandbox_image: Option<&'a str>,
     /// Marks the ticket as taken in Jira, when the developer wants that.
     pub claim: Option<&'a dyn Claimer>,
+    /// How many times the agent may try: a failed check or a reviewer's
+    /// "revise" sends it back with the reason, up to this many rounds.
+    pub rounds: usize,
+    /// A second engine that reads the ticket and the diff before the pull
+    /// request and says approve or revise. `None` skips the review.
+    pub reviewer: Option<&'a Engine>,
 }
 
 /// The branch a ticket's fix lives on: `fix/abc-7-crash-on-empty-repo`.
@@ -192,6 +202,8 @@ pub fn pull_request_text(
     issue: &BacklogIssue,
     checks: &[CheckOutcome],
     engine: &str,
+    rounds: usize,
+    reviewed_by: Option<&str>,
 ) -> (String, String) {
     let title = format!("{}: {}", issue.key, issue.summary.trim());
     let mut body = format!("Resolves [{}]({}).\n\n", issue.key, issue.url);
@@ -215,6 +227,12 @@ pub fn pull_request_text(
         for c in checks {
             body.push_str(&format!("- {} `{}`\n", if c.ok { "✅" } else { "❌" }, c.name));
         }
+    }
+    match reviewed_by {
+        Some(who) => body.push_str(&format!(
+            "\nReviewed and approved by {who} after {rounds} round(s).\n"
+        )),
+        None => body.push_str(&format!("\nNot reviewed by a second agent; {rounds} round(s).\n")),
     }
     body.push_str(&format!(
         "\n---\n*Drafted from the Jira backlog by DevDock, engine: {engine}. Review before \
@@ -304,6 +322,16 @@ fn work(
     let mut jobs = crate::local_ci::discover_configs(wt.path())
         .map(|c| c.config.jobs)
         .unwrap_or_default();
+    if jobs.is_empty() {
+        // "No config" must not mean "nothing was tested".
+        jobs = crate::local_ci::inferred_jobs(wt.path());
+        if jobs.is_empty() {
+            on_event("no checks declared and none could be inferred; the change will be unverified".into());
+        } else {
+            let names: Vec<String> = jobs.iter().flat_map(|j| j.commands.clone()).collect();
+            on_event(format!("no checks declared; inferred: {}", names.join(", ")));
+        }
+    }
     if let Some(image) = job.sandbox_image.map(str::trim).filter(|i| !i.is_empty()) {
         if !crate::local_ci::docker_available() {
             return Err(format!(
@@ -319,63 +347,119 @@ fn work(
         on_event(format!("checks run in the {image} sandbox"));
     }
 
-    // 2. The agent.
     let tracked = wt.tracked_files().map_err(|e| e.to_string())?;
-    let mut workspace = Workspace::new(wt.path(), tracked, Access::ReadWrite)?
+    let mut workspace = Workspace::new(wt.path(), tracked.clone(), Access::ReadWrite)?
         .with_write_mode(WriteMode::Live)
         .with_checks(jobs.clone());
-    let task = task_text(job.issue, job.triage);
-    let run = coding::run_with(
-        engine,
-        &mut workspace,
-        coding::Request {
-            branch: Some(branch),
-            instructions: job.instructions,
-            context: Some("This is an unattended run on a fresh worktree of the repository."),
-            ..coding::Request::new(&task)
-        },
-        &mut |event: Event| on_event(event.line()),
-    )?;
-    if run.edits.is_empty() {
-        return Err(format!("the agent changed nothing: {}", first_line(&run.text)));
+    let base_task = task_text(job.issue, job.triage);
+    let rounds = job.rounds.max(1);
+    let mut feedback: Option<String> = None;
+    let mut turns = 0;
+    let mut summary;
+    let mut checks: Vec<CheckOutcome> = Vec::new();
+    let mut reviewed_by: Option<String> = None;
+    let mut round = 0;
+    loop {
+        round += 1;
+        on_event(format!("round {round} of {rounds}"));
+        let task = match &feedback {
+            None => base_task.clone(),
+            Some(why) => format!(
+                "{base_task}\n\nThis is round {round} of {rounds}. Your previous attempt is \
+                 in the tree and was not accepted:\n\n{why}\n\nFix that. Do not start over \
+                 unless the approach was wrong."
+            ),
+        };
+        let run = coding::run_with(
+            engine,
+            &mut workspace,
+            coding::Request {
+                branch: Some(branch),
+                instructions: job.instructions,
+                context: Some("This is an unattended run on a fresh worktree of the repository."),
+                ..coding::Request::new(&task)
+            },
+            &mut |event: Event| on_event(event.line()),
+        )?;
+        turns += run.turns;
+        summary = run.text;
+        if changed_files(&wt)?.is_empty() {
+            return Err(format!("the agent changed nothing: {}", first_line(&summary)));
+        }
+
+        // The checks, run here. The agent's word that they passed is not
+        // what a draft pull request should rest on.
+        checks.clear();
+        let mut failed: Option<String> = None;
+        for j in &jobs {
+            on_event(format!("verifying: {}", j.name));
+            let result = crate::local_ci::run_job(wt.path(), j);
+            on_event(format!("{} {}", j.name, if result.ok { "passed" } else { "FAILED" }));
+            checks.push(CheckOutcome { name: j.name.clone(), ok: result.ok });
+            if !result.ok {
+                let tail: String = result
+                    .output
+                    .lines()
+                    .rev()
+                    .take(40)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                failed = Some(format!("The check `{}` fails:\n{tail}", j.name));
+                break;
+            }
+        }
+        if let Some(why) = failed {
+            if round >= rounds {
+                return Err(format!("after {rounds} round(s) the change still fails a check.\n{why}"));
+            }
+            on_event("sending the failure back to the agent".into());
+            feedback = Some(why);
+            continue;
+        }
+
+        // A second opinion, before anyone else sees it.
+        if let Some(reviewer) = job.reviewer {
+            on_event(format!("review by {}", reviewer.label()));
+            let diff = wt.git(&["diff", job.base]).map_err(|e| e.to_string())?;
+            let verdict = review_with(reviewer, wt.path(), &tracked, job.issue, &diff, on_event)?;
+            if verdict.approve {
+                on_event(format!("approved: {}", first_line(&verdict.feedback)));
+                reviewed_by = Some(reviewer.label());
+            } else {
+                on_event(format!("revise: {}", first_line(&verdict.feedback)));
+                if round >= rounds {
+                    return Err(format!(
+                        "after {rounds} round(s) the reviewer still asked for changes:\n{}",
+                        verdict.feedback
+                    ));
+                }
+                feedback = Some(format!("A reviewer read your change and asked for changes:\n{}", verdict.feedback));
+                continue;
+            }
+        }
+        break;
     }
-    let changes: Vec<ChangedFile> = run
-        .edits
-        .iter()
-        .map(|e| {
-            let (added, removed) = e.line_delta();
-            ChangedFile { path: e.path.clone(), added, removed, new: e.is_new() }
-        })
-        .collect();
+
+    let changes = changed_files(&wt)?;
     for c in &changes {
         on_event(format!("changed {} +{} -{}", c.path, c.added, c.removed));
     }
 
-    // 3. The checks, run here. The agent's word that they passed is not
-    // what a draft pull request should rest on.
-    let mut checks = Vec::new();
-    for j in &jobs {
-        on_event(format!("verifying: {}", j.name));
-        let result = crate::local_ci::run_job(wt.path(), j);
-        on_event(format!("{} {}", j.name, if result.ok { "passed" } else { "FAILED" }));
-        checks.push(CheckOutcome { name: j.name.clone(), ok: result.ok });
-        if !result.ok {
-            let tail: String = result.output.lines().rev().take(15).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
-            return Err(format!("the change fails the repository's check `{}`:\n{tail}", j.name));
-        }
-    }
-
-    // 4. Commit and push.
+    // Commit and push.
     wt.stage_all().map_err(|e| e.to_string())?;
     let subject = format!("{}: {}", job.issue.key, truncate(job.issue.summary.trim(), 60));
-    let body = format!("{}\n\n{}", run.text.trim(), job.issue.url);
+    let body = format!("{}\n\n{}", summary.trim(), job.issue.url);
     wt.commit(&subject, &body, false).map_err(|e| e.to_string())?;
     on_event(format!("committed: {subject}"));
     wt.push_branch(branch, false, job.auth).map_err(|e| format!("push failed: {e}"))?;
     on_event(format!("pushed {branch}"));
 
-    // 5. The pull request.
-    let (title, pr_body) = pull_request_text(&run.text, job.issue, &checks, &engine.label());
+    // The pull request.
+    let (title, pr_body) =
+        pull_request_text(&summary, job.issue, &checks, &engine.label(), round, reviewed_by.as_deref());
     let pr = publish(&title, &pr_body, branch)?;
     on_event(format!("draft pull request #{} opened", pr.number));
 
@@ -383,12 +467,70 @@ fn work(
         key: job.issue.key.clone(),
         branch: branch.to_string(),
         pr,
-        summary: run.text,
+        summary,
         changes,
         checks,
-        turns: run.turns,
+        turns,
         engine: engine.label(),
+        rounds: round,
+        reviewed_by,
     })
+}
+
+/// Reviews the change with whichever engine: the harness over a read-only
+/// workspace on the changed tree, or Claude Code with reading tools only.
+fn review_with(
+    reviewer: &Engine,
+    root: &Path,
+    tracked: &[String],
+    issue: &BacklogIssue,
+    diff: &str,
+    on_event: &mut dyn FnMut(String),
+) -> Result<crate::agent::backlog::Verdict, String> {
+    match reviewer {
+        Engine::Harness(provider) => {
+            let mut workspace = Workspace::new(root, tracked.to_vec(), Access::ReadOnly)?;
+            crate::agent::backlog::review(provider.as_ref(), &mut workspace, issue, diff, &mut |e| on_event(e.line()))
+        }
+        Engine::ClaudeCode(config) => {
+            let task = crate::agent::backlog::review_task(issue, diff);
+            let run = crate::agent::claude_code::run_readonly(
+                config,
+                root,
+                &task,
+                Some(
+                    "You are reviewing a change an unattended coding agent made, before it \
+                     becomes a pull request. Be strict: revise unless you would merge it. \
+                     Answer with JSON only: {\"verdict\": \"approve\" | \"revise\", \
+                     \"feedback\": \"…\"}",
+                ),
+                &mut |e| on_event(e.line()),
+            )?;
+            Ok(crate::agent::backlog::parse_verdict(&run.text))
+        }
+    }
+}
+
+/// What the worktree has changed against its commit, per git, so the
+/// report is of the tree and not of what one engine remembers doing.
+fn changed_files(wt: &Repo) -> Result<Vec<ChangedFile>, String> {
+    wt.stage_all().map_err(|e| e.to_string())?;
+    let numstat = wt.git(&["diff", "--cached", "--numstat"]).map_err(|e| e.to_string())?;
+    let head_files = wt.git(&["ls-tree", "-r", "--name-only", "HEAD"]).unwrap_or_default();
+    let mut changes = Vec::new();
+    for line in numstat.lines() {
+        let mut parts = line.split('\t');
+        let added = parts.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+        let removed = parts.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+        let Some(path) = parts.next() else { continue };
+        changes.push(ChangedFile {
+            path: path.to_string(),
+            added,
+            removed,
+            new: !head_files.lines().any(|f| f == path),
+        });
+    }
+    Ok(changes)
 }
 
 fn branch_has_commits(repo: &Repo, branch: &str, base: &str) -> bool {
@@ -420,7 +562,9 @@ pub fn worktree_path(repo: &Repo, issue: &BacklogIssue) -> PathBuf {
 /// obvious toolchain, in which case the user names one.
 pub fn suggest_sandbox_image(tracked: &[String]) -> Option<&'static str> {
     let has = |name: &str| tracked.iter().any(|t| t == name || t.ends_with(&format!("/{name}")));
-    if has("Cargo.toml") {
+    if has("pubspec.yaml") {
+        Some("ghcr.io/cirruslabs/flutter:stable")
+    } else if has("Cargo.toml") {
         Some("rust:1-bookworm")
     } else if has("package.json") {
         Some("node:22-bookworm")
@@ -548,7 +692,7 @@ mod tests {
         let fixed = fix(
             &repo,
             &engine,
-            &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None, claim: None },
+            &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 1, reviewer: None },
             &fake_pr,
             &mut |line| log.push(line),
         )
@@ -587,12 +731,12 @@ mod tests {
         let err = fix(
             &repo,
             &engine,
-            &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None, claim: None },
+            &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 1, reviewer: None },
             &fake_pr,
             &mut |line| log.push(line),
         )
         .unwrap_err();
-        assert!(err.contains("fails the repository's check"), "{err}");
+        assert!(err.contains("still fails a check"), "{err}");
         assert!(!repo.branches().unwrap().local.iter().any(|b| b.name.starts_with("fix/")), "the branch was kept");
         assert_eq!(repo.worktrees().unwrap().len(), 1);
     }
@@ -604,7 +748,7 @@ mod tests {
         let err = fix(
             &repo,
             &engine,
-            &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None, claim: None },
+            &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 1, reviewer: None },
             &fake_pr,
             &mut |_| {},
         )
@@ -612,6 +756,83 @@ mod tests {
         assert!(err.contains("changed nothing"), "{err}");
         assert!(err.contains("product decision"), "{err}");
         assert_eq!(repo.worktrees().unwrap().len(), 1);
+        assert!(!repo.branches().unwrap().local.iter().any(|b| b.name.starts_with("fix/")));
+    }
+
+    #[test]
+    fn a_failing_check_is_sent_back_and_the_second_round_can_pass() {
+        // The check wants `return 0`; the first attempt gives `sum(xs)`, the
+        // second, told why, gives `return 0`.
+        let (_tmp, repo) = setup("grep -q 'return 0$' lib.py");
+        let engine = Engine::Harness(Box::new(Scripted(RefCell::new(vec![
+            Reply { text: String::new(), calls: vec![ToolCall { id: "1".into(), name: "edit_file".into(), input: serde_json::json!({"path": "lib.py", "old_text": "sum(xs) + 1", "new_text": "sum(xs)"}) }], ..Default::default() },
+            Reply { text: String::new(), calls: vec![ToolCall { id: "c".into(), name: "run_check".into(), input: serde_json::json!({"name": "tests"}) }], ..Default::default() },
+            Reply { text: "first try".into(), ..Default::default() },
+            Reply { text: String::new(), calls: vec![ToolCall { id: "2".into(), name: "edit_file".into(), input: serde_json::json!({"path": "lib.py", "old_text": "return sum(xs)", "new_text": "return 0"}) }], ..Default::default() },
+            Reply { text: String::new(), calls: vec![ToolCall { id: "c".into(), name: "run_check".into(), input: serde_json::json!({"name": "tests"}) }], ..Default::default() },
+            Reply { text: "second try".into(), ..Default::default() },
+        ]))));
+        let mut log = Vec::new();
+        let fixed = fix(
+            &repo,
+            &engine,
+            &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 3, reviewer: None },
+            &fake_pr,
+            &mut |line| log.push(line),
+        )
+        .unwrap_or_else(|e| panic!("{e}\n{log:#?}"));
+        assert_eq!(fixed.rounds, 2);
+        assert_eq!(fixed.summary, "second try");
+        assert!(log.iter().any(|l| l == "sending the failure back to the agent"), "{log:?}");
+        assert!(log.iter().any(|l| l == "round 2 of 3"));
+        assert_eq!(fixed.checks, [CheckOutcome { name: "tests".into(), ok: true }]);
+    }
+
+    #[test]
+    fn a_reviewer_can_send_it_back_and_then_approve() {
+        let (_tmp, repo) = setup("true");
+        let fixer = Engine::Harness(Box::new(Scripted(RefCell::new(vec![
+            Reply { text: String::new(), calls: vec![ToolCall { id: "1".into(), name: "edit_file".into(), input: serde_json::json!({"path": "lib.py", "old_text": "sum(xs) + 1", "new_text": "sum(xs)"}) }], ..Default::default() },
+            Reply { text: String::new(), calls: vec![ToolCall { id: "c".into(), name: "run_check".into(), input: serde_json::json!({"name": "tests"}) }], ..Default::default() },
+            Reply { text: "fixed".into(), ..Default::default() },
+            Reply { text: String::new(), calls: vec![ToolCall { id: "2".into(), name: "write_file".into(), input: serde_json::json!({"path": "test_lib.py", "content": "from lib import total\n\ndef test_total():\n    assert total([1, 2]) == 3\n"}) }], ..Default::default() },
+            Reply { text: String::new(), calls: vec![ToolCall { id: "c".into(), name: "run_check".into(), input: serde_json::json!({"name": "tests"}) }], ..Default::default() },
+            Reply { text: "fixed, with a test".into(), ..Default::default() },
+        ]))));
+        let reviewer = Engine::Harness(Box::new(Scripted(RefCell::new(vec![
+            Reply { text: r#"{"verdict": "revise", "feedback": "No test covers the off-by-one; add one."}"#.into(), ..Default::default() },
+            Reply { text: r#"{"verdict": "approve", "feedback": "Fix and test both present."}"#.into(), ..Default::default() },
+        ]))));
+        let mut log = Vec::new();
+        let fixed = fix(
+            &repo,
+            &fixer,
+            &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 3, reviewer: Some(&reviewer) },
+            &fake_pr,
+            &mut |line| log.push(line),
+        )
+        .unwrap_or_else(|e| panic!("{e}\n{log:#?}"));
+        assert_eq!(fixed.rounds, 2);
+        assert_eq!(fixed.reviewed_by.as_deref(), Some("scripted"));
+        assert!(log.iter().any(|l| l.starts_with("revise: No test covers")), "{log:?}");
+        assert!(log.iter().any(|l| l.starts_with("approved: Fix and test")), "{log:?}");
+        let paths: Vec<&str> = fixed.changes.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, ["lib.py", "test_lib.py"], "both rounds' changes are in the report");
+        assert!(fixed.changes[1].new);
+
+        // A reviewer that never approves within the rounds is a failure, and
+        // the branch it would have pushed is not there.
+        let (_tmp, repo) = setup("true");
+        let fixer = Engine::Harness(Box::new(Scripted(RefCell::new(vec![
+            Reply { text: String::new(), calls: vec![ToolCall { id: "1".into(), name: "edit_file".into(), input: serde_json::json!({"path": "lib.py", "old_text": "sum(xs) + 1", "new_text": "sum(xs)"}) }], ..Default::default() },
+            Reply { text: String::new(), calls: vec![ToolCall { id: "c".into(), name: "run_check".into(), input: serde_json::json!({"name": "tests"}) }], ..Default::default() },
+            Reply { text: "fixed".into(), ..Default::default() },
+        ]))));
+        let reviewer = Engine::Harness(Box::new(Scripted(RefCell::new(vec![
+            Reply { text: r#"{"verdict": "revise", "feedback": "wrong"}"#.into(), ..Default::default() },
+        ]))));
+        let err = fix(&repo, &fixer, &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 1, reviewer: Some(&reviewer) }, &fake_pr, &mut |_| {}).unwrap_err();
+        assert!(err.contains("reviewer still asked for changes"), "{err}");
         assert!(!repo.branches().unwrap().local.iter().any(|b| b.name.starts_with("fix/")));
     }
 
@@ -641,7 +862,7 @@ mod tests {
         fix(
             &repo,
             &engine,
-            &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None, claim: Some(&claim) },
+            &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None, claim: Some(&claim), rounds: 1, reviewer: None },
             &fake_pr,
             &mut |line| log.push(line),
         )
@@ -656,7 +877,7 @@ mod tests {
         let (_tmp, repo) = setup("true");
         let claim = Recording(std::sync::Mutex::new(Vec::new()));
         let engine = Engine::Harness(Box::new(Scripted(RefCell::new(vec![Reply { text: "Needs a person.".into(), ..Default::default() }]))));
-        let _ = fix(&repo, &engine, &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None, claim: Some(&claim) }, &fake_pr, &mut |_| {});
+        let _ = fix(&repo, &engine, &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None, claim: Some(&claim), rounds: 1, reviewer: None }, &fake_pr, &mut |_| {});
         assert!(claim.0.lock().unwrap()[1].starts_with("finish ABC-7 err the agent changed nothing"));
     }
 
@@ -665,7 +886,7 @@ mod tests {
         let (_tmp, repo) = setup("true");
         repo.create_branch("fix/abc-7-total-is-off-by-one", false).unwrap();
         let engine = Engine::Harness(Box::new(Scripted(RefCell::new(vec![]))));
-        let err = fix(&repo, &engine, &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None, claim: None }, &fake_pr, &mut |_| {}).unwrap_err();
+        let err = fix(&repo, &engine, &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 1, reviewer: None }, &fake_pr, &mut |_| {}).unwrap_err();
         assert!(err.contains("already exists"), "{err}");
     }
 
@@ -680,7 +901,7 @@ mod tests {
         let err = fix(
             &repo,
             &engine,
-            &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: Some("alpine:3"), claim: None },
+            &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: Some("alpine:3"), claim: None, rounds: 1, reviewer: None },
             &fake_pr,
             &mut |_| {},
         )
@@ -696,6 +917,7 @@ mod tests {
         assert_eq!(suggest_sandbox_image(&files(&["app/package.json"])), Some("node:22-bookworm"));
         assert_eq!(suggest_sandbox_image(&files(&["pyproject.toml"])), Some("python:3.12-bookworm"));
         assert_eq!(suggest_sandbox_image(&files(&["README.md"])), None);
+        assert_eq!(suggest_sandbox_image(&files(&["pubspec.yaml", "lib/main.dart"])), Some("ghcr.io/cirruslabs/flutter:stable"));
         // Rust wins in a mixed repository: it is the one that most needs a
         // pinned toolchain.
         assert_eq!(suggest_sandbox_image(&files(&["package.json", "Cargo.toml"])), Some("rust:1-bookworm"));
@@ -703,14 +925,15 @@ mod tests {
 
     #[test]
     fn the_pull_request_text_quotes_the_ticket_and_the_checks() {
-        let (title, body) = pull_request_text("- fixed it", &issue(), &[CheckOutcome { name: "tests".into(), ok: true }], "Claude Code");
+        let (title, body) = pull_request_text("- fixed it", &issue(), &[CheckOutcome { name: "tests".into(), ok: true }], "Claude Code", 2, Some("Claude (opus)"));
         assert_eq!(title, "ABC-7: total() is off by one");
         assert!(body.contains("Resolves [ABC-7](https://acme.atlassian.net/browse/ABC-7)"));
         assert!(body.contains("> It adds 1."));
         assert!(body.contains("- fixed it"));
         assert!(body.contains("✅ `tests`"));
         assert!(body.contains("engine: Claude Code"), "{body}");
-        let (_, none) = pull_request_text("x", &issue(), &[], "scripted");
+        assert!(body.contains("approved by Claude (opus) after 2 round(s)"), "{body}");
+        let (_, none) = pull_request_text("x", &issue(), &[], "scripted", 1, None);
         assert!(none.contains("declares no checks"));
     }
 

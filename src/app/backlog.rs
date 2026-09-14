@@ -86,6 +86,12 @@ pub struct BacklogState {
     /// Assign a ticket to me, move it to the active sprint, and mark it In
     /// Progress when its agent starts; comment when it finishes.
     pub claim: bool,
+    /// How many attempts a ticket gets: a failed check or a reviewer's
+    /// "revise" goes back to the agent with the reason.
+    pub rounds: usize,
+    /// A second agent reads the ticket and the diff before the pull
+    /// request, with the code-review model.
+    pub review: bool,
     /// Whose log is unfolded.
     pub expanded: Option<String>,
 }
@@ -109,6 +115,8 @@ impl Default for BacklogState {
             sandbox: false,
             sandbox_image: String::new(),
             claim: true,
+            rounds: 3,
+            review: true,
             expanded: None,
         }
     }
@@ -309,6 +317,13 @@ impl App {
         let instructions = self.coding_instructions();
         let sandbox = self.backlog.sandbox.then(|| self.backlog.sandbox_image.trim().to_string()).filter(|s| !s.is_empty());
         let claim = self.backlog.claim;
+        let rounds = self.backlog.rounds.max(1);
+        // The reviewer is the code-review task's model — the one already
+        // chosen for judging changes — falling back to the fixer's own
+        // engine as a fresh session.
+        let review_sel = self.backlog.review.then(|| {
+            self.ai_selection(worker::AiTarget::Review).unwrap_or_else(|| sel.clone())
+        });
         let project = self.backlog.project.clone();
         let progress = self.worker.progress();
         if let Some(run) = self.backlog.runs.get_mut(&key) {
@@ -319,6 +334,10 @@ impl App {
         self.worker.spawn(move || {
             let result = (|| -> Result<crate::backlog::Fixed, String> {
                 let engine = super::agent_engine(&sel, &url)?;
+                let reviewer = match &review_sel {
+                    Some(r) => Some(super::agent_engine(r, &url)?),
+                    None => None,
+                };
                 let client = crate::github::Client::from_store().ok_or("Not signed in to GitHub")?;
                 let slug = super::views::origin_slug(&repo).ok_or("No github.com remote found")?;
                 let base = crate::stack::default_branch(&repo);
@@ -355,13 +374,15 @@ impl App {
                     instructions: instructions.as_deref(),
                     sandbox_image: sandbox.as_deref(),
                     claim: claimer.as_ref().map(|c| c as &dyn crate::backlog::Claimer),
+                    rounds,
+                    reviewer: reviewer.as_ref(),
                 };
                 let key = issue.key.clone();
                 crate::backlog::fix(&repo, &engine, &job, &publish, &mut |line| {
                     progress.send(Msg::BacklogProgress { key: key.clone(), line });
                 })
             })();
-            Msg::BacklogDone { key: done_key, result }
+            Msg::BacklogDone { key: done_key, result: result.map(Box::new) }
         });
     }
 
@@ -404,13 +425,13 @@ impl App {
         }
     }
 
-    pub(super) fn on_backlog_done(&mut self, key: String, result: Result<crate::backlog::Fixed, String>) {
+    pub(super) fn on_backlog_done(&mut self, key: String, result: Result<Box<crate::backlog::Fixed>, String>) {
         if let Some(run) = self.backlog.runs.get_mut(&key) {
             run.took = run.started.map(|s| s.elapsed());
             run.state = match result {
                 Ok(fixed) => {
                     run.log.push(format!("done: {}", fixed.pr.html_url));
-                    RunState::Done(Box::new(fixed))
+                    RunState::Done(fixed)
                 }
                 Err(e) => {
                     run.log.push(format!("failed: {}", e.lines().next().unwrap_or("")));
@@ -563,6 +584,24 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
             .on_hover_text("How many agents run in parallel, each in its own worktree");
     });
     ui.horizontal(|ui| {
+        ui.label("Rounds");
+        ui.add(egui::Slider::new(&mut app.backlog.rounds, 1..=5).show_value(true)).on_hover_text(
+            "How many attempts a ticket gets. A failed check, or a reviewer asking for \
+             changes, goes back to the agent with the reason. No draft pull request is \
+             opened while a check fails.",
+        );
+        ui.add_space(theme::UNIT);
+        ui.checkbox(&mut app.backlog.review, "Second agent reviews").on_hover_text(
+            "Before the pull request, the code-review model reads the ticket and the diff \
+             and answers approve or revise. Revise is another round. Pick its model under \
+             Reviewer, or in Settings for code review.",
+        );
+        if app.backlog.review {
+            ui.label("Reviewer");
+            super::views::ai_model_picker(app, ui, worker::AiTarget::Review);
+        }
+    });
+    ui.horizontal(|ui| {
         ui.checkbox(&mut app.backlog.claim, "Claim tickets I start").on_hover_text(
             "When an agent starts on a ticket: assign it to you, move it into the \
              active sprint, and mark it In Progress. When it finishes: a comment with \
@@ -693,8 +732,10 @@ fn agent_card(app: &mut App, ui: &mut egui::Ui, key: &str) {
                         ui.label(RichText::new(&fixed.branch).monospace().size(theme::SMALL).color(theme::fg_dim()));
                         ui.label(
                             RichText::new(format!(
-                                "{} · {} turn(s) · {} file(s) · checks: {}",
+                                "{} · {} round(s){} · {} turn(s) · {} file(s) · checks: {}",
                                 fixed.engine,
+                                fixed.rounds,
+                                fixed.reviewed_by.as_ref().map(|r| format!(" · approved by {r}")).unwrap_or_default(),
                                 fixed.turns,
                                 fixed.changes.len(),
                                 if fixed.checks.is_empty() {

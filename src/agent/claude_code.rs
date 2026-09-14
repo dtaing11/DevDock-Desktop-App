@@ -112,11 +112,35 @@ pub fn run(
     check_commands: &[String],
     on_event: &mut dyn FnMut(Event),
 ) -> Result<Run, String> {
+    run_with_tools(config, root, task, system_extra, &allowed_tools(check_commands), true, on_event)
+}
+
+/// Runs Claude Code with reading tools only — no edits, no commands — and
+/// returns what it said. For a review.
+pub fn run_readonly(
+    config: &Config,
+    root: &Path,
+    task: &str,
+    system_extra: Option<&str>,
+    on_event: &mut dyn FnMut(Event),
+) -> Result<Run, String> {
+    run_with_tools(config, root, task, system_extra, "Read,Grep,Glob,LS", false, on_event)
+}
+
+fn run_with_tools(
+    config: &Config,
+    root: &Path,
+    task: &str,
+    system_extra: Option<&str>,
+    allowed: &str,
+    collect_edits: bool,
+    on_event: &mut dyn FnMut(Event),
+) -> Result<Run, String> {
     let program = program().ok_or(
         "Claude Code is not installed on this machine (the `claude` command was not found).",
     )?;
     let repo = Repo::open(root).map_err(|e| e.to_string())?;
-    let before = snapshot(&repo)?;
+    let before = if collect_edits { snapshot(&repo)? } else { Default::default() };
 
     let mut cmd = Command::new(&program);
     cmd.arg("-p")
@@ -126,7 +150,7 @@ pub fn run(
         .arg("--max-turns")
         .arg(config.max_turns.to_string())
         .arg("--allowedTools")
-        .arg(allowed_tools(check_commands))
+        .arg(allowed)
         .arg("--disallowedTools")
         .arg("WebFetch,WebSearch");
     let model = config.model.trim();
@@ -218,7 +242,7 @@ pub fn run(
             return Err(format!("Claude Code reported an error: {}", first_line(&text)));
         }
     }
-    let edits = edits_since(&repo, &before)?;
+    let edits = if collect_edits { edits_since(&repo, &before)? } else { Vec::new() };
     Ok(Run {
         text: outcome.result.unwrap_or_default(),
         edits,

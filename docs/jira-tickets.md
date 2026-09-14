@@ -103,10 +103,24 @@ under **At once**, the rest queued. Each agent:
 2. runs the coding agent on the ticket, live, with the repository's own
    checks from `.git-manage-ci.toml`;
 3. runs those checks again itself once the agent says it is done — a draft
-   pull request is never opened on the agent's word that the tests passed;
-4. commits, pushes, and opens a **draft pull request** that quotes the
-   ticket, the agent's summary, and which checks passed;
-5. **removes the worktree**. The branch and the pull request are what
+   pull request is never opened on the agent's word that the tests passed.
+   A repository that declares no checks gets the ones its toolchain
+   implies: `flutter analyze` and `flutter test` for a Flutter app, `cargo
+   build` and `cargo test`, `npm test`, `pytest`, `go test`; the log says
+   they were inferred;
+4. if a check fails, sends the failure back to the agent for another
+   **round**, up to the number set in the dialog (three by default). No
+   pull request is opened while a check fails; a ticket that still fails
+   after the last round is a failure, with the check's output on its card;
+5. once the checks pass, has a **second agent review** the ticket and the
+   diff — the code-review model, which can be Claude Code — and answer
+   approve or revise. Revise is another round with the feedback; approve
+   is recorded in the pull request. Untick **Second agent reviews** to
+   skip this;
+6. commits, pushes, and opens a **draft pull request** that quotes the
+   ticket, the agent's summary, which checks passed, and who approved it
+   after how many rounds;
+7. **removes the worktree**. The branch and the pull request are what
    remain.
 
 A ticket the agent changed nothing for, or whose change fails a check,

@@ -74,7 +74,7 @@ fn print_help() {
         ("worktree add BRANCH [PATH] [--from BASE]", "check a branch out in its own directory"),
         ("worktree remove PATH [--force]", "delete a worktree's directory, keeping the branch"),
         ("backlog [--project KEY]", "unassigned Jira tickets, judged for what an agent could fix"),
-        ("backlog fix KEY... [--parallel N] [--sandbox IMAGE] [--claim]", "fix tickets in parallel worktrees; each ends as a draft PR"),
+        ("backlog fix KEY... [--parallel N] [--rounds N] [--no-review] [--sandbox IMAGE] [--claim]", "fix tickets in parallel worktrees; each ends as a draft PR"),
         ("resolve", "interactive conflict resolver with AI proposals"),
         ("resolve --agent", "AI reads the repo and proposes every fix, you confirm each"),
         ("ci", "run all local CI jobs (.git-manage-ci.toml)"),
@@ -624,7 +624,7 @@ fn cmd_backlog(rest: &[String]) -> ExitCode {
             .filter(|a| {
                 // Not the value of a flag.
                 let i = rest.iter().position(|x| x == *a).unwrap_or(0);
-                i == 0 || !matches!(rest[i - 1].as_str(), "--parallel" | "--sandbox" | "--project")
+                i == 0 || !matches!(rest[i - 1].as_str(), "--parallel" | "--sandbox" | "--project" | "--rounds")
             })
             .map(|k| k.trim().to_uppercase())
             .collect();
@@ -640,6 +640,11 @@ fn cmd_backlog(rest: &[String]) -> ExitCode {
             Err(e) => return fail(e),
         };
         let claim = rest.iter().any(|a| a == "--claim");
+        let rounds: usize = match flag_value(rest, "--rounds") {
+            Ok(v) => v.and_then(|n| n.parse().ok()).unwrap_or(3),
+            Err(e) => return fail(e),
+        };
+        let review = !rest.iter().any(|a| a == "--no-review");
         let jql = format!("key in ({})", keys.join(","));
         let issues = match jira.search(&jql, keys.len()) {
             Ok(i) => i,
@@ -686,6 +691,12 @@ fn cmd_backlog(rest: &[String]) -> ExitCode {
                     let Some(issue) = slots.lock().unwrap().pop_front() else { break };
                     let result = (|| -> Result<crate::backlog::Fixed, String> {
                         let engine = crate::app::agent_engine(&sel, &url)?;
+                        let reviewer = if review {
+                            let r = config.review_ai.clone().unwrap_or_else(|| sel.clone());
+                            Some(crate::app::agent_engine(&r, &url)?)
+                        } else {
+                            None
+                        };
                         let publish = |title: &str, body: &str, head: &str| {
                             client.create_draft_pull_request(&slug, title, body, head, &base).map_err(|e| e.to_string())
                         };
@@ -697,6 +708,8 @@ fn cmd_backlog(rest: &[String]) -> ExitCode {
                             instructions: instructions.as_deref(),
                             sandbox_image: sandbox.as_deref(),
                             claim: claimer.as_ref().map(|c| c as &dyn crate::backlog::Claimer),
+                            rounds,
+                            reviewer: reviewer.as_ref(),
                         };
                         crate::backlog::fix(&repo, &engine, &job, &publish, &mut |line| {
                             println!("{} {}", style::dim(&format!("[{}]", issue.key)), line);

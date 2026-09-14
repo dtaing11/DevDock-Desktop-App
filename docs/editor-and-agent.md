@@ -292,8 +292,12 @@ it makes them, which is what allows the other half of the loop:
 
 - `diagnostics` — it asks the language server what it just broke, and fixes
   it before moving on.
-- `run_check` — it runs the checks **your repository already declares** in
-  `.git-manage-ci.toml`, and sees the output.
+- `run_check` — it runs the checks **your repository declares** in
+  `.git-manage-ci.toml`, and sees the output. A repository that declares
+  none gets the checks its toolchain implies — `flutter analyze` and
+  `flutter test`, `cargo build` and `cargo test`, `npm test`, `pytest`,
+  `go vet` and `go test` — and the log says they were inferred. Declare
+  your own to be exact.
 
 You still review every change at the end; the buttons become **Keep** and
 **Revert**, and reverting restores exactly what was there before the run,

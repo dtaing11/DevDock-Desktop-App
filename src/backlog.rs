@@ -434,7 +434,9 @@ fn work(
     let tracked = wt.tracked_files().map_err(|e| e.to_string())?;
     let mut workspace = Workspace::new(wt.path(), tracked.clone(), Access::ReadWrite)?
         .with_write_mode(WriteMode::Live)
-        .with_checks(jobs.clone());
+        .with_checks(jobs.clone())
+        .with_commands(true)
+        .with_sandbox(job.sandbox_image.map(str::to_string));
     let base_task = task_text(job.task);
     let rounds = job.rounds.max(1);
     let mut feedback: Option<String> = None;

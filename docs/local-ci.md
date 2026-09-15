@@ -603,14 +603,18 @@ list rather than failing. Claude models all support it.
 
 ### The checks the coding agent can run
 
-The jobs you declare here are also the only commands the
-[coding agent](editor-and-agent.md#the-coding-agent) can run. In "let it
-iterate" mode it may call `run_check` with a job's **name**, so it can prove
-a change builds before reporting it as done — and it cannot run anything you
-have not already written down.
+The jobs you declare here are what the
+[coding agent](editor-and-agent.md#the-coding-agent) treats as the
+definition of done. In "let it iterate" mode it may call `run_check` with a
+job's **name**, and the harness sends it back if it tries to finish an edit
+without running one. It also has `run_command` — a shell in the repository
+for the toolchain, one test, a formatter, a package manager — with git
+history commands refused; declared checks are still what DevDock reruns
+itself before a worktree run becomes a pull request.
 
-A repository with no `[[job]]` blocks gives the agent no way to execute
-anything at all.
+A repository with no `[[job]]` blocks gets the checks its toolchain implies
+(`cargo test`, `flutter test`, `npm test`, …), and the log says so.
+
 ### Findings are verified before you see them
 
 A reviewer that reports things which are not true costs more than one that

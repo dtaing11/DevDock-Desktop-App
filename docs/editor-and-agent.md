@@ -268,10 +268,14 @@ Two things follow from what Claude Code is:
 - It **writes to disk as it works**, so it needs **Let it iterate** on. The
   changes are found afterwards by comparing the tree with a snapshot taken
   before the run, which is what makes Revert exact.
-- Its `Bash` tool is **allowed only the repository's own checks** — the
-  commands `.git-manage-ci.toml` declares, as `Bash(cargo test:*)` and the
-  like — and its web tools are off. That is the rule the built-in harness
-  lives by, kept.
+- Its `Bash` tool is **open**, less the same things the built-in harness
+  refuses: git commands that commit, push, or rewrite history (`commit`,
+  `push`, `reset`, `checkout`, `rebase`, `stash`, …), `sudo`, and the web
+  tools. Reading git (`status`, `diff`, `log`, `show`) is fine. The system
+  prompt names the repository's toolchain (`flutter` and `dart` for a
+  Flutter app, `cargo` for Rust, `npm` for Node…) and says a denied command
+  will stay denied, so it does not spend turns retrying one. A denial shows
+  in the log as `tool error: … requires approval`.
 
 The model under it is a Claude Code alias (`default`, `sonnet`, `opus`,
 `haiku` — the latest of each family) or any model id your account has,
@@ -298,6 +302,8 @@ it makes them, which is what allows the other half of the loop:
 
 - `diagnostics` — it asks the language server what it just broke, and fixes
   it before moving on.
+- `run_command` — a shell in the repository: build it, run one test, format,
+  install a dependency. Git commands that change history are refused.
 - `run_check` — it runs the checks **your repository declares** in
   `.git-manage-ci.toml`, and sees the output. A repository that declares
   none gets the checks its toolchain implies — `flutter analyze` and
@@ -355,6 +361,7 @@ and to change nothing rather than guess.
 | `diagnostics` | Errors and warnings from the language server |
 | `definition`, `references`, `find_symbol` | Navigate like you do |
 | `run_check` | Run one of your declared checks |
+| `run_command` | Run a shell command in the repository — the toolchain, one test, a formatter, a package manager. Live runs only |
 
 Three limits are structural, not prompt instructions:
 
@@ -362,9 +369,12 @@ Three limits are structural, not prompt instructions:
   are invisible to it and never reach a model provider.
 - **Inside the repository.** Absolute paths, `..`, and symlinks out are
   refused, as is anything under `.git/`.
-- **No arbitrary commands.** `run_check` takes the *name* of a job from your
-  config. There is no shell to inject into, and a run with no checks
-  configured has no way to execute anything.
+- **No git history from inside a run.** `run_command` is a real shell, on a
+  live tree only (it would see the old code otherwise), with a timeout and
+  capped output — but `git commit`, `push`, `reset`, `checkout`, `rebase`,
+  `stash` and the like are refused, as is `sudo`. You commit what you keep;
+  a worktree run commits for itself when it is done. In a worktree run with
+  a sandbox, every command runs inside the container.
 
 Budgets bound each run (turns, tool calls, bytes read, check runs). When one
 runs out the agent is asked to finish with what it has, and the panel says

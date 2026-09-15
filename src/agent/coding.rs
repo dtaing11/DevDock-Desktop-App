@@ -87,11 +87,15 @@ The language server: diagnostics, definition, references, find_symbol. Use it ra
 const CHECK_TOOLS: &str = r#"
 The project's checks: run_check runs one of the commands this repository already declares (build, tests, lint). Run the relevant one before you report a change as done, and if it fails, fix what you broke rather than reporting it as finished. You will be sent back if you try to finish an edit without running one."#;
 
+const COMMAND_TOOLS: &str = r#"
+Commands: run_command runs a shell command in the repository root — the toolchain (build, a single test, a formatter, a linter), installing dependencies, a script — anything the named checks do not cover. Prefer it over guessing whether something compiles. It cannot commit, push, or rewrite git history; that is done for you. Stay inside the repository."#;
+
 /// The system prompt for a run, describing exactly the tools it has.
 pub fn system_prompt(
     write_mode: WriteMode,
     has_language_tools: bool,
     has_checks: bool,
+    has_commands: bool,
     extra_instructions: Option<&str>,
 ) -> String {
     let mut prompt = String::from(BASE_PROMPT);
@@ -106,6 +110,9 @@ pub fn system_prompt(
     }
     if has_checks {
         prompt.push_str(CHECK_TOOLS);
+    }
+    if has_commands {
+        prompt.push_str(COMMAND_TOOLS);
     }
     if let Some(extra) = extra_instructions.map(str::trim).filter(|s| !s.is_empty()) {
         prompt.push_str("\n\nProject-specific instructions:\n");
@@ -209,7 +216,7 @@ pub fn run_with(
 
 /// The same request, handed to Claude Code. The tree has to be live —
 /// Claude Code edits files, it does not propose — and its commands are
-/// limited to the repository's own checks.
+/// limited to the repository's checks, its toolchains, and reading.
 fn run_claude_code(
     config: &claude_code::Config,
     workspace: &Workspace,
@@ -235,6 +242,9 @@ fn run_claude_code(
          so and change nothing. Finish with a short summary: what you changed and why, one \
          bullet per file, then a line starting \"Verified:\" naming what you ran.",
     );
+    let checks = workspace.check_commands();
+    extra.push_str("\n\n");
+    extra.push_str(&claude_code::allowed_commands_note(workspace.root(), &checks));
     if let Some(instructions) = request.instructions.map(str::trim).filter(|s| !s.is_empty()) {
         extra.push_str("\n\nProject-specific instructions:\n");
         extra.push_str(instructions);
@@ -242,7 +252,7 @@ fn run_claude_code(
     let overview = workspace.overview();
     let prompt = task_prompt(request.task, request.history, request.branch, Some(&overview), request.context);
     let config = claude_code::Config { max_turns: request.limits.max_turns, ..config.clone() };
-    claude_code::run(&config, workspace.root(), &prompt, Some(&extra), &workspace.check_commands(), on_event)
+    claude_code::run(&config, workspace.root(), &prompt, Some(&extra), &checks, on_event)
 }
 
 /// Runs the coding agent on the built-in harness.
@@ -273,6 +283,7 @@ pub fn run(
         workspace.write_mode(),
         tools.contains(&"diagnostics"),
         tools.contains(&"run_check"),
+        tools.contains(&"run_command"),
         (!instructions.is_empty()).then_some(instructions.as_str()),
     );
     let overview = workspace.overview();
@@ -298,15 +309,17 @@ mod tests {
 
     #[test]
     fn the_prompt_describes_only_the_tools_that_exist() {
-        let bare = system_prompt(WriteMode::Overlay, false, false, None);
+        let bare = system_prompt(WriteMode::Overlay, false, false, false, None);
         assert!(bare.contains("list_files"));
         assert!(bare.contains("show_changes"));
         assert!(!bare.contains("The language server:"), "no language server was offered");
         assert!(!bare.contains("run_check"), "no checks were offered");
+        assert!(!bare.contains("run_command"), "no commands were offered");
         assert!(bare.contains("nothing reaches disk"));
 
-        let full = system_prompt(WriteMode::Live, true, true, Some("Never touch vendor/."));
+        let full = system_prompt(WriteMode::Live, true, true, true, Some("Never touch vendor/."));
         assert!(full.contains("The language server:") && full.contains("run_check"));
+        assert!(full.contains("run_command") && full.contains("cannot commit, push"));
         assert!(full.contains("write to the developer's working tree immediately"));
         assert!(full.contains("Never touch vendor/."));
     }
@@ -417,5 +430,60 @@ mod tests {
         assert_eq!(run.edits[0].path, "a.rs");
         // Overlay by default: the file on disk is untouched.
         assert_eq!(std::fs::read_to_string(tmp.path().join("a.rs")).unwrap(), "fn a() {}\n");
+    }
+
+    /// The built-in harness with a real model, on a tree with no checks
+    /// declared: the only way to verify is run_command, and the model uses
+    /// it rather than guessing. Stored Claude credentials, or
+    /// `LIVE_OLLAMA_MODEL=qwen2.5-coder:7b` for a local model.
+    /// `cargo test --lib coding::tests::live_harness -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_harness_runs_the_toolchain_through_run_command() {
+        let provider: Box<dyn Provider> = match std::env::var("LIVE_OLLAMA_MODEL") {
+            Ok(model) => Box::new(crate::ollama::Client::new("http://localhost:11434").agent(model)),
+            Err(_) => match crate::claude::Client::from_store("claude-haiku-4-5-20251001") {
+                Some(client) => Box::new(client),
+                None => {
+                    eprintln!("no Claude credentials; skipping");
+                    return;
+                }
+            },
+        };
+        let client = provider.as_ref();
+        let tmp = tempfile::tempdir().unwrap();
+        let sh = |args: &[&str]| {
+            let out = std::process::Command::new("git").args(args).current_dir(tmp.path()).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        };
+        sh(&["init", "-q", "-b", "main"]);
+        sh(&["config", "user.email", "t@t"]);
+        sh(&["config", "user.name", "t"]);
+        std::fs::write(tmp.path().join("pyproject.toml"), "[project]\nname = \"t\"\n").unwrap();
+        std::fs::write(tmp.path().join("total.py"), "def total(xs):\n    return sum(xs) + 1\n\nif __name__ == '__main__':\n    assert total([1, 2]) == 3\n    print('ok')\n").unwrap();
+        sh(&["add", "-A"]);
+        sh(&["commit", "-q", "-m", "init"]);
+        let repo = crate::git::Repo::open(tmp.path()).unwrap();
+        let mut ws = Workspace::new(repo.path(), repo.tracked_files().unwrap(), Access::ReadWrite)
+            .unwrap()
+            .with_write_mode(WriteMode::Live)
+            .with_commands(true);
+        let mut log = Vec::new();
+        let run = run(
+            client,
+            &mut ws,
+            Request::new("Running `python3 total.py` fails an assertion. Fix total() and prove it by running the file. Then run `git commit -am fix` and tell me what happened."),
+            &mut |e| {
+                println!("  {}", e.line());
+                log.push(e.line());
+            },
+        )
+        .unwrap();
+        println!("{}", run.text);
+        assert!(log.iter().any(|l| l.contains("run `python3")), "ran the file: {log:?}");
+        assert!(log.iter().any(|l| l.contains("git commit") && l.starts_with('!')), "the commit was refused: {log:?}");
+        assert_eq!(std::fs::read_to_string(tmp.path().join("total.py")).unwrap().matches("+ 1").count(), 0);
+        let head = repo.log(1, None).unwrap()[0].subject.clone();
+        assert_eq!(head, "init", "nothing was committed");
     }
 }

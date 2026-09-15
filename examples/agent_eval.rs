@@ -797,7 +797,8 @@ fn main() {
             let mut ws = Workspace::new(repo.path(), repo.tracked_files().unwrap(), Access::ReadWrite)
                 .unwrap()
                 .with_write_mode(WriteMode::Live)
-                .with_checks(jobs);
+                .with_checks(jobs)
+                .with_commands(true);
 
             let stats = std::sync::Arc::new(Stats::default());
             let engine = make_engine(stats.clone());

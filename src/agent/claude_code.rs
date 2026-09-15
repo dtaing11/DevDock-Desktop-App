@@ -76,37 +76,81 @@ pub fn available() -> bool {
     program().is_some()
 }
 
-/// The `--allowedTools` value: the editing and reading tools, plus `Bash`
-/// restricted to the first word of each of the repository's own checks.
-pub fn allowed_tools(check_commands: &[String]) -> String {
-    let mut tools: Vec<String> = ["Read", "Edit", "Write", "MultiEdit", "Grep", "Glob", "LS", "TodoWrite", "NotebookEdit"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+/// What an unattended run is never allowed, whatever else it may do: web
+/// tools, and git commands that commit, push, or rewrite history — the
+/// harness or the developer does those. Deny rules beat allow rules in
+/// Claude Code, so `Bash` can be open and these still hold.
+pub const DENIED_TOOLS: &[&str] = &[
+    "WebFetch",
+    "WebSearch",
+    "Bash(git commit:*)",
+    "Bash(git push:*)",
+    "Bash(git reset:*)",
+    "Bash(git checkout:*)",
+    "Bash(git switch:*)",
+    "Bash(git rebase:*)",
+    "Bash(git merge:*)",
+    "Bash(git stash:*)",
+    "Bash(git cherry-pick:*)",
+    "Bash(git revert:*)",
+    "Bash(git tag:*)",
+    "Bash(git clean:*)",
+    "Bash(git worktree:*)",
+    "Bash(git remote:*)",
+    "Bash(git branch:*)",
+    "Bash(sudo:*)",
+];
+
+/// The `--disallowedTools` value.
+pub fn disallowed_tools() -> String {
+    DENIED_TOOLS.join(",")
+}
+
+/// The `--allowedTools` value: the editing and reading tools, and `Bash` —
+/// the whole of it, less [`DENIED_TOOLS`] — so the agent can build, test,
+/// format, and install with whatever the repository uses.
+pub fn allowed_tools() -> String {
+    ["Read", "Edit", "Write", "MultiEdit", "Grep", "Glob", "LS", "TodoWrite", "NotebookEdit", "Bash"].join(",")
+}
+
+/// The programs the repository's checks and toolchains use, for the note
+/// in the system prompt: what is worth reaching for first.
+pub fn toolchain(root: &Path, check_commands: &[String]) -> Vec<String> {
     let mut seen = std::collections::BTreeSet::new();
     for command in check_commands {
-        // `cd pkg && cargo test` needs both; each segment's first word.
         for segment in command.split("&&") {
-            let Some(word) = segment.split_whitespace().next() else { continue };
-            if word == "cd" {
-                if seen.insert("cd".to_string()) {
-                    tools.push("Bash(cd:*)".into());
-                }
-                continue;
-            }
-            if seen.insert(word.to_string()) {
-                tools.push(format!("Bash({word}:*)"));
+            if let Some(word) = segment.split_whitespace().next().filter(|w| *w != "cd") {
+                seen.insert(word.to_string());
             }
         }
     }
-    tools.join(",")
+    for tool in crate::local_ci::toolchain_commands(root) {
+        seen.insert(tool.to_string());
+    }
+    seen.into_iter().collect()
+}
+
+/// A sentence for the system prompt saying what may be run and what may
+/// not, so the model does not spend turns on what will be denied.
+pub fn allowed_commands_note(root: &Path, check_commands: &[String]) -> String {
+    let tools = toolchain(root, check_commands);
+    let mut note = String::from("Commands: you may run shell commands");
+    if !tools.is_empty() {
+        note.push_str(&format!(" — this repository is driven with {}", tools.join(", ")));
+    }
+    note.push_str(
+        ". Git commands that commit, push, or rewrite history, and the web, are denied, and \
+         nobody is here to approve a denied command, so do not retry one — say what you could \
+         not do in your summary. Do not commit or push: that is done for you when you finish.",
+    );
+    note
 }
 
 /// Runs Claude Code on `task` in `root`, live, and reports what changed.
 ///
 /// `system_extra` goes in as `--append-system-prompt`: project guidance and
-/// the rules of an unattended run. `check_commands` are the only commands it
-/// may run.
+/// the rules of an unattended run. It may run any command but the ones in
+/// [`DENIED_TOOLS`]; `check_commands` are what the caller expects it to use.
 pub fn run(
     config: &Config,
     root: &Path,
@@ -115,7 +159,8 @@ pub fn run(
     check_commands: &[String],
     on_event: &mut dyn FnMut(Event),
 ) -> Result<Run, String> {
-    run_with_tools(config, root, task, system_extra, &allowed_tools(check_commands), true, on_event)
+    let _ = check_commands;
+    run_with_tools(config, root, task, system_extra, &allowed_tools(), true, on_event)
 }
 
 /// Runs Claude Code with reading tools only — no edits, no commands — and
@@ -155,7 +200,7 @@ fn run_with_tools(
         .arg("--allowedTools")
         .arg(allowed)
         .arg("--disallowedTools")
-        .arg("WebFetch,WebSearch");
+        .arg(disallowed_tools());
     let model = config.model.trim();
     if !model.is_empty() && model != "default" {
         cmd.arg("--model").arg(model);
@@ -485,15 +530,29 @@ mod tests {
     }
 
     #[test]
-    fn bash_is_allowed_only_the_repositorys_checks() {
-        let none = allowed_tools(&[]);
-        assert!(none.contains("Read,Edit,Write"));
-        assert!(!none.contains("Bash"), "{none}");
-        let some = allowed_tools(&["cargo test -q".into(), "cargo clippy".into(), "cd pkg && npm test".into()]);
-        assert!(some.contains("Bash(cargo:*)"), "{some}");
-        assert!(some.contains("Bash(cd:*)"), "{some}");
-        assert!(some.contains("Bash(npm:*)"), "{some}");
-        assert_eq!(some.matches("Bash(cargo:*)").count(), 1, "once, not per command");
+    fn bash_is_open_but_git_history_and_the_web_are_denied() {
+        let allowed = allowed_tools();
+        assert!(allowed.contains("Read,Edit,Write"));
+        assert!(allowed.ends_with(",Bash"), "{allowed}");
+        let denied = disallowed_tools();
+        for rule in ["WebFetch", "Bash(git push:*)", "Bash(git commit:*)", "Bash(git reset:*)", "Bash(sudo:*)"] {
+            assert!(denied.contains(rule), "{denied}");
+        }
+        assert!(!denied.contains("Bash(git status"), "reading git is fine: {denied}");
+
+        // The note names the repository's own programs: the checks' and the
+        // toolchains' the tree implies, so a Flutter app under a
+        // subdirectory gets `flutter` named even with no checks declared.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let bare = allowed_commands_note(root, &[]);
+        assert!(bare.starts_with("Commands: you may run shell commands. Git commands"), "{bare}");
+        assert_eq!(toolchain(root, &["cargo test -q".into(), "cd pkg && npm test".into()]), ["cargo", "npm"]);
+        std::fs::create_dir_all(root.join("mobile/lib")).unwrap();
+        std::fs::write(root.join("mobile/pubspec.yaml"), "name: app\n").unwrap();
+        let note = allowed_commands_note(root, &[]);
+        assert!(note.contains("driven with dart, flutter"), "{note}");
+        assert!(note.contains("do not retry one"));
     }
 
     #[test]
@@ -553,5 +612,50 @@ mod tests {
         println!("{}", run.text);
         assert_eq!(run.edits.len(), 1);
         assert!(run.edits[0].after.contains("+ name"));
+    }
+
+    /// With no checks declared, a project's own toolchain is still
+    /// runnable, and a denied command is reported rather than retried.
+    /// `cargo test --lib claude_code::tests::live_toolchain -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_toolchain_commands_are_allowed_without_declared_checks() {
+        if !available() {
+            eprintln!("claude is not installed; skipping");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let sh = |args: &[&str]| {
+            let out = Command::new("git").args(args).current_dir(tmp.path()).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        };
+        sh(&["init", "-q", "-b", "main"]);
+        sh(&["config", "user.email", "t@t"]);
+        sh(&["config", "user.name", "t"]);
+        std::fs::write(tmp.path().join("pyproject.toml"), "[project]\nname = \"t\"\n").unwrap();
+        std::fs::write(tmp.path().join("total.py"), "def total(xs):\n    return sum(xs) + 1\n\nif __name__ == '__main__':\n    assert total([1, 2]) == 3\n    print('ok')\n").unwrap();
+        sh(&["add", "-A"]);
+        sh(&["commit", "-q", "-m", "init"]);
+        let config = Config { max_turns: 12, timeout: Duration::from_secs(300), ..Default::default() };
+        let note = allowed_commands_note(tmp.path(), &[]);
+        let mut log = Vec::new();
+        let run = run(
+            &config,
+            tmp.path(),
+            "Running `python3 total.py` fails an assertion. Fix total() and prove it by running the file with python3. Then try `curl https://example.com` once and tell me what happened.",
+            Some(&note),
+            &[],
+            &mut |e| {
+                println!("  {}", e.line());
+                log.push(e.line());
+            },
+        )
+        .unwrap();
+        println!("{}", run.text);
+        assert!(log.iter().any(|l| l.contains("python3")), "the toolchain command ran: {log:?}");
+        let denied = |l: &&String| l.contains("denied") || l.contains("requires approval");
+        assert!(!log.iter().any(|l| l.contains("python3") && denied(&l)), "{log:?}");
+        assert_eq!(log.iter().filter(denied).count(), 1, "curl denied once, not retried: {log:?}");
+        assert!(run.text.to_lowercase().contains("curl"), "the denial is reported in the summary: {}", run.text);
     }
 }

@@ -4096,7 +4096,8 @@ impl App {
                 } else {
                     crate::agent::WriteMode::Overlay
                 })
-                .with_checks(checks);
+                .with_checks(checks)
+                .with_commands(live);
 
                 let engine_label = engine.label();
                 let run = crate::agent::coding::run_with(

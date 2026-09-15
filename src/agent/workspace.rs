@@ -104,6 +104,52 @@ const MAX_SEARCH_SCAN_BYTES: usize = 8_000_000;
 /// A hard stop on a model that would otherwise run the test suite after
 /// every edit.
 const MAX_CHECK_RUNS: usize = 12;
+/// Commands of the model's own are cheaper to allow generously: a build,
+/// a test, a formatter, a package manager, all in one run.
+const MAX_COMMAND_RUNS: usize = 40;
+
+/// Why a command may not run, when it may not: git operations that commit,
+/// push, or rewrite history — the harness or the developer does those, and
+/// a run that did them itself would leave the tree the harness reads in a
+/// state it does not expect — and `sudo`.
+pub fn refused_command(command: &str) -> Option<String> {
+    const GIT_WRITES: &[&str] = &[
+        "commit", "push", "reset", "checkout", "switch", "rebase", "merge", "stash", "cherry-pick",
+        "revert", "tag", "am", "filter-branch", "clean", "worktree", "remote", "branch",
+    ];
+    for segment in command.split([';', '|', '&', '\n']) {
+        let mut words = segment.split_whitespace().filter(|w| !w.contains('=') || w.starts_with('-'));
+        let Some(first) = words.next() else { continue };
+        if first == "sudo" || first == "doas" {
+            return Some("sudo is not available to this run.".into());
+        }
+        if first == "git" {
+            // Skip global options, with their arguments: `git -C dir commit`.
+            let mut sub = None;
+            let mut takes_value = false;
+            for w in words {
+                if takes_value {
+                    takes_value = false;
+                } else if ["-C", "-c", "--git-dir", "--work-tree", "--namespace"].contains(&w) {
+                    takes_value = true;
+                } else if !w.starts_with('-') {
+                    sub = Some(w);
+                    break;
+                }
+            }
+            if let Some(sub) = sub {
+                if GIT_WRITES.contains(&sub) {
+                    return Some(format!(
+                        "`git {sub}` is not allowed: this run must not commit, push, or rewrite \
+                         history — that is done for you when you finish. Read-only git (status, \
+                         diff, log, show) is fine."
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
 /// Cap on a diff of the run's own changes.
 const MAX_CHANGES_BYTES: usize = 40_000;
 /// Cap on a project instructions file (AGENTS.md and friends).
@@ -132,9 +178,15 @@ pub struct Workspace {
     /// Diagnostic epoch per file at the moment it was last written, so
     /// `diagnostics` can wait for results about the new text.
     epochs: BTreeMap<String, u64>,
-    /// The project's own checks, the only commands that may be run.
+    /// The project's own checks, runnable by name.
     checks: Vec<crate::local_ci::Job>,
     check_runs: usize,
+    /// Whether the model may run commands of its own (build, test, format,
+    /// install) besides the named checks. Live tree only.
+    commands: bool,
+    command_runs: usize,
+    /// A Docker image every check and command runs in, when set.
+    sandbox: Option<String>,
     /// Files edited since the model last asked for their diagnostics.
     undiagnosed: BTreeSet<String>,
     /// The file most recently read, for a nudge that needs to name one.
@@ -170,6 +222,9 @@ impl Workspace {
             epochs: BTreeMap::new(),
             checks: Vec::new(),
             check_runs: 0,
+            commands: false,
+            command_runs: 0,
+            sandbox: None,
             undiagnosed: BTreeSet::new(),
             last_read: None,
             edited_since_check: false,
@@ -196,6 +251,35 @@ impl Workspace {
     pub fn with_checks(mut self, checks: Vec<crate::local_ci::Job>) -> Self {
         self.checks = checks;
         self
+    }
+
+    /// Lets the model run shell commands of its own in the repository —
+    /// the toolchain, a single test, a formatter, a package manager — on a
+    /// live tree. Git commands that commit, push, or rewrite history are
+    /// still refused: the harness or the developer does that.
+    pub fn with_commands(mut self, enabled: bool) -> Self {
+        self.commands = enabled;
+        self
+    }
+
+    /// Runs every check and command inside this Docker image, with the tree
+    /// mounted at /work, instead of on the host.
+    pub fn with_sandbox(mut self, image: Option<String>) -> Self {
+        self.sandbox = image.map(|i| i.trim().to_string()).filter(|i| !i.is_empty());
+        if let Some(image) = &self.sandbox {
+            for job in self.checks.iter_mut() {
+                if job.image.is_none() {
+                    job.image = Some(image.clone());
+                }
+            }
+        }
+        self
+    }
+
+    /// Whether run_command is on offer: enabled, on a live tree, for a run
+    /// that may change things.
+    pub fn commands_available(&self) -> bool {
+        self.commands && self.write_mode == WriteMode::Live && self.access == Access::ReadWrite
     }
 
     pub fn write_mode(&self) -> WriteMode {
@@ -580,6 +664,35 @@ impl Workspace {
             });
         }
 
+        if self.commands_available() {
+            tools.push(ToolSpec {
+                name: "run_command",
+                description: if self.sandbox.is_some() {
+                    "Run a shell command in the repository root, inside the sandbox \
+                     container with the tree mounted at /work, and get its output: the \
+                     toolchain (build, a single test, a formatter, a linter, installing \
+                     dependencies), or anything the named checks do not cover. Git commands \
+                     that commit, push, or rewrite history are refused — the harness commits. \
+                     Output is capped; commands are killed after the timeout."
+                } else {
+                    "Run a shell command in the repository root and get its output: the \
+                     toolchain (build, a single test, a formatter, a linter, installing \
+                     dependencies), or anything the named checks do not cover. Stay inside \
+                     the repository. Git commands that commit, push, or rewrite history are \
+                     refused — the developer commits. Output is capped; commands are killed \
+                     after the timeout."
+                },
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "The command line, as for `sh -c`."},
+                        "timeout_secs": {"type": "integer", "description": "Seconds before it is killed (default 300, at most 900)."}
+                    },
+                    "required": ["command"]
+                }),
+            });
+        }
+
         if self.access == Access::ReadWrite {
             tools.push(ToolSpec {
                 name: "write_file",
@@ -668,6 +781,12 @@ impl Workspace {
             "references" if self.lsp.is_some() => self.locate(&call.input, true),
             "find_symbol" if self.lsp.is_some() => self.find_symbol(&call.input),
             "run_check" if !self.checks.is_empty() => self.run_check(&call.input),
+            "run_command" if self.commands_available() => self.run_command(&call.input),
+            "run_command" if self.commands => Err(
+                "This run proposes changes without writing them, so a command would see the \
+                 old code. Report what you changed instead."
+                    .to_string(),
+            ),
             "write_file" | "edit_file" | "replace_lines" => {
                 Err("This run is read-only: you can inspect the repository but not change \
                      it. Report what you found instead."
@@ -1498,6 +1617,60 @@ impl Workspace {
         ))
     }
 
+    fn run_command(&mut self, input: &serde_json::Value) -> Result<String, String> {
+        const MAX_OUTPUT: usize = 8_000;
+        const DEFAULT_TIMEOUT: u64 = 300;
+        const MAX_TIMEOUT: u64 = 900;
+
+        if self.command_runs >= MAX_COMMAND_RUNS {
+            return Err(format!(
+                "Command budget spent ({MAX_COMMAND_RUNS} runs). Finish with what you know."
+            ));
+        }
+        let command = self.arg_str(input, "command")?.trim().to_string();
+        if command.is_empty() {
+            return Err("command is empty".into());
+        }
+        if let Some(why) = refused_command(&command) {
+            return Err(why);
+        }
+        let timeout = input
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(DEFAULT_TIMEOUT)
+            .clamp(1, MAX_TIMEOUT);
+
+        self.command_runs += 1;
+        // Running one of the checks' own programs is verification too.
+        let first = command.split_whitespace().next().unwrap_or_default();
+        if self.checks.iter().any(|c| {
+            c.commands.iter().any(|cmd| cmd.split_whitespace().next() == Some(first))
+        }) {
+            self.edited_since_check = false;
+        }
+        let job = crate::local_ci::Job {
+            name: "command".into(),
+            commands: vec![command.clone()],
+            image: self.sandbox.clone(),
+            timeout_secs: Some(timeout),
+            ..Default::default()
+        };
+        let result = crate::local_ci::run_job(&self.root, &job);
+        let mut output = result.output;
+        if output.len() > MAX_OUTPUT {
+            let start = output.len() - MAX_OUTPUT;
+            let start = (start..output.len())
+                .find(|i| output.is_char_boundary(*i))
+                .unwrap_or(output.len());
+            output = format!("[earlier output trimmed]\n{}", &output[start..]);
+        }
+        Ok(format!(
+            "`{command}` {} in {:.1}s\n{output}",
+            if result.ok { "exited 0" } else { "FAILED" },
+            result.duration_secs
+        ))
+    }
+
     // -- paths and content --------------------------------------------------
 
     fn arg_str(&self, input: &serde_json::Value, key: &str) -> Result<String, String> {
@@ -1666,6 +1839,11 @@ pub fn summarize(call: &ToolCall) -> String {
         "references" => format!("references to {}", arg("symbol")),
         "find_symbol" => format!("find symbol {}", arg("query")),
         "run_check" => format!("run check {}", arg("name")),
+        "run_command" => {
+            let command = arg("command");
+            let short: String = command.chars().take(80).collect();
+            format!("run `{short}{}`", if short.len() < command.len() { "…" } else { "" })
+        }
         other => other.to_string(),
     }
 }
@@ -2356,6 +2534,63 @@ mod tests {
         // The available names go in the description, so the model does not
         // have to guess what it may run.
         assert!(spec.description.contains("tests"), "{}", spec.description);
+    }
+
+    #[test]
+    fn commands_run_on_a_live_tree_and_git_history_is_off_limits() {
+        let (tmp, ws) = fixture(Access::ReadWrite);
+        assert!(!ws.tools().iter().any(|t| t.name == "run_command"), "off by default");
+        let ws = ws.with_commands(true);
+        assert!(!ws.tools().iter().any(|t| t.name == "run_command"), "not on an overlay");
+        let mut ws = ws;
+        let out = ws.dispatch(&call("run_command", serde_json::json!({"command": "echo hi"})), 40);
+        assert!(out.is_error);
+        assert!(out.content.contains("without writing them"), "{}", out.content);
+
+        let mut ws = ws.with_write_mode(WriteMode::Live);
+        assert!(ws.tools().iter().any(|t| t.name == "run_command"));
+        let out = ws.dispatch(&call("run_command", serde_json::json!({"command": "echo hi && pwd"})), 40);
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("exited 0"), "{}", out.content);
+        assert!(out.content.contains("hi\n"), "{}", out.content);
+        let root = tmp.path().canonicalize().unwrap();
+        assert!(out.content.contains(&root.display().to_string()), "runs in the repository: {}", out.content);
+
+        let out = ws.dispatch(&call("run_command", serde_json::json!({"command": "exit 3"})), 40);
+        assert!(!out.is_error, "a failing command is a result, not a tool error: {}", out.content);
+        assert!(out.content.contains("FAILED"), "{}", out.content);
+
+        for forbidden in ["git commit -m x", "git -C . push origin main", "echo a; git reset --hard", "ls | git stash", "sudo rm -rf /"] {
+            let out = ws.dispatch(&call("run_command", serde_json::json!({"command": forbidden})), 40);
+            assert!(out.is_error, "{forbidden} ran: {}", out.content);
+            assert!(out.content.contains("not allowed") || out.content.contains("not available"), "{forbidden}: {}", out.content);
+        }
+        for fine in ["git status --short", "git diff --stat", "git log -1", "git add -A"] {
+            let out = ws.dispatch(&call("run_command", serde_json::json!({"command": fine})), 40);
+            assert!(!out.is_error, "{fine}: {}", out.content);
+        }
+        assert!(refused_command("GIT_PAGER=cat git log").is_none());
+        assert!(refused_command("git rebase -i").is_some());
+
+        // A read-only run gets no command tool, whatever was asked for.
+        let (_tmp, ws) = fixture(Access::ReadOnly);
+        let ws = ws.with_commands(true).with_write_mode(WriteMode::Live);
+        assert!(!ws.tools().iter().any(|t| t.name == "run_command"));
+    }
+
+    #[test]
+    fn a_command_that_runs_a_checks_program_counts_as_verification() {
+        let (tmp, ws) = fixture(Access::ReadWrite);
+        let job = crate::local_ci::Job { name: "tests".into(), commands: vec!["true".into()], ..Default::default() };
+        let mut ws = ws.with_checks(vec![job]).with_commands(true).with_write_mode(WriteMode::Live);
+        std::fs::write(tmp.path().join("src/lib.rs"), "pub fn x() {}\n").unwrap();
+        let out = ws.dispatch(&call("write_file", serde_json::json!({"path": "src/lib.rs", "content": "pub fn y() {}\n"})), 10);
+        assert!(!out.is_error, "{}", out.content);
+        assert!(ws.verification_gap().is_some());
+        ws.dispatch(&call("run_command", serde_json::json!({"command": "ls"})), 10);
+        assert!(ws.verification_gap().is_some(), "ls proves nothing");
+        ws.dispatch(&call("run_command", serde_json::json!({"command": "true"})), 10);
+        assert!(ws.verification_gap().is_none(), "the check's own program did");
     }
 
     #[test]

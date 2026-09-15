@@ -229,6 +229,53 @@ pub fn inferred_jobs(repo_root: &Path) -> Vec<Job> {
     jobs
 }
 
+/// The programs the repository's toolchains are driven with — `flutter` and
+/// `dart` for a Flutter app, `cargo` for Rust, and so on — for every project
+/// directory in the tree. What an unattended agent is allowed to run besides
+/// the checks: building, formatting, fetching dependencies, all with the
+/// tool the project already relies on.
+pub fn toolchain_commands(repo_root: &Path) -> Vec<&'static str> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    collect_project_dirs(repo_root, 0, &mut dirs);
+    let mut out: Vec<&'static str> = Vec::new();
+    for dir in dirs {
+        let has = |name: &str| dir.join(name).exists();
+        if has("pubspec.yaml") {
+            out.extend(["flutter", "dart"]);
+        }
+        if has("Cargo.toml") {
+            out.extend(["cargo", "rustc", "rustfmt"]);
+        }
+        if has("go.mod") {
+            out.extend(["go", "gofmt"]);
+        }
+        if has("package.json") {
+            out.extend(["npm", "npx", "node", "pnpm", "yarn"]);
+        }
+        if has("pyproject.toml") || has("setup.py") || has("pytest.ini") || has("requirements.txt") {
+            out.extend(["python", "python3", "pytest", "pip", "uv", "ruff"]);
+        }
+        if has("mix.exs") {
+            out.extend(["mix", "elixir"]);
+        }
+        if has("Gemfile") {
+            out.extend(["bundle", "ruby", "rspec", "rake"]);
+        }
+        if has("Makefile") {
+            out.push("make");
+        }
+        if has("build.gradle") || has("build.gradle.kts") {
+            out.extend(["gradle", "./gradlew"]);
+        }
+        if has("pom.xml") {
+            out.extend(["mvn", "./mvnw"]);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// Directories that look like a project, nearest the root first. Stops
 /// descending once one is found: a project's own subdirectories are its
 /// business, and dependency and build trees are never projects.

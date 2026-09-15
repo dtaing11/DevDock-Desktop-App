@@ -2976,7 +2976,17 @@ fn settings(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                 }
                 ui.label(label);
                 ui.push_id(target.label(), |ui| {
-                    super::views::ai_model_picker(app, ui, target);
+                    ui.horizontal_wrapped(|ui| {
+                        if matches!(
+                            target,
+                            crate::app::worker::AiTarget::Coding
+                                | crate::app::worker::AiTarget::Backlog
+                                | crate::app::worker::AiTarget::Review
+                        ) {
+                            super::views::engine_toggle(app, ui, target);
+                        }
+                        super::views::ai_model_picker(app, ui, target);
+                    });
                 });
                 ui.end_row();
             }

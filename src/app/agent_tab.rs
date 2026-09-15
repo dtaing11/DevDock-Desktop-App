@@ -620,6 +620,7 @@ fn task_panel(app: &mut App, ui: &mut egui::Ui) {
     let busy = app.coding.running;
     ui.horizontal(|ui| {
         ui.label(theme::overline("TASK"));
+        super::views::engine_toggle(app, ui, AiTarget::Coding);
         super::views::ai_model_picker(app, ui, AiTarget::Coding);
 
         let mut iterate = app.coding.iterate;

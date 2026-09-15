@@ -596,6 +596,10 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
         }
     });
     ui.horizontal_wrapped(|ui| {
+        ui.push_id("backlog-fixer-engine", |ui| {
+            super::views::engine_toggle(app, ui, worker::AiTarget::Backlog);
+        });
+        ui.add_space(theme::UNIT);
         ui.label("Fixer model");
         // Two pickers in one dialog: each in its own id scope, or egui sees
         // one widget twice and the second acts on the first.
@@ -621,6 +625,9 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
              Reviewer, or in Settings for code review.",
         );
         if app.backlog.review {
+            ui.push_id("backlog-reviewer-engine", |ui| {
+                super::views::engine_toggle(app, ui, worker::AiTarget::Review);
+            });
             ui.label("Reviewer");
             ui.push_id("backlog-reviewer-model", |ui| {
                 super::views::ai_model_picker(app, ui, worker::AiTarget::Review);

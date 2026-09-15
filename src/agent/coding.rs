@@ -28,14 +28,17 @@ pub enum Engine {
 }
 
 impl Engine {
+    /// Says which harness, then which model: "DevDock harness · Claude
+    /// (claude-sonnet-5)" or "Claude Code agent (sonnet)". A label that only
+    /// named the model left the question it exists to answer open.
     pub fn label(&self) -> String {
         match self {
-            Self::Harness(p) => p.label(),
+            Self::Harness(p) => format!("DevDock harness · {}", p.label()),
             Self::ClaudeCode(c) => {
                 if c.model.is_empty() || c.model == "default" {
-                    "Claude Code".into()
+                    "Claude Code agent".into()
                 } else {
-                    format!("Claude Code ({})", c.model)
+                    format!("Claude Code agent ({})", c.model)
                 }
             }
         }
@@ -335,11 +338,11 @@ mod tests {
         let mut ws = workspace(&tmp);
         let engine = Engine::ClaudeCode(claude_code::Config::default());
         assert!(engine.needs_live_tree());
-        assert_eq!(engine.label(), "Claude Code");
+        assert_eq!(engine.label(), "Claude Code agent");
         let mut events = Vec::new();
         let err = run_with(&engine, &mut ws, Request::new("do it"), &mut |e| events.push(e.line())).unwrap_err();
         assert!(err.contains("Let it iterate"), "{err}");
-        assert_eq!(events.first().map(String::as_str), Some("engine: Claude Code"), "announced first");
+        assert_eq!(events.first().map(String::as_str), Some("engine: Claude Code agent"), "announced first");
     }
 
     #[test]

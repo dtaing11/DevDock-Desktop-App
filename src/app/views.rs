@@ -1566,6 +1566,47 @@ pub fn ai_controls(
 /// Reusable AI model picker bound to one task (commit vs PR), so each task
 /// can use a different provider/model (e.g. a small local model for commits,
 /// a stronger Claude model for PR descriptions).
+/// Which harness a task runs on: this app's own loop over a model, or the
+/// Claude Code agent. Shown beside the model picker for the tasks that can
+/// use Claude Code, so the choice is visible rather than an entry at the
+/// bottom of a long model list.
+pub fn engine_toggle(app: &mut App, ui: &mut egui::Ui, target: crate::app::worker::AiTarget) {
+    use crate::agent::claude_code;
+    use crate::app::AiSelection;
+    let current = app.ai_selection(target);
+    let on_claude_code = current.as_ref().is_some_and(|s| s.provider == claude_code::PROVIDER);
+    let installed = claude_code::available();
+    ui.label(RichText::new("Engine").size(theme::SMALL).color(theme::fg_dim()));
+    if ui
+        .selectable_label(!on_claude_code, "DevDock harness")
+        .on_hover_text("This app's own agent loop, driving the model picked here.")
+        .clicked()
+        && on_claude_code
+    {
+        match app.harness_default_selection() {
+            Some(sel) => app.set_ai_selection(target, sel),
+            None => app.toast("Pick a Claude or Ollama model in Settings first.", true),
+        }
+    }
+    let response = ui.add_enabled(installed, egui::Button::selectable(on_claude_code, "Claude Code agent"));
+    if !installed {
+        response.on_disabled_hover_text(
+            "Claude Code is not installed on this machine: the `claude` command was not \
+             found. Install it (npm install -g @anthropic-ai/claude-code, or the desktop \
+             app) and restart DevDock.",
+        );
+    } else if response
+        .on_hover_text("Claude Code's own agent, run in the tree with its tools and its loop.")
+        .clicked()
+        && !on_claude_code
+    {
+        app.set_ai_selection(
+            target,
+            AiSelection { provider: claude_code::PROVIDER.into(), model: "default".into() },
+        );
+    }
+}
+
 pub fn ai_model_picker(app: &mut App, ui: &mut egui::Ui, target: crate::app::worker::AiTarget) {
     use crate::app::AiSelection;
     let salt = ui.id().with("ai-model-picker");
@@ -1598,6 +1639,49 @@ pub fn ai_model_picker(app: &mut App, ui: &mut egui::Ui, target: crate::app::wor
         .selected_text(egui::RichText::new(selected).size(theme::SMALL))
         .width(PICKER_W)
         .show_ui(ui, |ui| {
+        if offers_claude_code {
+            ui.label(theme::overline("CLAUDE CODE AGENT (THIS MACHINE)"));
+            ui.label(
+                RichText::new(
+                    "Claude Code's own agent — its tools, its loop — via the claude \
+                     command, run in the tree. Not a model for the built-in agent. \
+                     Needs \"Let it iterate\".",
+                )
+                .size(theme::SMALL)
+                .color(theme::fg_dim()),
+            );
+            // The aliases, then every model id the account can use — the
+            // CLI takes both, and only the ids say which version.
+            let mut choices: Vec<String> =
+                crate::agent::claude_code::MODELS.iter().map(|s| s.to_string()).collect();
+            let ids: Vec<String> = if app.claude.models.is_empty() {
+                crate::claude::FALLBACK_MODELS.iter().map(|s| s.to_string()).collect()
+            } else {
+                app.claude.models.clone()
+            };
+            choices.extend(ids);
+            for choice in choices {
+                let is_selected = current.as_ref().is_some_and(|s| {
+                    s.provider == crate::agent::claude_code::PROVIDER
+                        && (s.model == choice || (s.model.is_empty() && choice == "default"))
+                });
+                let label = match choice.as_str() {
+                    "default" => "default (Claude Code's own choice)".to_string(),
+                    "sonnet" | "opus" | "haiku" => format!("{choice} (latest of the family)"),
+                    id => id.to_string(),
+                };
+                if ui.selectable_label(is_selected, label).clicked() {
+                    app.set_ai_selection(
+                        target,
+                        AiSelection {
+                            provider: crate::agent::claude_code::PROVIDER.into(),
+                            model: choice.clone(),
+                        },
+                    );
+                }
+            }
+            ui.separator();
+        }
         // Ollama section
         ui.label(theme::overline("OLLAMA (LOCAL)"));
         if app.ollama_models.is_empty() {
@@ -1642,34 +1726,6 @@ pub fn ai_model_picker(app: &mut App, ui: &mut egui::Ui, target: crate::app::wor
             }
         }
 
-        if offers_claude_code {
-            ui.separator();
-            ui.label(theme::overline("CLAUDE CODE AGENT (THIS MACHINE)"));
-            ui.label(
-                RichText::new(
-                    "Claude Code's own agent — its tools, its loop — via the claude \
-                     command, run in the tree. Not a model for the built-in agent. \
-                     Needs \"Let it iterate\".",
-                )
-                .size(theme::SMALL)
-                .color(theme::fg_dim()),
-            );
-            for alias in crate::agent::claude_code::MODELS {
-                let is_selected = current.as_ref().is_some_and(|s| {
-                    s.provider == crate::agent::claude_code::PROVIDER
-                        && (s.model == *alias || (s.model.is_empty() && *alias == "default"))
-                });
-                if ui.selectable_label(is_selected, *alias).clicked() {
-                    app.set_ai_selection(
-                        target,
-                        AiSelection {
-                            provider: crate::agent::claude_code::PROVIDER.into(),
-                            model: alias.to_string(),
-                        },
-                    );
-                }
-            }
-        }
     });
 }
 

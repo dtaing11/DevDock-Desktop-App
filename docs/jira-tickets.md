@@ -106,8 +106,10 @@ under **At once**, the rest queued. Each agent:
    pull request is never opened on the agent's word that the tests passed.
    A repository that declares no checks gets the ones its toolchain
    implies: `flutter analyze` and `flutter test` for a Flutter app, `cargo
-   build` and `cargo test`, `npm test`, `pytest`, `go test`; the log says
-   they were inferred;
+   build` and `cargo test`, `npm test`, `pytest`, `go test`. Projects are
+   found at the root or up to three directories down (a Flutter app under
+   `mobile/`), and each check runs in its project's directory; the log
+   says they were inferred;
 4. if a check fails, sends the failure back to the agent for another
    **round**, up to the number set in the dialog (three by default). No
    pull request is opened while a check fails; a ticket that still fails

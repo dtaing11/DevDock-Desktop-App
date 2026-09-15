@@ -252,9 +252,12 @@ The model can call the tool again if it still needs it.
 
 ### The engine: the built-in harness, or Claude Code
 
-The picker next to the task box lists Ollama models and Claude models — and,
-when the `claude` command is installed on this machine, **Claude Code**.
-Picking it hands the task to Anthropic's own agent, run headless in the
+Next to the task box, **Engine** switches between **DevDock harness** and
+**Claude Code agent**; the same switch sits beside the backlog fixer, the
+reviewer, and each of those tasks in Settings. It is greyed out, with the
+install command on hover, when the `claude` command is not on this machine.
+The model picker lists the Claude Code aliases first for those tasks, too.
+Picking Claude Code hands the task to Anthropic's own agent, run headless in the
 working tree (`claude -p … --output-format stream-json`), instead of this
 app's tool-use loop. Everything else is the same: its tool calls stream into
 the same log, its `TodoWrite` list is the plan the sidebar shows, and its
@@ -271,11 +274,14 @@ Two things follow from what Claude Code is:
   lives by, kept.
 
 The model under it is a Claude Code alias (`default`, `sonnet`, `opus`,
-`haiku`). The same choice is available for the backlog fixer; judging the
+`haiku` — the latest of each family) or any model id your account has,
+version and all (`claude-fable-5-1`, `claude-opus-5`); the picker lists
+both. The same choice is available for the backlog fixer; judging the
 backlog is a read-only harness run, so that still uses a model.
 
 **How to tell which harness ran.** Every run's log opens with an `engine:`
-line — `engine: Claude Code` or `engine: Claude (claude-sonnet-5)` — and
+line — `engine: Claude Code agent` or `engine: DevDock harness · Claude
+(claude-sonnet-5)` — and
 the strip above the summary repeats it next to the turn count. A backlog
 card and its draft pull request say the same. While Claude Code is
 running, `claude -p …` is a child process of DevDock, which `ps` will show.

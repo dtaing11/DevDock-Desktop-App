@@ -205,7 +205,7 @@ fn seed_backlog(app: &mut App) {
                 ],
                 checks: vec![git_manage::backlog::CheckOutcome { name: "tests".into(), ok: true }],
                 turns: 14,
-                engine: "Claude Code".into(),
+                engine: "Claude Code agent".into(),
                 rounds: 2,
                 reviewed_by: Some("Claude (claude-opus-5)".into()),
             })),

@@ -27,7 +27,10 @@ use std::time::{Duration, Instant};
 use super::{Event, PendingEdit, PlanStep, Run, Usage};
 use crate::git::Repo;
 
-/// Model aliases the CLI accepts. "default" sends no `--model` at all.
+/// Model aliases the CLI accepts. "default" sends no `--model` at all; the
+/// CLI also takes any full model id (`claude-opus-5`, `claude-fable-5-1`),
+/// which the picker lists from the account's own model list, so a family
+/// the aliases do not cover — and the exact version — can be chosen.
 pub const MODELS: &[&str] = &["default", "sonnet", "opus", "haiku"];
 
 /// The provider id the model picker writes for this engine.

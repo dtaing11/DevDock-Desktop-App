@@ -704,9 +704,9 @@ mod tests {
         assert_eq!(fixed.changes[0].path, "lib.py");
         assert_eq!(fixed.checks, [CheckOutcome { name: "tests".into(), ok: true }]);
         assert!(fixed.pr.title.starts_with("ABC-7: total() is off by one"));
-        assert_eq!(fixed.engine, "scripted");
+        assert_eq!(fixed.engine, "DevDock harness · scripted");
         assert_eq!(log.first().map(String::as_str), Some("branch fix/abc-7-total-is-off-by-one from main"));
-        assert!(log.iter().any(|l| l == "engine: scripted"), "{log:?}");
+        assert!(log.iter().any(|l| l == "engine: DevDock harness · scripted"), "{log:?}");
 
         // The branch is on the remote, the main checkout is untouched, and
         // the worktree is gone.
@@ -813,7 +813,7 @@ mod tests {
         )
         .unwrap_or_else(|e| panic!("{e}\n{log:#?}"));
         assert_eq!(fixed.rounds, 2);
-        assert_eq!(fixed.reviewed_by.as_deref(), Some("scripted"));
+        assert_eq!(fixed.reviewed_by.as_deref(), Some("DevDock harness · scripted"));
         assert!(log.iter().any(|l| l.starts_with("revise: No test covers")), "{log:?}");
         assert!(log.iter().any(|l| l.starts_with("approved: Fix and test")), "{log:?}");
         let paths: Vec<&str> = fixed.changes.iter().map(|c| c.path.as_str()).collect();

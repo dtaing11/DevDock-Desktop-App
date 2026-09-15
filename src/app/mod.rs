@@ -1361,6 +1361,33 @@ impl App {
         })
     }
 
+    /// A model for the built-in harness, for switching a task back from
+    /// Claude Code: the app-wide default, else the first Claude model when
+    /// signed in, else the first Ollama model.
+    pub fn harness_default_selection(&self) -> Option<AiSelection> {
+        let provider = self.config.ai_provider.clone().unwrap_or_else(|| "ollama".into());
+        let configured = if provider == "claude" {
+            self.config.claude_model.clone()
+        } else {
+            self.config.ollama_model.clone()
+        };
+        if let Some(model) = configured.filter(|m| !m.is_empty()) {
+            return Some(AiSelection { provider, model });
+        }
+        if self.claude.auth_label.is_some() {
+            let model = self
+                .claude
+                .models
+                .first()
+                .cloned()
+                .unwrap_or_else(|| claude::DEFAULT_MODEL.to_string());
+            return Some(AiSelection { provider: "claude".into(), model });
+        }
+        self.ollama_models
+            .first()
+            .map(|m| AiSelection { provider: "ollama".into(), model: m.name.clone() })
+    }
+
     /// Stores the selection for a task.
     pub fn set_ai_selection(&mut self, target: worker::AiTarget, sel: AiSelection) {
         match target {

@@ -25,7 +25,7 @@ pub mod runner;
 pub use runner::{DockerRunner, ExecOutput, ExecRequest, HostRunner, Runner, RunnerRegistry};
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 /// Config file name at the repository root.
@@ -208,7 +208,61 @@ pub struct LoadedConfigs {
 /// developer would run before pushing. Used by the coding agent and the
 /// backlog fixer so "no config" never means "nothing was tested"; the log
 /// says they were inferred. An empty list means nothing recognisable.
+///
+/// Projects are looked for at the root and up to three directories down —
+/// a Flutter app under `mobile/`, a service under `services/api/` — and
+/// each job runs in its project's directory, named after it.
 pub fn inferred_jobs(repo_root: &Path) -> Vec<Job> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    collect_project_dirs(repo_root, 0, &mut dirs);
+    let mut jobs = Vec::new();
+    for dir in dirs {
+        let rel = dir.strip_prefix(repo_root).unwrap_or(&dir).to_string_lossy().replace('\\', "/");
+        for mut job in inferred_jobs_in(&dir) {
+            if !rel.is_empty() {
+                job.name = format!("{} ({rel})", job.name);
+                job.dir = rel.clone();
+            }
+            jobs.push(job);
+        }
+    }
+    jobs
+}
+
+/// Directories that look like a project, nearest the root first. Stops
+/// descending once one is found: a project's own subdirectories are its
+/// business, and dependency and build trees are never projects.
+fn collect_project_dirs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    const SKIP: &[&str] = &[
+        "node_modules", "target", "build", "dist", "vendor", ".dart_tool", ".git", "ios",
+        "android", "macos", "linux", "windows", "web", "Pods", "__pycache__", ".venv", "venv",
+    ];
+    if !inferred_jobs_in(dir).is_empty() {
+        out.push(dir.to_path_buf());
+        return;
+    }
+    if depth >= 3 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut children: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| !n.starts_with('.') && !SKIP.contains(&n))
+        })
+        .collect();
+    children.sort();
+    for child in children {
+        collect_project_dirs(&child, depth + 1, out);
+    }
+}
+
+/// The checks one directory's project files imply, run in that directory.
+fn inferred_jobs_in(repo_root: &Path) -> Vec<Job> {
     let has = |name: &str| repo_root.join(name).exists();
     let read = |name: &str| std::fs::read_to_string(repo_root.join(name)).unwrap_or_default();
     let job = |name: &str, commands: &[&str]| Job {
@@ -956,6 +1010,28 @@ mod tests {
         std::fs::write(tmp.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
         let names: Vec<String> = inferred_jobs(tmp.path()).iter().map(|j| j.name.clone()).collect();
         assert_eq!(names, ["build", "test"]);
+
+        // A Flutter app under mobile/ and a service under services/api/,
+        // with a build tree that must not count: each job runs in its own
+        // directory, and the name says which.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("mobile/test")).unwrap();
+        std::fs::write(tmp.path().join("mobile/pubspec.yaml"), "dependencies:\n  flutter:\n    sdk: flutter\n").unwrap();
+        std::fs::create_dir_all(tmp.path().join("services/api")).unwrap();
+        std::fs::write(tmp.path().join("services/api/go.mod"), "module api\n").unwrap();
+        std::fs::create_dir_all(tmp.path().join("build/x")).unwrap();
+        std::fs::write(tmp.path().join("build/x/Cargo.toml"), "").unwrap();
+        let jobs = inferred_jobs(tmp.path());
+        let described: Vec<String> = jobs.iter().map(|j| format!("{} @ {}: {}", j.name, j.dir, j.commands.join(" && "))).collect();
+        assert_eq!(
+            described,
+            [
+                "analyze (mobile) @ mobile: flutter analyze",
+                "test (mobile) @ mobile: flutter test",
+                "vet (services/api) @ services/api: go vet ./...",
+                "test (services/api) @ services/api: go test ./...",
+            ]
+        );
     }
 
     #[test]

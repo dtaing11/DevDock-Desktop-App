@@ -1953,6 +1953,8 @@ impl App {
             Msg::BacklogTriageEvent(line) => self.backlog.triage_log.push(line),
             Msg::BacklogProgress { key, line } => self.on_backlog_progress(key, line),
             Msg::BacklogDone { key, result } => self.on_backlog_done(key, result),
+            Msg::AgentRunProgress { key, line } => self.on_agent_run_progress(key, line),
+            Msg::AgentRunDone { key, result } => self.on_agent_run_done(key, result),
 
             Msg::Worktrees(result) => self.on_worktrees(result),
             Msg::WorktreeDone { message, open } => self.on_worktree_done(message, open),
@@ -4135,6 +4137,113 @@ impl App {
     /// Guidance for the coding agent: the repository's own review
     /// instructions, which is where a project already writes down how its
     /// code is supposed to look.
+    /// Runs the task box's prompt the way the backlog fixer runs a ticket:
+    /// a branch and worktree of its own, the checks, a commit, a push, a
+    /// draft pull request, and the worktree removed. This tree is not
+    /// touched, so several can run at once and the box is free again.
+    pub fn start_worktree_run(&mut self) {
+        let Some(repo) = self.repo.clone() else { return };
+        let prompt = self.coding.task.trim().to_string();
+        if prompt.is_empty() {
+            return;
+        }
+        let Some(sel) = self.ai_selection(worker::AiTarget::Coding) else {
+            self.toast("No AI model selected. Pick one next to the task box.", true);
+            return;
+        };
+        if github::Client::from_store().is_none() {
+            self.toast("Sign in to GitHub first: a worktree run ends as a draft pull request.", true);
+            return;
+        }
+        let mut task = crate::backlog::Task::from_prompt(&prompt);
+        let wanted = self.coding.worktree.branch.trim().to_string();
+        if !wanted.is_empty() {
+            task.branch = wanted;
+        }
+        let key = task.branch.clone();
+        if self.coding.worktree.runs.get(&key).is_some_and(|r| !r.is_finished()) {
+            self.toast(format!("An agent is already working on {key}. Name another branch."), true);
+            return;
+        }
+        let url = self.effective_ollama_url();
+        let token = self.gh_token();
+        let instructions = self.coding_instructions();
+        let wt = &self.coding.worktree;
+        let sandbox = wt.sandbox.then(|| wt.sandbox_image.trim().to_string()).filter(|s| !s.is_empty());
+        let rounds = wt.rounds.max(1);
+        let review_sel = wt.review.then(|| self.ai_selection(worker::AiTarget::Review).unwrap_or_else(|| sel.clone()));
+
+        let mut run = backlog::TicketRun::queued(task.title.clone());
+        run.state = backlog::RunState::Running;
+        run.started = Some(Instant::now());
+        self.coding.worktree.runs.insert(key.clone(), run);
+        self.coding.worktree.expanded = Some(key.clone());
+        self.coding.task.clear();
+        self.coding.worktree.branch.clear();
+        self.tab = Tab::Agent;
+
+        let progress = self.worker.progress();
+        let done_key = key.clone();
+        self.worker.spawn(move || {
+            let result = (|| -> Result<crate::backlog::Fixed, String> {
+                let engine = agent_engine(&sel, &url)?;
+                let reviewer = match &review_sel {
+                    Some(r) => Some(agent_engine(r, &url)?),
+                    None => None,
+                };
+                let client = github::Client::from_store().ok_or("Not signed in to GitHub")?;
+                let slug = views::origin_slug(&repo).ok_or("No github.com remote found")?;
+                let base = crate::stack::default_branch(&repo);
+                let _ = repo.fetch(token.as_deref());
+                let publish = |title: &str, body: &str, head: &str| {
+                    client.create_draft_pull_request(&slug, title, body, head, &base).map_err(|e| e.to_string())
+                };
+                let job = crate::backlog::Job {
+                    task: &task,
+                    base: &base,
+                    auth: token.as_deref(),
+                    instructions: instructions.as_deref(),
+                    sandbox_image: sandbox.as_deref(),
+                    claim: None,
+                    rounds,
+                    reviewer: reviewer.as_ref(),
+                };
+                crate::backlog::fix(&repo, &engine, &job, &publish, &mut |line| {
+                    progress.send(Msg::AgentRunProgress { key: key.clone(), line });
+                })
+            })();
+            Msg::AgentRunDone { key: done_key, result: result.map(Box::new) }
+        });
+    }
+
+    fn on_agent_run_progress(&mut self, key: String, line: String) {
+        if let Some(run) = self.coding.worktree.runs.get_mut(&key) {
+            run.log.push(line);
+        }
+    }
+
+    fn on_agent_run_done(&mut self, key: String, result: Result<Box<crate::backlog::Fixed>, String>) {
+        let Some(run) = self.coding.worktree.runs.get_mut(&key) else { return };
+        run.took = run.started.map(|s| s.elapsed());
+        let toast = match result {
+            Ok(fixed) => {
+                run.log.push(format!("done: {}", fixed.pr.html_url));
+                let text = format!("Draft PR #{} opened from {key}; the worktree is gone.", fixed.pr.number);
+                run.state = backlog::RunState::Done(fixed);
+                (text, false)
+            }
+            Err(e) => {
+                let first = e.lines().next().unwrap_or("").to_string();
+                run.log.push(format!("failed: {first}"));
+                run.state = backlog::RunState::Failed(e);
+                (format!("Worktree agent on {key} failed: {first}"), true)
+            }
+        };
+        self.toast(toast.0, toast.1);
+        // A new branch may exist now; a worktree no longer does.
+        self.refresh();
+    }
+
     fn coding_instructions(&self) -> Option<String> {
         let repo = self.repo.as_ref()?;
         let cfg = self.review.config.resolve_files(repo.path()).ok()?;
@@ -5823,8 +5932,8 @@ mod tests {
         assert!(app.backlog.selected.contains("T-1"));
 
         // Two agents in flight, by hand: starting one for real needs a model.
-        app.backlog.runs.insert("T-1".into(), TicketRun { state: RunState::Running, log: Vec::new(), started: Some(Instant::now()), took: None });
-        app.backlog.runs.insert("T-2".into(), TicketRun { state: RunState::Running, log: Vec::new(), started: Some(Instant::now()), took: None });
+        app.backlog.runs.insert("T-1".into(), TicketRun { title: "one".into(), state: RunState::Running, log: Vec::new(), started: Some(Instant::now()), took: None });
+        app.backlog.runs.insert("T-2".into(), TicketRun { title: "two".into(), state: RunState::Running, log: Vec::new(), started: Some(Instant::now()), took: None });
         app.handle(Msg::BacklogProgress { key: "T-1".into(), line: "· read a.rs".into() });
         assert_eq!(app.backlog.runs["T-1"].log, ["· read a.rs"]);
         assert_eq!(app.backlog.running(), 2);
@@ -5860,6 +5969,71 @@ mod tests {
         theme::run_test_ctx(|ctx| dialogs::show(&mut app, ctx));
         app.backlog_clear_finished();
         assert!(app.backlog.runs.is_empty());
+    }
+
+    /// A prompt sent to a worktree from the Agent tab is tracked as a card,
+    /// keyed by its branch, through running, done, and failed — and the
+    /// tab draws every state.
+    #[test]
+    fn the_agent_tab_tracks_worktree_runs() {
+        use backlog::{RunState, TicketRun};
+        let (_tmp, mut app, _file) = app_with_repo();
+        app.coding.worktree.enabled = true;
+
+        // An empty prompt starts nothing. (A real start needs a model and
+        // GitHub, both of which this machine may have — so not here.)
+        app.coding.task = "   ".into();
+        app.start_worktree_run();
+        assert!(app.coding.worktree.runs.is_empty());
+
+        // Two runs in flight, by hand: starting one for real needs a model.
+        let mut run = TicketRun::queued("add a --json flag");
+        run.state = RunState::Running;
+        run.started = Some(Instant::now());
+        app.coding.worktree.runs.insert("agent/add-a-json-flag".into(), run);
+        let mut run = TicketRun::queued("rename foo");
+        run.state = RunState::Running;
+        run.started = Some(Instant::now());
+        app.coding.worktree.runs.insert("agent/rename-foo".into(), run);
+        assert_eq!(app.coding.worktree.running(), 2);
+
+        app.handle(Msg::AgentRunProgress { key: "agent/add-a-json-flag".into(), line: "branch agent/add-a-json-flag from main".into() });
+        assert_eq!(app.coding.worktree.runs["agent/add-a-json-flag"].log, ["branch agent/add-a-json-flag from main"]);
+
+        app.handle(Msg::AgentRunDone { key: "agent/rename-foo".into(), result: Err("the agent changed nothing: nothing named foo".into()) });
+        assert!(matches!(app.coding.worktree.runs["agent/rename-foo"].state, RunState::Failed(_)));
+        assert!(app.coding.worktree.runs["agent/rename-foo"].took.is_some());
+        assert!(app.toast.as_ref().is_some_and(|t| t.text.contains("failed: the agent changed nothing")));
+
+        let fixed = crate::backlog::Fixed {
+            key: "agent".into(),
+            branch: "agent/add-a-json-flag".into(),
+            pr: github::PullRequest { number: 9, title: "add a --json flag".into(), html_url: "u".into(), state: "open".into(), head: "agent/add-a-json-flag".into(), head_sha: String::new(), base: "main".into(), user: "me".into() },
+            summary: "- done".into(),
+            changes: vec![crate::backlog::ChangedFile { path: "src/cli.rs".into(), added: 4, removed: 0, new: false }],
+            checks: vec![crate::backlog::CheckOutcome { name: "tests".into(), ok: true }],
+            turns: 5,
+            engine: "scripted".into(),
+            rounds: 1,
+            reviewed_by: None,
+        };
+        app.handle(Msg::AgentRunDone { key: "agent/add-a-json-flag".into(), result: Ok(Box::new(fixed)) });
+        assert_eq!(app.coding.worktree.done(), 1);
+        assert_eq!(app.coding.worktree.failed(), 1);
+        assert_eq!(app.coding.worktree.running(), 0);
+        assert!(app.toast.as_ref().is_some_and(|t| t.text.contains("Draft PR #9")));
+
+        // Every state draws, in the sidebar and the viewport, with a log
+        // unfolded — and the tab's own run is not confused with these.
+        app.coding.worktree.expanded = Some("agent/add-a-json-flag".into());
+        app.tab = Tab::Agent;
+        theme::run_test_ctx(|ctx| {
+            egui::SidePanel::left("t").show(ctx, |ui| agent_tab::agent_sidebar(&mut app, ui));
+            egui::CentralPanel::default().show(ctx, |ui| agent_tab::agent_viewport(&mut app, ui));
+        });
+        assert!(!app.coding.running);
+        app.coding.worktree.clear_finished();
+        assert!(app.coding.worktree.runs.is_empty());
     }
 
     /// Creating a worktree from the dialog puts the branch in its own

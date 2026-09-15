@@ -53,8 +53,9 @@ pub struct Verdict {
     pub feedback: String,
 }
 
-/// The reviewer's task: the ticket and the diff, capped.
-pub fn review_task(issue: &BacklogIssue, diff: &str) -> String {
+/// The reviewer's task: what was asked (a ticket, or a prompt) and the
+/// diff, capped.
+pub fn review_task(brief: &str, diff: &str) -> String {
     const MAX_DIFF: usize = 60_000;
     let mut diff = diff.to_string();
     if diff.len() > MAX_DIFF {
@@ -63,9 +64,20 @@ pub fn review_task(issue: &BacklogIssue, diff: &str) -> String {
         diff.push_str("\n[diff truncated; read the files for the rest]");
     }
     format!(
-        "The ticket:\n{}\n\nThe change, as a diff against the branch it started from:\n```diff\n{diff}\n```\n\nRead the repository as needed, then give your verdict.",
-        issue.prompt_text(MAX_DESCRIPTION)
+        "What was asked:\n{}\n\nThe change, as a diff against the branch it started from:\n```diff\n{diff}\n```\n\nRead the repository as needed, then give your verdict.",
+        cap(brief, MAX_DESCRIPTION)
     )
+}
+
+/// The first `max` bytes of a text, cut at a character boundary.
+fn cap(text: &str, max: usize) -> String {
+    let mut text = text.trim().to_string();
+    if text.len() > max {
+        let end = (0..=max).rev().find(|i| text.is_char_boundary(*i)).unwrap_or(0);
+        text.truncate(end);
+        text.push_str("\n[truncated]");
+    }
+    text
 }
 
 /// Parses a reviewer's reply; a reply that is not a verdict is a revise
@@ -86,11 +98,11 @@ pub fn parse_verdict(text: &str) -> Verdict {
 pub fn review(
     provider: &dyn Provider,
     workspace: &mut Workspace,
-    issue: &BacklogIssue,
+    brief: &str,
     diff: &str,
     on_event: &mut dyn FnMut(Event),
 ) -> Result<Verdict, String> {
-    let run = super::run(provider, workspace, REVIEW_SYSTEM_PROMPT, &review_task(issue, diff), limits(2), on_event)?;
+    let run = super::run(provider, workspace, REVIEW_SYSTEM_PROMPT, &review_task(brief, diff), limits(2), on_event)?;
     Ok(parse_verdict(&run.text))
 }
 
@@ -295,8 +307,9 @@ mod tests {
         let v = parse_verdict("I could not decide.");
         assert!(!v.approve, "no verdict is not an approval");
         assert_eq!(v.feedback, "I could not decide.");
-        let task = review_task(&issue("B-1", "x"), &"+line\n".repeat(100_000));
+        let task = review_task(&issue("B-1", "x").prompt_text(1_000), &"+line\n".repeat(100_000));
         assert!(task.contains("[diff truncated"));
+        assert!(task.starts_with("What was asked:\nB-1: x"), "{task}");
     }
 
     #[test]

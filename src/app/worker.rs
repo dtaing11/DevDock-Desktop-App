@@ -97,6 +97,10 @@ pub enum Msg {
     BacklogProgress { key: String, line: String },
     /// A ticket's fix finished, one way or the other.
     BacklogDone { key: String, result: Result<Box<crate::backlog::Fixed>, String> },
+    /// A line from an Agent-tab run in its own worktree, keyed by branch.
+    AgentRunProgress { key: String, line: String },
+    /// An Agent-tab worktree run finished.
+    AgentRunDone { key: String, result: Result<Box<crate::backlog::Fixed>, String> },
 
     /// Every checkout of the repository.
     Worktrees(Result<Vec<crate::git::Worktree>, String>),

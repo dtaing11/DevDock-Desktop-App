@@ -177,6 +177,7 @@ fn seed_backlog(app: &mut App) {
         app.backlog.triage.insert(t.key.clone(), t);
     }
     let run = |state: RunState, log: &[&str]| TicketRun {
+        title: log.first().map(|l| l.trim_start_matches("branch ").split(" from ").next().unwrap_or_default()).unwrap_or_default().replacen("fix/", "", 1),
         state,
         log: log.iter().map(|l| l.to_string()).collect(),
         started: Some(std::time::Instant::now() - std::time::Duration::from_secs(94)),
@@ -309,6 +310,48 @@ fn seed_agent(app: &mut App, mode: &str) {
     use git_manage::agent::{PendingEdit, PlanStep};
     let step = |text: &str, done: bool| PlanStep { text: text.into(), done };
     app.tab = Tab::Agent;
+    if mode == "worktree" {
+        // Two prompts sent to worktrees of their own: the tab's tree idle,
+        // the runs in the viewport.
+        use git_manage::app::backlog::{RunState, TicketRun};
+        app.coding.worktree.enabled = true;
+        app.coding.task = "make `devdock branches --json` list upstreams too".into();
+        let run = |title: &str, state: RunState, log: &[&str]| TicketRun {
+            title: title.into(),
+            state,
+            log: log.iter().map(|l| l.to_string()).collect(),
+            started: Some(std::time::Instant::now() - std::time::Duration::from_secs(131)),
+            took: None,
+        };
+        app.coding.worktree.runs.insert(
+            "agent/add-a-json-flag-to-devdock-status".into(),
+            run(
+                "add a --json flag to devdock status and cover it with a test",
+                RunState::Done(Box::new(git_manage::backlog::Fixed {
+                    key: "agent".into(),
+                    branch: "agent/add-a-json-flag-to-devdock-status".into(),
+                    pr: git_manage::github::PullRequest { number: 14, title: "add a --json flag to devdock status and cover it with a test".into(), html_url: "https://github.com/acme/devdock/pull/14".into(), state: "open".into(), head: "agent/add-a-json-flag-to-devdock-status".into(), head_sha: String::new(), base: "main".into(), user: "dina".into() },
+                    summary: "- src/cli.rs: `--json` on `status`, serialising the same struct the table prints\n- tests/workflow.rs: a test that parses the output\n\nVerified: tests passed".into(),
+                    changes: vec![
+                        git_manage::backlog::ChangedFile { path: "src/cli.rs".into(), added: 18, removed: 2, new: false },
+                        git_manage::backlog::ChangedFile { path: "tests/workflow.rs".into(), added: 9, removed: 0, new: false },
+                    ],
+                    checks: vec![git_manage::backlog::CheckOutcome { name: "tests".into(), ok: true }],
+                    turns: 11,
+                    engine: "Claude Code agent (claude-opus-5)".into(),
+                    rounds: 1,
+                    reviewed_by: Some("DevDock harness · Claude (claude-fable-5-1)".into()),
+                })),
+                &["branch agent/add-a-json-flag-to-devdock-status from main", "· read src/cli.rs", "· edit src/cli.rs", "verifying: tests", "tests passed", "review by DevDock harness · Claude (claude-fable-5-1)", "approved: Flag, serialisation and test all present.", "committed: add a --json flag to devdock status and cover it with a test", "pushed agent/add-a-json-flag-to-devdock-status", "draft pull request #14 opened", "worktree removed"],
+            ),
+        );
+        app.coding.worktree.runs.insert(
+            "agent/rename-the-conflicts-tab".into(),
+            run("rename the Conflicts tab to Merge", RunState::Running, &["branch agent/rename-the-conflicts-tab from main", "engine: DevDock harness · Claude (claude-fable-5-1)", "round 1 of 3", "· search \"Conflicts\"", "· read src/app/mod.rs", "· edit src/app/mod.rs"]),
+        );
+        app.coding.worktree.expanded = Some("agent/add-a-json-flag-to-devdock-status".into());
+        return;
+    }
     app.coding.task = "add a --json flag to devdock status and cover it with a test".into();
     app.coding.plan = vec![
         step("Read the CLI argument parser", true),

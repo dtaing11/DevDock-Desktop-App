@@ -19,9 +19,11 @@
 //! The wording in the panel changes with the mode, because "Apply" and
 //! "Revert" are not the same promise.
 
+use super::backlog::{RunState, TicketRun};
 use super::worker::AiTarget;
 use super::{theme, App, ProposedEdit};
 use egui::{RichText, ScrollArea};
+use std::collections::BTreeMap;
 
 /// One completed exchange, shown in the transcript.
 pub struct Exchange {
@@ -70,6 +72,65 @@ pub struct CodingState {
     pub usage: Option<crate::agent::Usage>,
     /// Which harness ran the last task, as the run reported it.
     pub engine: String,
+    /// Runs sent to a worktree of their own instead of this tree.
+    pub worktree: WorktreeRuns,
+}
+
+/// Tasks run the way the backlog fixer runs a ticket: a fresh branch and
+/// worktree from the default branch, the checks, a commit, a push, a draft
+/// pull request, and the worktree removed — while this window's tree is
+/// untouched and free for the next task.
+pub struct WorktreeRuns {
+    /// Whether the next Run goes to a worktree rather than this tree.
+    pub enabled: bool,
+    /// The branch to work on; empty means one made from the prompt.
+    pub branch: String,
+    /// Attempts before giving up: a failed check or a reviewer's "revise"
+    /// goes back to the agent with the reason.
+    pub rounds: usize,
+    /// A second agent reads the prompt and the diff before the pull request.
+    pub review: bool,
+    /// Run every check inside this Docker image.
+    pub sandbox: bool,
+    pub sandbox_image: String,
+    /// One entry per run, keyed by branch.
+    pub runs: BTreeMap<String, TicketRun>,
+    /// Whose log is unfolded.
+    pub expanded: Option<String>,
+}
+
+impl Default for WorktreeRuns {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            branch: String::new(),
+            rounds: 3,
+            review: true,
+            sandbox: false,
+            sandbox_image: String::new(),
+            runs: BTreeMap::new(),
+            expanded: None,
+        }
+    }
+}
+
+impl WorktreeRuns {
+    pub fn running(&self) -> usize {
+        self.runs.values().filter(|r| r.is_running()).count()
+    }
+
+    pub fn done(&self) -> usize {
+        self.runs.values().filter(|r| matches!(r.state, RunState::Done(_))).count()
+    }
+
+    pub fn failed(&self) -> usize {
+        self.runs.values().filter(|r| matches!(r.state, RunState::Failed(_))).count()
+    }
+
+    /// Forgets finished runs so the list is the live ones again.
+    pub fn clear_finished(&mut self) {
+        self.runs.retain(|_, r| !r.is_finished());
+    }
 }
 
 impl CodingState {
@@ -109,6 +170,7 @@ pub fn agent_sidebar(app: &mut App, ui: &mut egui::Ui) {
         ui,
         |ui| {
             transcript(app, ui);
+            worktree_status(app, ui);
             plan(app, ui);
             if app.coding.running || !app.coding.log.is_empty() {
                 activity(app, ui);
@@ -140,6 +202,10 @@ pub fn agent_viewport(app: &mut App, ui: &mut egui::Ui) {
         && app.coding.summary.trim().is_empty()
         && app.coding.edits.is_empty();
     if idle {
+        if !app.coding.worktree.runs.is_empty() {
+            worktree_runs(app, ui);
+            return;
+        }
         ui.add_space(24.0);
         ui.vertical_centered(|ui| {
             ui.label(
@@ -658,6 +724,8 @@ fn task_panel(app: &mut App, ui: &mut egui::Ui) {
             ),
     );
 
+    worktree_options(app, ui);
+
     ui.horizontal(|ui| {
         let ready = !busy && !app.coding.task.trim().is_empty();
         if busy {
@@ -665,6 +733,17 @@ fn task_panel(app: &mut App, ui: &mut egui::Ui) {
             // run is still yours and offer no button that would fight it.
             ui.add(egui::Spinner::new().size(theme::SPINNER).color(theme::ember()));
             ui.label(RichText::new("working…").size(theme::TEXT).color(theme::fg_dim()));
+        } else if app.coding.worktree.enabled {
+            if ui
+                .add_enabled(ready, egui::Button::new("Run in a worktree").fill(theme::ember()))
+                .on_hover_text(
+                    "A fresh branch and worktree, the agent, the checks, a commit, a push, \
+                     a draft pull request, and the worktree removed. This tree is untouched.",
+                )
+                .clicked()
+            {
+                app.start_worktree_run();
+            }
         } else if ui
             .add_enabled(ready, egui::Button::new("Run").fill(theme::ember()))
             .on_hover_text("Send the task to the selected model")
@@ -692,6 +771,130 @@ fn task_panel(app: &mut App, ui: &mut egui::Ui) {
             app.coding.history.clear();
             app.coding.summary.clear();
             app.coding.log.clear();
+        }
+    });
+}
+
+/// The choice between this tree and a worktree of its own, and what the
+/// worktree run gets: a branch, rounds, a reviewer, a sandbox.
+fn worktree_options(app: &mut App, ui: &mut egui::Ui) {
+    ui.checkbox(&mut app.coding.worktree.enabled, "In a fresh worktree").on_hover_text(
+        "Like a backlog ticket: a branch and worktree from the default branch, the \
+         repository's checks, a commit, a push, a draft pull request, and the \
+         worktree removed. Several can run at once; this tree stays as it is.",
+    );
+    if !app.coding.worktree.enabled {
+        return;
+    }
+    // The sidebar is narrow: one setting per row, or the rows clip.
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("branch").small().color(theme::fg_dim()));
+        let hint = if app.coding.task.trim().is_empty() {
+            "agent/<from the prompt>".to_string()
+        } else {
+            crate::backlog::Task::from_prompt(&app.coding.task).branch
+        };
+        ui.add(
+            egui::TextEdit::singleline(&mut app.coding.worktree.branch)
+                .hint_text(super::views::dim_hint(&hint))
+                .desired_width(f32::INFINITY),
+        )
+        .on_hover_text("Leave empty for a name made from the prompt's first line");
+    });
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("rounds").small().color(theme::fg_dim()));
+        ui.add(egui::Slider::new(&mut app.coding.worktree.rounds, 1..=5).show_value(true)).on_hover_text(
+            "How many attempts. A failed check, or a reviewer asking for changes, goes \
+             back to the agent with the reason. No pull request while a check fails.",
+        );
+    });
+    ui.checkbox(&mut app.coding.worktree.review, "Second agent reviews").on_hover_text(
+        "Before the pull request, the code-review model reads the prompt and the \
+         diff and answers approve or revise. Revise is another round. Its model is \
+         the one chosen for code review in Settings.",
+    );
+    ui.checkbox(&mut app.coding.worktree.sandbox, "Checks in a sandbox").on_hover_text(
+        "Every build and test runs inside this Docker image with the worktree \
+         mounted at /work, so it cannot touch the machine.",
+    );
+    if app.coding.worktree.sandbox {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("image").small().color(theme::fg_dim()));
+            ui.add(
+                egui::TextEdit::singleline(&mut app.coding.worktree.sandbox_image)
+                    .hint_text(super::views::dim_hint("rust:1.80, python:3.12, node:22…"))
+                    .desired_width(f32::INFINITY),
+            );
+        });
+        if !crate::local_ci::docker_available() {
+            ui.label(RichText::new("Docker not found").size(theme::SMALL).color(theme::danger()));
+        }
+    }
+}
+
+/// One line in the sidebar on the worktree runs, while the cards themselves
+/// are in the viewport where a log can be read.
+fn worktree_status(app: &mut App, ui: &mut egui::Ui) {
+    let wt = &app.coding.worktree;
+    if wt.runs.is_empty() {
+        return;
+    }
+    let (running, done, failed) = (wt.running(), wt.done(), wt.failed());
+    ui.horizontal_wrapped(|ui| {
+        ui.label(theme::overline("WORKTREE AGENTS"));
+        ui.label(
+            RichText::new(format!("{running} running · {done} done · {failed} failed"))
+                .size(theme::SMALL)
+                .color(theme::fg_dim()),
+        );
+        if running > 0 {
+            ui.add(egui::Spinner::new().size(theme::SPINNER));
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+        }
+    });
+    ui.separator();
+}
+
+/// The worktree runs, one card each, in the viewport.
+fn worktree_runs(app: &mut App, ui: &mut egui::Ui) {
+    let (running, done, failed) =
+        (app.coding.worktree.running(), app.coding.worktree.done(), app.coding.worktree.failed());
+    ui.add_space(theme::UNIT);
+    ui.horizontal(|ui| {
+        ui.label(theme::overline("WORKTREE AGENTS"));
+        ui.label(
+            RichText::new(format!("{running} running · {done} done · {failed} failed"))
+                .size(theme::SMALL)
+                .color(theme::fg_dim()),
+        );
+        if running > 0 {
+            ui.add(egui::Spinner::new().size(theme::SPINNER));
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if (done + failed) > 0 && ui.small_button("Clear finished").clicked() {
+                app.coding.worktree.clear_finished();
+            }
+        });
+    });
+    ui.label(
+        RichText::new(
+            "Each runs on a branch and worktree of its own and ends as a draft pull request; \
+             the worktree is removed when it is done. Nothing here touches this tree.",
+        )
+        .small()
+        .color(theme::fg_dim()),
+    );
+    ui.add_space(theme::UNIT);
+    let keys: Vec<String> = app.coding.worktree.runs.keys().cloned().collect();
+    ScrollArea::vertical().auto_shrink([false, false]).id_salt("agent-worktree-runs").show(ui, |ui| {
+        for key in keys {
+            let Some(run) = app.coding.worktree.runs.get(&key) else { continue };
+            let expanded = app.coding.worktree.expanded.as_deref() == Some(key.as_str());
+            if super::backlog::run_card(ui, &key, &run.title, run, expanded, "agent-worktree-log") {
+                app.coding.worktree.expanded = if expanded { None } else { Some(key.clone()) };
+            }
+            ui.add_space(theme::UNIT);
         }
     });
 }

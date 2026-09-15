@@ -52,6 +52,12 @@ macOS/Windows since egui is cross-platform).
   a ticket an agent starts is assigned to you, moved to the active sprint,
   and marked In Progress, and gets a comment with the pull request.
   See [docs/jira-tickets.md](docs/jira-tickets.md#working-the-backlog).
+- **Prompts in a worktree of their own**: tick *In a fresh worktree* in the
+  Agent tab and a prompt runs like a backlog ticket — its own branch and
+  worktree, the checks, rounds with a reviewing agent, a draft pull request,
+  and the worktree removed after — while your tree stays as it is. Every run
+  is tracked as a card. See
+  [docs/editor-and-agent.md](docs/editor-and-agent.md#in-a-fresh-worktree).
 - **Stacked pull requests**: split one large change into a chain of branches,
   each PR targeting the branch below it so every reviewer sees one focused
   diff. Built on GitHub's own `gh stack` extension, so the stack is the one

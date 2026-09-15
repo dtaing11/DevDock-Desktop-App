@@ -313,6 +313,38 @@ Use propose for anything you want to inspect first. Use iterate when the task
 has a definition of done the machine can check — "make the tests pass",
 "fix the build", "add a flag and cover it with a test".
 
+### In a fresh worktree
+
+**In a fresh worktree** (the checkbox under the task box) sends the prompt
+the way [the backlog fixer](jira-tickets.md#working-the-backlog) sends a
+ticket, and leaves this window's tree alone:
+
+1. a branch — `agent/<the prompt's first line>`, or the name you type — and a
+   worktree for it, made from the default branch;
+2. the chosen engine, live, in that worktree, with the repository's checks
+   (declared, or inferred from the toolchain);
+3. the checks run again by DevDock, not on the agent's word; a failure goes
+   back to the agent with the output, for up to **rounds** attempts;
+4. optionally a **second agent** — the code-review model — reading the prompt
+   and the diff, and sending it back with feedback until it approves;
+5. a commit, a push, and a **draft pull request**;
+6. the worktree removed. A run that changed nothing, or never passed, also
+   deletes its branch — nothing is left but the log.
+
+Every run is a card in the viewport, keyed by branch: queued, running, done or
+failed, with elapsed time, everything it did as it did it, and at the end the
+pull request and the files it changed. Several can run at once — send one
+prompt, then the next — and the task box is free as soon as one starts. The
+cards stay until **Clear finished**.
+
+**Checks in a sandbox** runs every build and test inside a Docker image with
+the worktree mounted at `/work`. The image is removed with the container, and
+the worktree with the run, so a sandbox cannot accumulate on disk.
+
+It needs GitHub sign-in, because the outcome is a pull request. A prompt that
+needs a decision from you is not a fit: the agent is told nobody can answer,
+and to change nothing rather than guess.
+
 ### What it can and cannot do
 
 | Tool | What it does |

@@ -1,7 +1,8 @@
-//! Fixing a Jira ticket unattended: a worktree, the coding agent, the
+//! Fixing something unattended: a worktree, the coding agent, the
 //! repository's own checks, a commit, a push, and a draft pull request.
 //!
-//! One ticket is one [`fix`] call, and several can run at the same time,
+//! The something is a [`Task`]: a Jira ticket from the backlog, or a prompt
+//! typed into the Agent tab. One task is one [`fix`] call, and several can run at the same time,
 //! each in its own worktree so none of them can see another's half-written
 //! files. The worktree is temporary: it is removed once the branch is pushed,
 //! and the branch is what the draft pull request is made from. A run that
@@ -125,10 +126,98 @@ impl Claimer for JiraClaim {
     }
 }
 
+/// What an agent is asked to do in a worktree of its own: a Jira ticket,
+/// or a prompt typed into the Agent tab. The fixer does not care which; the
+/// pull request's wording does.
+#[derive(Debug, Clone, Default)]
+pub struct Task {
+    /// The ticket key, or `agent` for a prompt: what the log and the commit
+    /// prefix say.
+    pub label: String,
+    /// One line: the ticket's summary, or the prompt's first line.
+    pub title: String,
+    /// The ticket's description, or the whole prompt, for the pull request.
+    pub description: String,
+    /// What the agent and the reviewer read: the ticket with its metadata,
+    /// or the prompt as typed.
+    pub brief: String,
+    /// The ticket's page; a prompt has none.
+    pub url: Option<String>,
+    /// The branch the work goes on.
+    pub branch: String,
+    /// What triage found, when the task came through it.
+    pub triage: Option<Triage>,
+}
+
+impl Task {
+    /// A ticket from the backlog.
+    pub fn from_issue(issue: &BacklogIssue, triage: Option<&Triage>) -> Self {
+        Self {
+            label: issue.key.clone(),
+            title: issue.summary.trim().to_string(),
+            description: issue.description.trim().to_string(),
+            brief: issue.prompt_text(6_000),
+            url: Some(issue.url.clone()),
+            branch: branch_name(issue),
+            triage: triage.cloned(),
+        }
+    }
+
+    /// A prompt from the Agent tab. The branch is `agent/<slug of the first
+    /// line>`; the caller may rename it.
+    pub fn from_prompt(prompt: &str) -> Self {
+        let prompt = prompt.trim();
+        let first = prompt.lines().next().unwrap_or_default().trim();
+        let title = truncate(first, 72);
+        let slug = slugify(first, 40);
+        Self {
+            label: "agent".into(),
+            title: title.clone(),
+            description: prompt.to_string(),
+            brief: prompt.to_string(),
+            url: None,
+            branch: if slug.is_empty() { "agent/task".into() } else { format!("agent/{slug}") },
+            triage: None,
+        }
+    }
+
+    /// Whether this is a ticket, with a page to link and a key to prefix.
+    pub fn is_ticket(&self) -> bool {
+        self.url.is_some()
+    }
+
+    /// The pull request's title and the commit's subject: `KEY: summary`
+    /// for a ticket, the first line for a prompt.
+    pub fn subject(&self) -> String {
+        if self.is_ticket() {
+            format!("{}: {}", self.label, self.title)
+        } else {
+            self.title.clone()
+        }
+    }
+}
+
+/// Lowercase letters and digits, runs of anything else collapsed to one
+/// dash, cut at `max` bytes.
+fn slugify(text: &str, max: usize) -> String {
+    let mut slug = String::new();
+    for c in text.chars() {
+        let c = c.to_ascii_lowercase();
+        if c.is_ascii_alphanumeric() {
+            slug.push(c);
+        } else if !slug.ends_with('-') && !slug.is_empty() {
+            slug.push('-');
+        }
+        if slug.len() >= max {
+            break;
+        }
+    }
+    slug.trim_matches('-').to_string()
+}
+
 /// What the fix needs from the outside.
 pub struct Job<'a> {
-    pub issue: &'a BacklogIssue,
-    pub triage: Option<&'a Triage>,
+    pub task: &'a Task,
     /// The branch the fix starts from and the pull request targets.
     pub base: &'a str,
     /// GitHub token for the push; `None` uses whatever git has.
@@ -152,19 +241,7 @@ pub struct Job<'a> {
 /// The branch a ticket's fix lives on: `fix/abc-7-crash-on-empty-repo`.
 pub fn branch_name(issue: &BacklogIssue) -> String {
     let key = issue.key.trim().to_lowercase();
-    let mut slug = String::new();
-    for c in issue.summary.chars() {
-        let c = c.to_ascii_lowercase();
-        if c.is_ascii_alphanumeric() {
-            slug.push(c);
-        } else if !slug.ends_with('-') && !slug.is_empty() {
-            slug.push('-');
-        }
-        if slug.len() >= 40 {
-            break;
-        }
-    }
-    let slug = slug.trim_matches('-');
+    let slug = slugify(&issue.summary, 40);
     if slug.is_empty() {
         format!("fix/{key}")
     } else {
@@ -172,16 +249,17 @@ pub fn branch_name(issue: &BacklogIssue) -> String {
     }
 }
 
-/// The instruction the agent gets: the ticket, what triage found, and the
+/// The instruction the agent gets: the task, what triage found, and the
 /// rules of an unattended run.
-pub fn task_text(issue: &BacklogIssue, triage: Option<&Triage>) -> String {
+pub fn task_text(task: &Task) -> String {
+    let what = if task.is_ticket() { "Resolve this Jira ticket" } else { "Do this task" };
+    let asks = if task.is_ticket() { "the ticket" } else { "the task" };
     let mut text = format!(
-        "Resolve this Jira ticket. Nobody can answer questions during the run: decide \
-         for yourself, state any assumption in your summary, and keep the change to \
-         what the ticket asks.\n\n{}\n",
-        issue.prompt_text(6_000)
+        "{what}. Nobody can answer questions during the run: decide for yourself, state \
+         any assumption in your summary, and keep the change to what {asks} asks.\n\n{}\n",
+        task.brief
     );
-    if let Some(t) = triage {
+    if let Some(t) = &task.triage {
         if !t.area.is_empty() {
             text.push_str(&format!("\nThe work is in {}/.\n", t.area));
         }
@@ -190,7 +268,7 @@ pub fn task_text(issue: &BacklogIssue, triage: Option<&Triage>) -> String {
         }
     }
     text.push_str(
-        "\nRun the repository's checks before you finish. If the ticket cannot be done \
+        "\nRun the repository's checks before you finish. If this cannot be done \
          without a decision from a person, say so in your summary and change nothing.",
     );
     text
@@ -199,25 +277,27 @@ pub fn task_text(issue: &BacklogIssue, triage: Option<&Triage>) -> String {
 /// The pull request's title and body.
 pub fn pull_request_text(
     fixed_summary: &str,
-    issue: &BacklogIssue,
+    task: &Task,
     checks: &[CheckOutcome],
     engine: &str,
     rounds: usize,
     reviewed_by: Option<&str>,
 ) -> (String, String) {
-    let title = format!("{}: {}", issue.key, issue.summary.trim());
-    let mut body = format!("Resolves [{}]({}).\n\n", issue.key, issue.url);
-    if !issue.description.trim().is_empty() {
-        let quoted: Vec<String> = issue
-            .description
-            .trim()
-            .lines()
-            .take(30)
-            .map(|l| format!("> {l}"))
-            .collect();
-        body.push_str(&quoted.join("\n"));
-        body.push_str("\n\n");
-    }
+    let title = task.subject();
+    let quoted = |text: &str| -> String {
+        text.trim().lines().take(30).map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n")
+    };
+    let mut body = match &task.url {
+        Some(url) => {
+            let mut b = format!("Resolves [{}]({url}).\n\n", task.label);
+            if !task.description.trim().is_empty() {
+                b.push_str(&quoted(&task.description));
+                b.push_str("\n\n");
+            }
+            b
+        }
+        None => format!("Asked in DevDock's Agent tab:\n\n{}\n\n", quoted(&task.description)),
+    };
     body.push_str("## What changed\n\n");
     body.push_str(fixed_summary.trim());
     body.push_str("\n\n## Verified\n\n");
@@ -234,14 +314,15 @@ pub fn pull_request_text(
         )),
         None => body.push_str(&format!("\nNot reviewed by a second agent; {rounds} round(s).\n")),
     }
+    let from = if task.is_ticket() { "from the Jira backlog" } else { "in a worktree of its own" };
     body.push_str(&format!(
-        "\n---\n*Drafted from the Jira backlog by DevDock, engine: {engine}. Review before \
+        "\n---\n*Drafted {from} by DevDock's coding agent, engine: {engine}. Review before \
          marking ready.*\n"
     ));
     (title, body)
 }
 
-/// Fixes one ticket end to end. `publish` opens the pull request from the
+/// Fixes one task end to end. `publish` opens the pull request from the
 /// pushed branch, so a test can stand in a fake GitHub.
 ///
 /// Steps, and what a failure at each leaves behind:
@@ -259,7 +340,10 @@ pub fn fix(
     publish: &dyn Fn(&str, &str, &str) -> Result<PullRequest, String>,
     on_event: &mut dyn FnMut(String),
 ) -> Result<Fixed, String> {
-    let branch = branch_name(job.issue);
+    let branch = job.task.branch.clone();
+    if branch.trim().is_empty() || repo.git(&["check-ref-format", "--branch", &branch]).is_err() {
+        return Err(format!("{branch:?} is not a valid branch name"));
+    }
     let dir = repo.worktree_default_path(&branch);
     on_event(format!("branch {branch} from {}", job.base));
 
@@ -277,7 +361,7 @@ pub fn fix(
     }
     on_event(format!("worktree {}", dir.display()));
     if let Some(claim) = job.claim {
-        for line in claim.start(&job.issue.key) {
+        for line in claim.start(&job.task.label) {
             on_event(line);
         }
     }
@@ -300,8 +384,8 @@ pub fn fix(
     // The ticket hears how it went last, once everything else is settled.
     if let Some(claim) = job.claim {
         let lines = match &result {
-            Ok(fixed) => claim.finish(&job.issue.key, Ok(&fixed.pr)),
-            Err(e) => claim.finish(&job.issue.key, Err(e)),
+            Ok(fixed) => claim.finish(&job.task.label, Ok(&fixed.pr)),
+            Err(e) => claim.finish(&job.task.label, Err(e)),
         };
         for line in lines {
             on_event(line);
@@ -351,7 +435,7 @@ fn work(
     let mut workspace = Workspace::new(wt.path(), tracked.clone(), Access::ReadWrite)?
         .with_write_mode(WriteMode::Live)
         .with_checks(jobs.clone());
-    let base_task = task_text(job.issue, job.triage);
+    let base_task = task_text(job.task);
     let rounds = job.rounds.max(1);
     let mut feedback: Option<String> = None;
     let mut turns = 0;
@@ -424,7 +508,7 @@ fn work(
         if let Some(reviewer) = job.reviewer {
             on_event(format!("review by {}", reviewer.label()));
             let diff = wt.git(&["diff", job.base]).map_err(|e| e.to_string())?;
-            let verdict = review_with(reviewer, wt.path(), &tracked, job.issue, &diff, on_event)?;
+            let verdict = review_with(reviewer, wt.path(), &tracked, &job.task.brief, &diff, on_event)?;
             if verdict.approve {
                 on_event(format!("approved: {}", first_line(&verdict.feedback)));
                 reviewed_by = Some(reviewer.label());
@@ -450,8 +534,11 @@ fn work(
 
     // Commit and push.
     wt.stage_all().map_err(|e| e.to_string())?;
-    let subject = format!("{}: {}", job.issue.key, truncate(job.issue.summary.trim(), 60));
-    let body = format!("{}\n\n{}", summary.trim(), job.issue.url);
+    let subject = truncate(&job.task.subject(), 72);
+    let body = match &job.task.url {
+        Some(url) => format!("{}\n\n{url}", summary.trim()),
+        None => summary.trim().to_string(),
+    };
     wt.commit(&subject, &body, false).map_err(|e| e.to_string())?;
     on_event(format!("committed: {subject}"));
     wt.push_branch(branch, false, job.auth).map_err(|e| format!("push failed: {e}"))?;
@@ -459,12 +546,12 @@ fn work(
 
     // The pull request.
     let (title, pr_body) =
-        pull_request_text(&summary, job.issue, &checks, &engine.label(), round, reviewed_by.as_deref());
+        pull_request_text(&summary, job.task, &checks, &engine.label(), round, reviewed_by.as_deref());
     let pr = publish(&title, &pr_body, branch)?;
     on_event(format!("draft pull request #{} opened", pr.number));
 
     Ok(Fixed {
-        key: job.issue.key.clone(),
+        key: job.task.label.clone(),
         branch: branch.to_string(),
         pr,
         summary,
@@ -483,17 +570,17 @@ fn review_with(
     reviewer: &Engine,
     root: &Path,
     tracked: &[String],
-    issue: &BacklogIssue,
+    brief: &str,
     diff: &str,
     on_event: &mut dyn FnMut(String),
 ) -> Result<crate::agent::backlog::Verdict, String> {
     match reviewer {
         Engine::Harness(provider) => {
             let mut workspace = Workspace::new(root, tracked.to_vec(), Access::ReadOnly)?;
-            crate::agent::backlog::review(provider.as_ref(), &mut workspace, issue, diff, &mut |e| on_event(e.line()))
+            crate::agent::backlog::review(provider.as_ref(), &mut workspace, brief, diff, &mut |e| on_event(e.line()))
         }
         Engine::ClaudeCode(config) => {
-            let task = crate::agent::backlog::review_task(issue, diff);
+            let task = crate::agent::backlog::review_task(brief, diff);
             let run = crate::agent::claude_code::run_readonly(
                 config,
                 root,
@@ -641,6 +728,10 @@ mod tests {
         }
     }
 
+    fn task() -> Task {
+        Task::from_issue(&issue(), None)
+    }
+
     fn fixing_provider() -> Scripted {
         Scripted(RefCell::new(vec![
             Reply {
@@ -692,7 +783,7 @@ mod tests {
         let fixed = fix(
             &repo,
             &engine,
-            &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 1, reviewer: None },
+            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 1, reviewer: None },
             &fake_pr,
             &mut |line| log.push(line),
         )
@@ -731,7 +822,7 @@ mod tests {
         let err = fix(
             &repo,
             &engine,
-            &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 1, reviewer: None },
+            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 1, reviewer: None },
             &fake_pr,
             &mut |line| log.push(line),
         )
@@ -748,7 +839,7 @@ mod tests {
         let err = fix(
             &repo,
             &engine,
-            &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 1, reviewer: None },
+            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 1, reviewer: None },
             &fake_pr,
             &mut |_| {},
         )
@@ -776,7 +867,7 @@ mod tests {
         let fixed = fix(
             &repo,
             &engine,
-            &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 3, reviewer: None },
+            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 3, reviewer: None },
             &fake_pr,
             &mut |line| log.push(line),
         )
@@ -807,7 +898,7 @@ mod tests {
         let fixed = fix(
             &repo,
             &fixer,
-            &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 3, reviewer: Some(&reviewer) },
+            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 3, reviewer: Some(&reviewer) },
             &fake_pr,
             &mut |line| log.push(line),
         )
@@ -831,7 +922,7 @@ mod tests {
         let reviewer = Engine::Harness(Box::new(Scripted(RefCell::new(vec![
             Reply { text: r#"{"verdict": "revise", "feedback": "wrong"}"#.into(), ..Default::default() },
         ]))));
-        let err = fix(&repo, &fixer, &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 1, reviewer: Some(&reviewer) }, &fake_pr, &mut |_| {}).unwrap_err();
+        let err = fix(&repo, &fixer, &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 1, reviewer: Some(&reviewer) }, &fake_pr, &mut |_| {}).unwrap_err();
         assert!(err.contains("reviewer still asked for changes"), "{err}");
         assert!(!repo.branches().unwrap().local.iter().any(|b| b.name.starts_with("fix/")));
     }
@@ -862,7 +953,7 @@ mod tests {
         fix(
             &repo,
             &engine,
-            &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None, claim: Some(&claim), rounds: 1, reviewer: None },
+            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: Some(&claim), rounds: 1, reviewer: None },
             &fake_pr,
             &mut |line| log.push(line),
         )
@@ -877,7 +968,7 @@ mod tests {
         let (_tmp, repo) = setup("true");
         let claim = Recording(std::sync::Mutex::new(Vec::new()));
         let engine = Engine::Harness(Box::new(Scripted(RefCell::new(vec![Reply { text: "Needs a person.".into(), ..Default::default() }]))));
-        let _ = fix(&repo, &engine, &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None, claim: Some(&claim), rounds: 1, reviewer: None }, &fake_pr, &mut |_| {});
+        let _ = fix(&repo, &engine, &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: Some(&claim), rounds: 1, reviewer: None }, &fake_pr, &mut |_| {});
         assert!(claim.0.lock().unwrap()[1].starts_with("finish ABC-7 err the agent changed nothing"));
     }
 
@@ -886,7 +977,7 @@ mod tests {
         let (_tmp, repo) = setup("true");
         repo.create_branch("fix/abc-7-total-is-off-by-one", false).unwrap();
         let engine = Engine::Harness(Box::new(Scripted(RefCell::new(vec![]))));
-        let err = fix(&repo, &engine, &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 1, reviewer: None }, &fake_pr, &mut |_| {}).unwrap_err();
+        let err = fix(&repo, &engine, &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 1, reviewer: None }, &fake_pr, &mut |_| {}).unwrap_err();
         assert!(err.contains("already exists"), "{err}");
     }
 
@@ -901,7 +992,7 @@ mod tests {
         let err = fix(
             &repo,
             &engine,
-            &Job { issue: &issue(), triage: None, base: "main", auth: None, instructions: None, sandbox_image: Some("alpine:3"), claim: None, rounds: 1, reviewer: None },
+            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: Some("alpine:3"), claim: None, rounds: 1, reviewer: None },
             &fake_pr,
             &mut |_| {},
         )
@@ -925,7 +1016,7 @@ mod tests {
 
     #[test]
     fn the_pull_request_text_quotes_the_ticket_and_the_checks() {
-        let (title, body) = pull_request_text("- fixed it", &issue(), &[CheckOutcome { name: "tests".into(), ok: true }], "Claude Code", 2, Some("Claude (opus)"));
+        let (title, body) = pull_request_text("- fixed it", &task(), &[CheckOutcome { name: "tests".into(), ok: true }], "Claude Code", 2, Some("Claude (opus)"));
         assert_eq!(title, "ABC-7: total() is off by one");
         assert!(body.contains("Resolves [ABC-7](https://acme.atlassian.net/browse/ABC-7)"));
         assert!(body.contains("> It adds 1."));
@@ -933,17 +1024,82 @@ mod tests {
         assert!(body.contains("✅ `tests`"));
         assert!(body.contains("engine: Claude Code"), "{body}");
         assert!(body.contains("approved by Claude (opus) after 2 round(s)"), "{body}");
-        let (_, none) = pull_request_text("x", &issue(), &[], "scripted", 1, None);
+        let (_, none) = pull_request_text("x", &task(), &[], "scripted", 1, None);
         assert!(none.contains("declares no checks"));
+
+        // A prompt has no ticket to resolve: the prompt itself is quoted.
+        let prompt = Task::from_prompt("add a --json flag to devdock status\n\nand cover it with a test");
+        let (title, body) = pull_request_text("- added it", &prompt, &[], "scripted", 1, None);
+        assert_eq!(title, "add a --json flag to devdock status");
+        assert!(body.starts_with("Asked in DevDock's Agent tab:\n\n> add a --json flag"), "{body}");
+        assert!(body.contains("> and cover it with a test"));
+        assert!(!body.contains("Resolves"));
+        assert!(body.contains("in a worktree of its own"), "{body}");
     }
 
     #[test]
     fn the_task_carries_the_triage_plan() {
         let t = Triage { key: "ABC-7".into(), in_scope: true, area: "src/cli".into(), autonomous: true, confidence: 80, reason: "r".into(), plan: "edit cli.rs".into() };
-        let text = task_text(&issue(), Some(&t));
+        let text = task_text(&Task::from_issue(&issue(), Some(&t)));
+        assert!(text.starts_with("Resolve this Jira ticket."));
         assert!(text.contains("ABC-7: total() is off by one"));
         assert!(text.contains("The work is in src/cli/."));
         assert!(text.contains("edit cli.rs"));
         assert!(text.contains("Nobody can answer questions"));
+        let text = task_text(&Task::from_prompt("rename foo to bar"));
+        assert!(text.starts_with("Do this task."), "{text}");
+        assert!(text.contains("rename foo to bar"));
+    }
+
+    #[test]
+    fn a_prompt_is_a_task_with_its_own_branch() {
+        let t = Task::from_prompt("  Add a --json flag to `devdock status`!\n\nCover it with a test.  ");
+        assert_eq!(t.label, "agent");
+        assert_eq!(t.title, "Add a --json flag to `devdock status`!");
+        assert_eq!(t.branch, "agent/add-a-json-flag-to-devdock-status");
+        assert_eq!(t.brief, "Add a --json flag to `devdock status`!\n\nCover it with a test.");
+        assert!(!t.is_ticket());
+        assert_eq!(t.subject(), "Add a --json flag to `devdock status`!");
+        assert_eq!(Task::from_prompt("!!!").branch, "agent/task");
+        let long = Task::from_prompt(&"word ".repeat(50));
+        assert!(long.title.chars().count() <= 72);
+        assert!(long.branch.len() <= "agent/".len() + 40);
+        let ticket = task();
+        assert!(ticket.is_ticket());
+        assert_eq!(ticket.subject(), "ABC-7: total() is off by one");
+        assert_eq!(ticket.branch, "fix/abc-7-total-is-off-by-one");
+    }
+
+    #[test]
+    fn a_prompt_task_ends_as_a_branch_and_a_pull_request_like_a_ticket() {
+        let (_tmp, repo) = setup("grep -q 'return sum(xs)$' lib.py");
+        let engine = Engine::Harness(Box::new(fixing_provider()));
+        let task = Task::from_prompt("total() is off by one: drop the stray + 1");
+        let mut log = Vec::new();
+        let fixed = fix(
+            &repo,
+            &engine,
+            &Job { task: &task, base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 1, reviewer: None },
+            &fake_pr,
+            &mut |line| log.push(line),
+        )
+        .unwrap_or_else(|e| panic!("{e}\n{log:#?}"));
+        assert_eq!(fixed.branch, "agent/total-is-off-by-one-drop-the-stray-1");
+        assert_eq!(fixed.key, "agent");
+        assert_eq!(fixed.pr.title, "total() is off by one: drop the stray + 1");
+        let subject = repo.log(1, Some(&fixed.branch)).unwrap()[0].subject.clone();
+        assert_eq!(subject, "total() is off by one: drop the stray + 1");
+        assert_eq!(repo.worktrees().unwrap().len(), 1, "the worktree is gone");
+        assert!(!repo.worktree_default_path(&fixed.branch).exists());
+        let remote = repo.git(&["ls-remote", "--heads", "origin"]).unwrap();
+        assert!(remote.contains("refs/heads/agent/total-is-off-by-one"), "{remote}");
+
+        // A branch name the user typed that git would refuse is refused
+        // here, before a worktree is made.
+        let mut bad = Task::from_prompt("x");
+        bad.branch = "agent/..oops".into();
+        let err = fix(&repo, &engine, &Job { task: &bad, base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 1, reviewer: None }, &fake_pr, &mut |_| {}).unwrap_err();
+        assert!(err.contains("not a valid branch name"), "{err}");
+        assert_eq!(repo.worktrees().unwrap().len(), 1);
     }
 }

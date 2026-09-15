@@ -45,11 +45,20 @@ affect the others.
 
 ## Running agents on several branches
 
-Create a worktree per branch, each in a new window, and give each window's
-**Agent** tab its task. Every agent reads and writes only its own directory;
-checks it runs (`cargo test`, and so on) run there too, so a failing build in
-one branch is not visible from another. Commit and push from each window as
-usual.
+Two ways.
+
+**One window per branch.** Create a worktree per branch, each in a new
+window, and give each window's **Agent** tab its task. Every agent reads and
+writes only its own directory; checks it runs (`cargo test`, and so on) run
+there too, so a failing build in one branch is not visible from another.
+Commit and push from each window as usual.
+
+**One prompt per worktree, from one window.** Tick **In a fresh worktree**
+under the Agent tab's task box. Each prompt gets a branch and a temporary
+worktree of its own, runs with the checks, ends as a draft pull request, and
+the worktree is removed when it is done — this window's tree is never
+touched, and the runs are tracked as cards in the tab. See
+[docs/editor-and-agent.md](editor-and-agent.md#in-a-fresh-worktree).
 
 ## Removing one
 

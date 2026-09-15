@@ -700,9 +700,9 @@ fn cmd_backlog(rest: &[String]) -> ExitCode {
                         let publish = |title: &str, body: &str, head: &str| {
                             client.create_draft_pull_request(&slug, title, body, head, &base).map_err(|e| e.to_string())
                         };
+                        let task = crate::backlog::Task::from_issue(issue, None);
                         let job = crate::backlog::Job {
-                            issue,
-                            triage: None,
+                            task: &task,
                             base: &base,
                             auth: token.as_deref(),
                             instructions: instructions.as_deref(),

@@ -32,6 +32,8 @@ pub enum RunState {
 /// One agent working one ticket, as the dialog tracks it.
 #[derive(Debug)]
 pub struct TicketRun {
+    /// What it is on: the ticket's summary, or the prompt's first line.
+    pub title: String,
     pub state: RunState,
     /// Everything it did, one line per tool call, check, commit, and push.
     pub log: Vec<String>,
@@ -40,8 +42,8 @@ pub struct TicketRun {
 }
 
 impl TicketRun {
-    fn queued() -> Self {
-        Self { state: RunState::Queued, log: Vec::new(), started: None, took: None }
+    pub fn queued(title: impl Into<String>) -> Self {
+        Self { title: title.into(), state: RunState::Queued, log: Vec::new(), started: None, took: None }
     }
 
     pub fn is_running(&self) -> bool {
@@ -291,7 +293,8 @@ impl App {
             return;
         }
         for key in keys {
-            self.backlog.runs.insert(key.clone(), TicketRun::queued());
+            let title = self.backlog.issues.iter().find(|i| i.key == key).map(|i| i.summary.clone()).unwrap_or_default();
+            self.backlog.runs.insert(key.clone(), TicketRun::queued(title));
             self.backlog.queue.push_back(key);
         }
         self.pump_backlog();
@@ -366,9 +369,9 @@ impl App {
                         line: "could not look up your Jira account; the ticket is not claimed".into(),
                     });
                 }
+                let task = crate::backlog::Task::from_issue(&issue, triage.as_ref());
                 let job = crate::backlog::Job {
-                    issue: &issue,
-                    triage: triage.as_ref(),
+                    task: &task,
                     base: &base,
                     auth: token.as_deref(),
                     instructions: instructions.as_deref(),
@@ -453,12 +456,12 @@ impl App {
 }
 
 /// A label that wraps to the width it has instead of widening the dialog.
-fn wrapped(ui: &mut egui::Ui, text: RichText) {
+pub(super) fn wrapped(ui: &mut egui::Ui, text: RichText) {
     ui.add(egui::Label::new(text).wrap());
 }
 
 /// The first `max` characters of a line, with an ellipsis when cut.
-fn clip(text: &str, max: usize) -> String {
+pub(super) fn clip(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         text.to_string()
     } else {
@@ -466,7 +469,7 @@ fn clip(text: &str, max: usize) -> String {
     }
 }
 
-fn mmss(d: Duration) -> String {
+pub(super) fn mmss(d: Duration) -> String {
     let secs = d.as_secs();
     format!("{}:{:02}", secs / 60, secs % 60)
 }
@@ -697,13 +700,17 @@ fn agents(app: &mut App, ui: &mut egui::Ui) {
 
 fn agent_card(app: &mut App, ui: &mut egui::Ui, key: &str) {
     let Some(run) = app.backlog.runs.get(key) else { return };
-    let summary = app
-        .backlog
-        .issues
-        .iter()
-        .find(|i| i.key == key)
-        .map(|i| i.summary.clone())
-        .unwrap_or_default();
+    let expanded = app.backlog.expanded.as_deref() == Some(key);
+    if run_card(ui, key, &run.title, run, expanded, "backlog-log") {
+        app.backlog.expanded = if expanded { None } else { Some(key.to_string()) };
+    }
+}
+
+/// One agent's card: its state, what it is doing or did, its log on
+/// request, and — when it is done — the pull request and the files. Shared
+/// by the backlog dialog and the Agent tab's worktree runs. Returns whether
+/// the log toggle was clicked.
+pub(super) fn run_card(ui: &mut egui::Ui, key: &str, title: &str, run: &TicketRun, expanded: bool, salt: &str) -> bool {
     let (state_label, color) = match &run.state {
         RunState::Queued => ("queued", theme::fg_dim()),
         RunState::Running => ("running", theme::ember()),
@@ -712,13 +719,7 @@ fn agent_card(app: &mut App, ui: &mut egui::Ui, key: &str) {
     };
     let elapsed = run.elapsed().map(mmss);
     let last = run.log.last().cloned().unwrap_or_default();
-    let expanded = app.backlog.expanded.as_deref() == Some(key);
-    let log = run.log.clone();
-    let outcome: Option<Result<crate::backlog::Fixed, String>> = match &run.state {
-        RunState::Done(f) => Some(Ok((**f).clone())),
-        RunState::Failed(e) => Some(Err(e.clone())),
-        _ => None,
-    };
+    let mut toggled = false;
 
     let width = ui.available_width();
     egui::Frame::new()
@@ -731,14 +732,14 @@ fn agent_card(app: &mut App, ui: &mut egui::Ui, key: &str) {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(format!("[{state_label}]")).color(color).monospace().small());
                 ui.label(RichText::new(key).monospace().strong());
-                ui.label(RichText::new(&summary).color(theme::fg()));
+                ui.label(RichText::new(title).color(theme::fg()));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(elapsed) = elapsed {
                         ui.label(RichText::new(elapsed).monospace().size(theme::SMALL).color(theme::fg_dim()));
                     }
-                    let toggle = if expanded { "Hide log" } else { format!("Log ({})", log.len()).leak() };
+                    let toggle = if expanded { "Hide log".to_string() } else { format!("Log ({})", run.log.len()) };
                     if ui.small_button(toggle).clicked() {
-                        app.backlog.expanded = if expanded { None } else { Some(key.to_string()) };
+                        toggled = true;
                     }
                 });
             });
@@ -746,8 +747,8 @@ fn agent_card(app: &mut App, ui: &mut egui::Ui, key: &str) {
                 wrapped(ui, RichText::new(clip(&last, 240)).monospace().size(theme::SMALL).color(theme::fg_dim()));
             }
             if expanded {
-                ScrollArea::vertical().max_height(180.0).id_salt(("backlog-log", key)).stick_to_bottom(true).show(ui, |ui| {
-                    for line in &log {
+                ScrollArea::vertical().max_height(180.0).id_salt((salt, key)).stick_to_bottom(true).show(ui, |ui| {
+                    for line in &run.log {
                         let color = if line.starts_with('!') || line.starts_with("failed") {
                             theme::danger()
                         } else {
@@ -757,8 +758,8 @@ fn agent_card(app: &mut App, ui: &mut egui::Ui, key: &str) {
                     }
                 });
             }
-            match outcome {
-                Some(Ok(fixed)) => {
+            match &run.state {
+                RunState::Done(fixed) => {
                     ui.add_space(4.0);
                     ui.horizontal_wrapped(|ui| {
                         if ui.link(RichText::new(format!("Draft PR #{}", fixed.pr.number)).color(theme::teal())).clicked() {
@@ -794,13 +795,14 @@ fn agent_card(app: &mut App, ui: &mut egui::Ui, key: &str) {
                     let summary_short: String = fixed.summary.lines().take(6).collect::<Vec<_>>().join("\n");
                     wrapped(ui, RichText::new(summary_short).size(theme::SMALL));
                 }
-                Some(Err(e)) => {
+                RunState::Failed(e) => {
                     ui.add_space(4.0);
                     wrapped(ui, RichText::new(e.lines().take(6).collect::<Vec<_>>().join("\n")).size(theme::SMALL).color(theme::danger()));
                 }
-                None => {}
+                _ => {}
             }
         });
+    toggled
 }
 
 /// The tickets and their judgements, with a checkbox each.

@@ -682,6 +682,14 @@ fn wire_messages(messages: &[crate::agent::Message]) -> serde_json::Value {
             Message::User(text) => {
                 out.push(serde_json::json!({"role": "user", "content": text}));
             }
+            Message::UserImages { text, images } => {
+                let mut blocks: Vec<serde_json::Value> = images
+                    .iter()
+                    .map(|i| serde_json::json!({"type": "image", "source": {"type": "base64", "media_type": i.media_type, "data": i.data}}))
+                    .collect();
+                blocks.push(serde_json::json!({"type": "text", "text": text}));
+                out.push(serde_json::json!({"role": "user", "content": blocks}));
+            }
             Message::Assistant { text, calls } => {
                 let mut blocks = Vec::new();
                 // An empty text block is a 400, so only send prose that exists.

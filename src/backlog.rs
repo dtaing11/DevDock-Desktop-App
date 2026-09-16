@@ -162,6 +162,8 @@ pub struct Task {
     pub branch: String,
     /// What triage found, when the task came through it.
     pub triage: Option<Triage>,
+    /// Images the developer attached to a prompt.
+    pub images: Vec<crate::agent::Attachment>,
 }
 
 impl Task {
@@ -175,6 +177,7 @@ impl Task {
             url: Some(issue.url.clone()),
             branch: branch_name(issue),
             triage: triage.cloned(),
+            images: Vec::new(),
         }
     }
 
@@ -193,6 +196,7 @@ impl Task {
             url: None,
             branch: if slug.is_empty() { "agent/task".into() } else { format!("agent/{slug}") },
             triage: None,
+            images: Vec::new(),
         }
     }
 
@@ -601,6 +605,7 @@ fn work(
                 branch: Some(branch),
                 instructions: job.instructions,
                 context: Some(&context),
+                images: &job.task.images,
                 history: &history,
                 ..coding::Request::new(&task)
             },
@@ -1081,7 +1086,7 @@ fn stage_change(wt: &Repo) -> Result<(), String> {
 /// tracks on purpose stays tracked.
 fn unstage_artifacts(wt: &Repo) -> Result<(), String> {
     const ARTIFACT_DIRS: &[&str] = &[
-        "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "target", "node_modules",
+        ".devdock", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "target", "node_modules",
         ".dart_tool", "build", "dist", ".gradle", ".next", ".nuxt", "coverage", ".coverage",
         ".tox", ".venv", "venv", "Pods", "DerivedData", ".idea", ".vscode",
     ];

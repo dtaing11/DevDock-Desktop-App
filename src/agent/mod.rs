@@ -81,11 +81,67 @@ pub struct ToolResult {
 /// unattended); the agent is told to decide for itself.
 pub type Asker = Arc<dyn Fn(&str) -> std::result::Result<String, String> + Send + Sync>;
 
+/// An image the developer attached to a prompt: a screenshot, a mockup,
+/// a photo of a whiteboard — what words describe badly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    /// `image/png`, `image/jpeg`, `image/gif`, `image/webp`.
+    pub media_type: String,
+    /// The bytes, base64.
+    pub data: String,
+    /// The file's name, for the log and for an engine that reads files.
+    pub name: String,
+}
+
+impl Attachment {
+    /// Reads an image file. Only the formats the model providers accept.
+    pub fn from_file(path: &std::path::Path) -> std::result::Result<Attachment, String> {
+        use base64::Engine as _;
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        let media_type = match ext.as_str() {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            other => return Err(format!("{}: not an image the models accept (.{other}); use png, jpg, gif or webp", path.display())),
+        };
+        let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        const MAX: usize = 20 * 1024 * 1024;
+        if bytes.len() > MAX {
+            return Err(format!("{}: {} MB is more than an image may be (20 MB)", path.display(), bytes.len() / (1024 * 1024)));
+        }
+        Ok(Attachment {
+            media_type: media_type.to_string(),
+            data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+            name: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "image".into()),
+        })
+    }
+
+    /// The bytes back.
+    pub fn bytes(&self) -> Vec<u8> {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.decode(&self.data).unwrap_or_default()
+    }
+
+    /// The file extension for the media type.
+    pub fn extension(&self) -> &'static str {
+        match self.media_type.as_str() {
+            "image/jpeg" => "jpg",
+            "image/gif" => "gif",
+            "image/webp" => "webp",
+            _ => "png",
+        }
+    }
+}
+
 /// One entry in the conversation the loop maintains. Providers translate
 /// these into their own wire formats.
 #[derive(Debug, Clone)]
 pub enum Message {
     User(String),
+    /// A user turn with images in it: the opening prompt, when the
+    /// developer attached some.
+    UserImages { text: String, images: Vec<Attachment> },
     Assistant { text: String, calls: Vec<ToolCall> },
     ToolResults(Vec<ToolResult>),
 }
@@ -273,7 +329,25 @@ pub fn run(
     limits: Limits,
     on_event: &mut dyn FnMut(Event),
 ) -> Result<Run, String> {
-    let mut messages = vec![Message::User(task.to_string())];
+    run_with_images(provider, workspace, system, task, &[], limits, on_event)
+}
+
+/// [`run`], with images attached to the opening prompt.
+pub fn run_with_images(
+    provider: &dyn Provider,
+    workspace: &mut Workspace,
+    system: &str,
+    task: &str,
+    images: &[Attachment],
+    limits: Limits,
+    on_event: &mut dyn FnMut(Event),
+) -> Result<Run, String> {
+    let first = if images.is_empty() {
+        Message::User(task.to_string())
+    } else {
+        Message::UserImages { text: task.to_string(), images: images.to_vec() }
+    };
+    let mut messages = vec![first];
     let mut log: Vec<String> = Vec::new();
     let mut truncated = false;
     let mut nudged = false;
@@ -520,6 +594,8 @@ fn transcript_bytes(messages: &[Message]) -> usize {
         .iter()
         .map(|m| match m {
             Message::User(t) => t.len(),
+            // Counted as the model does, roughly: an image is a page or so.
+            Message::UserImages { text, images } => text.len() + images.len() * 4_000,
             Message::Assistant { text, calls } => {
                 text.len() + calls.iter().map(|c| c.input.to_string().len()).sum::<usize>()
             }
@@ -579,6 +655,30 @@ fn first_line(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_attachment_is_read_from_an_image_file_and_only_that() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The smallest PNG there is: a 1×1 pixel.
+        let png: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41,
+            0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+            0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        let path = tmp.path().join("Mock up.PNG");
+        std::fs::write(&path, png).unwrap();
+        let a = Attachment::from_file(&path).unwrap();
+        assert_eq!(a.media_type, "image/png");
+        assert_eq!(a.name, "Mock up.PNG");
+        assert_eq!(a.bytes(), png, "round-trips through base64");
+        assert_eq!(a.extension(), "png");
+        let text = tmp.path().join("notes.txt");
+        std::fs::write(&text, "hi").unwrap();
+        let err = Attachment::from_file(&text).unwrap_err();
+        assert!(err.contains("not an image"), "{err}");
+        assert_eq!(transcript_bytes(&[Message::UserImages { text: "look".into(), images: vec![a] }]), 4 + 4_000);
+    }
     use std::cell::RefCell;
 
     /// A provider that replays a fixed script of replies.

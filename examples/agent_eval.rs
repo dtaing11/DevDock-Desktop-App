@@ -682,6 +682,7 @@ impl Provider for Metered {
                 .iter()
                 .map(|m| match m {
                     Message::User(t) => t.len(),
+                    Message::UserImages { text, images } => text.len() + images.iter().map(|i| i.data.len()).sum::<usize>(),
                     Message::Assistant { text, calls } => {
                         text.len() + calls.iter().map(|c| c.input.to_string().len()).sum::<usize>()
                     }

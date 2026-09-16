@@ -488,6 +488,9 @@ fn edits_since(
     let mut edits = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     for file in &status.files {
+        if file.path.starts_with(".devdock/") {
+            continue;
+        }
         seen.insert(file.path.clone());
         let full = repo.path().join(&file.path);
         // A deleted file, or a binary one, is not something the review shows.

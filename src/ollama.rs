@@ -408,6 +408,11 @@ fn wire_messages(messages: &[crate::agent::Message]) -> Vec<serde_json::Value> {
             Message::User(text) => {
                 out.push(serde_json::json!({"role": "user", "content": text}));
             }
+            // Vision models look at them; the rest ignore the field.
+            Message::UserImages { text, images } => {
+                let data: Vec<&str> = images.iter().map(|i| i.data.as_str()).collect();
+                out.push(serde_json::json!({"role": "user", "content": text, "images": data}));
+            }
             Message::Assistant { text, calls } => {
                 let tool_calls: Vec<serde_json::Value> = calls
                     .iter()

@@ -4150,6 +4150,7 @@ impl App {
 
         let live = self.coding.iterate;
         let history = self.coding.turns();
+        let images: Vec<crate::agent::Attachment> = self.coding.images.drain(..).map(|i| i.attachment).collect();
         let branch = self.status.as_ref().map(|s| s.branch.clone());
         let instructions = self.coding_instructions();
         // The checks this repository declares — or, when it declares none,
@@ -4240,6 +4241,7 @@ impl App {
                         branch: branch.as_deref(),
                         instructions: instructions.as_deref(),
                         context: (!context.trim().is_empty()).then_some(context.as_str()),
+                        images: &images,
                         limits: crate::agent::coding::limits(),
                     },
                     &mut |event| match event {
@@ -4269,6 +4271,17 @@ impl App {
     /// Guidance for the coding agent: the repository's own review
     /// instructions, which is where a project already writes down how its
     /// code is supposed to look.
+    /// Attaches an image file to the next task, or says why it cannot.
+    pub fn attach_image(&mut self, path: &std::path::Path) {
+        match agent_tab::PromptImage::from_file(path) {
+            Ok(image) => {
+                self.coding.images.push(image);
+                self.tab = Tab::Agent;
+            }
+            Err(e) => self.toast(e, true),
+        }
+    }
+
     /// Runs the task box's prompt the way the backlog fixer runs a ticket:
     /// a branch and worktree of its own, the checks, a commit, a push, a
     /// draft pull request, and the worktree removed. This tree is not
@@ -4287,7 +4300,8 @@ impl App {
             self.toast("Sign in to GitHub first: a worktree run ends as a draft pull request.", true);
             return;
         }
-        let task = crate::backlog::Task::from_prompt(&prompt).with_branch(&self.coding.worktree.branch);
+        let mut task = crate::backlog::Task::from_prompt(&prompt).with_branch(&self.coding.worktree.branch);
+        task.images = self.coding.images.drain(..).map(|i| i.attachment).collect();
         let key = task.branch.clone();
         if self.coding.worktree.runs.get(&key).is_some_and(|r| !r.is_finished()) {
             self.toast(format!("An agent is already working on {key}. Name another branch."), true);

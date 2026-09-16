@@ -364,6 +364,18 @@ It needs GitHub sign-in, because the outcome is a pull request. A prompt that
 needs a decision from you is not a fit: the agent is told nobody can answer,
 and to change nothing rather than guess.
 
+### Images in the prompt
+
+Some things words describe badly: a screenshot of the bug, a mockup of what
+the screen should become, a photo of a whiteboard. **Attach image…** under
+the task box adds PNG, JPEG, GIF or WebP files, and files dropped anywhere
+on the window while the Agent tab is up are attached too; thumbnails show
+what is attached, with a way to take one off. The images go with the task —
+in this tree or in a fresh worktree — and are gone from the box once it
+starts. A Claude model sees them directly; an Ollama model does if it is a
+vision model; Claude Code reads them as files DevDock puts in the worktree
+for the run and removes after, never part of the change.
+
 ### When it is not sure, it asks
 
 An agent that hits something it cannot decide — a product choice, two

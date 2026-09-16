@@ -111,6 +111,27 @@ pub const CLAUDE_CODE_ASK: &str = "If you need the developer to decide something
     changing anything more. You will be resumed with the answer. Ask only when it truly changes \
     what you would build.";
 
+/// Where a run's attached images are put for Claude Code to read.
+pub const IMAGE_DIR: &str = ".devdock/prompt-images";
+
+/// The paragraph that points Claude Code at the attached images.
+pub fn image_note(paths: &[String]) -> String {
+    format!(
+        "\n\nThe developer attached {} image(s) to this task — a screenshot, a mockup, what \
+         words describe badly. Look at each with the Read tool before you start, and treat \
+         what they show as part of the task:\n{}\n",
+        paths.len(),
+        paths.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n")
+    )
+}
+
+fn sanitize_name(name: &str) -> String {
+    let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
+    let cleaned: String = stem.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect();
+    let cleaned = cleaned.trim_matches('-').chars().take(40).collect::<String>();
+    if cleaned.is_empty() { "image".into() } else { cleaned }
+}
+
 /// The question a Claude Code reply ends with, if it ends with one.
 pub fn question_in(reply: &str) -> Option<String> {
     reply
@@ -222,6 +243,8 @@ pub struct Request<'a> {
     /// What is going on in the repository right now — recent commits,
     /// uncommitted files — for the opening turn.
     pub context: Option<&'a str>,
+    /// Images the developer attached to the task.
+    pub images: &'a [super::Attachment],
     pub limits: Limits,
 }
 
@@ -230,6 +253,7 @@ impl<'a> Request<'a> {
     pub fn new(task: &'a str) -> Self {
         Self {
             task,
+            images: &[],
             history: &[],
             branch: None,
             instructions: None,
@@ -296,9 +320,31 @@ fn run_claude_code(
         extra.push_str(instructions);
     }
     let overview = workspace.overview();
-    let prompt = task_prompt(request.task, request.history, request.branch, Some(&overview), request.context);
+    let mut prompt = task_prompt(request.task, request.history, request.branch, Some(&overview), request.context);
+    // Claude Code takes no image in its prompt, but reads image files:
+    // the attachments go into the worktree for the run and are removed
+    // after — never part of the change.
+    let image_dir = workspace.root().join(IMAGE_DIR);
+    if !request.images.is_empty() {
+        std::fs::create_dir_all(&image_dir).map_err(|e| e.to_string())?;
+        let mut paths = Vec::new();
+        for (i, image) in request.images.iter().enumerate() {
+            let path = image_dir.join(format!("{}-{}.{}", i + 1, sanitize_name(&image.name), image.extension()));
+            std::fs::write(&path, image.bytes()).map_err(|e| e.to_string())?;
+            paths.push(format!("{IMAGE_DIR}/{}", path.file_name().unwrap().to_string_lossy()));
+        }
+        prompt.push_str(&image_note(&paths));
+    }
     let config = claude_code::Config { max_turns: request.limits.max_turns, ..config.clone() };
-    let mut run = claude_code::run(&config, workspace.root(), &prompt, Some(&extra), &checks, on_event)?;
+    let outcome = claude_code::run(&config, workspace.root(), &prompt, Some(&extra), &checks, on_event);
+    if !request.images.is_empty() {
+        let _ = std::fs::remove_dir_all(&image_dir);
+        // And the parent, when nothing else of DevDock's is in it.
+        if let Some(parent) = image_dir.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
+    let mut run = outcome?;
     // A question at the end of the reply: put it to the developer, resume
     // the same session with the answer, and let it finish. A few times at
     // most; after that it decides.
@@ -365,7 +411,7 @@ pub fn run(
         Some(&overview),
         request.context,
     );
-    super::run(provider, workspace, &system, &prompt, request.limits, on_event)
+    super::run_with_images(provider, workspace, &system, &prompt, request.images, request.limits, on_event)
 }
 
 #[cfg(test)]
@@ -393,6 +439,10 @@ mod tests {
         assert_eq!(question_in("I did x.\n\nQUESTION: Red or blue?").as_deref(), Some("Red or blue?"));
         assert_eq!(question_in("QUESTION: only this"), Some("only this".into()));
         assert_eq!(question_in("Done. Verified: tests"), None);
+        let note = image_note(&[".devdock/prompt-images/1-mockup.png".into()]);
+        assert!(note.contains("1 image(s)") && note.contains("- .devdock/prompt-images/1-mockup.png"));
+        assert_eq!(sanitize_name("Screen Shot 2026 (1).png"), "Screen-Shot-2026--1");
+        assert_eq!(sanitize_name("...png"), "image");
         assert!(full.contains("The language server:") && full.contains("run_check"));
         assert!(full.contains("run_command") && full.contains("cannot commit, push"));
         assert!(bare.contains("Reusable over ad hoc") && full.contains("One responsibility per unit"), "the standard is in every prompt");
@@ -619,5 +669,54 @@ mod tests {
         let text = std::fs::read_to_string(tmp.path().join("greeting.txt")).unwrap();
         assert!(text.contains("Olá"), "the answer was used: {text}");
         assert!(log.iter().any(|l| l.contains("asked you:")), "{log:?}");
+    }
+
+    /// An attached image reaches the model: a picture with a word in it,
+    /// and the task to write that word down. `LIVE_IMAGE` is the PNG;
+    /// `LIVE_ENGINE=claude-code` reads it through Claude Code's Read tool.
+    /// `cargo test --lib coding::tests::live_sees -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_sees_an_attached_image() {
+        let Ok(image_path) = std::env::var("LIVE_IMAGE") else {
+            eprintln!("set LIVE_IMAGE to a png with a word in it; skipping");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let sh = |args: &[&str]| {
+            let out = std::process::Command::new("git").args(args).current_dir(tmp.path()).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        };
+        sh(&["init", "-q", "-b", "main"]);
+        sh(&["config", "user.email", "t@t"]);
+        sh(&["config", "user.name", "t"]);
+        std::fs::write(tmp.path().join("word.txt"), "?\n").unwrap();
+        sh(&["add", "-A"]);
+        sh(&["commit", "-q", "-m", "init"]);
+        let repo = crate::git::Repo::open(tmp.path()).unwrap();
+        let image = crate::agent::Attachment::from_file(std::path::Path::new(&image_path)).unwrap();
+        let mut ws = Workspace::new(repo.path(), repo.tracked_files().unwrap(), Access::ReadWrite)
+            .unwrap()
+            .with_write_mode(WriteMode::Live)
+            .with_commands(true);
+        let engine = match std::env::var("LIVE_ENGINE").as_deref() {
+            Ok("claude-code") => Engine::ClaudeCode(claude_code::Config::default()),
+            _ => match crate::claude::Client::from_store("claude-haiku-4-5-20251001") {
+                Some(c) => Engine::Harness(Box::new(c)),
+                None => return,
+            },
+        };
+        let images = [image];
+        let run = run_with(
+            &engine,
+            &mut ws,
+            Request { images: &images, ..Request::new("The attached image shows a secret word. Replace the contents of word.txt with exactly that word, in capitals, and nothing else.") },
+            &mut |e| println!("  {}", e.line()),
+        )
+        .unwrap();
+        println!("{}", run.text);
+        let word = std::fs::read_to_string(tmp.path().join("word.txt")).unwrap();
+        assert!(word.trim().eq_ignore_ascii_case("MANGO"), "the model saw the image: {word:?}");
+        assert!(!tmp.path().join(".devdock").exists(), "no image files left behind");
     }
 }

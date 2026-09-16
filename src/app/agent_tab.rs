@@ -76,6 +76,33 @@ pub struct CodingState {
     pub worktree: WorktreeRuns,
     /// A question the in-tab run is waiting on.
     pub question: Option<super::backlog::PendingQuestion>,
+    /// Images attached to the next task.
+    pub images: Vec<PromptImage>,
+}
+
+/// An image attached to the task box, with its thumbnail once decoded.
+pub struct PromptImage {
+    pub attachment: crate::agent::Attachment,
+    pub texture: Option<egui::TextureHandle>,
+}
+
+impl PromptImage {
+    pub fn from_file(path: &std::path::Path) -> Result<Self, String> {
+        Ok(Self { attachment: crate::agent::Attachment::from_file(path)?, texture: None })
+    }
+
+    /// The thumbnail, decoded on first use.
+    fn texture(&mut self, ctx: &egui::Context) -> Option<egui::TextureHandle> {
+        if self.texture.is_none() {
+            let bytes = self.attachment.bytes();
+            self.texture = image::load_from_memory(&bytes).ok().map(|img| {
+                let thumb = img.thumbnail(320, 320).to_rgba8();
+                let size = [thumb.width() as usize, thumb.height() as usize];
+                ctx.load_texture(format!("prompt-image-{}", self.attachment.name), egui::ColorImage::from_rgba_unmultiplied(size, thumb.as_raw()), egui::TextureOptions::LINEAR)
+            });
+        }
+        self.texture.clone()
+    }
 }
 
 /// Tasks run the way the backlog fixer runs a ticket: a fresh branch and
@@ -736,6 +763,7 @@ fn task_panel(app: &mut App, ui: &mut egui::Ui) {
         });
     });
 
+    attachments(app, ui);
     worktree_options(app, ui);
 
     ui.horizontal(|ui| {
@@ -785,6 +813,57 @@ fn task_panel(app: &mut App, ui: &mut egui::Ui) {
             app.coding.log.clear();
         }
     });
+}
+
+/// Images attached to the task: a button, the files dropped on the window,
+/// thumbnails with a way to take one off.
+fn attachments(app: &mut App, ui: &mut egui::Ui) {
+    // Files dropped anywhere on the window while this tab is up.
+    let dropped: Vec<std::path::PathBuf> = ui.ctx().input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+    for path in dropped {
+        app.attach_image(&path);
+    }
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .small_button("Attach image…")
+            .on_hover_text("A screenshot, a mockup, a photo — what words describe badly. Or drop image files on the window.")
+            .clicked()
+        {
+            if let Some(paths) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp"]).pick_files() {
+                for path in paths {
+                    app.attach_image(&path);
+                }
+            }
+        }
+        if !app.coding.images.is_empty() {
+            ui.label(RichText::new(format!("{} attached", app.coding.images.len())).small().color(theme::fg_dim()));
+        }
+    });
+    if app.coding.images.is_empty() {
+        return;
+    }
+    let ctx = ui.ctx().clone();
+    let mut remove: Option<usize> = None;
+    ui.horizontal_wrapped(|ui| {
+        for (i, image) in app.coding.images.iter_mut().enumerate() {
+            ui.vertical(|ui| {
+                if let Some(texture) = image.texture(&ctx) {
+                    let size = texture.size_vec2();
+                    let scale = (96.0 / size.x.max(size.y)).min(1.0);
+                    ui.add(egui::Image::from_texture(&texture).fit_to_exact_size(size * scale).corner_radius(theme::RADIUS_MD as f32))
+                        .on_hover_text(&image.attachment.name);
+                } else {
+                    ui.label(RichText::new(&image.attachment.name).small());
+                }
+                if ui.small_button("✕").on_hover_text("Take it off").clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+    });
+    if let Some(i) = remove {
+        app.coding.images.remove(i);
+    }
 }
 
 /// The choice between this tree and a worktree of its own, and what the

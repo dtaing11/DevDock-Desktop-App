@@ -90,8 +90,9 @@ pub struct WorktreeRuns {
     pub rounds: usize,
     /// A second agent reads the prompt and the diff before the pull request.
     pub review: bool,
-    /// Run every check inside this Docker image.
+    /// Run every check and command in a machine of the run's own.
     pub sandbox: bool,
+    pub sandbox_kind: Option<crate::sandbox::Kind>,
     pub sandbox_image: String,
     /// One entry per run, keyed by branch.
     pub runs: BTreeMap<String, TicketRun>,
@@ -107,6 +108,7 @@ impl Default for WorktreeRuns {
             rounds: 3,
             review: true,
             sandbox: false,
+            sandbox_kind: None,
             sandbox_image: String::new(),
             runs: BTreeMap::new(),
             expanded: None,
@@ -814,23 +816,12 @@ fn worktree_options(app: &mut App, ui: &mut egui::Ui) {
          diff and answers approve or revise. Revise is another round. Its model is \
          the one chosen for code review in Settings.",
     );
-    ui.checkbox(&mut app.coding.worktree.sandbox, "Checks in a sandbox").on_hover_text(
-        "Every build and test runs inside this Docker image with the worktree \
-         mounted at /work, so it cannot touch the machine.",
-    );
-    if app.coding.worktree.sandbox {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("image").small().color(theme::fg_dim()));
-            ui.add(
-                egui::TextEdit::singleline(&mut app.coding.worktree.sandbox_image)
-                    .hint_text(super::views::dim_hint("rust:1.80, python:3.12, node:22…"))
-                    .desired_width(f32::INFINITY),
-            );
+    ui.horizontal_wrapped(|ui| {
+        ui.push_id("agent-sandbox", |ui| {
+            let wt = &mut app.coding.worktree;
+            super::views::sandbox_controls(ui, &mut wt.sandbox, &mut wt.sandbox_kind, &mut wt.sandbox_image);
         });
-        if !crate::local_ci::docker_available() {
-            ui.label(RichText::new("Docker not found").size(theme::SMALL).color(theme::danger()));
-        }
-    }
+    });
 }
 
 /// One line in the sidebar on the worktree runs, while the cards themselves

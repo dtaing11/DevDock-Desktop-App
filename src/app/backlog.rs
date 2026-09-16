@@ -93,8 +93,11 @@ pub struct BacklogState {
     pub parallel: usize,
     /// Show only what triage suggested.
     pub only_suggested: bool,
-    /// Run every check inside this Docker image, when set.
+    /// Run every check and command in a machine of the run's own.
     pub sandbox: bool,
+    /// Which runtime; `None` is whichever is installed.
+    pub sandbox_kind: Option<crate::sandbox::Kind>,
+    /// Image for a container runtime; empty is plain Ubuntu.
     pub sandbox_image: String,
     /// Assign a ticket to me, move it to the active sprint, and mark it In
     /// Progress when its agent starts; comment when it finishes.
@@ -126,6 +129,7 @@ impl Default for BacklogState {
             parallel: 3,
             only_suggested: false,
             sandbox: false,
+            sandbox_kind: None,
             sandbox_image: String::new(),
             claim: true,
             rounds: 3,
@@ -192,7 +196,7 @@ impl App {
                 let tracked = repo.tracked_files().unwrap_or_default();
                 if let Some(image) = crate::backlog::suggest_sandbox_image(&tracked) {
                     self.backlog.sandbox_image = image.to_string();
-                    self.backlog.sandbox = crate::local_ci::docker_available();
+                    self.backlog.sandbox = !crate::sandbox::installed().is_empty();
                 }
             }
         }
@@ -331,7 +335,7 @@ impl App {
         let url = self.effective_ollama_url();
         let token = self.gh_token();
         let instructions = self.coding_instructions();
-        let sandbox = self.backlog.sandbox.then(|| self.backlog.sandbox_image.trim().to_string()).filter(|s| !s.is_empty());
+        let sandbox = self.backlog.sandbox.then(|| crate::sandbox::Spec { kind: self.backlog.sandbox_kind, image: self.backlog.sandbox_image.trim().to_string() });
         let claim = self.backlog.claim;
         let rounds = self.backlog.rounds.max(1);
         // The reviewer is the code-review task's model — the one already
@@ -389,7 +393,7 @@ impl App {
                     base: &base,
                     auth: token.as_deref(),
                     instructions: instructions.as_deref(),
-                    sandbox_image: sandbox.as_deref(),
+                    sandbox: sandbox.as_ref(),
                     claim: claimer.as_ref().map(|c| c as &dyn crate::backlog::Claimer),
                     rounds,
                     reviewer: reviewer.as_ref(),
@@ -663,20 +667,9 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
         );
     });
     ui.horizontal_wrapped(|ui| {
-        ui.checkbox(&mut app.backlog.sandbox, "Run checks in a sandbox").on_hover_text(
-            "Every build and test the agent triggers runs inside this Docker image with \
-             the worktree mounted at /work, so it cannot touch the machine.",
-        );
-        if app.backlog.sandbox {
-            ui.add(
-                egui::TextEdit::singleline(&mut app.backlog.sandbox_image)
-                    .hint_text(super::views::dim_hint("rust:1.80, python:3.12, node:22…"))
-                    .desired_width(220.0),
-            );
-            if !crate::local_ci::docker_available() {
-                ui.label(RichText::new("Docker not found").size(theme::SMALL).color(theme::danger()));
-            }
-        }
+        ui.push_id("backlog-sandbox", |ui| {
+            super::views::sandbox_controls(ui, &mut app.backlog.sandbox, &mut app.backlog.sandbox_kind, &mut app.backlog.sandbox_image);
+        });
     });
 }
 

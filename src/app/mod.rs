@@ -1767,6 +1767,9 @@ impl App {
                         for file in open {
                             self.lsp_open(&file);
                         }
+                        // The worktree list is a fact about the repository,
+                        // read fresh for the checkout this window is now in.
+                        self.load_worktrees();
                     }
                     self.refresh();
                 }
@@ -4292,7 +4295,7 @@ impl App {
         let token = self.gh_token();
         let instructions = self.coding_instructions();
         let wt = &self.coding.worktree;
-        let sandbox = wt.sandbox.then(|| wt.sandbox_image.trim().to_string()).filter(|s| !s.is_empty());
+        let sandbox = wt.sandbox.then(|| crate::sandbox::Spec { kind: wt.sandbox_kind, image: wt.sandbox_image.trim().to_string() });
         let rounds = wt.rounds.max(1);
         let review_sel = wt.review.then(|| self.ai_selection(worker::AiTarget::Review).unwrap_or_else(|| sel.clone()));
 
@@ -4327,7 +4330,7 @@ impl App {
                     base: &base,
                     auth: token.as_deref(),
                     instructions: instructions.as_deref(),
-                    sandbox_image: sandbox.as_deref(),
+                    sandbox: sandbox.as_ref(),
                     claim: None,
                     rounds,
                     reviewer: reviewer.as_ref(),

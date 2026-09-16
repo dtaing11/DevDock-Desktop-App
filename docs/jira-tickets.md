@@ -185,23 +185,39 @@ nearest task's model (Jira tickets, the coding agent, …) instead.
 
 ### The sandbox
 
-**Run checks in a sandbox** runs every check the agent triggers, and the
-verification afterwards, inside a Docker image with the worktree mounted at
-`/work`. A build or a test suite then cannot touch the machine. The image
-is guessed from the repository (`rust:1-bookworm` for a Cargo project,
-`node:22-bookworm`, `python:3.12-bookworm`, …) and can be changed; the
-setting is on by default when Docker is available and the repository has a
-recognisable toolchain. Checks that already name an `image` in
-`.git-manage-ci.toml` keep theirs.
+**Run in a sandbox** gives the run a Linux machine of its own, and
+everything executes there: every command the agent runs, every build and
+test it triggers, and DevDock's own verification afterwards. It is not a
+padded cell. The network is on, the agent may `sudo` (refused on the host), and it installs
+what the repository needs — Flutter, Node, a database — itself. What it
+installs stays for the next run. Nothing touches this machine.
 
-It does not accumulate: each container runs with `--rm`, so it and its
-anonymous volumes are deleted when it exits; build output goes into the
-mounted worktree, which is deleted with it; and every check has a timeout
-(`timeout_secs` per job, 30 minutes otherwise) after which the container is
-removed by name and the check fails. What stays is the image itself, which
-is the cache — `docker image prune` reclaims it. A fresh container has no
-dependency cache, so a Rust or Node build downloads its dependencies every
-run; that is the price of a clean room.
+Three runtimes, whichever is installed (the picker shows which):
+
+- **Lima VM** (`brew install lima`): a Linux virtual machine, created the
+  first time (it downloads Ubuntu), kept between runs, with your home
+  directory mounted writable at the same path, so the worktree is where the
+  agent expects it. No daemon, no Docker. Toolchains live in the VM;
+  `limactl delete devdock` clears everything.
+- **Apple container** (macOS 26): a Linux container in its own lightweight
+  VM, `docker`-shaped.
+- **Docker**: one long-lived container per run, so `apt-get install` in one
+  command is there for the next.
+
+The container runtimes mount the worktree at `/work` and keep toolchains in
+a named volume, `devdock-toolchains`, with `HOME` inside it; `docker volume
+rm devdock-toolchains` clears it. The base image is plain Ubuntu unless you
+name one — a toolchain image (`ghcr.io/cirruslabs/flutter:stable`,
+`rust:1-bookworm`) saves the agent installing it, and DevDock suggests one
+when the repository's toolchain is obvious.
+
+Every check and command has a timeout, after which it is killed and the
+check fails; a run's container is removed when the run ends, and its
+worktree with it.
+
+Claude Code as the engine runs its own shell on this machine, not in the
+sandbox: the sandbox holds DevDock's checks and the built-in harness's
+commands.
 
 ## What it does not do
 

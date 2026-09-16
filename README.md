@@ -46,7 +46,8 @@ macOS/Windows since egui is cross-platform).
 - **Working the Jira backlog**: the unassigned tickets of a project, judged
   by a model with the repository open — this repository or not, which part,
   doable unattended or needs a person. Pick any; one agent per ticket runs
-  in its own worktree, in parallel, with the checks in a Docker sandbox, and
+  in its own worktree, in parallel, with a Linux sandbox of its own (a Lima
+  VM, an Apple container, or Docker; network on, root shell, installs kept), and
   ends as a draft pull request. Every agent is tracked live: state, elapsed,
   every tool call, the files it changed. Worktrees are removed when done;
   a ticket an agent starts is assigned to you, moved to the active sprint,

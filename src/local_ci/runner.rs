@@ -166,7 +166,7 @@ impl Runner for HostRunner {
 /// Ends every process in `pid`'s group; on other platforms the child alone
 /// is killed by the caller.
 #[cfg(unix)]
-fn kill_group(pid: u32) {
+pub fn kill_group(pid: u32) {
     // SAFETY: a plain signal to a process group this process created.
     unsafe {
         libc::kill(-(pid as i32), libc::SIGKILL);
@@ -174,7 +174,7 @@ fn kill_group(pid: u32) {
 }
 
 #[cfg(not(unix))]
-fn kill_group(_pid: u32) {}
+pub fn kill_group(_pid: u32) {}
 
 // ---------------------------------------------------------------------------
 // Built-in: Docker
@@ -278,7 +278,7 @@ fn container_name() -> String {
 /// Waits for a child, collecting its output, and kills it — through
 /// `teardown`, then directly — once `timeout` has passed. A timed-out job
 /// is a failed job whose stderr says so.
-fn wait_with_timeout(
+pub fn wait_with_timeout(
     mut child: Child,
     timeout: Option<Duration>,
     teardown: impl FnOnce(),

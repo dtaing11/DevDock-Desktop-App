@@ -233,10 +233,10 @@ pub struct Job<'a> {
     pub auth: Option<&'a str>,
     /// Project guidance for the agent (review instructions, say).
     pub instructions: Option<&'a str>,
-    /// A Docker image to run every check in, with the worktree mounted at
-    /// /work, so a build or a test suite the agent triggers cannot touch
-    /// the machine. Checks that already name an image keep theirs.
-    pub sandbox_image: Option<&'a str>,
+    /// A machine of the run's own for every check and command — a Lima VM,
+    /// an Apple container, or Docker — with the network on and what the
+    /// agent installs kept for next time. `None` runs on the host.
+    pub sandbox: Option<&'a crate::sandbox::Spec>,
     /// Marks the ticket as taken in Jira, when the developer wants that.
     pub claim: Option<&'a dyn Claimer>,
     /// How many times the agent may try: a failed check or a reviewer's
@@ -435,27 +435,30 @@ fn work(
             on_event(format!("no checks declared; inferred: {}", names.join(", ")));
         }
     }
-    if let Some(image) = job.sandbox_image.map(str::trim).filter(|i| !i.is_empty()) {
-        if !crate::local_ci::docker_available() {
-            return Err(format!(
-                "checks are set to run in the {image} sandbox, but Docker is not available \
-                 on this machine"
-            ));
-        }
+    // The sandbox, when there is one: started once, shared by the agent's
+    // commands and the verification here, gone when this returns.
+    let sandbox = match job.sandbox {
+        Some(spec) => Some(std::sync::Arc::new(crate::sandbox::Sandbox::start(spec, wt.path(), on_event)?)),
+        None => None,
+    };
+    let mut runners = crate::local_ci::runner::RunnerRegistry::with_builtins();
+    if let Some(sandbox) = &sandbox {
+        runners.register(Box::new(crate::sandbox::SandboxRunner(sandbox.clone())));
         for j in jobs.iter_mut() {
-            if j.image.is_none() {
-                j.image = Some(image.to_string());
-            }
+            j.runner = Some(crate::sandbox::RUNNER_ID.into());
+            j.image = None;
         }
-        on_event(format!("checks run in the {image} sandbox"));
     }
+    let runners = std::sync::Arc::new(runners);
 
     let tracked = wt.tracked_files().map_err(|e| e.to_string())?;
     let mut workspace = Workspace::new(wt.path(), tracked.clone(), Access::ReadWrite)?
         .with_write_mode(WriteMode::Live)
         .with_checks(jobs.clone())
-        .with_commands(true)
-        .with_sandbox(job.sandbox_image.map(str::to_string));
+        .with_commands(true);
+    if let Some(sandbox) = &sandbox {
+        workspace = workspace.with_sandbox(sandbox.describe(), runners.clone());
+    }
     let base_task = task_text(job.task);
     let rounds = job.rounds.max(1);
     // The advisor: whoever reviews, else the fixer's engine in a fresh
@@ -544,7 +547,7 @@ fn work(
         let mut failed: Option<String> = None;
         for j in &jobs {
             on_event(format!("verifying: {}", j.name));
-            let result = crate::local_ci::run_job(wt.path(), j);
+            let result = crate::local_ci::run_job_with(&runners, wt.path(), j);
             on_event(format!("{} {}", j.name, if result.ok { "passed" } else { "FAILED" }));
             checks.push(CheckOutcome { name: j.name.clone(), ok: result.ok });
             if !result.ok {
@@ -980,7 +983,7 @@ mod tests {
         let fixed = fix(
             &repo,
             &engine,
-            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 1, reviewer: None },
+            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox: None, claim: None, rounds: 1, reviewer: None },
             &fake_pr,
             &mut |line| log.push(line),
         )
@@ -1018,7 +1021,7 @@ mod tests {
         let fixed = fix(
             &repo,
             &engine,
-            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 1, reviewer: None },
+            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox: None, claim: None, rounds: 1, reviewer: None },
             &fake_pr,
             &mut |_| {},
         )
@@ -1039,7 +1042,7 @@ mod tests {
         let err = fix(
             &repo,
             &engine,
-            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 1, reviewer: None },
+            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox: None, claim: None, rounds: 1, reviewer: None },
             &fake_pr,
             &mut |line| log.push(line),
         )
@@ -1060,7 +1063,7 @@ mod tests {
 
         // Running the same ticket again is refused until that branch is
         // dealt with, and the refusal says how.
-        let err = fix(&repo, &engine, &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 1, reviewer: None }, &fake_pr, &mut |_| {}).unwrap_err();
+        let err = fix(&repo, &engine, &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox: None, claim: None, rounds: 1, reviewer: None }, &fake_pr, &mut |_| {}).unwrap_err();
         assert!(err.contains("git branch -D fix/abc-7-total-is-off-by-one"), "{err}");
     }
 
@@ -1071,7 +1074,7 @@ mod tests {
         let err = fix(
             &repo,
             &engine,
-            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 1, reviewer: None },
+            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox: None, claim: None, rounds: 1, reviewer: None },
             &fake_pr,
             &mut |_| {},
         )
@@ -1101,7 +1104,7 @@ mod tests {
         let fixed = fix(
             &repo,
             &engine,
-            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 3, reviewer: None },
+            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox: None, claim: None, rounds: 3, reviewer: None },
             &fake_pr,
             &mut |line| log.push(line),
         )
@@ -1134,7 +1137,7 @@ mod tests {
         let fixed = fix(
             &repo,
             &fixer,
-            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 3, reviewer: Some(&reviewer) },
+            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox: None, claim: None, rounds: 3, reviewer: Some(&reviewer) },
             &fake_pr,
             &mut |line| log.push(line),
         )
@@ -1158,7 +1161,7 @@ mod tests {
         let reviewer = Engine::Harness(Box::new(Scripted(RefCell::new(vec![
             Reply { text: r#"{"verdict": "revise", "feedback": "wrong"}"#.into(), ..Default::default() },
         ]))));
-        let err = fix(&repo, &fixer, &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 1, reviewer: Some(&reviewer) }, &fake_pr, &mut |_| {}).unwrap_err();
+        let err = fix(&repo, &fixer, &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox: None, claim: None, rounds: 1, reviewer: Some(&reviewer) }, &fake_pr, &mut |_| {}).unwrap_err();
         assert!(err.contains("reviewer still asked for changes"), "{err}");
         assert!(err.contains("kept on branch"), "the attempt survives for a person: {err}");
         let remote = repo.git(&["ls-remote", "--heads", "origin"]).unwrap();
@@ -1182,7 +1185,7 @@ mod tests {
         let fixed = fix(
             &repo,
             &engine,
-            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 3, reviewer: None },
+            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox: None, claim: None, rounds: 3, reviewer: None },
             &fake_pr,
             &mut |line| log.push(line),
         )
@@ -1199,7 +1202,7 @@ mod tests {
             Reply { text: "Needs a designer.".into(), ..Default::default() },
             Reply { text: r#"{"doable": false, "advice": "The ticket asks for a visual choice nobody has made."}"#.into(), ..Default::default() },
         ]))));
-        let err = fix(&repo, &engine, &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 3, reviewer: None }, &fake_pr, &mut |_| {}).unwrap_err();
+        let err = fix(&repo, &engine, &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox: None, claim: None, rounds: 3, reviewer: None }, &fake_pr, &mut |_| {}).unwrap_err();
         assert!(err.contains("agreed it needs a person: The ticket asks for a visual choice"), "{err}");
         assert!(err.contains("The agent said: Needs a designer."), "{err}");
         assert!(!repo.branches().unwrap().local.iter().any(|b| b.name.starts_with("fix/")));
@@ -1218,7 +1221,7 @@ mod tests {
             edit(), check(), Reply { text: "try 2".into(), ..Default::default() },
         ]))));
         let mut log = Vec::new();
-        let err = fix(&repo, &engine, &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 5, reviewer: None }, &fake_pr, &mut |line| log.push(line)).unwrap_err();
+        let err = fix(&repo, &engine, &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox: None, claim: None, rounds: 5, reviewer: None }, &fake_pr, &mut |line| log.push(line)).unwrap_err();
         assert!(err.starts_with("no progress: round 2 left the tree exactly as round 1 did"), "{err}\n{log:#?}");
         assert!(err.contains("kept on branch"), "{err}");
         assert_eq!(repo.worktrees().unwrap().len(), 1);
@@ -1241,7 +1244,7 @@ mod tests {
             Reply { text: r#"{"doable": false, "advice": "The empty-list behaviour is a product decision nobody has made."}"#.into(), ..Default::default() },
         ]))));
         let mut log = Vec::new();
-        let err = fix(&repo, &fixer, &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 6, reviewer: Some(&reviewer) }, &fake_pr, &mut |line| log.push(line)).unwrap_err();
+        let err = fix(&repo, &fixer, &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox: None, claim: None, rounds: 6, reviewer: Some(&reviewer) }, &fake_pr, &mut |line| log.push(line)).unwrap_err();
         assert!(err.starts_with("the reviewer and the agent could not agree after 2 round(s)"), "{err}\n{log:#?}");
         assert!(err.contains("needs a person: The empty-list behaviour"), "{err}");
         assert!(log.iter().any(|l| l.starts_with("the reviewer asked twice; asking")), "{log:?}");
@@ -1274,7 +1277,7 @@ mod tests {
         fix(
             &repo,
             &engine,
-            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: Some(&claim), rounds: 1, reviewer: None },
+            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox: None, claim: Some(&claim), rounds: 1, reviewer: None },
             &fake_pr,
             &mut |line| log.push(line),
         )
@@ -1289,7 +1292,7 @@ mod tests {
         let (_tmp, repo) = setup("true");
         let claim = Recording(std::sync::Mutex::new(Vec::new()));
         let engine = Engine::Harness(Box::new(Scripted(RefCell::new(vec![Reply { text: "Needs a person.".into(), ..Default::default() }]))));
-        let _ = fix(&repo, &engine, &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: Some(&claim), rounds: 1, reviewer: None }, &fake_pr, &mut |_| {});
+        let _ = fix(&repo, &engine, &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox: None, claim: Some(&claim), rounds: 1, reviewer: None }, &fake_pr, &mut |_| {});
         assert!(claim.0.lock().unwrap()[1].starts_with("finish ABC-7 err the agent changed nothing"));
     }
 
@@ -1298,28 +1301,68 @@ mod tests {
         let (_tmp, repo) = setup("true");
         repo.create_branch("fix/abc-7-total-is-off-by-one", false).unwrap();
         let engine = Engine::Harness(Box::new(Scripted(RefCell::new(vec![]))));
-        let err = fix(&repo, &engine, &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 1, reviewer: None }, &fake_pr, &mut |_| {}).unwrap_err();
+        let err = fix(&repo, &engine, &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox: None, claim: None, rounds: 1, reviewer: None }, &fake_pr, &mut |_| {}).unwrap_err();
         assert!(err.contains("already exists"), "{err}");
     }
 
     #[test]
-    fn a_sandbox_without_docker_is_refused_before_anything_runs() {
-        if crate::local_ci::docker_available() {
-            eprintln!("skipped: docker is available here");
+    fn a_sandbox_runtime_that_is_missing_is_refused_before_anything_runs() {
+        let Some(missing) = crate::sandbox::Kind::ALL.into_iter().find(|k| !k.installed()) else {
+            eprintln!("skipped: every runtime is installed here");
             return;
-        }
+        };
         let (_tmp, repo) = setup("true");
         let engine = Engine::Harness(Box::new(fixing_provider()));
+        let spec = crate::sandbox::Spec { kind: Some(missing), image: String::new() };
         let err = fix(
             &repo,
             &engine,
-            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: Some("alpine:3"), claim: None, rounds: 1, reviewer: None },
+            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox: Some(&spec), claim: None, rounds: 1, reviewer: None },
             &fake_pr,
             &mut |_| {},
         )
         .unwrap_err();
-        assert!(err.contains("Docker is not available"), "{err}");
+        assert!(err.contains("not installed"), "{err}");
         assert_eq!(repo.worktrees().unwrap().len(), 1);
+    }
+
+    /// The whole fix inside a real sandbox, on whatever runtime is here:
+    /// the agent's command and the check both run in it, and the sandbox
+    /// is gone afterwards.
+    /// `cargo test --lib backlog::tests::live_sandbox -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_sandbox_a_fix_runs_its_command_and_its_check_inside() {
+        if crate::sandbox::installed().is_empty() {
+            eprintln!("no sandbox runtime; skipping");
+            return;
+        }
+        // The check proves it ran in Linux, wherever the host is.
+        let (_tmp, repo) = setup("grep -q 'return sum(xs)$' lib.py && uname -s | grep -q Linux && test -f linux-was-here");
+        let engine = Engine::Harness(Box::new(Scripted(RefCell::new(vec![
+            Reply { text: String::new(), calls: vec![ToolCall { id: "1".into(), name: "edit_file".into(), input: serde_json::json!({"path": "lib.py", "old_text": "sum(xs) + 1", "new_text": "sum(xs)"}) }], ..Default::default() },
+            Reply { text: String::new(), calls: vec![ToolCall { id: "2".into(), name: "run_command".into(), input: serde_json::json!({"command": "uname -a && touch linux-was-here"}) }], ..Default::default() },
+            Reply { text: String::new(), calls: vec![ToolCall { id: "3".into(), name: "run_check".into(), input: serde_json::json!({"name": "tests"}) }], ..Default::default() },
+            Reply { text: "fixed, inside the sandbox".into(), ..Default::default() },
+        ]))));
+        let spec = crate::sandbox::Spec::default();
+        let mut log = Vec::new();
+        let fixed = fix(
+            &repo,
+            &engine,
+            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox: Some(&spec), claim: None, rounds: 1, reviewer: None },
+            &fake_pr,
+            &mut |line| {
+                println!("  {line}");
+                log.push(line);
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}\n{log:#?}"));
+        assert!(log.iter().any(|l| l.starts_with("sandbox: ")), "{log:?}");
+        assert_eq!(fixed.checks, [CheckOutcome { name: "tests".into(), ok: true }]);
+        // The file the agent's command made inside is an artifact of the
+        // run, not part of the change.
+        assert_eq!(fixed.changes.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(), ["lib.py", "linux-was-here"]);
     }
 
     #[test]
@@ -1400,7 +1443,7 @@ mod tests {
         let fixed = fix(
             &repo,
             &engine,
-            &Job { task: &task, base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 1, reviewer: None },
+            &Job { task: &task, base: "main", auth: None, instructions: None, sandbox: None, claim: None, rounds: 1, reviewer: None },
             &fake_pr,
             &mut |line| log.push(line),
         )
@@ -1419,7 +1462,7 @@ mod tests {
         // here, before a worktree is made.
         let mut bad = Task::from_prompt("x");
         bad.branch = "agent/..oops".into();
-        let err = fix(&repo, &engine, &Job { task: &bad, base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 1, reviewer: None }, &fake_pr, &mut |_| {}).unwrap_err();
+        let err = fix(&repo, &engine, &Job { task: &bad, base: "main", auth: None, instructions: None, sandbox: None, claim: None, rounds: 1, reviewer: None }, &fake_pr, &mut |_| {}).unwrap_err();
         assert!(err.contains("not a valid branch name"), "{err}");
         assert_eq!(repo.worktrees().unwrap().len(), 1);
     }
@@ -1471,7 +1514,7 @@ mod tests {
         let result = fix(
             &repo,
             &fixer,
-            &Job { task: &task, base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 4, reviewer: Some(&reviewer) },
+            &Job { task: &task, base: "main", auth: None, instructions: None, sandbox: None, claim: None, rounds: 4, reviewer: Some(&reviewer) },
             &fake_pr,
             &mut |line| {
                 println!("  {line}");

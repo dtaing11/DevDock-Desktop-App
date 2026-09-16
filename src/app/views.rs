@@ -3029,6 +3029,62 @@ pub fn prose_box(ui: &mut egui::Ui, text: &mut String, min_rows: usize, hint: &s
     )
 }
 
+/// The sandbox setting: on or off, which runtime, and — for a container
+/// runtime — which image. One widget for the backlog dialog and the Agent
+/// tab, so the two say the same thing.
+pub fn sandbox_controls(ui: &mut egui::Ui, on: &mut bool, kind: &mut Option<crate::sandbox::Kind>, image: &mut String) {
+    let installed = crate::sandbox::installed();
+    ui.checkbox(on, "Run in a sandbox").on_hover_text(
+        "A Linux machine of the run's own — a Lima VM, an Apple container, or Docker — \
+         with the network on and a root shell: the agent installs what the repository \
+         needs (Flutter, Node, whatever) and builds and tests there, and DevDock's own \
+         verification runs there too. What it installs stays for the next run. Nothing \
+         touches this machine.",
+    );
+    if !*on {
+        return;
+    }
+    let chosen = kind.map(crate::sandbox::Kind::label).unwrap_or(match installed.first() {
+        Some(k) => k.label(),
+        None => "none installed",
+    });
+    egui::ComboBox::from_id_salt("sandbox-kind")
+        .selected_text(RichText::new(format!("Runtime: {chosen}")).size(theme::TEXT))
+        .show_ui(ui, |ui| {
+            let auto = format!(
+                "Whichever is installed{}",
+                installed.first().map(|k| format!(" ({})", k.label())).unwrap_or_default()
+            );
+            if ui.selectable_label(kind.is_none(), auto).clicked() {
+                *kind = None;
+            }
+            for k in crate::sandbox::Kind::ALL {
+                let label = if installed.contains(&k) { k.label().to_string() } else { format!("{} (not installed)", k.label()) };
+                if ui.selectable_label(*kind == Some(k), label).clicked() {
+                    *kind = Some(k);
+                }
+            }
+        });
+    let effective = kind.or_else(|| installed.first().copied());
+    match effective {
+        None => {
+            ui.label(RichText::new("no runtime installed: brew install lima").size(theme::SMALL).color(theme::danger()));
+        }
+        Some(k) if k.uses_image() => {
+            ui.label(RichText::new("image").small().color(theme::fg_dim()));
+            ui.add(
+                egui::TextEdit::singleline(image)
+                    .hint_text(dim_hint(crate::sandbox::DEFAULT_IMAGE))
+                    .desired_width(200.0),
+            )
+            .on_hover_text("A base the agent adds to; plain Ubuntu unless a toolchain image saves it time.");
+        }
+        Some(_) => {
+            ui.label(RichText::new("Ubuntu VM, kept between runs").small().color(theme::fg_dim()));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{elide_path, is_markdown};

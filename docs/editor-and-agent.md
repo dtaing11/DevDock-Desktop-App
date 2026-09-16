@@ -354,9 +354,11 @@ pull request and the files it changed. Several can run at once — send one
 prompt, then the next — and the task box is free as soon as one starts. The
 cards stay until **Clear finished**.
 
-**Checks in a sandbox** runs every build and test inside a Docker image with
-the worktree mounted at `/work`. The image is removed with the container, and
-the worktree with the run, so a sandbox cannot accumulate on disk.
+**Run in a sandbox** gives the run a Linux machine of its own — a Lima VM,
+an Apple container, or Docker, whichever is installed — with the network on
+and a root shell, where the agent installs what it needs and builds and
+tests, and where DevDock's verification runs too. What it installs stays for
+the next run. See [the sandbox](jira-tickets.md#the-sandbox).
 
 It needs GitHub sign-in, because the outcome is a pull request. A prompt that
 needs a decision from you is not a fit: the agent is told nobody can answer,
@@ -385,7 +387,7 @@ Three limits are structural, not prompt instructions:
   capped output — but `git commit`, `push`, `reset`, `checkout`, `rebase`,
   `stash` and the like are refused, as is `sudo`. You commit what you keep;
   a worktree run commits for itself when it is done. In a worktree run with
-  a sandbox, every command runs inside the container.
+  a sandbox, every command runs inside it.
 
 Budgets bound each run (turns, tool calls, bytes read, check runs). When one
 runs out the agent is asked to finish with what it has, and the panel says

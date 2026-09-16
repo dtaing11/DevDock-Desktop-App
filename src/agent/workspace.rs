@@ -111,8 +111,9 @@ const MAX_COMMAND_RUNS: usize = 40;
 /// Why a command may not run, when it may not: git operations that commit,
 /// push, or rewrite history — the harness or the developer does those, and
 /// a run that did them itself would leave the tree the harness reads in a
-/// state it does not expect — and `sudo`.
-pub fn refused_command(command: &str) -> Option<String> {
+/// state it does not expect — and, on the host, `sudo`. In a sandbox the
+/// machine is the run's own, and root is how it installs things.
+pub fn refused_command(command: &str, sandboxed: bool) -> Option<String> {
     const GIT_WRITES: &[&str] = &[
         "commit", "push", "reset", "checkout", "switch", "rebase", "merge", "stash", "cherry-pick",
         "revert", "tag", "am", "filter-branch", "clean", "worktree", "remote", "branch",
@@ -120,8 +121,8 @@ pub fn refused_command(command: &str) -> Option<String> {
     for segment in command.split([';', '|', '&', '\n']) {
         let mut words = segment.split_whitespace().filter(|w| !w.contains('=') || w.starts_with('-'));
         let Some(first) = words.next() else { continue };
-        if first == "sudo" || first == "doas" {
-            return Some("sudo is not available to this run.".into());
+        if (first == "sudo" || first == "doas") && !sandboxed {
+            return Some("sudo is not available on the host; turn on the sandbox for a machine with root.".into());
         }
         if first == "git" {
             // Skip global options, with their arguments: `git -C dir commit`.
@@ -185,8 +186,12 @@ pub struct Workspace {
     /// install) besides the named checks. Live tree only.
     commands: bool,
     command_runs: usize,
-    /// A Docker image every check and command runs in, when set.
+    /// Where checks and commands run when not on the host, for the tool
+    /// text: "Lima VM devdock", "Docker (ubuntu:24.04)".
     sandbox: Option<String>,
+    /// Resolves each job's runner: the built-ins, plus the sandbox when
+    /// there is one.
+    runners: std::sync::Arc<crate::local_ci::runner::RunnerRegistry>,
     /// Files edited since the model last asked for their diagnostics.
     undiagnosed: BTreeSet<String>,
     /// The file most recently read, for a nudge that needs to name one.
@@ -225,6 +230,7 @@ impl Workspace {
             commands: false,
             command_runs: 0,
             sandbox: None,
+            runners: std::sync::Arc::new(crate::local_ci::runner::RunnerRegistry::with_builtins()),
             undiagnosed: BTreeSet::new(),
             last_read: None,
             edited_since_check: false,
@@ -262,16 +268,15 @@ impl Workspace {
         self
     }
 
-    /// Runs every check and command inside this Docker image, with the tree
-    /// mounted at /work, instead of on the host.
-    pub fn with_sandbox(mut self, image: Option<String>) -> Self {
-        self.sandbox = image.map(|i| i.trim().to_string()).filter(|i| !i.is_empty());
-        if let Some(image) = &self.sandbox {
-            for job in self.checks.iter_mut() {
-                if job.image.is_none() {
-                    job.image = Some(image.clone());
-                }
-            }
+    /// Runs every check and command inside a sandbox — described by
+    /// `note` for the model — whose runner is registered in `runners`
+    /// under [`crate::sandbox::RUNNER_ID`]. The checks are pointed at it.
+    pub fn with_sandbox(mut self, note: String, runners: std::sync::Arc<crate::local_ci::runner::RunnerRegistry>) -> Self {
+        self.sandbox = Some(note);
+        self.runners = runners;
+        for job in self.checks.iter_mut() {
+            job.runner = Some(crate::sandbox::RUNNER_ID.into());
+            job.image = None;
         }
         self
     }
@@ -667,13 +672,20 @@ impl Workspace {
         if self.commands_available() {
             tools.push(ToolSpec {
                 name: "run_command",
-                description: if self.sandbox.is_some() {
-                    "Run a shell command in the repository root, inside the sandbox \
-                     container with the tree mounted at /work, and get its output: the \
-                     toolchain (build, a single test, a formatter, a linter, installing \
-                     dependencies), or anything the named checks do not cover. Git commands \
-                     that commit, push, or rewrite history are refused — the harness commits. \
-                     Output is capped; commands are killed after the timeout."
+                description: if let Some(note) = &self.sandbox {
+                    Box::leak(
+                        format!(
+                            "Run a shell command in the repository's worktree inside its \
+                             sandbox ({note}): a Linux machine of this run's own, with the \
+                             network on, root available, and a package manager — install \
+                             whatever the repository needs (apt-get, curl, an SDK), build it, \
+                             run one test, a formatter, a linter. What you install stays for \
+                             later runs. Git commands that commit, push, or rewrite history are \
+                             refused — the harness commits. Output is capped; commands are \
+                             killed after the timeout."
+                        )
+                        .into_boxed_str(),
+                    )
                 } else {
                     "Run a shell command in the repository root and get its output: the \
                      toolchain (build, a single test, a formatter, a linter, installing \
@@ -1599,7 +1611,7 @@ impl Workspace {
 
         self.check_runs += 1;
         self.edited_since_check = false;
-        let result = crate::local_ci::run_job(&self.root, &job);
+        let result = crate::local_ci::run_job_with(&self.runners, &self.root, &job);
         let mut output = result.output;
         if output.len() > MAX_OUTPUT {
             // Failures print the useful part last, so keep the tail.
@@ -1631,7 +1643,7 @@ impl Workspace {
         if command.is_empty() {
             return Err("command is empty".into());
         }
-        if let Some(why) = refused_command(&command) {
+        if let Some(why) = refused_command(&command, self.sandbox.is_some()) {
             return Err(why);
         }
         let timeout = input
@@ -1651,11 +1663,11 @@ impl Workspace {
         let job = crate::local_ci::Job {
             name: "command".into(),
             commands: vec![command.clone()],
-            image: self.sandbox.clone(),
+            runner: self.sandbox.as_ref().map(|_| crate::sandbox::RUNNER_ID.to_string()),
             timeout_secs: Some(timeout),
             ..Default::default()
         };
-        let result = crate::local_ci::run_job(&self.root, &job);
+        let result = crate::local_ci::run_job_with(&self.runners, &self.root, &job);
         let mut output = result.output;
         if output.len() > MAX_OUTPUT {
             let start = output.len() - MAX_OUTPUT;
@@ -2569,8 +2581,11 @@ mod tests {
             let out = ws.dispatch(&call("run_command", serde_json::json!({"command": fine})), 40);
             assert!(!out.is_error, "{fine}: {}", out.content);
         }
-        assert!(refused_command("GIT_PAGER=cat git log").is_none());
-        assert!(refused_command("git rebase -i").is_some());
+        assert!(refused_command("GIT_PAGER=cat git log", false).is_none());
+        assert!(refused_command("git rebase -i", false).is_some());
+        assert!(refused_command("sudo apt-get install -y curl", false).is_some());
+        assert!(refused_command("sudo apt-get install -y curl", true).is_none(), "root is the point of a sandbox");
+        assert!(refused_command("git push", true).is_some(), "history is still the harness's");
 
         // A read-only run gets no command tool, whatever was asked for.
         let (_tmp, ws) = fixture(Access::ReadOnly);

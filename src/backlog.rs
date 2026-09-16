@@ -190,6 +190,25 @@ impl Task {
         }
     }
 
+    /// A branch name as a person typed it, made valid: spaces and other
+    /// characters git refuses become dashes, runs of them collapse, and an
+    /// empty result falls back to the name made from the prompt.
+    pub fn with_branch(mut self, typed: &str) -> Self {
+        let mut name = String::new();
+        for c in typed.trim().chars() {
+            if c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-') {
+                name.push(c);
+            } else if !name.ends_with('-') && !name.is_empty() {
+                name.push('-');
+            }
+        }
+        let name = name.trim_matches(|c| c == '-' || c == '/' || c == '.').replace("//", "/").replace("..", ".");
+        if !name.is_empty() {
+            self.branch = name;
+        }
+        self
+    }
+
     /// Whether this is a ticket, with a page to link and a key to prefix.
     pub fn is_ticket(&self) -> bool {
         self.url.is_some()
@@ -1425,6 +1444,9 @@ mod tests {
         assert!(!t.is_ticket());
         assert_eq!(t.subject(), "Add a --json flag to `devdock status`!");
         assert_eq!(Task::from_prompt("!!!").branch, "agent/task");
+        assert_eq!(Task::from_prompt("x").with_branch("fix/Historical Map").branch, "fix/Historical-Map");
+        assert_eq!(Task::from_prompt("x").with_branch("  feature: new thing!  ").branch, "feature-new-thing");
+        assert_eq!(Task::from_prompt("x").with_branch("   ").branch, "agent/x", "nothing typed keeps the default");
         let long = Task::from_prompt(&"word ".repeat(50));
         assert!(long.title.chars().count() <= 72);
         assert!(long.branch.len() <= "agent/".len() + 40);

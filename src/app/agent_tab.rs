@@ -689,8 +689,13 @@ fn task_panel(app: &mut App, ui: &mut egui::Ui) {
     ui.horizontal_wrapped(|ui| {
         ui.label(theme::overline("TASK"));
         super::views::engine_toggle(app, ui, AiTarget::Coding);
+    });
+    // The picker on a row of its own: next to the toggle it was clipped at
+    // the panel's edge in a narrow sidebar.
+    ui.horizontal(|ui| {
         super::views::ai_model_picker(app, ui, AiTarget::Coding);
-
+    });
+    ui.horizontal_wrapped(|ui| {
         let mut iterate = app.coding.iterate;
         let toggle = ui
             .checkbox(&mut iterate, "Let it iterate")
@@ -715,13 +720,17 @@ fn task_panel(app: &mut App, ui: &mut egui::Ui) {
         }
     });
 
-    ui.add_enabled_ui(!busy, |ui| {
-        super::views::prose_box(
-            ui,
-            &mut app.coding.task,
-            3,
-            "What should it do? e.g. \"add a --json flag to devdock status and cover it with a test\"",
-        );
+    // Grows with the prompt up to a cap, then scrolls inside itself: a long
+    // prompt must not push the Run button out of the panel.
+    ScrollArea::vertical().max_height(220.0).id_salt("agent-task-box").show(ui, |ui| {
+        ui.add_enabled_ui(!busy, |ui| {
+            super::views::prose_box(
+                ui,
+                &mut app.coding.task,
+                3,
+                "What should it do? e.g. \"add a --json flag to devdock status and cover it with a test\"",
+            );
+        });
     });
 
     worktree_options(app, ui);
@@ -817,10 +826,8 @@ fn worktree_options(app: &mut App, ui: &mut egui::Ui) {
          the one chosen for code review in Settings.",
     );
     ui.horizontal_wrapped(|ui| {
-        ui.push_id("agent-sandbox", |ui| {
-            let wt = &mut app.coding.worktree;
-            super::views::sandbox_controls(ui, &mut wt.sandbox, &mut wt.sandbox_kind, &mut wt.sandbox_image);
-        });
+        let wt = &mut app.coding.worktree;
+        super::views::sandbox_controls(ui, "agent", &mut wt.sandbox, &mut wt.sandbox_kind, &mut wt.sandbox_image);
     });
 }
 

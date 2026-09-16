@@ -43,6 +43,8 @@ impl eframe::App for Shot {
                     self.app.dialog = git_manage::app::Dialog::Backlog;
                 }
                 Ok("pr") => self.app.dialog = git_manage::app::Dialog::PullRequests,
+                Ok("settings") => self.app.dialog = git_manage::app::Dialog::Settings,
+                Ok("github") => self.app.dialog = git_manage::app::Dialog::GitHub,
                 Ok("tickets") => {
                     seed_tickets(&mut self.app);
                     self.app.dialog = git_manage::app::Dialog::Tickets;

@@ -4281,11 +4281,7 @@ impl App {
             self.toast("Sign in to GitHub first: a worktree run ends as a draft pull request.", true);
             return;
         }
-        let mut task = crate::backlog::Task::from_prompt(&prompt);
-        let wanted = self.coding.worktree.branch.trim().to_string();
-        if !wanted.is_empty() {
-            task.branch = wanted;
-        }
+        let task = crate::backlog::Task::from_prompt(&prompt).with_branch(&self.coding.worktree.branch);
         let key = task.branch.clone();
         if self.coding.worktree.runs.get(&key).is_some_and(|r| !r.is_finished()) {
             self.toast(format!("An agent is already working on {key}. Name another branch."), true);

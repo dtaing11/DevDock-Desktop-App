@@ -1635,7 +1635,8 @@ pub fn engine_toggle(app: &mut App, ui: &mut egui::Ui, target: crate::app::worke
 
 pub fn ai_model_picker(app: &mut App, ui: &mut egui::Ui, target: crate::app::worker::AiTarget) {
     use crate::app::AiSelection;
-    let salt = ui.id().with("ai-model-picker");
+    // Unique per task, so two pickers in one dialog never share an id.
+    let salt = egui::Id::new(("ai-model-picker", target.label()));
     let current = app.ai_selection(target);
     let selected = match &current {
         Some(sel) if sel.provider == "claude" => format!("Claude: {}", sel.model),
@@ -1663,7 +1664,7 @@ pub fn ai_model_picker(app: &mut App, ui: &mut egui::Ui, target: crate::app::wor
     // which it cannot do for a widget whose width is "however much it wants".
     egui::ComboBox::from_id_salt(salt)
         .selected_text(egui::RichText::new(selected).size(theme::SMALL))
-        .width(PICKER_W)
+        .width(PICKER_W.min((ui.available_width() - 8.0).max(120.0)))
         .show_ui(ui, |ui| {
         if offers_claude_code {
             ui.label(theme::overline("CLAUDE CODE AGENT (THIS MACHINE)"));
@@ -3029,10 +3030,25 @@ pub fn prose_box(ui: &mut egui::Ui, text: &mut String, min_rows: usize, hint: &s
     )
 }
 
+/// In a wrapping row, moves to the next line unless `needed` pixels are
+/// left on this one. A slider with its value box, or a label with the
+/// picker it names, lays itself out as one inner row that cannot wrap
+/// midway: placed where it does not fit, it overflows the dialog and
+/// widens every row below it. This asks first.
+pub fn keep_together(ui: &mut egui::Ui, needed: f32) {
+    // `available_width` is the whole row in a wrapping layout; what is left
+    // on this line is `available_size_before_wrap`.
+    let left = ui.available_size_before_wrap().x;
+    let at_line_start = ui.cursor().min.x <= ui.max_rect().min.x + 1.0;
+    if left < needed && !at_line_start {
+        ui.end_row();
+    }
+}
+
 /// The sandbox setting: on or off, which runtime, and — for a container
 /// runtime — which image. One widget for the backlog dialog and the Agent
 /// tab, so the two say the same thing.
-pub fn sandbox_controls(ui: &mut egui::Ui, on: &mut bool, kind: &mut Option<crate::sandbox::Kind>, image: &mut String) {
+pub fn sandbox_controls(ui: &mut egui::Ui, id: &str, on: &mut bool, kind: &mut Option<crate::sandbox::Kind>, image: &mut String) {
     let installed = crate::sandbox::installed();
     ui.checkbox(on, "Run in a sandbox").on_hover_text(
         "A Linux machine of the run's own — a Lima VM, an Apple container, or Docker — \
@@ -3044,11 +3060,12 @@ pub fn sandbox_controls(ui: &mut egui::Ui, on: &mut bool, kind: &mut Option<crat
     if !*on {
         return;
     }
+    keep_together(ui, 220.0);
     let chosen = kind.map(crate::sandbox::Kind::label).unwrap_or(match installed.first() {
         Some(k) => k.label(),
         None => "none installed",
     });
-    egui::ComboBox::from_id_salt("sandbox-kind")
+    egui::ComboBox::from_id_salt((id, "sandbox-kind"))
         .selected_text(RichText::new(format!("Runtime: {chosen}")).size(theme::TEXT))
         .show_ui(ui, |ui| {
             let auto = format!(
@@ -3071,6 +3088,7 @@ pub fn sandbox_controls(ui: &mut egui::Ui, on: &mut bool, kind: &mut Option<crat
             ui.label(RichText::new("no runtime installed: brew install lima").size(theme::SMALL).color(theme::danger()));
         }
         Some(k) if k.uses_image() => {
+            keep_together(ui, 260.0);
             ui.label(RichText::new("image").small().color(theme::fg_dim()));
             ui.add(
                 egui::TextEdit::singleline(image)

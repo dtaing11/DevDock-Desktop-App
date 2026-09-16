@@ -501,7 +501,9 @@ pub fn dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         // Sizing to wrapped content instead oscillates — wider makes a row
         // fit on one line, which makes the content narrower, which wraps the
         // row again — and with a dropdown open that is visible as twitching.
-        let width = (ctx.screen_rect().width() * 0.85 - 48.0).clamp(460.0, 920.0);
+        // Never wider than the modal itself allows, or the dialog runs off
+        // both edges of a small window.
+        let width = (ctx.screen_rect().width() * 0.85 - 48.0).clamp(320.0, 920.0);
         ui.set_width(width);
 
         if app.tickets.account.is_none() {
@@ -618,17 +620,13 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
         }
     });
     ui.horizontal_wrapped(|ui| {
-        ui.push_id("backlog-fixer-engine", |ui| {
-            super::views::engine_toggle(app, ui, worker::AiTarget::Backlog);
-        });
+        super::views::engine_toggle(app, ui, worker::AiTarget::Backlog);
         ui.add_space(theme::UNIT);
+        super::views::keep_together(ui, 240.0);
         ui.label("Fixer model");
-        // Two pickers in one dialog: each in its own id scope, or egui sees
-        // one widget twice and the second acts on the first.
-        ui.push_id("backlog-fixer-model", |ui| {
-            super::views::ai_model_picker(app, ui, worker::AiTarget::Backlog);
-        });
+        super::views::ai_model_picker(app, ui, worker::AiTarget::Backlog);
         ui.add_space(theme::UNIT);
+        super::views::keep_together(ui, 220.0);
         ui.label("At once");
         ui.add(egui::Slider::new(&mut app.backlog.parallel, 1..=6).show_value(true))
             .on_hover_text("How many agents run in parallel, each in its own worktree");
@@ -649,13 +647,11 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
              Reviewer, or in Settings for code review.",
         );
         if app.backlog.review {
-            ui.push_id("backlog-reviewer-engine", |ui| {
-                super::views::engine_toggle(app, ui, worker::AiTarget::Review);
-            });
+            super::views::keep_together(ui, 320.0);
+            super::views::engine_toggle(app, ui, worker::AiTarget::Review);
+            super::views::keep_together(ui, 230.0);
             ui.label("Reviewer");
-            ui.push_id("backlog-reviewer-model", |ui| {
-                super::views::ai_model_picker(app, ui, worker::AiTarget::Review);
-            });
+            super::views::ai_model_picker(app, ui, worker::AiTarget::Review);
         }
     });
     ui.horizontal_wrapped(|ui| {
@@ -667,9 +663,7 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
         );
     });
     ui.horizontal_wrapped(|ui| {
-        ui.push_id("backlog-sandbox", |ui| {
-            super::views::sandbox_controls(ui, &mut app.backlog.sandbox, &mut app.backlog.sandbox_kind, &mut app.backlog.sandbox_image);
-        });
+        super::views::sandbox_controls(ui, "backlog", &mut app.backlog.sandbox, &mut app.backlog.sandbox_kind, &mut app.backlog.sandbox_image);
     });
 }
 

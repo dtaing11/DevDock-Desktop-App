@@ -74,6 +74,13 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
 ///
 /// The window is constrained to the app viewport: on small windows the
 /// content scrolls inside the dialog instead of overflowing off-screen.
+/// A dialog's preferred width, never more than the modal has: a dialog
+/// laid out for 760 pixels in a 900-pixel window would run off both edges.
+/// Rows wrap to what they get instead.
+pub(super) fn fit_width(ui: &mut egui::Ui, wanted: f32) {
+    ui.set_min_width(wanted.min(ui.available_width()));
+}
+
 pub(super) fn modal(
     ctx: &egui::Context,
     title: &str,
@@ -119,7 +126,31 @@ pub(super) fn modal(
             ScrollArea::vertical()
                 .max_height(max_height - 60.0)
                 .auto_shrink([true, true])
-                .show(ui, add_contents);
+                .show(ui, |ui| {
+                    // The body draws into a child of exactly the width the
+                    // dialog may have, clipped at its edges. A row that does
+                    // not wrap, a fixed-width picker, a long label: none of
+                    // them can widen the dialog past the window any more —
+                    // they wrap to this width, or are cut at it.
+                    let width = ui.available_width().min(max_width - 32.0);
+                    let rect = egui::Rect::from_min_size(
+                        ui.cursor().min,
+                        egui::vec2(width, ui.available_height().max(1.0)),
+                    );
+                    let mut child = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(rect)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+                    let clip = ui.clip_rect();
+                    child.set_clip_rect(egui::Rect::from_x_y_ranges(rect.x_range(), clip.y_range()));
+                    add_contents(&mut child);
+                    let used = child.min_rect();
+                    ui.advance_cursor_after_rect(egui::Rect::from_min_size(
+                        rect.min,
+                        egui::vec2(used.width().min(width), used.height()),
+                    ));
+                });
         });
 
     // The X button (ui.close) closes; Escape is handled by the global
@@ -137,7 +168,7 @@ pub(super) fn modal(
 
 fn repo_picker(app: &mut App, ctx: &egui::Context, open: &mut bool) {
     modal(ctx, "Open repository", open, |ui| {
-        ui.set_min_width(420.0);
+        fit_width(ui, 420.0);
 
         ui.label("Local path");
         ui.horizontal(|ui| {
@@ -277,7 +308,7 @@ fn repo_picker(app: &mut App, ctx: &egui::Context, open: &mut bool) {
 
 fn github_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
     modal(ctx, "GitHub", open, |ui| {
-        ui.set_min_width(420.0);
+        fit_width(ui, 420.0);
 
         if let Some(user) = app.gh.user.clone() {
             let name = user.name.as_deref().unwrap_or("");
@@ -353,7 +384,7 @@ fn github_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
 
 fn pull_requests(app: &mut App, ctx: &egui::Context, open: &mut bool) {
     modal(ctx, "Pull requests", open, |ui| {
-        ui.set_min_width(460.0);
+        fit_width(ui, 460.0);
 
         local_ci_panel(app, ui);
         ui.separator();
@@ -536,7 +567,7 @@ fn pull_requests(app: &mut App, ctx: &egui::Context, open: &mut bool) {
 /// browser afterwards defeats the point.
 fn tickets_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
     modal(ctx, "Write Jira tickets", open, |ui| {
-        ui.set_min_width(720.0);
+        fit_width(ui, 720.0);
 
         if app.tickets.account.is_none() {
             jira_connect(app, ui);
@@ -933,7 +964,7 @@ fn draft_card(app: &mut App, ui: &mut egui::Ui, index: usize) {
 /// printed below it.
 fn stack_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
     modal(ctx, "Stacked pull requests", open, |ui| {
-        ui.set_min_width(620.0);
+        fit_width(ui, 620.0);
 
         // The stack could not be read at all — most often because `gh` or
         // the extension is not installed. The message says how to fix that.
@@ -1332,7 +1363,7 @@ fn review_gate(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         app.review.pending.as_ref().map(|g| g.override_label()).unwrap_or("Proceed anyway");
 
     modal(ctx, "AI code review", open, |ui| {
-        ui.set_min_width(560.0);
+        fit_width(ui, 560.0);
 
         // Markdown mode has no severities: the reviewer's own verdict line is
         // what held the action, and the body is rendered as it was written.
@@ -1464,7 +1495,7 @@ fn checks_gate(app: &mut App, ctx: &egui::Context, open: &mut bool) {
     let noun = held.noun();
 
     modal(ctx, "Checks failed", open, |ui| {
-        ui.set_min_width(560.0);
+        fit_width(ui, 560.0);
         ui.label(RichText::new(format!(
             "{} check(s) failed, holding this {noun}.",
             failed.len()
@@ -1601,7 +1632,7 @@ pub(super) fn create_pr(app: &mut App) {
 
 fn conflict_resolver(app: &mut App, ctx: &egui::Context, open: &mut bool) {
     modal(ctx, "Resolve conflicts", open, |ui| {
-        ui.set_min_width(680.0);
+        fit_width(ui, 680.0);
 
         if app.conflicts.files.is_empty() {
             ui.label(RichText::new("All conflicts resolved").color(theme::add()));
@@ -1793,7 +1824,7 @@ fn pr_review(app: &mut App, ctx: &egui::Context, open: &mut bool) {
     };
     let title = format!("Review PR #{}: {}", pr.number, pr.title);
     modal(ctx, &title, open, |ui| {
-        ui.set_min_width(760.0);
+        fit_width(ui, 760.0);
         ui.horizontal(|ui| {
             ui.label(RichText::new(&pr.head).color(theme::teal()).monospace());
             ui.label(RichText::new("into").weak());
@@ -2091,7 +2122,7 @@ fn pr_review(app: &mut App, ctx: &egui::Context, open: &mut bool) {
 /// when the user explicitly confirms. Cancel discards everything.
 fn ci_config_review(app: &mut App, ctx: &egui::Context, open: &mut bool) {
     modal(ctx, "Review AI-generated CI config", open, |ui| {
-        ui.set_min_width(640.0);
+        fit_width(ui, 640.0);
         ui.label(
             RichText::new(
                 "AI PROPOSAL. Review and edit the config below. Nothing is \
@@ -2293,7 +2324,7 @@ fn agent_panel(app: &mut App, ui: &mut egui::Ui) {
 /// "Apply" writes the ticked ones.
 fn agent_changes(app: &mut App, ctx: &egui::Context, open: &mut bool) {
     modal(ctx, "AI proposed changes", open, |ui| {
-        ui.set_min_width(760.0);
+        fit_width(ui, 760.0);
 
         ui.label(
             RichText::new(
@@ -2506,7 +2537,7 @@ pub fn proposal_diff_body(
 /// Everything the app can do, by name.
 fn command_palette(app: &mut App, ctx: &egui::Context, open: &mut bool) {
     modal(ctx, "Commands", open, |ui| {
-        ui.set_min_width(560.0);
+        fit_width(ui, 560.0);
 
         let response = ui.add(
             egui::TextEdit::singleline(&mut app.palette_query)
@@ -2578,7 +2609,7 @@ fn command_palette(app: &mut App, ctx: &egui::Context, open: &mut bool) {
 /// developer may well want to word themselves.
 fn split_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
     modal(ctx, "Split into commits", open, |ui| {
-        ui.set_min_width(720.0);
+        fit_width(ui, 720.0);
         if !app.split.notes.trim().is_empty() {
             ui.label(RichText::new(&app.split.notes).color(theme::fg_dim()).small());
         }
@@ -2654,7 +2685,7 @@ fn tidy_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         return;
     };
     modal(ctx, "Tidy history", open, |ui| {
-        ui.set_min_width(720.0);
+        fit_width(ui, 720.0);
         if !app.tidy.notes.trim().is_empty() {
             ui.label(RichText::new(&app.tidy.notes).color(theme::fg_dim()).small());
         }
@@ -2726,7 +2757,7 @@ fn tidy_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
 /// was even when nothing else does.
 fn reflog_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
     modal(ctx, "Undo — recent history", open, |ui| {
-        ui.set_min_width(700.0);
+        fit_width(ui, 700.0);
         ui.label(
             RichText::new(
                 "Where this branch has been. Going back keeps your files: the undone \
@@ -2805,7 +2836,7 @@ fn rename_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
     let (path, position, old_name) = (rename.path.clone(), rename.position, rename.old_name.clone());
 
     modal(ctx, "Rename symbol", open, |ui| {
-        ui.set_min_width(360.0);
+        fit_width(ui, 360.0);
         ui.label(
             RichText::new(format!("Renaming `{old_name}` everywhere the language server finds it."))
                 .color(theme::fg_dim())
@@ -2857,7 +2888,7 @@ fn rename_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
 
 fn settings(app: &mut App, ctx: &egui::Context, open: &mut bool) {
     modal(ctx, "Settings", open, |ui| {
-        ui.set_min_width(420.0);
+        fit_width(ui, 420.0);
 
         ui.label(theme::overline("APPEARANCE"));
         ui.horizontal(|ui| {
@@ -2945,29 +2976,38 @@ fn settings(app: &mut App, ctx: &egui::Context, open: &mut bool) {
             .size(theme::SMALL)
             .color(theme::fg_dim()),
         );
-        egui::Grid::new("models-per-task").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-            for target in crate::app::worker::AiTarget::ALL {
-                let mut label = target.label().to_string();
-                if let Some(first) = label.get_mut(0..1) {
-                    first.make_ascii_uppercase();
-                }
-                ui.label(label);
-                ui.push_id(target.label(), |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        if matches!(
-                            target,
-                            crate::app::worker::AiTarget::Coding
-                                | crate::app::worker::AiTarget::Backlog
-                                | crate::app::worker::AiTarget::Review
-                        ) {
-                            super::views::engine_toggle(app, ui, target);
-                        }
-                        super::views::ai_model_picker(app, ui, target);
-                    });
-                });
-                ui.end_row();
+        // One wrapping row per task rather than a grid: a grid cell has no
+        // width to wrap to, so the engine toggle and the picker ran off the
+        // dialog's edge in a narrow window.
+        for target in crate::app::worker::AiTarget::ALL {
+            let mut label = target.label().to_string();
+            if let Some(first) = label.get_mut(0..1) {
+                first.make_ascii_uppercase();
             }
-        });
+            ui.push_id(target.label(), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    // A fixed-width, left-aligned label column, so the
+                    // pickers line up without a grid.
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(130.0, theme::CONTROL_SM),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.label(label);
+                        },
+                    );
+                    if matches!(
+                        target,
+                        crate::app::worker::AiTarget::Coding
+                            | crate::app::worker::AiTarget::Backlog
+                            | crate::app::worker::AiTarget::Review
+                    ) {
+                        super::views::engine_toggle(app, ui, target);
+                    }
+                    super::views::keep_together(ui, 170.0);
+                    super::views::ai_model_picker(app, ui, target);
+                });
+            });
+        }
 
         ui.separator();
         shortcut_settings(app, ui, ctx);
@@ -3477,7 +3517,7 @@ fn claude_settings(app: &mut App, ui: &mut egui::Ui) {
 
 fn add_remote(app: &mut App, ctx: &egui::Context, open: &mut bool) {
     modal(ctx, "Publish: add a remote", open, |ui| {
-        ui.set_min_width(420.0);
+        fit_width(ui, 420.0);
         ui.label("This repository has no remote yet. Add one to publish your branch:");
         ui.add(
             egui::TextEdit::singleline(&mut app.remote_url_input)
@@ -3519,7 +3559,7 @@ fn switch_branch(app: &mut App, ctx: &egui::Context, open: &mut bool) {
     let count = app.status.as_ref().map(|s| s.files.len()).unwrap_or(0);
 
     modal(ctx, "Uncommitted changes", open, |ui| {
-        ui.set_min_width(380.0);
+        fit_width(ui, 380.0);
         ui.label(format!(
             "You have {count} changed file{} not yet committed.",
             if count == 1 { "" } else { "s" }
@@ -3571,7 +3611,7 @@ fn confirm_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
     let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
 
     modal(ctx, action.title(), open, |ui| {
-        ui.set_min_width(360.0);
+        fit_width(ui, 360.0);
 
         // Merge gets a visual source -> target card so direction is obvious.
         if let crate::app::ConfirmAction::MergeInto { source, target, protected } = &action {

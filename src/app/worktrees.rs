@@ -265,7 +265,7 @@ pub fn spawn_window(path: &std::path::Path) -> Result<(), String> {
 /// The dialog: every checkout of the repository, and a form for one more.
 pub fn dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
     super::dialogs::modal(ctx, "Worktrees", open, |ui| {
-        ui.set_min_width(640.0);
+        super::dialogs::fit_width(ui, 640.0);
         ui.label(
             RichText::new(
                 "The same repository checked out more than once, one branch per \

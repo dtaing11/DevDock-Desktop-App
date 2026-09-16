@@ -1852,9 +1852,16 @@ pub fn summarize(call: &ToolCall) -> String {
         "find_symbol" => format!("find symbol {}", arg("query")),
         "run_check" => format!("run check {}", arg("name")),
         "run_command" => {
+            // `cd somewhere && the command`: the command is the news.
             let command = arg("command");
-            let short: String = command.chars().take(80).collect();
-            format!("run `{short}{}`", if short.len() < command.len() { "…" } else { "" })
+            let trimmed = command.trim();
+            let shown: &str = if trimmed.starts_with("cd ") {
+                trimmed.rsplit("&&").next().map(str::trim).unwrap_or(trimmed)
+            } else {
+                trimmed
+            };
+            let short: String = shown.chars().take(100).collect();
+            format!("run `{short}{}`", if short.chars().count() < shown.chars().count() { "…" } else { "" })
         }
         other => other.to_string(),
     }

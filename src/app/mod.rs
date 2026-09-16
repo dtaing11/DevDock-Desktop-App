@@ -364,6 +364,8 @@ pub enum ConfirmAction {
     UndoTo { sha: String, short: String, what: String },
     /// Delete a worktree's directory. `force` discards uncommitted changes.
     RemoveWorktree { path: String, force: bool },
+    /// Delete kept attempts of the coding agent: worktrees and branches.
+    ClearAttempts(Vec<String>),
 }
 
 impl ConfirmAction {
@@ -388,6 +390,7 @@ impl ConfirmAction {
             Self::UndoTo { .. } => "Go back to this commit?",
             Self::RemoveWorktree { force: false, .. } => "Remove worktree?",
             Self::RemoveWorktree { force: true, .. } => "Remove worktree and its changes?",
+            Self::ClearAttempts(_) => "Clear kept attempts?",
         }
     }
 
@@ -462,6 +465,12 @@ impl ConfirmAction {
                     )
                 }
             }
+            Self::ClearAttempts(branches) => format!(
+                "{} deleted for good: the branch{} and any worktree checked out for it under \
+                 the repository's -attempts folder. Nothing was pushed, so nothing remains.",
+                branches.join(", "),
+                if branches.len() == 1 { "" } else { "es" }
+            ),
             Self::UndoTo { short, what, .. } => format!(
                 "The branch moves back to {short} ({what}).\n\n\
                  Nothing is deleted: the changes from the commits you are undoing stay \
@@ -489,6 +498,7 @@ impl ConfirmAction {
             Self::UndoTo { .. } => "Go back",
             Self::RemoveWorktree { force: false, .. } => "Remove",
             Self::RemoveWorktree { force: true, .. } => "Remove and discard changes",
+            Self::ClearAttempts(_) => "Clear attempts",
         }
     }
 }
@@ -4217,6 +4227,25 @@ impl App {
         });
     }
 
+    /// Checks a kept attempt's branch out — under `<repo>-attempts/`, so
+    /// all of them are in one place and the Worktrees dialog can remove
+    /// them — and opens Visual Studio Code on it.
+    pub fn open_attempt_in_vscode(&mut self, branch: &str) {
+        let Some(repo) = self.repo.clone() else { return };
+        let dir = repo.attempt_worktree_path(branch);
+        if !dir.exists() {
+            if let Err(e) = repo.worktree_add(&dir, branch, None) {
+                self.toast(format!("Could not check {branch} out: {e}"), true);
+                return;
+            }
+        }
+        match views::open_in_vscode(&dir) {
+            Ok(()) => self.toast(format!("Opened {} in Visual Studio Code.", dir.display()), false),
+            Err(e) => self.toast(format!("The worktree is at {}, but Visual Studio Code did not open: {e}", dir.display()), true),
+        }
+        self.refresh();
+    }
+
     fn on_agent_run_progress(&mut self, key: String, line: String) {
         if let Some(run) = self.coding.worktree.runs.get_mut(&key) {
             run.log.push(line);
@@ -4236,6 +4265,7 @@ impl App {
             Err(e) => {
                 let first = e.lines().next().unwrap_or("").to_string();
                 run.log.push(format!("failed: {first}"));
+                run.kept = backlog::kept_branch(&e);
                 run.state = backlog::RunState::Failed(e);
                 (format!("Worktree agent on {key} failed: {first}"), true)
             }
@@ -4641,6 +4671,7 @@ impl App {
             ConfirmAction::RemoveWorktree { path, force } => {
                 self.worktree_remove_confirmed(path, force);
             }
+            ConfirmAction::ClearAttempts(branches) => self.clear_attempts_confirmed(branches),
             ConfirmAction::DeleteBranch(name) => {
                 self.worker.spawn(move || Msg::Done {
                     message: strerr(
@@ -5933,8 +5964,8 @@ mod tests {
         assert!(app.backlog.selected.contains("T-1"));
 
         // Two agents in flight, by hand: starting one for real needs a model.
-        app.backlog.runs.insert("T-1".into(), TicketRun { title: "one".into(), state: RunState::Running, log: Vec::new(), started: Some(Instant::now()), took: None });
-        app.backlog.runs.insert("T-2".into(), TicketRun { title: "two".into(), state: RunState::Running, log: Vec::new(), started: Some(Instant::now()), took: None });
+        app.backlog.runs.insert("T-1".into(), TicketRun { title: "one".into(), state: RunState::Running, kept: None, log: Vec::new(), started: Some(Instant::now()), took: None });
+        app.backlog.runs.insert("T-2".into(), TicketRun { title: "two".into(), state: RunState::Running, kept: None, log: Vec::new(), started: Some(Instant::now()), took: None });
         app.handle(Msg::BacklogProgress { key: "T-1".into(), line: "· read a.rs".into() });
         assert_eq!(app.backlog.runs["T-1"].log, ["· read a.rs"]);
         assert_eq!(app.backlog.running(), 2);
@@ -6003,8 +6034,45 @@ mod tests {
 
         app.handle(Msg::AgentRunDone { key: "agent/rename-foo".into(), result: Err("the agent changed nothing: nothing named foo".into()) });
         assert!(matches!(app.coding.worktree.runs["agent/rename-foo"].state, RunState::Failed(_)));
+        assert!(app.coding.worktree.runs["agent/rename-foo"].kept.is_none());
         assert!(app.coding.worktree.runs["agent/rename-foo"].took.is_some());
         assert!(app.toast.as_ref().is_some_and(|t| t.text.contains("failed: the agent changed nothing")));
+        // A failure that kept its attempt names the branch, and opening it
+        // checks the branch out under the attempts folder.
+        let repo = app.repo.clone().unwrap();
+        repo.stage_all().unwrap();
+        repo.commit("init", "", false).unwrap();
+        repo.create_branch("agent/kept-one", false).unwrap();
+        let mut run = TicketRun::queued("kept one");
+        run.state = RunState::Running;
+        app.coding.worktree.runs.insert("agent/kept-one".into(), run);
+        app.handle(Msg::AgentRunDone { key: "agent/kept-one".into(), result: Err("after 1 round(s) the change still fails a check.\n\nthe attempt is kept on branch agent/kept-one (2 file(s), not pushed): check it out to finish it, or delete the branch".into()) });
+        assert_eq!(app.coding.worktree.runs["agent/kept-one"].kept.as_deref(), Some("agent/kept-one"));
+        app.open_attempt_in_vscode("agent/kept-one");
+        let dir = repo.attempt_worktree_path("agent/kept-one");
+        assert!(dir.display().to_string().ends_with("-attempts/agent-kept-one"), "{}", dir.display());
+        assert!(dir.join(".git").exists(), "the worktree exists at {}", dir.display());
+        assert!(repo.worktrees().unwrap().iter().any(|w| w.path == dir), "listed with the other worktrees");
+
+        // A kept attempt is found again from its commit alone — after a
+        // restart, say — and cleared with its worktree.
+        std::fs::write(dir.join("kept.txt"), "half done\n").unwrap();
+        let wt = Repo::open(&dir).unwrap();
+        wt.stage_all().unwrap();
+        wt.commit("WIP: kept one (not accepted)", "", false).unwrap();
+        let attempts = repo.kept_attempts().unwrap();
+        assert_eq!(attempts.len(), 1, "{attempts:?}");
+        assert_eq!(attempts[0].branch, "agent/kept-one");
+        assert_eq!(attempts[0].title, "kept one");
+        assert_eq!(attempts[0].worktree.as_deref(), Some(dir.as_path()));
+        app.handle(Msg::Worktrees(Ok(repo.worktrees().unwrap())));
+        assert_eq!(app.worktrees.attempts.len(), 1, "{:?}", app.worktrees.attempts);
+        app.dialog = Dialog::Worktrees;
+        theme::run_test_ctx(|ctx| dialogs::show(&mut app, ctx));
+        repo.clear_attempt("agent/kept-one").unwrap();
+        assert!(!dir.exists());
+        assert!(repo.kept_attempts().unwrap().is_empty());
+        assert!(!repo.branches().unwrap().local.iter().any(|b| b.name == "agent/kept-one"));
 
         let fixed = crate::backlog::Fixed {
             key: "agent".into(),
@@ -6020,7 +6088,7 @@ mod tests {
         };
         app.handle(Msg::AgentRunDone { key: "agent/add-a-json-flag".into(), result: Ok(Box::new(fixed)) });
         assert_eq!(app.coding.worktree.done(), 1);
-        assert_eq!(app.coding.worktree.failed(), 1);
+        assert_eq!(app.coding.worktree.failed(), 2);
         assert_eq!(app.coding.worktree.running(), 0);
         assert!(app.toast.as_ref().is_some_and(|t| t.text.contains("Draft PR #9")));
 

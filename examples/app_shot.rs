@@ -179,6 +179,7 @@ fn seed_backlog(app: &mut App) {
     let run = |state: RunState, log: &[&str]| TicketRun {
         title: log.first().map(|l| l.trim_start_matches("branch ").split(" from ").next().unwrap_or_default()).unwrap_or_default().replacen("fix/", "", 1),
         state,
+        kept: None,
         log: log.iter().map(|l| l.to_string()).collect(),
         started: Some(std::time::Instant::now() - std::time::Duration::from_secs(94)),
         took: None,
@@ -319,6 +320,7 @@ fn seed_agent(app: &mut App, mode: &str) {
         let run = |title: &str, state: RunState, log: &[&str]| TicketRun {
             title: title.into(),
             state,
+            kept: None,
             log: log.iter().map(|l| l.to_string()).collect(),
             started: Some(std::time::Instant::now() - std::time::Duration::from_secs(131)),
             took: None,

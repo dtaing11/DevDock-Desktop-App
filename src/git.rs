@@ -140,6 +140,16 @@ pub struct BranchList {
 /// One checkout of the repository: a directory with a branch (or a detached
 /// commit) in it. The main worktree is where `.git` is a directory; linked
 /// ones point back to it.
+/// A coding agent's attempt that did not get through, kept on a branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeptAttempt {
+    pub branch: String,
+    /// What it was trying to do: the commit subject without the WIP frame.
+    pub title: String,
+    /// Where it is checked out, when someone opened it.
+    pub worktree: Option<PathBuf>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Worktree {
     pub path: PathBuf,
@@ -1387,6 +1397,55 @@ impl Repo {
         let slug = slug.trim_matches('-');
         let parent = main.parent().map(Path::to_path_buf).unwrap_or_else(|| main.clone());
         parent.join(format!("{name}-{slug}"))
+    }
+
+    /// Branches holding a coding agent's kept attempt: a run that did not
+    /// get through committed what it had as "WIP: … (not accepted)". They
+    /// survive restarts like any branch; this is how the dialog finds them
+    /// again to open or clear.
+    pub fn kept_attempts(&self) -> Result<Vec<KeptAttempt>> {
+        let out = self.git(&["for-each-ref", "--format=%(refname:short)%09%(subject)", "refs/heads/"])?;
+        let worktrees = self.worktrees().unwrap_or_default();
+        Ok(out
+            .lines()
+            .filter_map(|line| {
+                let (branch, subject) = line.split_once('\t')?;
+                let title = subject.strip_prefix("WIP: ")?.strip_suffix(" (not accepted)")?;
+                Some(KeptAttempt {
+                    branch: branch.to_string(),
+                    title: title.to_string(),
+                    worktree: worktrees.iter().find(|w| w.branch.as_deref() == Some(branch)).map(|w| w.path.clone()),
+                })
+            })
+            .collect())
+    }
+
+    /// Deletes a kept attempt: its worktree, if one was checked out, and
+    /// its branch. The attempt is gone for good.
+    pub fn clear_attempt(&self, branch: &str) -> Result<()> {
+        if let Some(wt) = self.worktrees()?.into_iter().find(|w| w.branch.as_deref() == Some(branch)) {
+            self.worktree_remove(&wt.path, true)?;
+        }
+        self.delete_branch(branch, true)
+    }
+
+    /// Where a kept attempt of the coding agent is checked out for a person
+    /// to finish: `<repo>-attempts/<branch slug>`, one folder next to the
+    /// main worktree that holds all of them, so they are easy to find and
+    /// easy to clear. The Worktrees dialog lists them like any other.
+    pub fn attempt_worktree_path(&self, branch: &str) -> PathBuf {
+        let main = self.main_worktree();
+        let name = main
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "repo".to_string());
+        let slug: String = branch
+            .trim()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' { c } else { '-' })
+            .collect();
+        let parent = main.parent().map(Path::to_path_buf).unwrap_or_else(|| main.clone());
+        parent.join(format!("{name}-attempts")).join(slug.trim_matches('-'))
     }
 
     /// Checks `branch` out into a new directory at `path`.

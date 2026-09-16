@@ -684,7 +684,7 @@ fn cost_line(app: &App) -> Option<String> {
 /// The task box and the controls that decide how the run behaves.
 fn task_panel(app: &mut App, ui: &mut egui::Ui) {
     let busy = app.coding.running;
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label(theme::overline("TASK"));
         super::views::engine_toggle(app, ui, AiTarget::Coding);
         super::views::ai_model_picker(app, ui, AiTarget::Coding);
@@ -713,16 +713,14 @@ fn task_panel(app: &mut App, ui: &mut egui::Ui) {
         }
     });
 
-    ui.add_enabled(
-        !busy,
-        egui::TextEdit::multiline(&mut app.coding.task)
-            .desired_rows(3)
-            .desired_width(f32::INFINITY)
-            .hint_text(
-                "What should it do? e.g. \"add a --json flag to devdock status and cover it \
-                 with a test\"",
-            ),
-    );
+    ui.add_enabled_ui(!busy, |ui| {
+        super::views::prose_box(
+            ui,
+            &mut app.coding.task,
+            3,
+            "What should it do? e.g. \"add a --json flag to devdock status and cover it with a test\"",
+        );
+    });
 
     worktree_options(app, ui);
 
@@ -894,8 +892,12 @@ fn worktree_runs(app: &mut App, ui: &mut egui::Ui) {
         for key in keys {
             let Some(run) = app.coding.worktree.runs.get(&key) else { continue };
             let expanded = app.coding.worktree.expanded.as_deref() == Some(key.as_str());
-            if super::backlog::run_card(ui, &key, &run.title, run, expanded, "agent-worktree-log") {
-                app.coding.worktree.expanded = if expanded { None } else { Some(key.clone()) };
+            match super::backlog::run_card(ui, &key, &run.title, run, expanded, "agent-worktree-log") {
+                super::backlog::CardAction::None => {}
+                super::backlog::CardAction::ToggleLog => {
+                    app.coding.worktree.expanded = if expanded { None } else { Some(key.clone()) };
+                }
+                super::backlog::CardAction::OpenAttempt(branch) => app.open_attempt_in_vscode(&branch),
             }
             ui.add_space(theme::UNIT);
         }

@@ -657,21 +657,127 @@ pub fn parse_suggestion_text(text: &str) -> CommitSuggestion {
     parse_suggestion(text)
 }
 
+/// Reads a title and body out of whatever the model sent: the JSON asked
+/// for; the same in a code fence or with prose around it; `title`/`body`
+/// keys instead of `summary`/`description`; JSON with raw newlines inside
+/// its strings, which models write and strict parsers refuse; and, when
+/// none of that is there, plain text with the title on the first line. The
+/// one thing it never does is hand JSON back as the title.
 fn parse_suggestion(text: &str) -> CommitSuggestion {
-    if let Ok(s) = serde_json::from_str::<CommitSuggestion>(text) {
+    if let Some(s) = suggestion_from_json(text) {
         return clamp(s);
     }
-    if let (Some(start), Some(end)) = (text.find('{'), text.rfind('}')) {
-        if end > start {
-            if let Ok(s) = serde_json::from_str::<CommitSuggestion>(&text[start..=end]) {
-                return clamp(s);
-            }
+    let text = strip_fences(text);
+    if text.trim_start().starts_with('{') {
+        // Broken JSON — cut off, unbalanced — still has the fields in it.
+        if let Some(summary) = salvage_field(&text, &["summary", "title", "subject"]) {
+            let description = salvage_field(&text, &["description", "body", "details"]).unwrap_or_default();
+            return clamp(CommitSuggestion { summary, description });
         }
     }
-    let mut lines = text.trim().lines();
-    let summary = lines.next().unwrap_or("Update files").trim().to_string();
+    let mut lines = text.trim().lines().filter(|l| !l.trim().is_empty());
+    let summary = lines.next().unwrap_or("Update files").trim().trim_start_matches('#').trim().to_string();
     let description = lines.collect::<Vec<_>>().join("\n").trim().to_string();
     clamp(CommitSuggestion { summary, description })
+}
+
+/// The JSON object in `text`, however it was wrapped, as a suggestion.
+fn suggestion_from_json(text: &str) -> Option<CommitSuggestion> {
+    let text = strip_fences(text);
+    let (start, end) = (text.find('{')?, text.rfind('}')?);
+    if end <= start {
+        return None;
+    }
+    let object = &text[start..=end];
+    let value: serde_json::Value = serde_json::from_str(object)
+        .or_else(|_| serde_json::from_str(&escape_control_chars_in_strings(object)))
+        .ok()?;
+    let field = |names: &[&str]| -> Option<String> {
+        names.iter().find_map(|n| value.get(n).and_then(|v| v.as_str()).map(str::to_string))
+    };
+    let summary = field(&["summary", "title", "subject"])?;
+    let description = field(&["description", "body", "details"]).unwrap_or_default();
+    Some(CommitSuggestion { summary, description })
+}
+
+/// The value of the first of `names` in JSON-like text, read up to the
+/// closing quote or, when there is none, the end: what can be had from an
+/// object a parser rejects.
+fn salvage_field(text: &str, names: &[&str]) -> Option<String> {
+    for name in names {
+        let key = format!("\"{name}\"");
+        let Some(at) = text.find(&key) else { continue };
+        let rest = &text[at + key.len()..];
+        let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+        let rest = rest.strip_prefix('"')?;
+        let mut value = String::new();
+        let mut chars = rest.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => match chars.next() {
+                    Some('n') => value.push('\n'),
+                    Some('t') => value.push('\t'),
+                    Some(other) => value.push(other),
+                    None => break,
+                },
+                '"' => break,
+                _ => value.push(c),
+            }
+        }
+        let value = value.trim().to_string();
+        if !value.is_empty() {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// Text without a surrounding ```json fence, if it had one.
+fn strip_fences(text: &str) -> String {
+    let trimmed = text.trim();
+    if !trimmed.starts_with("```") {
+        return trimmed.to_string();
+    }
+    let inner = trimmed.trim_start_matches('`');
+    let inner = inner.strip_prefix("json").unwrap_or(inner);
+    inner.trim_end_matches('`').trim().to_string()
+}
+
+/// JSON with literal newlines and tabs inside its string values escaped,
+/// so a parser accepts what a model wrote.
+fn escape_control_chars_in_strings(json: &str) -> String {
+    let mut out = String::with_capacity(json.len() + 16);
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in json.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                out.push(c);
+            } else {
+                match c {
+                    '\\' => {
+                        escaped = true;
+                        out.push(c);
+                    }
+                    '"' => {
+                        in_string = false;
+                        out.push(c);
+                    }
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    _ => out.push(c),
+                }
+            }
+        } else {
+            if c == '"' {
+                in_string = true;
+            }
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Enforces the 72-char summary limit and trims whitespace.
@@ -699,6 +805,29 @@ mod tests {
     fn parses_json_embedded_in_text() {
         let s = parse_suggestion("Sure:\n{\"summary\":\"fix: y\",\"description\":\"d\"}\ndone");
         assert_eq!(s.summary, "fix: y");
+    }
+
+    #[test]
+    fn json_the_model_wrapped_or_misnamed_is_still_a_title_and_a_body() {
+        // A fence around it.
+        let s = parse_suggestion("```json\n{\"summary\": \"feat: add x\", \"description\": \"why\"}\n```");
+        assert_eq!((s.summary.as_str(), s.description.as_str()), ("feat: add x", "why"));
+        // title/body instead of summary/description.
+        let s = parse_suggestion("{\"title\": \"Add x\", \"body\": \"## Why\\nBecause.\"}");
+        assert_eq!(s.summary, "Add x");
+        assert_eq!(s.description, "## Why\nBecause.");
+        // Raw newlines inside the strings, which strict JSON refuses.
+        let s = parse_suggestion("{\"summary\": \"Add x\",\n\"description\": \"Line one.\nLine two.\n\n- a\n- b\"}");
+        assert_eq!(s.summary, "Add x");
+        assert_eq!(s.description, "Line one.\nLine two.\n\n- a\n- b");
+        // Escapes inside the strings survive the repair.
+        let s = parse_suggestion("{\"summary\": \"Say \\\"hi\\\"\", \"description\": \"a\\nb\nc\"}");
+        assert_eq!(s.summary, "Say \"hi\"");
+        assert_eq!(s.description, "a\nb\nc");
+        // Whatever happens, the title is never a brace.
+        let s = parse_suggestion("{\"summary\": \"Add x\", \"description\": \"unterminated");
+        assert_eq!(s.summary, "Add x");
+        assert_eq!(s.description, "unterminated");
     }
 
     #[test]

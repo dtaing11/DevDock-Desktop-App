@@ -35,15 +35,26 @@ pub struct TicketRun {
     /// What it is on: the ticket's summary, or the prompt's first line.
     pub title: String,
     pub state: RunState,
+    /// The branch a failed run kept its attempt on, unpushed, for a person
+    /// to finish.
+    pub kept: Option<String>,
     /// Everything it did, one line per tool call, check, commit, and push.
     pub log: Vec<String>,
     pub started: Option<Instant>,
     pub took: Option<Duration>,
 }
 
+/// The branch a failed run's reason says the attempt was kept on. The
+/// fixer writes that line; this reads it back.
+pub fn kept_branch(reason: &str) -> Option<String> {
+    const MARK: &str = "the attempt is kept on branch ";
+    let at = reason.find(MARK)?;
+    reason[at + MARK.len()..].split_whitespace().next().map(str::to_string)
+}
+
 impl TicketRun {
     pub fn queued(title: impl Into<String>) -> Self {
-        Self { title: title.into(), state: RunState::Queued, log: Vec::new(), started: None, took: None }
+        Self { title: title.into(), state: RunState::Queued, kept: None, log: Vec::new(), started: None, took: None }
     }
 
     pub fn is_running(&self) -> bool {
@@ -438,6 +449,7 @@ impl App {
                 }
                 Err(e) => {
                     run.log.push(format!("failed: {}", e.lines().next().unwrap_or("")));
+                    run.kept = kept_branch(&e);
                     RunState::Failed(e)
                 }
             };
@@ -703,16 +715,25 @@ fn agents(app: &mut App, ui: &mut egui::Ui) {
 fn agent_card(app: &mut App, ui: &mut egui::Ui, key: &str) {
     let Some(run) = app.backlog.runs.get(key) else { return };
     let expanded = app.backlog.expanded.as_deref() == Some(key);
-    if run_card(ui, key, &run.title, run, expanded, "backlog-log") {
-        app.backlog.expanded = if expanded { None } else { Some(key.to_string()) };
+    match run_card(ui, key, &run.title, run, expanded, "backlog-log") {
+        CardAction::None => {}
+        CardAction::ToggleLog => app.backlog.expanded = if expanded { None } else { Some(key.to_string()) },
+        CardAction::OpenAttempt(branch) => app.open_attempt_in_vscode(&branch),
     }
+}
+
+/// What a click on a card asks for.
+pub(super) enum CardAction {
+    None,
+    ToggleLog,
+    /// Check the kept branch out and open it in Visual Studio Code.
+    OpenAttempt(String),
 }
 
 /// One agent's card: its state, what it is doing or did, its log on
 /// request, and — when it is done — the pull request and the files. Shared
-/// by the backlog dialog and the Agent tab's worktree runs. Returns whether
-/// the log toggle was clicked.
-pub(super) fn run_card(ui: &mut egui::Ui, key: &str, title: &str, run: &TicketRun, expanded: bool, salt: &str) -> bool {
+/// by the backlog dialog and the Agent tab's worktree runs.
+pub(super) fn run_card(ui: &mut egui::Ui, key: &str, title: &str, run: &TicketRun, expanded: bool, salt: &str) -> CardAction {
     let (state_label, color) = match &run.state {
         RunState::Queued => ("queued", theme::fg_dim()),
         RunState::Running => ("running", theme::ember()),
@@ -721,7 +742,7 @@ pub(super) fn run_card(ui: &mut egui::Ui, key: &str, title: &str, run: &TicketRu
     };
     let elapsed = run.elapsed().map(mmss);
     let last = run.log.last().cloned().unwrap_or_default();
-    let mut toggled = false;
+    let mut action = CardAction::None;
 
     let width = ui.available_width();
     egui::Frame::new()
@@ -731,17 +752,18 @@ pub(super) fn run_card(ui: &mut egui::Ui, key: &str, title: &str, run: &TicketRu
         .inner_margin(egui::Margin::symmetric(10, 8))
         .show(ui, |ui| {
             ui.set_width(width - 20.0);
-            ui.horizontal_wrapped(|ui| {
+            // The state and the buttons share one row; the title, which
+            // can be long, gets its own and wraps, so the buttons never
+            // draw over it.
+            ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("[{state_label}]")).color(color).monospace().small());
-                ui.label(RichText::new(key).monospace().strong());
-                ui.label(RichText::new(title).color(theme::fg()));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(elapsed) = elapsed {
                         ui.label(RichText::new(elapsed).monospace().size(theme::SMALL).color(theme::fg_dim()));
                     }
                     let toggle = if expanded { "Hide log".to_string() } else { format!("Log ({})", run.log.len()) };
                     if ui.small_button(toggle).clicked() {
-                        toggled = true;
+                        action = CardAction::ToggleLog;
                     }
                     if !run.log.is_empty()
                         && ui.small_button("Copy log").on_hover_text("The whole log, to paste somewhere").clicked()
@@ -749,6 +771,12 @@ pub(super) fn run_card(ui: &mut egui::Ui, key: &str, title: &str, run: &TicketRu
                         ui.ctx().copy_text(run.log.join("\n"));
                     }
                 });
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(key).monospace().strong());
+                if !title.is_empty() {
+                    ui.label(RichText::new(title).color(theme::fg()));
+                }
             });
             if !expanded && !last.is_empty() {
                 wrapped(ui, RichText::new(clip(&last, 240)).monospace().size(theme::SMALL).color(theme::fg_dim()));
@@ -805,11 +833,27 @@ pub(super) fn run_card(ui: &mut egui::Ui, key: &str, title: &str, run: &TicketRu
                 RunState::Failed(e) => {
                     ui.add_space(4.0);
                     wrapped(ui, RichText::new(e.lines().take(6).collect::<Vec<_>>().join("\n")).size(theme::SMALL).color(theme::danger()));
+                    if let Some(branch) = &run.kept {
+                        ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .button("Open in VS Code")
+                                .on_hover_text(format!(
+                                    "Checks {branch} out in a worktree under the repository's \
+                                     -attempts folder and opens it in Visual Studio Code. The \
+                                     Worktrees dialog lists it, with Remove, when you are done."
+                                ))
+                                .clicked()
+                            {
+                                action = CardAction::OpenAttempt(branch.clone());
+                            }
+                            ui.label(RichText::new(format!("kept on {branch}, not pushed")).monospace().size(theme::SMALL).color(theme::fg_dim()));
+                        });
+                    }
                 }
                 _ => {}
             }
         });
-    toggled
+    action
 }
 
 /// The tickets and their judgements, with a checkbox each.

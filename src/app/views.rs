@@ -90,12 +90,20 @@ fn segment(ui: &mut egui::Ui, caption: &str, value: &str, min_width: f32) -> egu
 
 /// Top toolbar: repository, branch, and one context-aware sync action,
 /// plus pull request / GitHub / settings on the right.
+/// Below this width the toolbar's two halves would overlap on one row.
+const TOOLBAR_ONE_ROW_MIN: f32 = 1_040.0;
+
 pub fn toolbar(app: &mut App, ctx: &egui::Context) {
     egui::TopBottomPanel::top("toolbar")
         .frame(egui::Frame::new().fill(theme::bg()).inner_margin(8.0))
         .show(ctx, |ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            ui.horizontal(|ui| {
+            // The segments on the left and the buttons on the right share a
+            // row only when there is room for both; in a narrow window the
+            // buttons get a row of their own rather than drawing over the
+            // segments.
+            let narrow = ui.available_width() < TOOLBAR_ONE_ROW_MIN;
+            let left = |app: &mut App, ui: &mut egui::Ui| {
                 // 1. Current repository (dropdown of recent repos)
                 repo_menu(app, ui);
 
@@ -115,6 +123,15 @@ pub fn toolbar(app: &mut App, ctx: &egui::Context) {
                     if app.graph_open {
                         app.load_graph();
                     }
+                }
+            };
+            if narrow {
+                ui.horizontal_wrapped(|ui| left(app, ui));
+                ui.add_space(4.0);
+            }
+            ui.horizontal(|ui| {
+                if !narrow {
+                    left(app, ui);
                 }
 
                 // Right side
@@ -1455,15 +1472,10 @@ fn commit_box(app: &mut App, ui: &mut egui::Ui) {
             .hint_text(dim_hint("Summary (required)"))
             .desired_width(f32::INFINITY),
     );
-    // Fixed-height, scrollable description so long text never pushes the
-    // buttons below off screen.
-    ScrollArea::vertical().max_height(72.0).id_salt("commit-desc").show(ui, |ui| {
-        ui.add(
-            egui::TextEdit::multiline(&mut app.commit_description)
-                .hint_text(dim_hint("Description"))
-                .desired_rows(3)
-                .desired_width(f32::INFINITY),
-        );
+    // Grows with the text up to a cap, then scrolls, so a long description
+    // is readable without pushing the buttons below off screen.
+    ScrollArea::vertical().max_height(160.0).id_salt("commit-desc").show(ui, |ui| {
+        prose_box(ui, &mut app.commit_description, 3, "Description");
     });
 
     ui.horizontal(|ui| {
@@ -2963,6 +2975,44 @@ pub fn toasts(app: &mut App, ctx: &egui::Context) {
                     ui.label(RichText::new(&toast.text).color(color));
                 });
         });
+}
+
+/// Opens a directory in Visual Studio Code: the `code` command when it is
+/// on the path, else the app itself on macOS.
+pub fn open_in_vscode(dir: &std::path::Path) -> Result<(), String> {
+    let quiet = |cmd: &mut std::process::Command| {
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+    };
+    if let Ok(status) = quiet(std::process::Command::new("code").arg(dir)) {
+        if status.success() {
+            return Ok(());
+        }
+    }
+    if cfg!(target_os = "macos") {
+        if let Ok(status) = quiet(std::process::Command::new("open").args(["-a", "Visual Studio Code"]).arg(dir)) {
+            if status.success() {
+                return Ok(());
+            }
+        }
+    }
+    Err("the `code` command was not found. In Visual Studio Code, run \"Shell Command: Install 'code' command in PATH\" from the Command Palette.".into())
+}
+
+/// A box for prose — a task, a description, a body — that wraps at the
+/// width it has and grows with what is typed, so nothing scrolls off to the
+/// right and nothing is hidden until Enter. `min_rows` is its height when
+/// empty. Returns the response for `.changed()`.
+pub fn prose_box(ui: &mut egui::Ui, text: &mut String, min_rows: usize, hint: &str) -> egui::Response {
+    let width = ui.available_width();
+    ui.add(
+        egui::TextEdit::multiline(text)
+            .desired_rows(min_rows)
+            .desired_width(width)
+            .hint_text(dim_hint(hint)),
+    )
 }
 
 #[cfg(test)]

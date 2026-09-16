@@ -36,6 +36,8 @@ pub struct WorktreeState {
     pub new_window: bool,
     /// Why the list could not be read.
     pub error: Option<String>,
+    /// Attempts the coding agent kept on branches, read with the list.
+    pub attempts: Vec<crate::git::KeptAttempt>,
 }
 
 impl Default for WorktreeState {
@@ -49,6 +51,7 @@ impl Default for WorktreeState {
             path: String::new(),
             new_window: true,
             error: None,
+            attempts: Vec::new(),
         }
     }
 }
@@ -179,9 +182,31 @@ impl App {
             Ok(list) => {
                 self.worktrees.list = list;
                 self.worktrees.error = None;
+                self.worktrees.attempts =
+                    self.repo.as_ref().and_then(|r| r.kept_attempts().ok()).unwrap_or_default();
             }
             Err(e) => self.worktrees.error = Some(e),
         }
+    }
+
+    /// Deletes kept attempts — worktree and branch — after confirmation.
+    pub(super) fn clear_attempts_confirmed(&mut self, branches: Vec<String>) {
+        let Some(repo) = self.repo.clone() else { return };
+        self.worktrees.busy = true;
+        self.worker.spawn(move || {
+            let mut failed = Vec::new();
+            for branch in &branches {
+                if let Err(e) = repo.clear_attempt(branch) {
+                    failed.push(format!("{branch}: {e}"));
+                }
+            }
+            let result = if failed.is_empty() {
+                Ok(format!("Cleared {} kept attempt(s).", branches.len()))
+            } else {
+                Err(format!("Could not clear: {}", failed.join("; ")))
+            };
+            Msg::WorktreeDone { message: result, open: None }
+        });
     }
 
     /// The worker's answer to an add or remove.
@@ -348,6 +373,59 @@ pub fn dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                 ui.add_space(4.0);
             }
         });
+
+        // Attempts the agent kept: branches with a WIP commit, with or
+        // without a worktree. They outlive the run cards and the app.
+        let attempts = app.worktrees.attempts.clone();
+        if !attempts.is_empty() {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(theme::overline("KEPT ATTEMPTS"));
+                ui.label(
+                    RichText::new(format!(
+                        "{} — a coding agent's run that did not get through, committed as WIP on its branch",
+                        attempts.len()
+                    ))
+                    .small()
+                    .color(theme::fg_dim()),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("Clear all").small())
+                        .on_hover_text("Deletes every kept attempt: its worktree and its branch.")
+                        .clicked()
+                    {
+                        app.confirm(ConfirmAction::ClearAttempts(attempts.iter().map(|a| a.branch.clone()).collect()));
+                    }
+                });
+            });
+            for attempt in &attempts {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&attempt.branch).monospace().strong());
+                    ui.label(RichText::new(&attempt.title).small().color(theme::fg_dim()));
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(16.0);
+                    if let Some(path) = &attempt.worktree {
+                        ui.label(RichText::new(path.display().to_string()).small().color(theme::fg_dim()));
+                    }
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("Open in VS Code").small())
+                        .on_hover_text("Checks it out under the -attempts folder, if it is not yet, and opens Visual Studio Code there.")
+                        .clicked()
+                    {
+                        app.open_attempt_in_vscode(&attempt.branch);
+                    }
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("Clear").small())
+                        .on_hover_text("Deletes this attempt: its worktree and its branch.")
+                        .clicked()
+                    {
+                        app.confirm(ConfirmAction::ClearAttempts(vec![attempt.branch.clone()]));
+                    }
+                });
+            }
+        }
 
         if list.iter().any(|w| w.prunable)
             && ui.add_enabled(!busy, egui::Button::new("Prune missing").small()).clicked()

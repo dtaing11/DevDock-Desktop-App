@@ -44,6 +44,8 @@ Decide:
 
 Be strict. "revise" when anything above is not so, with feedback the agent can act on: what is wrong, where, and what to do. "approve" only when you would merge it.
 
+Two things are not grounds to revise. Where the ticket's wording and the repository's own tests or checks conflict, the checks win: note it in your feedback and judge the code. And a decision no person has made: the agent had to assume something and say so; judge whether the assumption is reasonable and stated, not whether someone signed it off.
+
 Answer with JSON only:
 {"verdict": "approve" | "revise", "feedback": "…"}"#;
 

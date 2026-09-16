@@ -361,11 +361,7 @@ fn pull_requests(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         ui.label("Title");
         ui.add(egui::TextEdit::singleline(&mut app.pr.title).desired_width(f32::INFINITY));
         ui.label("Description");
-        ui.add(
-            egui::TextEdit::multiline(&mut app.pr.body)
-                .desired_rows(4)
-                .desired_width(f32::INFINITY),
-        );
+        super::views::prose_box(ui, &mut app.pr.body, 4, "");
 
         let locals: Vec<String> = app
             .branches
@@ -560,13 +556,11 @@ fn tickets_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
             .size(theme::SMALL)
             .color(theme::fg_dim()),
         );
-        ui.add(
-            egui::TextEdit::multiline(&mut app.tickets.list)
-                .desired_rows(6)
-                .desired_width(f32::INFINITY)
-                .hint_text(super::views::dim_hint(
-                    "- add a --json flag to devdock status\n- fix the crash on an empty repository",
-                )),
+        super::views::prose_box(
+            ui,
+            &mut app.tickets.list,
+            6,
+            "- add a --json flag to devdock status\n- fix the crash on an empty repository",
         );
 
         ui.add_space(theme::UNIT);
@@ -917,14 +911,9 @@ fn draft_card(app: &mut App, ui: &mut egui::Ui, index: usize) {
 
             if expanded {
                 ui.add_space(theme::UNIT);
-                ui.add_enabled(
-                    created.is_none(),
-                    egui::TextEdit::multiline(
-                        &mut app.tickets.drafts[index].draft.description,
-                    )
-                    .desired_rows(6)
-                    .desired_width(f32::INFINITY),
-                );
+                ui.add_enabled_ui(created.is_none(), |ui| {
+                    super::views::prose_box(ui, &mut app.tickets.drafts[index].draft.description, 6, "");
+                });
             }
             if let Some(error) = error {
                 ui.add_space(theme::UNIT);
@@ -1969,13 +1958,11 @@ fn pr_review(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                                 if is_here {
                                     ui.horizontal(|ui| {
                                         ui.add_space(40.0);
-                                        ui.add(
-                                            egui::TextEdit::multiline(
-                                                &mut app.pr.review.comment_draft,
-                                            )
-                                            .hint_text("Comment on this line…")
-                                            .desired_rows(2)
-                                            .desired_width(480.0),
+                                        super::views::prose_box(
+                                            ui,
+                                            &mut app.pr.review.comment_draft,
+                                            2,
+                                            "Comment on this line…",
                                         );
                                     });
                                     ui.horizontal(|ui| {
@@ -2041,12 +2028,7 @@ fn pr_review(app: &mut App, ctx: &egui::Context, open: &mut bool) {
 
         ui.separator();
         ui.label(theme::overline("YOUR REVIEW"));
-        ui.add(
-            egui::TextEdit::multiline(&mut app.pr.review.body)
-                .hint_text("Overall review summary (optional for approve/comment)…")
-                .desired_rows(3)
-                .desired_width(f32::INFINITY),
-        );
+        super::views::prose_box(ui, &mut app.pr.review.body, 3, "Overall review summary (optional for approve/comment)…");
 
         ui.horizontal(|ui| {
             let submitting = app.pr.review.submitting;
@@ -2621,12 +2603,7 @@ fn split_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                             .hint_text("summary"),
                     );
                 });
-                ui.add(
-                    egui::TextEdit::multiline(&mut group.description)
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(2)
-                        .hint_text("description (optional)"),
-                );
+                super::views::prose_box(ui, &mut group.description, 2, "description (optional)");
                 for file in &group.files {
                     ui.label(RichText::new(format!("   {file}")).small().monospace());
                 }
@@ -3119,14 +3096,7 @@ fn repo_prompt_settings(app: &mut App, ui: &mut egui::Ui) {
     ) {
         let PromptSlot { label, hint, text, file } = slot;
         ui.label(RichText::new(label).color(theme::fg_dim()).small());
-        *changed |= ui
-            .add(
-                egui::TextEdit::multiline(text)
-                    .hint_text(super::views::dim_hint(hint))
-                    .desired_rows(2)
-                    .desired_width(f32::INFINITY),
-            )
-            .changed();
+        *changed |= super::views::prose_box(ui, text, 2, hint).changed();
         ui.horizontal(|ui| {
             match file {
                 Some(path) => {

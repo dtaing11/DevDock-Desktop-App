@@ -362,8 +362,8 @@ pub fn fix(
         let exists = repo.branches().map(|b| b.local.iter().any(|br| br.name == branch)).unwrap_or(false);
         if exists {
             return Err(format!(
-                "branch {branch} already exists; a previous attempt left it. Delete it or \
-                 open its pull request."
+                "branch {branch} already exists; a previous attempt left it. Delete it \
+                 (git branch -D {branch}), finish it by hand, or open its pull request."
             ));
         }
         repo.worktree_add(&dir, &branch, Some(job.base)).map_err(|e| e.to_string())?;
@@ -375,7 +375,17 @@ pub fn fix(
         }
     }
 
-    let result = work(engine, job, &branch, &dir, publish, on_event);
+    let mut result = work(engine, job, &branch, &dir, publish, on_event);
+
+    // A failed run's attempt is not thrown away: it is committed on the
+    // branch, unpushed, so there is something to finish by hand or to send
+    // back. Only the worktree goes.
+    if let Err(why) = &result {
+        if let Some(line) = keep_attempt(&dir, job.task, why) {
+            on_event(line.clone());
+            result = Err(format!("{why}\n\n{line}"));
+        }
+    }
 
     // The worktree is temporary whatever happened.
     {
@@ -458,6 +468,7 @@ fn work(
     let mut summary;
     let mut checks: Vec<CheckOutcome> = Vec::new();
     let mut reviewed_by: Option<String> = None;
+    let mut revises = 0;
     let mut round = 0;
     loop {
         round += 1;
@@ -582,13 +593,42 @@ fn work(
                 reviewed_by = Some(reviewer.label());
             } else {
                 on_event(format!("revise: {}", first_line(&verdict.feedback)));
+                revises += 1;
                 if round >= rounds {
                     return Err(format!(
                         "after {rounds} round(s) the reviewer still asked for changes:\n{}",
                         verdict.feedback
                     ));
                 }
-                feedback = Some(format!("A reviewer read your change and asked for changes:\n{}", verdict.feedback));
+                let mut next = format!("A reviewer read your change and asked for changes:\n{}", verdict.feedback);
+                // Twice in a row is a disagreement, not a correction. A third
+                // party decides whether the demand can be met at all, before
+                // more rounds go the same way.
+                if revises >= 2 {
+                    on_event(format!("the reviewer asked twice; asking {} to arbitrate", advisor.label()));
+                    let happened = format!(
+                        "The reviewer has asked for changes {revises} rounds in a row. Its latest \
+                         feedback:\n{}\n\nThe agent's account of its latest attempt:\n{summary}\n\n\
+                         Decide whether the reviewer's demand is something the agent can and should \
+                         do in this repository. Where the ticket's wording and the repository's own \
+                         tests conflict, the tests win. If the demand needs a decision no person has \
+                         made, say it needs a person.",
+                        verdict.feedback
+                    );
+                    let advice = advise_with(advisor, wt.path(), &tracked, &job.task.brief, &happened, &diff, on_event)?;
+                    if !advice.doable {
+                        return Err(format!(
+                            "the reviewer and the agent could not agree after {round} round(s), and {} says \
+                             it needs a person: {}\n\nThe reviewer's last word: {}",
+                            advisor.label(),
+                            advice.advice,
+                            verdict.feedback
+                        ));
+                    }
+                    on_event(format!("advice: {}", first_line(&advice.advice)));
+                    next.push_str(&format!("\n\nA senior engineer weighed in:\n{}", advice.advice));
+                }
+                feedback = Some(next);
                 continue;
             }
         }
@@ -601,7 +641,7 @@ fn work(
     }
 
     // Commit and push.
-    wt.stage_all().map_err(|e| e.to_string())?;
+    stage_change(&wt)?;
     let subject = truncate(&job.task.subject(), 72);
     let body = match &job.task.url {
         Some(url) => format!("{}\n\n{url}", summary.trim()),
@@ -704,7 +744,7 @@ fn advise_with(
 /// What the worktree has changed against its commit, per git, so the
 /// report is of the tree and not of what one engine remembers doing.
 fn changed_files(wt: &Repo) -> Result<Vec<ChangedFile>, String> {
-    wt.stage_all().map_err(|e| e.to_string())?;
+    stage_change(wt)?;
     let numstat = wt.git(&["diff", "--cached", "--numstat"]).map_err(|e| e.to_string())?;
     let head_files = wt.git(&["ls-tree", "-r", "--name-only", "HEAD"]).unwrap_or_default();
     let mut changes = Vec::new();
@@ -721,6 +761,60 @@ fn changed_files(wt: &Repo) -> Result<Vec<ChangedFile>, String> {
         });
     }
     Ok(changes)
+}
+
+/// Stages everything the run changed, less what the checks left behind.
+fn stage_change(wt: &Repo) -> Result<(), String> {
+    wt.stage_all().map_err(|e| e.to_string())?;
+    unstage_artifacts(wt)
+}
+
+/// Build and cache output that running the checks leaves behind —
+/// `__pycache__`, `target/`, `node_modules/`, `.dart_tool/` — in a
+/// repository whose `.gitignore` does not cover it. `git add -A` would put
+/// it in the pull request; a reviewer would rightly send that back. Only
+/// files new since the commit are dropped: an artifact the repository
+/// tracks on purpose stays tracked.
+fn unstage_artifacts(wt: &Repo) -> Result<(), String> {
+    const ARTIFACT_DIRS: &[&str] = &[
+        "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "target", "node_modules",
+        ".dart_tool", "build", "dist", ".gradle", ".next", ".nuxt", "coverage", ".coverage",
+        ".tox", ".venv", "venv", "Pods", "DerivedData", ".idea", ".vscode",
+    ];
+    const ARTIFACT_EXTENSIONS: &[&str] = &[".pyc", ".pyo", ".class", ".o", ".so", ".dylib", ".dll", ".log"];
+    let added = wt.git(&["diff", "--cached", "--name-only", "--diff-filter=A"]).map_err(|e| e.to_string())?;
+    let artifacts: Vec<&str> = added
+        .lines()
+        .filter(|path| {
+            path.split('/').any(|part| ARTIFACT_DIRS.contains(&part))
+                || ARTIFACT_EXTENSIONS.iter().any(|ext| path.ends_with(ext))
+        })
+        .collect();
+    if artifacts.is_empty() {
+        return Ok(());
+    }
+    let mut args = vec!["rm", "--cached", "-q", "--"];
+    args.extend(artifacts.iter().copied());
+    wt.git(&args).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Commits whatever a failed run left in its worktree, as work in
+/// progress on its branch, and says so. `None` when there was nothing.
+fn keep_attempt(dir: &Path, task: &Task, why: &str) -> Option<String> {
+    let wt = Repo::open(dir).ok()?;
+    let changes = changed_files(&wt).ok()?;
+    if changes.is_empty() {
+        return None;
+    }
+    let subject = format!("WIP: {} (not accepted)", truncate(&task.subject(), 50));
+    let body = format!("The coding agent's attempt, kept for a person to finish.\n\nNot accepted because:\n{}", first_line(why));
+    wt.commit(&subject, &body, false).ok()?;
+    let branch = wt.git(&["rev-parse", "--abbrev-ref", "HEAD"]).ok()?.trim().to_string();
+    Some(format!(
+        "the attempt is kept on branch {branch} ({} file(s), not pushed): check it out to finish it, or delete the branch",
+        changes.len()
+    ))
 }
 
 fn branch_has_commits(repo: &Repo, branch: &str, base: &str) -> bool {
@@ -916,7 +1010,27 @@ mod tests {
     }
 
     #[test]
-    fn a_change_that_fails_the_check_leaves_nothing_behind() {
+    fn what_the_checks_leave_behind_is_not_part_of_the_change() {
+        // The check compiles lib.py, which writes __pycache__/… next to it,
+        // and the repository has no .gitignore.
+        let (_tmp, repo) = setup("mkdir -p __pycache__ && echo x > __pycache__/lib.cpython-312.pyc && echo y > build.log && grep -q 'return sum(xs)$' lib.py");
+        let engine = Engine::Harness(Box::new(fixing_provider()));
+        let fixed = fix(
+            &repo,
+            &engine,
+            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 1, reviewer: None },
+            &fake_pr,
+            &mut |_| {},
+        )
+        .unwrap();
+        let paths: Vec<&str> = fixed.changes.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, ["lib.py"], "artifacts were swept into the change");
+        let tree = repo.git(&["ls-tree", "-r", "--name-only", &fixed.branch]).unwrap();
+        assert!(!tree.contains("pycache") && !tree.contains("build.log"), "{tree}");
+    }
+
+    #[test]
+    fn a_change_that_fails_the_check_is_kept_on_the_branch_unpushed() {
         // The check wants something the fix does not do.
         let (_tmp, repo) = setup("grep -q 'return 0$' lib.py");
         let engine = Engine::Harness(Box::new(fixing_provider()));
@@ -931,8 +1045,23 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("still fails a check"), "{err}");
-        assert!(!repo.branches().unwrap().local.iter().any(|b| b.name.starts_with("fix/")), "the branch was kept");
+        assert!(err.contains("the attempt is kept on branch fix/abc-7-total-is-off-by-one (1 file(s), not pushed)"), "{err}");
+        // The attempt is a commit on the branch, here and not on the
+        // remote; the worktree is gone; main is untouched.
+        let subject = repo.log(1, Some("fix/abc-7-total-is-off-by-one")).unwrap()[0].subject.clone();
+        assert_eq!(subject, "WIP: ABC-7: total() is off by one (not accepted)");
+        let lib = repo.git(&["show", "fix/abc-7-total-is-off-by-one:lib.py"]).unwrap();
+        assert!(lib.contains("return sum(xs)\n"), "{lib}");
+        let remote = repo.git(&["ls-remote", "--heads", "origin"]).unwrap();
+        assert!(!remote.contains("fix/"), "{remote}");
         assert_eq!(repo.worktrees().unwrap().len(), 1);
+        assert_eq!(fs::read_to_string(repo.path().join("lib.py")).unwrap(), "def total(xs):\n    return sum(xs) + 1\n");
+        assert!(log.iter().any(|l| l.starts_with("the attempt is kept on branch")), "{log:?}");
+
+        // Running the same ticket again is refused until that branch is
+        // dealt with, and the refusal says how.
+        let err = fix(&repo, &engine, &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 1, reviewer: None }, &fake_pr, &mut |_| {}).unwrap_err();
+        assert!(err.contains("git branch -D fix/abc-7-total-is-off-by-one"), "{err}");
     }
 
     #[test]
@@ -1031,7 +1160,9 @@ mod tests {
         ]))));
         let err = fix(&repo, &fixer, &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 1, reviewer: Some(&reviewer) }, &fake_pr, &mut |_| {}).unwrap_err();
         assert!(err.contains("reviewer still asked for changes"), "{err}");
-        assert!(!repo.branches().unwrap().local.iter().any(|b| b.name.starts_with("fix/")));
+        assert!(err.contains("kept on branch"), "the attempt survives for a person: {err}");
+        let remote = repo.git(&["ls-remote", "--heads", "origin"]).unwrap();
+        assert!(!remote.contains("fix/"), "{remote}");
     }
 
     #[test]
@@ -1089,8 +1220,32 @@ mod tests {
         let mut log = Vec::new();
         let err = fix(&repo, &engine, &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 5, reviewer: None }, &fake_pr, &mut |line| log.push(line)).unwrap_err();
         assert!(err.starts_with("no progress: round 2 left the tree exactly as round 1 did"), "{err}\n{log:#?}");
-        assert!(!repo.branches().unwrap().local.iter().any(|b| b.name.starts_with("fix/")));
+        assert!(err.contains("kept on branch"), "{err}");
         assert_eq!(repo.worktrees().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_reviewer_that_keeps_objecting_is_arbitrated() {
+        let (_tmp, repo) = setup("true");
+        let edit = |id: &str, old: &str, new: &str| Reply { text: String::new(), calls: vec![ToolCall { id: id.into(), name: "edit_file".into(), input: serde_json::json!({"path": "lib.py", "old_text": old, "new_text": new}) }], ..Default::default() };
+        let check = || Reply { text: String::new(), calls: vec![ToolCall { id: "c".into(), name: "run_check".into(), input: serde_json::json!({"name": "tests"}) }], ..Default::default() };
+        let fixer = Engine::Harness(Box::new(Scripted(RefCell::new(vec![
+            edit("1", "sum(xs) + 1", "sum(xs)"), check(), Reply { text: "fixed".into(), ..Default::default() },
+            edit("2", "return sum(xs)", "return sum(xs)  # per ticket"), check(), Reply { text: "fixed, noted".into(), ..Default::default() },
+        ]))));
+        // The reviewer wants a product decision the ticket did not make;
+        // as the advisor, it is asked to arbitrate and says so.
+        let reviewer = Engine::Harness(Box::new(Scripted(RefCell::new(vec![
+            Reply { text: r#"{"verdict": "revise", "feedback": "The ticket says to ask the owner about empty lists first."}"#.into(), ..Default::default() },
+            Reply { text: r#"{"verdict": "revise", "feedback": "Still no owner decision on empty lists."}"#.into(), ..Default::default() },
+            Reply { text: r#"{"doable": false, "advice": "The empty-list behaviour is a product decision nobody has made."}"#.into(), ..Default::default() },
+        ]))));
+        let mut log = Vec::new();
+        let err = fix(&repo, &fixer, &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 6, reviewer: Some(&reviewer) }, &fake_pr, &mut |line| log.push(line)).unwrap_err();
+        assert!(err.starts_with("the reviewer and the agent could not agree after 2 round(s)"), "{err}\n{log:#?}");
+        assert!(err.contains("needs a person: The empty-list behaviour"), "{err}");
+        assert!(log.iter().any(|l| l.starts_with("the reviewer asked twice; asking")), "{log:?}");
+        assert!(err.contains("kept on branch"), "{err}");
     }
 
     /// What a claimer was told, in order.
@@ -1267,5 +1422,70 @@ mod tests {
         let err = fix(&repo, &engine, &Job { task: &bad, base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 1, reviewer: None }, &fake_pr, &mut |_| {}).unwrap_err();
         assert!(err.contains("not a valid branch name"), "{err}");
         assert_eq!(repo.worktrees().unwrap().len(), 1);
+    }
+
+    /// The whole pipeline with real models: a ticket that undersells the
+    /// work, a check that knows the rest, a reviewer on a second model,
+    /// and the advisor between rounds. Needs stored Claude credentials;
+    /// `LIVE_ENGINE=claude-code` runs the fixer on Claude Code instead.
+    /// `cargo test --lib backlog::tests::live_ -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_a_ticket_becomes_a_pull_request_through_rounds() {
+        let Some(fixer_client) = crate::claude::Client::from_store("claude-haiku-4-5-20251001") else {
+            eprintln!("no Claude credentials; skipping");
+            return;
+        };
+        let Some(senior) = crate::claude::Client::from_store("claude-sonnet-5") else { return };
+        let (_tmp, repo) = setup("python3 test_total.py");
+        std::fs::write(
+            repo.path().join("test_total.py"),
+            "from lib import total\n\nassert total([1, 2]) == 3, total([1, 2])\ntry:\n    total([])\nexcept ValueError:\n    pass\nelse:\n    raise SystemExit('total([]) must raise ValueError')\nprint('ok')\n",
+        )
+        .unwrap();
+        repo.git(&["add", "-A"]).unwrap();
+        repo.git(&["commit", "-q", "-m", "add the test"]).unwrap();
+        repo.git(&["push", "-q", "origin", "main"]).unwrap();
+
+        let fixer = match std::env::var("LIVE_ENGINE").as_deref() {
+            Ok("claude-code") => Engine::ClaudeCode(crate::agent::claude_code::Config::default()),
+            _ => Engine::Harness(Box::new(fixer_client)),
+        };
+        let reviewer = Engine::Harness(Box::new(senior));
+        // `LIVE_TICKET=undecided` words the ticket so the fixer is tempted
+        // to ask a person, which is the advisor's cue.
+        let undecided = std::env::var("LIVE_TICKET").as_deref() == Ok("undecided");
+        let issue = BacklogIssue {
+            key: "ABC-9".into(),
+            summary: "total() gives the wrong answer".into(),
+            description: if undecided {
+                "total([1, 2]) returns 4. Also nobody has decided what total([]) should do — check with the product owner before implementing anything for the empty case.".into()
+            } else {
+                "total([1, 2]) returns 4. Make total() right; the test file in the repository says what right is.".into()
+            },
+            url: "https://acme.atlassian.net/browse/ABC-9".into(),
+            ..Default::default()
+        };
+        let task = Task::from_issue(&issue, None);
+        let mut log = Vec::new();
+        let result = fix(
+            &repo,
+            &fixer,
+            &Job { task: &task, base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 4, reviewer: Some(&reviewer) },
+            &fake_pr,
+            &mut |line| {
+                println!("  {line}");
+                log.push(line);
+            },
+        );
+        let fixed = result.unwrap_or_else(|e| panic!("{e}\n{log:#?}"));
+        println!("--- PR body ---\n{}", fixed.summary);
+        assert_eq!(fixed.checks, [CheckOutcome { name: "tests".into(), ok: true }]);
+        assert!(fixed.reviewed_by.is_some(), "the reviewer approved");
+        assert_eq!(repo.worktrees().unwrap().len(), 1, "the worktree is gone");
+        let lib = repo.git(&["show", &format!("{}:lib.py", fixed.branch)]).unwrap();
+        assert!(lib.contains("ValueError"), "the hidden rule made it in:\n{lib}");
+        assert!(!lib.contains("+ 1"), "{lib}");
+        println!("rounds: {}, turns: {}, engine: {}, reviewed by: {:?}", fixed.rounds, fixed.turns, fixed.engine, fixed.reviewed_by);
     }
 }

@@ -141,7 +141,11 @@ pub fn allowed_commands_note(root: &Path, check_commands: &[String]) -> String {
     note.push_str(
         ". Git commands that commit, push, or rewrite history, and the web, are denied, and \
          nobody is here to approve a denied command, so do not retry one — say what you could \
-         not do in your summary. Do not commit or push: that is done for you when you finish.",
+         not do in your summary. Do not commit or push: that is done for you when you finish. \
+         Run every command to completion in the foreground and read its output: never start \
+         one in the background, never `sleep`, never poll a log in a loop — `sleep` is \
+         refused here, and a refusal is final. A build or a test suite that takes minutes \
+         is fine to wait on.",
     );
     note
 }
@@ -585,6 +589,7 @@ mod tests {
         let note = allowed_commands_note(root, &[]);
         assert!(note.contains("driven with dart, flutter"), "{note}");
         assert!(note.contains("do not retry one"));
+        assert!(note.contains("never `sleep`"), "polling with sleep is refused by the CLI: {note}");
     }
 
     #[test]

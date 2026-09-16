@@ -275,7 +275,11 @@ Two things follow from what Claude Code is:
   prompt names the repository's toolchain (`flutter` and `dart` for a
   Flutter app, `cargo` for Rust, `npm` for Node…) and says a denied command
   will stay denied, so it does not spend turns retrying one. A denial shows
-  in the log as `tool error: … requires approval`.
+  in the log as `tool error: … requires approval`. The CLI also refuses
+  `sleep` and log-polling loops; the prompt tells the agent to run every
+  command to completion in the foreground instead, so a refusal like
+  `Blocked: sleep 60 followed by …` in a log means the model ignored that
+  once, not that anything is broken.
 
 The model under it is a Claude Code alias (`default`, `sonnet`, `opus`,
 `haiku` — the latest of each family) or any model id your account has,

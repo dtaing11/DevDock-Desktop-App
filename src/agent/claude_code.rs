@@ -145,7 +145,8 @@ pub fn allowed_commands_note(root: &Path, check_commands: &[String]) -> String {
          Run every command to completion in the foreground and read its output: never start \
          one in the background, never `sleep`, never poll a log in a loop — `sleep` is \
          refused here, and a refusal is final. A build or a test suite that takes minutes \
-         is fine to wait on.",
+         is fine to wait on. There are no MCP tools in this run; use the shell for what \
+         a plugin tool would do (pub, analyze, tests).",
     );
     note
 }
@@ -225,7 +226,11 @@ fn run_with_tools(
         .arg("--allowedTools")
         .arg(allowed)
         .arg("--disallowedTools")
-        .arg(disallowed_tools());
+        .arg(disallowed_tools())
+        // No MCP servers: a plugin's tools (a Dart `pub` tool, say) would
+        // appear without being allowed, and every reach for one is a
+        // refusal that costs a turn. The shell does the same jobs.
+        .args(["--strict-mcp-config", "--mcp-config", r#"{"mcpServers":{}}"#]);
     let model = config.model.trim();
     if !model.is_empty() && model != "default" {
         cmd.arg("--model").arg(model);

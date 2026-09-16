@@ -279,7 +279,9 @@ Two things follow from what Claude Code is:
   `sleep` and log-polling loops; the prompt tells the agent to run every
   command to completion in the foreground instead, so a refusal like
   `Blocked: sleep 60 followed by …` in a log means the model ignored that
-  once, not that anything is broken.
+  once, not that anything is broken. Headless runs load no MCP servers,
+  so a plugin's tools (a Dart `pub` tool, say) cannot appear unallowed;
+  the shell does those jobs.
 
 The model under it is a Claude Code alias (`default`, `sonnet`, `opus`,
 `haiku` — the latest of each family) or any model id your account has,

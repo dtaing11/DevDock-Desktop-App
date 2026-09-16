@@ -110,7 +110,12 @@ under **At once**, the rest queued. Each agent:
    found at the root or up to three directories down (a Flutter app under
    `mobile/`), and each check runs in its project's directory; the log
    says they were inferred;
-4. if a check fails, sends the failure back to the agent for another
+4. runs the checks on the untouched tree first. A check that already
+   fails on the base branch, and fails the same way after the change, is
+   the repository's problem and is not held against the change — the log,
+   the reviewer and the pull request all say so. A failure that is new or
+   different counts;
+5. if a check fails, sends the failure back to the agent for another
    **round**, up to the number set in the dialog (three by default, up to
    ten). The failure does not go back alone: a second agent — the
    reviewer's engine, or the fixer's own in a fresh session — reads the
@@ -121,15 +126,15 @@ under **At once**, the rest queued. Each agent:
    agrees, which ends the run with both opinions on the card. A round that
    leaves the tree exactly as the last one did ends the run too. No pull
    request is opened while a check fails;
-5. once the checks pass, has a **second agent review** the ticket and the
+6. once the checks pass, has a **second agent review** the ticket and the
    diff — the code-review model, which can be Claude Code — and answer
    approve or revise. Revise is another round with the feedback; approve
    is recorded in the pull request. Untick **Second agent reviews** to
    skip this;
-6. commits, pushes, and opens a **draft pull request** that quotes the
+7. commits, pushes, and opens a **draft pull request** that quotes the
    ticket, the agent's summary, which checks passed, and who approved it
    after how many rounds;
-7. **removes the worktree**. The branch and the pull request are what
+8. **removes the worktree**. The branch and the pull request are what
    remain.
 
 A ticket the agent changed nothing for, or whose change fails a check,

@@ -6143,6 +6143,7 @@ mod tests {
             engine: "scripted".into(),
             rounds: 1,
             reviewed_by: None,
+            skipped: vec![],
         };
         app.handle(Msg::BacklogDone { key: "T-1".into(), result: Ok(Box::new(fixed)) });
         assert_eq!(app.backlog.done(), 1);
@@ -6242,6 +6243,7 @@ mod tests {
             engine: "scripted".into(),
             rounds: 1,
             reviewed_by: None,
+            skipped: vec![],
         };
         app.handle(Msg::AgentRunDone { key: "agent/add-a-json-flag".into(), result: Ok(Box::new(fixed)) });
         assert_eq!(app.coding.worktree.done(), 1);

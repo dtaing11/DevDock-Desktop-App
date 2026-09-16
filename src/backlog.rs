@@ -72,6 +72,9 @@ pub struct Fixed {
     pub rounds: usize,
     /// Who reviewed it, when someone did.
     pub reviewed_by: Option<String>,
+    /// Checks that already failed on the base branch before any change,
+    /// and so were not held against it.
+    pub skipped: Vec<String>,
 }
 
 /// Marks a ticket as taken while an agent works on it, and says how it
@@ -307,6 +310,7 @@ pub fn pull_request_text(
     fixed_summary: &str,
     task: &Task,
     checks: &[CheckOutcome],
+    skipped: &[String],
     engine: &str,
     rounds: usize,
     reviewed_by: Option<&str>,
@@ -329,11 +333,14 @@ pub fn pull_request_text(
     body.push_str("## What changed\n\n");
     body.push_str(fixed_summary.trim());
     body.push_str("\n\n## Verified\n\n");
-    if checks.is_empty() {
+    if checks.is_empty() && skipped.is_empty() {
         body.push_str("This repository declares no checks (`.git-manage-ci.toml`), so nothing was run.\n");
     } else {
         for c in checks {
             body.push_str(&format!("- {} `{}`\n", if c.ok { "✅" } else { "❌" }, c.name));
+        }
+        for name in skipped {
+            body.push_str(&format!("- ⏭ `{name}` — fails on the base branch and fails the same way after this change; not counted\n"));
         }
     }
     match reviewed_by {
@@ -501,6 +508,36 @@ fn work(
         }
     }
 
+    // The untouched tree first. A check that fails before any change, and
+    // fails the same way after it, is the repository's problem and not the
+    // change's; holding it against the agent means every attempt fails the
+    // same way. A check that fails differently, or newly, counts.
+    let mut baseline: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    if !jobs.is_empty() {
+        on_event("running the checks on the untouched tree first".into());
+        for j in &jobs {
+            let result = crate::local_ci::run_job_with(&runners, wt.path(), j);
+            if result.ok {
+                continue;
+            }
+            if let Some(program) = missing_program(&result.output) {
+                return Err(format!(
+                    "the check `{}` needs `{program}`, which is not installed where the checks run{}.\n{}",
+                    j.name,
+                    if sandbox.is_some() { " (the sandbox)" } else { " (this machine; DevDock uses your login shell's PATH)" },
+                    result.output.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")
+                ));
+            }
+            let first = result.output.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+            on_event(format!(
+                "`{}` already fails on {} before any change: {}",
+                j.name, job.base, first.chars().take(140).collect::<String>()
+            ));
+            baseline.insert(j.name.clone(), normalize_output(&result.output));
+        }
+    }
+    let mut skipped: Vec<String> = Vec::new();
+
     let tracked = wt.tracked_files().map_err(|e| e.to_string())?;
     let mut workspace = Workspace::new(wt.path(), tracked.clone(), Access::ReadWrite)?
         .with_write_mode(WriteMode::Live)
@@ -510,6 +547,16 @@ fn work(
         workspace = workspace.with_sandbox(sandbox.describe(), runners.clone());
     }
     let base_task = task_text(job.task);
+    let mut context = String::from("This is an unattended run on a fresh worktree of the repository.");
+    if !baseline.is_empty() {
+        context.push_str(&format!(
+            " These checks already fail on {} before any change: {}. If the task is about \
+             them, fix them; if not, a failure that is the same as before will not be held \
+             against you, but do not make it worse.",
+            job.base,
+            baseline.keys().cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
     let rounds = job.rounds.max(1);
     // The advisor: whoever reviews, else the fixer's engine in a fresh
     // session — a second pair of eyes on the same model still helps.
@@ -540,7 +587,7 @@ fn work(
             coding::Request {
                 branch: Some(branch),
                 instructions: job.instructions,
-                context: Some("This is an unattended run on a fresh worktree of the repository."),
+                context: Some(&context),
                 history: &history,
                 ..coding::Request::new(&task)
             },
@@ -594,10 +641,20 @@ fn work(
         // The checks, run here. The agent's word that they passed is not
         // what a draft pull request should rest on.
         checks.clear();
+        skipped.clear();
         let mut failed: Option<String> = None;
         for j in &jobs {
             on_event(format!("verifying: {}", j.name));
             let result = crate::local_ci::run_job_with(&runners, wt.path(), j);
+            if !result.ok {
+                if let Some(before) = baseline.get(&j.name) {
+                    if *before == normalize_output(&result.output) {
+                        on_event(format!("{} fails exactly as it did before the change; not counted", j.name));
+                        skipped.push(j.name.clone());
+                        continue;
+                    }
+                }
+            }
             on_event(format!("{} {}", j.name, if result.ok { "passed" } else { "FAILED" }));
             checks.push(CheckOutcome { name: j.name.clone(), ok: result.ok });
             if !result.ok {
@@ -650,7 +707,16 @@ fn work(
         // A second opinion, before anyone else sees it.
         if let Some(reviewer) = job.reviewer {
             on_event(format!("review by {}", reviewer.label()));
-            let verdict = review_with(reviewer, wt.path(), &tracked, &job.task.brief, &diff, on_event)?;
+            let brief = if skipped.is_empty() {
+                job.task.brief.clone()
+            } else {
+                format!(
+                    "{}\n\nNote: these checks fail on the base branch and still fail the same way after the change: {}. Judge whether the task required fixing them.",
+                    job.task.brief,
+                    skipped.join(", ")
+                )
+            };
+            let verdict = review_with(reviewer, wt.path(), &tracked, &brief, &diff, on_event)?;
             if verdict.approve {
                 on_event(format!("approved: {}", first_line(&verdict.feedback)));
                 reviewed_by = Some(reviewer.label());
@@ -717,7 +783,7 @@ fn work(
 
     // The pull request.
     let (title, pr_body) =
-        pull_request_text(&summary, job.task, &checks, &engine.label(), round, reviewed_by.as_deref());
+        pull_request_text(&summary, job.task, &checks, &skipped, &engine.label(), round, reviewed_by.as_deref());
     let pr = publish(&title, &pr_body, branch)?;
     on_event(format!("draft pull request #{} opened", pr.number));
 
@@ -732,6 +798,7 @@ fn work(
         engine: engine.label(),
         rounds: round,
         reviewed_by,
+        skipped,
     })
 }
 
@@ -878,6 +945,19 @@ fn keep_attempt(dir: &Path, task: &Task, why: &str) -> Option<String> {
         "the attempt is kept on branch {branch} ({} file(s), not pushed): check it out to finish it, or delete the branch",
         changes.len()
     ))
+}
+
+/// A check's output with what varies between identical runs taken out —
+/// durations, blank lines, surrounding whitespace — so two failures can be
+/// told to be the same failure.
+fn normalize_output(output: &str) -> String {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|l| l.chars().map(|c| if c.is_ascii_digit() { '#' } else { c }).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The program a shell said it could not find, from a check's output:
@@ -1159,6 +1239,34 @@ mod tests {
     }
 
     #[test]
+    fn a_check_that_already_fails_on_the_base_is_not_held_against_the_change() {
+        // "lint" fails on main as it is; "tests" passes once the fix is in.
+        let (_tmp, repo) = setup("grep -q 'return sum(xs)$' lib.py");
+        fs::write(
+            repo.path().join(".git-manage-ci.toml"),
+            "[[job]]\nname = \"lint\"\ncommands = [\"echo 'lib.py:1: style: pre-existing problem' && false\"]\n\n[[job]]\nname = \"tests\"\ncommands = [\"grep -q 'return sum(xs)$' lib.py\"]\n",
+        )
+        .unwrap();
+        sh(repo.path(), &["commit", "-q", "-am", "a failing lint on main"]);
+        sh(repo.path(), &["push", "-q", "origin", "main"]);
+        let engine = Engine::Harness(Box::new(fixing_provider()));
+        let mut log = Vec::new();
+        let fixed = fix(
+            &repo,
+            &engine,
+            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox: None, claim: None, rounds: 1, reviewer: None },
+            &fake_pr,
+            &mut |line| log.push(line),
+        )
+        .unwrap_or_else(|e| panic!("{e}\n{log:#?}"));
+        assert!(log.iter().any(|l| l.starts_with("`lint` already fails on main before any change: lib.py:1: style")), "{log:?}");
+        assert!(log.iter().any(|l| l == "lint fails exactly as it did before the change; not counted"), "{log:?}");
+        assert_eq!(fixed.skipped, ["lint"]);
+        assert_eq!(fixed.checks, [CheckOutcome { name: "tests".into(), ok: true }]);
+        assert!(fixed.pr.number == 42);
+    }
+
+    #[test]
     fn what_the_checks_leave_behind_is_not_part_of_the_change() {
         // The check compiles lib.py, which writes __pycache__/… next to it,
         // and the repository has no .gitignore.
@@ -1181,7 +1289,7 @@ mod tests {
     #[test]
     fn a_change_that_fails_the_check_is_kept_on_the_branch_unpushed() {
         // The check wants something the fix does not do.
-        let (_tmp, repo) = setup("grep -q 'return 0$' lib.py");
+        let (_tmp, repo) = setup("cat lib.py && grep -q 'return 0$' lib.py");
         let engine = Engine::Harness(Box::new(fixing_provider()));
         // The agent's own run_check will fail too; it answers anyway.
         let mut log = Vec::new();
@@ -1235,7 +1343,7 @@ mod tests {
     fn a_failing_check_is_sent_back_and_the_second_round_can_pass() {
         // The check wants `return 0`; the first attempt gives `sum(xs)`, the
         // second, told why, gives `return 0`.
-        let (_tmp, repo) = setup("grep -q 'return 0$' lib.py");
+        let (_tmp, repo) = setup("cat lib.py && grep -q 'return 0$' lib.py");
         let engine = Engine::Harness(Box::new(Scripted(RefCell::new(vec![
             Reply { text: String::new(), calls: vec![ToolCall { id: "1".into(), name: "edit_file".into(), input: serde_json::json!({"path": "lib.py", "old_text": "sum(xs) + 1", "new_text": "sum(xs)"}) }], ..Default::default() },
             Reply { text: String::new(), calls: vec![ToolCall { id: "c".into(), name: "run_check".into(), input: serde_json::json!({"name": "tests"}) }], ..Default::default() },
@@ -1357,7 +1465,7 @@ mod tests {
     #[test]
     fn a_round_that_repeats_the_last_change_stops_the_run() {
         // The check can never pass; the agent makes the same edit twice.
-        let (_tmp, repo) = setup("grep -q 'return 0$' lib.py");
+        let (_tmp, repo) = setup("cat lib.py && grep -q 'return 0$' lib.py");
         let edit = || Reply { text: String::new(), calls: vec![ToolCall { id: "1".into(), name: "edit_file".into(), input: serde_json::json!({"path": "lib.py", "old_text": "sum(xs) + 1", "new_text": "sum(xs)"}) }], ..Default::default() };
         let check = || Reply { text: String::new(), calls: vec![ToolCall { id: "c".into(), name: "run_check".into(), input: serde_json::json!({"name": "tests"}) }], ..Default::default() };
         let engine = Engine::Harness(Box::new(Scripted(RefCell::new(vec![
@@ -1526,20 +1634,21 @@ mod tests {
 
     #[test]
     fn the_pull_request_text_quotes_the_ticket_and_the_checks() {
-        let (title, body) = pull_request_text("- fixed it", &task(), &[CheckOutcome { name: "tests".into(), ok: true }], "Claude Code", 2, Some("Claude (opus)"));
+        let (title, body) = pull_request_text("- fixed it", &task(), &[CheckOutcome { name: "tests".into(), ok: true }], &["lint".to_string()], "Claude Code", 2, Some("Claude (opus)"));
         assert_eq!(title, "ABC-7: total() is off by one");
         assert!(body.contains("Resolves [ABC-7](https://acme.atlassian.net/browse/ABC-7)"));
         assert!(body.contains("> It adds 1."));
         assert!(body.contains("- fixed it"));
         assert!(body.contains("✅ `tests`"));
+        assert!(body.contains("⏭ `lint` — fails on the base branch"), "{body}");
         assert!(body.contains("engine: Claude Code"), "{body}");
         assert!(body.contains("approved by Claude (opus) after 2 round(s)"), "{body}");
-        let (_, none) = pull_request_text("x", &task(), &[], "scripted", 1, None);
+        let (_, none) = pull_request_text("x", &task(), &[], &[], "scripted", 1, None);
         assert!(none.contains("declares no checks"));
 
         // A prompt has no ticket to resolve: the prompt itself is quoted.
         let prompt = Task::from_prompt("add a --json flag to devdock status\n\nand cover it with a test");
-        let (title, body) = pull_request_text("- added it", &prompt, &[], "scripted", 1, None);
+        let (title, body) = pull_request_text("- added it", &prompt, &[], &[], "scripted", 1, None);
         assert_eq!(title, "add a --json flag to devdock status");
         assert!(body.starts_with("Asked in DevDock's Agent tab:\n\n> add a --json flag"), "{body}");
         assert!(body.contains("> and cover it with a test"));

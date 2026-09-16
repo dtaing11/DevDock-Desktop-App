@@ -99,12 +99,37 @@ The project's checks: run_check runs one of the commands this repository already
 const COMMAND_TOOLS: &str = r#"
 Commands: run_command runs a shell command in the repository root — the toolchain (build, a single test, a formatter, a linter), installing dependencies, a script — anything the named checks do not cover. Prefer it over guessing whether something compiles. It cannot commit, push, or rewrite git history; that is done for you. Stay inside the repository."#;
 
+const ASK_TOOLS: &str = r#"
+Asking: ask_developer puts one question to the developer and waits for the answer. Use it only when something genuinely uncertain would change what you build — a product choice, two reasonable readings of the task, a value nobody wrote down — and ask it specifically, with the options you see. Everything else you decide and state in your summary. If no answer comes you are told; then proceed on your best assumption."#;
+
+/// What Claude Code is told about asking: it has no tool for it in an
+/// unattended run, so a question is a line at the end of its reply, and
+/// the run is resumed with the answer.
+pub const CLAUDE_CODE_ASK: &str = "If you need the developer to decide something before you can proceed — a \
+    product choice, two reasonable readings of the task — do not guess: end your reply with a \
+    single line `QUESTION: <one specific question, with the options you see>` and stop without \
+    changing anything more. You will be resumed with the answer. Ask only when it truly changes \
+    what you would build.";
+
+/// The question a Claude Code reply ends with, if it ends with one.
+pub fn question_in(reply: &str) -> Option<String> {
+    reply
+        .trim()
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .and_then(|last| last.trim().strip_prefix("QUESTION:"))
+        .map(|q| q.trim().to_string())
+        .filter(|q| !q.is_empty())
+}
+
 /// The system prompt for a run, describing exactly the tools it has.
 pub fn system_prompt(
     write_mode: WriteMode,
     has_language_tools: bool,
     has_checks: bool,
     has_commands: bool,
+    has_ask: bool,
     extra_instructions: Option<&str>,
 ) -> String {
     let mut prompt = String::from(BASE_PROMPT);
@@ -124,6 +149,9 @@ pub fn system_prompt(
     }
     if has_commands {
         prompt.push_str(COMMAND_TOOLS);
+    }
+    if has_ask {
+        prompt.push_str(ASK_TOOLS);
     }
     if let Some(extra) = extra_instructions.map(str::trim).filter(|s| !s.is_empty()) {
         prompt.push_str("\n\nProject-specific instructions:\n");
@@ -258,6 +286,11 @@ fn run_claude_code(
     let checks = workspace.check_commands();
     extra.push_str("\n\n");
     extra.push_str(&claude_code::allowed_commands_note(workspace.root(), &checks));
+    let asker = workspace.asker();
+    if asker.is_some() {
+        extra.push_str("\n\n");
+        extra.push_str(CLAUDE_CODE_ASK);
+    }
     if let Some(instructions) = request.instructions.map(str::trim).filter(|s| !s.is_empty()) {
         extra.push_str("\n\nProject-specific instructions:\n");
         extra.push_str(instructions);
@@ -265,7 +298,31 @@ fn run_claude_code(
     let overview = workspace.overview();
     let prompt = task_prompt(request.task, request.history, request.branch, Some(&overview), request.context);
     let config = claude_code::Config { max_turns: request.limits.max_turns, ..config.clone() };
-    claude_code::run(&config, workspace.root(), &prompt, Some(&extra), &checks, on_event)
+    let mut run = claude_code::run(&config, workspace.root(), &prompt, Some(&extra), &checks, on_event)?;
+    // A question at the end of the reply: put it to the developer, resume
+    // the same session with the answer, and let it finish. A few times at
+    // most; after that it decides.
+    if let Some(asker) = asker {
+        for _ in 0..5 {
+            let Some(question) = question_in(&run.text) else { break };
+            let Some(session) = run.session.clone() else { break };
+            on_event(Event::Tool { summary: format!("asked you: {question}"), is_error: false });
+            let answer = match asker(&question) {
+                Ok(a) if !a.trim().is_empty() => format!("The developer answered: {}\n\nContinue and finish the task.", a.trim()),
+                Ok(_) => "The developer sent no answer. Decide yourself, state the assumption in your summary, and finish the task.".to_string(),
+                Err(why) => format!("No answer came ({why}). Decide yourself, state the assumption in your summary, and finish the task."),
+            };
+            let more = claude_code::resume(&config, workspace.root(), &session, &answer, Some(&extra), on_event)?;
+            run.text = more.text;
+            run.session = more.session;
+            run.turns += more.turns;
+            run.truncated = more.truncated;
+            run.usage = run.usage.plus(more.usage);
+            run.log.extend(more.log);
+            run.edits = more.edits;
+        }
+    }
+    Ok(run)
 }
 
 /// Runs the coding agent on the built-in harness.
@@ -297,6 +354,7 @@ pub fn run(
         tools.contains(&"diagnostics"),
         tools.contains(&"run_check"),
         tools.contains(&"run_command"),
+        tools.contains(&"ask_developer"),
         (!instructions.is_empty()).then_some(instructions.as_str()),
     );
     let overview = workspace.overview();
@@ -322,7 +380,7 @@ mod tests {
 
     #[test]
     fn the_prompt_describes_only_the_tools_that_exist() {
-        let bare = system_prompt(WriteMode::Overlay, false, false, false, None);
+        let bare = system_prompt(WriteMode::Overlay, false, false, false, false, None);
         assert!(bare.contains("list_files"));
         assert!(bare.contains("show_changes"));
         assert!(!bare.contains("The language server:"), "no language server was offered");
@@ -330,7 +388,11 @@ mod tests {
         assert!(!bare.contains("run_command"), "no commands were offered");
         assert!(bare.contains("nothing reaches disk"));
 
-        let full = system_prompt(WriteMode::Live, true, true, true, Some("Never touch vendor/."));
+        let full = system_prompt(WriteMode::Live, true, true, true, true, Some("Never touch vendor/."));
+        assert!(!bare.contains("ask_developer") && full.contains("ask_developer"));
+        assert_eq!(question_in("I did x.\n\nQUESTION: Red or blue?").as_deref(), Some("Red or blue?"));
+        assert_eq!(question_in("QUESTION: only this"), Some("only this".into()));
+        assert_eq!(question_in("Done. Verified: tests"), None);
         assert!(full.contains("The language server:") && full.contains("run_check"));
         assert!(full.contains("run_command") && full.contains("cannot commit, push"));
         assert!(bare.contains("Reusable over ad hoc") && full.contains("One responsibility per unit"), "the standard is in every prompt");
@@ -499,5 +561,63 @@ mod tests {
         assert_eq!(std::fs::read_to_string(tmp.path().join("total.py")).unwrap().matches("+ 1").count(), 0);
         let head = repo.log(1, None).unwrap()[0].subject.clone();
         assert_eq!(head, "init", "nothing was committed");
+    }
+
+    /// Both engines ask when told to, wait for the answer, and use it.
+    /// `LIVE_ENGINE=claude-code` runs Claude Code, else the harness with Claude.
+    /// `cargo test --lib coding::tests::live_asks -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_asks_the_developer_and_uses_the_answer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sh = |args: &[&str]| {
+            let out = std::process::Command::new("git").args(args).current_dir(tmp.path()).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        };
+        sh(&["init", "-q", "-b", "main"]);
+        sh(&["config", "user.email", "t@t"]);
+        sh(&["config", "user.name", "t"]);
+        std::fs::write(tmp.path().join("greeting.txt"), "Hello\n").unwrap();
+        sh(&["add", "-A"]);
+        sh(&["commit", "-q", "-m", "init"]);
+        let repo = crate::git::Repo::open(tmp.path()).unwrap();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let record = asked.clone();
+        let asker: crate::agent::Asker = std::sync::Arc::new(move |q: &str| {
+            println!("  [question] {q}");
+            record.lock().unwrap().push(q.to_string());
+            Ok("Use Portuguese: the word is Olá.".into())
+        });
+        let mut ws = Workspace::new(repo.path(), repo.tracked_files().unwrap(), Access::ReadWrite)
+            .unwrap()
+            .with_write_mode(WriteMode::Live)
+            .with_commands(true)
+            .with_asker(asker);
+        let engine = match std::env::var("LIVE_ENGINE").as_deref() {
+            Ok("claude-code") => Engine::ClaudeCode(claude_code::Config::default()),
+            _ => match crate::claude::Client::from_store("claude-haiku-4-5-20251001") {
+                Some(c) => Engine::Harness(Box::new(c)),
+                None => {
+                    eprintln!("no Claude credentials; skipping");
+                    return;
+                }
+            },
+        };
+        let mut log = Vec::new();
+        let run = run_with(
+            &engine,
+            &mut ws,
+            Request::new("Translate the greeting in greeting.txt into another language. I have not said which language: you must ask me which one before changing anything, then write that translation into greeting.txt."),
+            &mut |e| {
+                println!("  {}", e.line());
+                log.push(e.line());
+            },
+        )
+        .unwrap();
+        println!("{}", run.text);
+        assert_eq!(asked.lock().unwrap().len(), 1, "asked exactly once: {:?}", asked.lock().unwrap());
+        let text = std::fs::read_to_string(tmp.path().join("greeting.txt")).unwrap();
+        assert!(text.contains("Olá"), "the answer was used: {text}");
+        assert!(log.iter().any(|l| l.contains("asked you:")), "{log:?}");
     }
 }

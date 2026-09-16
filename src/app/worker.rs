@@ -137,6 +137,10 @@ pub enum Msg {
     /// An agentic run finished. Its edits are proposals: the user accepts or
     /// rejects each one before anything is written.
     AgentDone { kind: AgentKind, result: Result<crate::app::AgentReport, String> },
+    /// An agent has a question for the developer and is waiting. `key` is
+    /// the worktree run's branch, or `None` for the Agent tab's own run.
+    /// The answer goes back through `reply`.
+    AgentQuestion { key: Option<String>, question: String, reply: std::sync::mpsc::Sender<String> },
 
     /// Background task finished with nothing to report.
     Noop,
@@ -249,6 +253,19 @@ impl Progress {
     pub fn for_repo(mut self, repo: String) -> Self {
         self.repo = Some(repo);
         self
+    }
+
+    /// A line to the developer for a run keyed by `key`: the question goes
+    /// to the UI, and this blocks the worker until the answer comes or the
+    /// developer has had half an hour.
+    pub fn asker(&self, key: Option<String>) -> crate::agent::Asker {
+        let progress = self.clone();
+        std::sync::Arc::new(move |question: &str| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            progress.send(Msg::AgentQuestion { key: key.clone(), question: question.to_string(), reply: tx });
+            rx.recv_timeout(std::time::Duration::from_secs(30 * 60))
+                .map_err(|_| "no answer within 30 minutes".to_string())
+        })
     }
 
     /// Delivers one message to the UI thread and asks for a repaint.

@@ -155,6 +155,13 @@ now, and — on **Log** — everything it did: every file read, every edit, ever
 check, the commit, the push. A finished card lists the files it changed with
 line counts, its summary, and the pull request.
 
+### Questions
+
+A fixer that is genuinely unsure asks you: the question appears on the
+ticket's card with a box to answer in, and the run waits (half an hour at
+most) — see [the agent](editor-and-agent.md#when-it-is-not-sure-it-asks).
+Both engines ask the same way from your side.
+
 ### Claiming the ticket
 
 **Claim tickets I start** (on by default) does what you would do when you

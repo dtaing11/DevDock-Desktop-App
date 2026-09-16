@@ -74,6 +74,8 @@ pub struct CodingState {
     pub engine: String,
     /// Runs sent to a worktree of their own instead of this tree.
     pub worktree: WorktreeRuns,
+    /// A question the in-tab run is waiting on.
+    pub question: Option<super::backlog::PendingQuestion>,
 }
 
 /// Tasks run the way the backlog fixer runs a ticket: a fresh branch and
@@ -173,6 +175,7 @@ pub fn agent_sidebar(app: &mut App, ui: &mut egui::Ui) {
         |ui| {
             transcript(app, ui);
             worktree_status(app, ui);
+            question_box(app, ui);
             plan(app, ui);
             if app.coding.running || !app.coding.log.is_empty() {
                 activity(app, ui);
@@ -831,6 +834,39 @@ fn worktree_options(app: &mut App, ui: &mut egui::Ui) {
     });
 }
 
+/// The in-tab run's question, when it is waiting on one.
+fn question_box(app: &mut App, ui: &mut egui::Ui) {
+    let mut answer = false;
+    if let Some(q) = app.coding.question.as_mut() {
+        egui::Frame::new()
+            .fill(theme::ember().linear_multiply(0.12))
+            .stroke(egui::Stroke::new(1.0_f32, theme::ember()))
+            .corner_radius(theme::RADIUS_MD as f32)
+            .inner_margin(egui::Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                ui.label(RichText::new("The agent asks:").font(theme::semibold(theme::TEXT)).color(theme::ember()));
+                ui.add(egui::Label::new(RichText::new(&q.question).color(theme::fg())).wrap());
+                super::views::prose_box(ui, &mut q.draft, 2, "Your answer — it is waiting");
+                ui.horizontal(|ui| {
+                    let ready = !q.draft.trim().is_empty();
+                    if ui.add_enabled(ready, egui::Button::new("Answer").fill(theme::ember())).clicked() {
+                        answer = true;
+                    }
+                    if ui.small_button("Let it decide").clicked() {
+                        q.draft.clear();
+                        answer = true;
+                    }
+                });
+            });
+        ui.add_space(theme::UNIT);
+    }
+    if answer {
+        if let Some(q) = app.coding.question.take() {
+            q.answer();
+        }
+    }
+}
+
 /// One line in the sidebar on the worktree runs, while the cards themselves
 /// are in the viewport where a log can be read.
 fn worktree_status(app: &mut App, ui: &mut egui::Ui) {
@@ -888,15 +924,21 @@ fn worktree_runs(app: &mut App, ui: &mut egui::Ui) {
     let keys: Vec<String> = app.coding.worktree.runs.keys().cloned().collect();
     ScrollArea::vertical().auto_shrink([false, false]).id_salt("agent-worktree-runs").show(ui, |ui| {
         for key in keys {
-            let Some(run) = app.coding.worktree.runs.get(&key) else { continue };
             let expanded = app.coding.worktree.expanded.as_deref() == Some(key.as_str());
-            match super::backlog::run_card(ui, &key, &run.title, run, expanded, "agent-worktree-log") {
+            let Some(run) = app.coding.worktree.runs.get_mut(&key) else { continue };
+            let title = run.title.clone();
+            match super::backlog::run_card(ui, &key, &title, run, expanded, "agent-worktree-log") {
                 super::backlog::CardAction::None => {}
                 super::backlog::CardAction::ToggleLog => {
                     app.coding.worktree.expanded = if expanded { None } else { Some(key.clone()) };
                 }
                 super::backlog::CardAction::OpenAttempt(branch) => app.open_attempt_in_vscode(&branch),
                 super::backlog::CardAction::PublishAttempt(branch) => app.publish_attempt(&branch),
+                super::backlog::CardAction::Answer => {
+                    if let Some(q) = app.coding.worktree.runs.get_mut(&key).and_then(|r| r.question.take()) {
+                        q.answer();
+                    }
+                }
             }
             ui.add_space(theme::UNIT);
         }

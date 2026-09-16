@@ -712,6 +712,7 @@ fn cmd_backlog(rest: &[String]) -> ExitCode {
                             claim: claimer.as_ref().map(|c| c as &dyn crate::backlog::Claimer),
                             rounds,
                             reviewer: reviewer.as_ref(),
+                            ask: None,
                         };
                         crate::backlog::fix(&repo, &engine, &job, &publish, &mut |line| {
                             println!("{} {}", style::dim(&format!("[{}]", issue.key)), line);

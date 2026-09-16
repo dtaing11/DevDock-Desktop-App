@@ -2077,6 +2077,7 @@ impl App {
             Msg::BacklogDone { key, result } => self.on_backlog_done(key, result),
             Msg::AgentRunProgress { key, line } => self.on_agent_run_progress(key, line),
             Msg::AgentRunDone { key, result } => self.on_agent_run_done(key, result),
+            Msg::AgentQuestion { key, question, reply } => self.on_agent_question(key, question, reply),
 
             Msg::Worktrees(result) => self.on_worktrees(result),
             Msg::WorktreeDone { message, open } => self.on_worktree_done(message, open),
@@ -2341,6 +2342,7 @@ impl App {
                 AgentKind::Tickets => self.tickets.log.push(line),
             },
             Msg::AgentDone { kind: AgentKind::Coding, result } => {
+                self.coding.question = None;
                 self.finish_coding_run(result)
             }
             Msg::AgentDone { kind: _, result } => {
@@ -4222,7 +4224,8 @@ impl App {
                     crate::agent::WriteMode::Overlay
                 })
                 .with_checks(checks)
-                .with_commands(live);
+                .with_commands(live)
+                .with_asker(progress.asker(None));
 
                 let engine_label = engine.label();
                 let run = crate::agent::coding::run_with(
@@ -4330,6 +4333,7 @@ impl App {
                     claim: None,
                     rounds,
                     reviewer: reviewer.as_ref(),
+                    ask: Some(progress.asker(Some(key.clone()))),
                 };
                 crate::backlog::fix(&repo, &engine, &job, &publish, &mut |line| {
                     progress.send(Msg::AgentRunProgress { key: key.clone(), line });
@@ -6120,8 +6124,8 @@ mod tests {
         assert!(app.backlog.selected.contains("T-1"));
 
         // Two agents in flight, by hand: starting one for real needs a model.
-        app.backlog.runs.insert("T-1".into(), TicketRun { title: "one".into(), state: RunState::Running, kept: None, log: Vec::new(), started: Some(Instant::now()), took: None });
-        app.backlog.runs.insert("T-2".into(), TicketRun { title: "two".into(), state: RunState::Running, kept: None, log: Vec::new(), started: Some(Instant::now()), took: None });
+        app.backlog.runs.insert("T-1".into(), TicketRun { title: "one".into(), state: RunState::Running, kept: None, question: None, log: Vec::new(), started: Some(Instant::now()), took: None });
+        app.backlog.runs.insert("T-2".into(), TicketRun { title: "two".into(), state: RunState::Running, kept: None, question: None, log: Vec::new(), started: Some(Instant::now()), took: None });
         app.handle(Msg::BacklogProgress { key: "T-1".into(), line: "· read a.rs".into() });
         assert_eq!(app.backlog.runs["T-1"].log, ["· read a.rs"]);
         assert_eq!(app.backlog.running(), 2);
@@ -6262,6 +6266,58 @@ mod tests {
         assert!(!app.coding.running);
         app.coding.worktree.clear_finished();
         assert!(app.coding.worktree.runs.is_empty());
+    }
+
+    /// An agent's question reaches the card of its run, the answer typed
+    /// there reaches the agent, and the in-tab run has its own box.
+    #[test]
+    fn a_question_from_an_agent_is_answered_from_its_card() {
+        use backlog::{RunState, TicketRun};
+        let (_tmp, mut app, _file) = app_with_repo();
+        let mut run = TicketRun::queued("colour");
+        run.state = RunState::Running;
+        app.coding.worktree.runs.insert("agent/colour".into(), run);
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.handle(Msg::AgentQuestion { key: Some("agent/colour".into()), question: "Red or blue?".into(), reply: tx });
+        let q = app.coding.worktree.runs["agent/colour"].question.as_ref().expect("the card has the question");
+        assert_eq!(q.question, "Red or blue?");
+        assert!(app.coding.worktree.runs["agent/colour"].log.last().unwrap().starts_with("? Red"));
+        assert!(app.toast.as_ref().is_some_and(|t| t.text.contains("has a question")));
+        // Typing and answering.
+        app.coding.worktree.runs.get_mut("agent/colour").unwrap().question.as_mut().unwrap().draft = "Red.".into();
+        app.coding.worktree.runs.get_mut("agent/colour").unwrap().question.take().unwrap().answer();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), "Red.");
+
+        // The in-tab run's question lives on the tab itself; the panel draws it.
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.handle(Msg::AgentQuestion { key: None, question: "Which module?".into(), reply: tx });
+        assert_eq!(app.coding.question.as_ref().unwrap().question, "Which module?");
+        app.tab = Tab::Agent;
+        theme::run_test_ctx(|ctx| {
+            egui::SidePanel::left("t").show(ctx, |ui| agent_tab::agent_sidebar(&mut app, ui));
+        });
+        app.coding.question.take().unwrap().answer();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), "", "no text typed is an empty answer");
+
+        // A question for a run that no longer exists is answered with
+        // nothing, so the agent is not left waiting.
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.handle(Msg::AgentQuestion { key: Some("agent/gone".into()), question: "?".into(), reply: tx });
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), "");
+        // The worker-side asker delivers a question as this message and
+        // hands the answer back.
+        let progress = app.worker.progress();
+        let asker = progress.asker(Some("agent/colour".into()));
+        let answered = std::thread::spawn(move || asker("Size?"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.coding.worktree.runs["agent/colour"].question.is_none() && Instant::now() < deadline {
+            app.handle_messages_for_test();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let q = app.coding.worktree.runs.get_mut("agent/colour").unwrap().question.take().expect("asked");
+        assert_eq!(q.question, "Size?");
+        let _ = q.reply.send("Large".into());
+        assert_eq!(answered.join().unwrap().unwrap(), "Large");
     }
 
     /// Switching repositories keeps each one's state — agent tab, runs,

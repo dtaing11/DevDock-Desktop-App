@@ -364,6 +364,19 @@ It needs GitHub sign-in, because the outcome is a pull request. A prompt that
 needs a decision from you is not a fit: the agent is told nobody can answer,
 and to change nothing rather than guess.
 
+### When it is not sure, it asks
+
+An agent that hits something it cannot decide — a product choice, two
+reasonable readings of the task, a value nobody wrote down — asks you rather
+than guessing. The built-in harness has an `ask_developer` tool; Claude
+Code ends its reply with a `QUESTION:` line and is resumed in the same
+session with the answer. Either way a box appears on the run's card (or at
+the top of the Agent panel for a run in this tree) with the question and a
+place to type. **Answer** sends it; **Let it decide** sends nothing, and
+the agent proceeds on its best assumption and says what it assumed. An
+unanswered question times out after half an hour the same way. Runs from
+the command line are unattended and have no such line: the agent decides.
+
 ### What it can and cannot do
 
 | Tool | What it does |

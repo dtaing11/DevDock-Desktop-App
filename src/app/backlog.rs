@@ -29,6 +29,26 @@ pub enum RunState {
     Failed(String),
 }
 
+/// A question an agent is waiting on, and the answer being typed.
+pub struct PendingQuestion {
+    pub question: String,
+    pub draft: String,
+    pub reply: std::sync::mpsc::Sender<String>,
+}
+
+impl std::fmt::Debug for PendingQuestion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingQuestion").field("question", &self.question).finish()
+    }
+}
+
+impl PendingQuestion {
+    /// Sends what was typed; the run carries on.
+    pub fn answer(self) {
+        let _ = self.reply.send(self.draft);
+    }
+}
+
 /// One agent working one ticket, as the dialog tracks it.
 #[derive(Debug)]
 pub struct TicketRun {
@@ -38,6 +58,8 @@ pub struct TicketRun {
     /// The branch a failed run kept its attempt on, unpushed, for a person
     /// to finish.
     pub kept: Option<String>,
+    /// A question the agent is waiting on.
+    pub question: Option<PendingQuestion>,
     /// Everything it did, one line per tool call, check, commit, and push.
     pub log: Vec<String>,
     pub started: Option<Instant>,
@@ -54,7 +76,7 @@ pub fn kept_branch(reason: &str) -> Option<String> {
 
 impl TicketRun {
     pub fn queued(title: impl Into<String>) -> Self {
-        Self { title: title.into(), state: RunState::Queued, kept: None, log: Vec::new(), started: None, took: None }
+        Self { title: title.into(), state: RunState::Queued, kept: None, question: None, log: Vec::new(), started: None, took: None }
     }
 
     pub fn is_running(&self) -> bool {
@@ -397,6 +419,7 @@ impl App {
                     claim: claimer.as_ref().map(|c| c as &dyn crate::backlog::Claimer),
                     rounds,
                     reviewer: reviewer.as_ref(),
+                    ask: Some(progress.asker(Some(issue.key.clone()))),
                 };
                 let key = issue.key.clone();
                 crate::backlog::fix(&repo, &engine, &job, &publish, &mut |line| {
@@ -438,6 +461,29 @@ impl App {
             }
             Err(e) => self.backlog.error = Some(e),
         }
+    }
+
+    /// An agent asked something: the card for its run shows the question
+    /// and a box for the answer. Runs are found by key in either place they
+    /// live — the backlog dialog or the Agent tab.
+    pub(super) fn on_agent_question(&mut self, key: Option<String>, question: String, reply: std::sync::mpsc::Sender<String>) {
+        let pending = PendingQuestion { question: question.clone(), draft: String::new(), reply };
+        match key {
+            Some(key) => {
+                if let Some(run) = self.backlog.runs.get_mut(&key).or_else(|| self.coding.worktree.runs.get_mut(&key)) {
+                    run.log.push(format!("? {question}"));
+                    run.question = Some(pending);
+                } else {
+                    // Nowhere to show it: the run is gone. Free the agent.
+                    let _ = pending.reply.send(String::new());
+                }
+            }
+            None => {
+                self.coding.log.push(format!("? {question}"));
+                self.coding.question = Some(pending);
+            }
+        }
+        self.toast(format!("An agent has a question: {}", clip(&question, 80)), false);
     }
 
     pub(super) fn on_backlog_progress(&mut self, key: String, line: String) {
@@ -703,13 +749,19 @@ fn agents(app: &mut App, ui: &mut egui::Ui) {
 }
 
 fn agent_card(app: &mut App, ui: &mut egui::Ui, key: &str) {
-    let Some(run) = app.backlog.runs.get(key) else { return };
     let expanded = app.backlog.expanded.as_deref() == Some(key);
-    match run_card(ui, key, &run.title, run, expanded, "backlog-log") {
+    let Some(run) = app.backlog.runs.get_mut(key) else { return };
+    let title = run.title.clone();
+    match run_card(ui, key, &title, run, expanded, "backlog-log") {
         CardAction::None => {}
         CardAction::ToggleLog => app.backlog.expanded = if expanded { None } else { Some(key.to_string()) },
         CardAction::OpenAttempt(branch) => app.open_attempt_in_vscode(&branch),
         CardAction::PublishAttempt(branch) => app.publish_attempt(&branch),
+        CardAction::Answer => {
+            if let Some(q) = app.backlog.runs.get_mut(key).and_then(|r| r.question.take()) {
+                q.answer();
+            }
+        }
     }
 }
 
@@ -721,12 +773,14 @@ pub(super) enum CardAction {
     OpenAttempt(String),
     /// Reword the kept attempt's commit, push it, open a draft pull request.
     PublishAttempt(String),
+    /// Send the answer typed into the card's question box.
+    Answer,
 }
 
 /// One agent's card: its state, what it is doing or did, its log on
 /// request, and — when it is done — the pull request and the files. Shared
 /// by the backlog dialog and the Agent tab's worktree runs.
-pub(super) fn run_card(ui: &mut egui::Ui, key: &str, title: &str, run: &TicketRun, expanded: bool, salt: &str) -> CardAction {
+pub(super) fn run_card(ui: &mut egui::Ui, key: &str, title: &str, run: &mut TicketRun, expanded: bool, salt: &str) -> CardAction {
     let (state_label, color) = match &run.state {
         RunState::Queued => ("queued", theme::fg_dim()),
         RunState::Running => ("running", theme::ember()),
@@ -771,6 +825,30 @@ pub(super) fn run_card(ui: &mut egui::Ui, key: &str, title: &str, run: &TicketRu
                     ui.label(RichText::new(title).color(theme::fg()));
                 }
             });
+            // The agent is waiting on an answer: the question, a box, a button.
+            if let Some(q) = run.question.as_mut() {
+                ui.add_space(4.0);
+                egui::Frame::new()
+                    .fill(theme::ember().linear_multiply(0.12))
+                    .stroke(egui::Stroke::new(1.0_f32, theme::ember()))
+                    .corner_radius(theme::RADIUS_MD as f32)
+                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("The agent asks:").font(theme::semibold(theme::TEXT)).color(theme::ember()));
+                        wrapped(ui, RichText::new(&q.question).color(theme::fg()));
+                        super::views::prose_box(ui, &mut q.draft, 2, "Your answer — it is waiting");
+                        ui.horizontal(|ui| {
+                            let ready = !q.draft.trim().is_empty();
+                            if ui.add_enabled(ready, egui::Button::new("Answer").fill(theme::ember())).clicked() {
+                                action = CardAction::Answer;
+                            }
+                            if ui.small_button("Let it decide").on_hover_text("Sends no answer; the agent decides and states its assumption.").clicked() {
+                                q.draft.clear();
+                                action = CardAction::Answer;
+                            }
+                        });
+                    });
+            }
             if !expanded && !last.is_empty() {
                 wrapped(ui, RichText::new(clip(&last, 240)).monospace().size(theme::SMALL).color(theme::fg_dim()));
             }

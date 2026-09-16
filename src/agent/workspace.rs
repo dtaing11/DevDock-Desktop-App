@@ -192,6 +192,9 @@ pub struct Workspace {
     /// Resolves each job's runner: the built-ins, plus the sandbox when
     /// there is one.
     runners: std::sync::Arc<crate::local_ci::runner::RunnerRegistry>,
+    /// A line to the developer, when someone is there to answer.
+    asker: Option<super::Asker>,
+    questions: usize,
     /// Files edited since the model last asked for their diagnostics.
     undiagnosed: BTreeSet<String>,
     /// The file most recently read, for a nudge that needs to name one.
@@ -231,6 +234,8 @@ impl Workspace {
             command_runs: 0,
             sandbox: None,
             runners: std::sync::Arc::new(crate::local_ci::runner::RunnerRegistry::with_builtins()),
+            asker: None,
+            questions: 0,
             undiagnosed: BTreeSet::new(),
             last_read: None,
             edited_since_check: false,
@@ -279,6 +284,17 @@ impl Workspace {
             job.image = None;
         }
         self
+    }
+
+    /// Lets the model ask the developer something and wait for the answer.
+    pub fn with_asker(mut self, asker: super::Asker) -> Self {
+        self.asker = Some(asker);
+        self
+    }
+
+    /// The line to the developer, for an engine that asks its own way.
+    pub fn asker(&self) -> Option<super::Asker> {
+        self.asker.clone()
     }
 
     /// Whether run_command is on offer: enabled, on a live tree, for a run
@@ -669,6 +685,25 @@ impl Workspace {
             });
         }
 
+        if self.asker.is_some() {
+            tools.push(ToolSpec {
+                name: "ask_developer",
+                description: "Ask the developer one specific question and wait for the answer. Only \
+                              for something genuinely uncertain that changes what you would build \
+                              — a product choice, two reasonable readings of the task, a value \
+                              nobody wrote down. Offer the options you see. Not for anything you \
+                              can find out from the code or decide reasonably yourself. If no \
+                              answer comes you are told so; then decide, and say what you assumed.",
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "question": {"type": "string", "description": "One question, specific, with the options you see."}
+                    },
+                    "required": ["question"]
+                }),
+            });
+        }
+
         if self.commands_available() {
             tools.push(ToolSpec {
                 name: "run_command",
@@ -794,6 +829,7 @@ impl Workspace {
             "find_symbol" if self.lsp.is_some() => self.find_symbol(&call.input),
             "run_check" if !self.checks.is_empty() => self.run_check(&call.input),
             "run_command" if self.commands_available() => self.run_command(&call.input),
+            "ask_developer" if self.asker.is_some() => self.ask_developer(&call.input),
             "run_command" if self.commands => Err(
                 "This run proposes changes without writing them, so a command would see the \
                  old code. Report what you changed instead."
@@ -1629,6 +1665,24 @@ impl Workspace {
         ))
     }
 
+    fn ask_developer(&mut self, input: &serde_json::Value) -> Result<String, String> {
+        const MAX_QUESTIONS: usize = 5;
+        let question = self.arg_str(input, "question")?.trim().to_string();
+        if question.is_empty() {
+            return Err("question is empty".into());
+        }
+        if self.questions >= MAX_QUESTIONS {
+            return Err(format!("You have asked {MAX_QUESTIONS} questions; decide the rest yourself and state your assumptions."));
+        }
+        self.questions += 1;
+        let Some(asker) = self.asker.clone() else { return Err("nobody is here to ask".into()) };
+        match asker(&question) {
+            Ok(answer) if !answer.trim().is_empty() => Ok(format!("The developer answered:\n{}", answer.trim())),
+            Ok(_) => Ok("The developer sent an empty answer. Decide yourself and state the assumption in your summary.".into()),
+            Err(why) => Ok(format!("No answer came ({why}). Decide yourself, state the assumption in your summary, and carry on.")),
+        }
+    }
+
     fn run_command(&mut self, input: &serde_json::Value) -> Result<String, String> {
         const MAX_OUTPUT: usize = 8_000;
         const DEFAULT_TIMEOUT: u64 = 300;
@@ -1851,6 +1905,7 @@ pub fn summarize(call: &ToolCall) -> String {
         "references" => format!("references to {}", arg("symbol")),
         "find_symbol" => format!("find symbol {}", arg("query")),
         "run_check" => format!("run check {}", arg("name")),
+        "ask_developer" => format!("asked you: {}", arg("question")),
         "run_command" => {
             // `cd somewhere && the command`: the command is the news.
             let command = arg("command");
@@ -2598,6 +2653,27 @@ mod tests {
         let (_tmp, ws) = fixture(Access::ReadOnly);
         let ws = ws.with_commands(true).with_write_mode(WriteMode::Live);
         assert!(!ws.tools().iter().any(|t| t.name == "run_command"));
+    }
+
+    #[test]
+    fn the_developer_can_be_asked_when_someone_is_there() {
+        let (_tmp, ws) = fixture(Access::ReadWrite);
+        assert!(!ws.tools().iter().any(|t| t.name == "ask_developer"), "no line, no tool");
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let record = asked.clone();
+        let asker: super::super::Asker = std::sync::Arc::new(move |q: &str| {
+            record.lock().unwrap().push(q.to_string());
+            if q.contains("timeout") { Err("no answer within 30 minutes".into()) } else { Ok("Use the red one.".into()) }
+        });
+        let mut ws = ws.with_asker(asker);
+        assert!(ws.tools().iter().any(|t| t.name == "ask_developer"));
+        let out = ws.dispatch(&call("ask_developer", serde_json::json!({"question": "Red or blue?"})), 10);
+        assert!(!out.is_error);
+        assert_eq!(out.content, "The developer answered:\nUse the red one.");
+        let out = ws.dispatch(&call("ask_developer", serde_json::json!({"question": "timeout?"})), 10);
+        assert!(!out.is_error, "no answer is not a tool error");
+        assert!(out.content.starts_with("No answer came (no answer within 30 minutes). Decide yourself"), "{}", out.content);
+        assert_eq!(asked.lock().unwrap().len(), 2);
     }
 
     #[test]

@@ -44,6 +44,7 @@ pub mod split;
 pub mod tickets;
 pub mod workspace;
 
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 pub use workspace::{Access, PendingEdit, Workspace, WriteMode};
 
@@ -75,6 +76,11 @@ pub struct ToolResult {
     pub is_error: bool,
 }
 
+/// A way for a run to put a question to the developer and wait for the
+/// answer. `Err` means no answer came (the developer was away, the run is
+/// unattended); the agent is told to decide for itself.
+pub type Asker = Arc<dyn Fn(&str) -> std::result::Result<String, String> + Send + Sync>;
+
 /// One entry in the conversation the loop maintains. Providers translate
 /// these into their own wire formats.
 #[derive(Debug, Clone)]
@@ -98,6 +104,16 @@ pub struct Usage {
 }
 
 impl Usage {
+    /// Both counts together.
+    pub fn plus(self, other: Usage) -> Usage {
+        Usage {
+            input_tokens: self.input_tokens + other.input_tokens,
+            output_tokens: self.output_tokens + other.output_tokens,
+            cache_read_tokens: self.cache_read_tokens + other.cache_read_tokens,
+            cache_write_tokens: self.cache_write_tokens + other.cache_write_tokens,
+        }
+    }
+
     pub fn add(&mut self, other: &Usage) {
         self.input_tokens += other.input_tokens;
         self.output_tokens += other.output_tokens;
@@ -239,6 +255,8 @@ pub struct Run {
     pub truncated: bool,
     /// Model turns taken.
     pub turns: usize,
+    /// The engine's own session, when it has one to resume (Claude Code).
+    pub session: Option<String>,
     /// Tokens across every turn, when the provider reports them.
     pub usage: Usage,
 }
@@ -384,6 +402,7 @@ pub fn run(
                 log,
                 truncated,
                 turns,
+                session: None,
                 usage,
             });
         }

@@ -160,7 +160,7 @@ pub fn run(
     on_event: &mut dyn FnMut(Event),
 ) -> Result<Run, String> {
     let _ = check_commands;
-    run_with_tools(config, root, task, system_extra, &allowed_tools(), true, on_event)
+    run_with_tools(config, root, Launch { task, system_extra, allowed: &allowed_tools(), collect_edits: true, resume: None }, on_event)
 }
 
 /// Runs Claude Code with reading tools only — no edits, no commands — and
@@ -172,18 +172,39 @@ pub fn run_readonly(
     system_extra: Option<&str>,
     on_event: &mut dyn FnMut(Event),
 ) -> Result<Run, String> {
-    run_with_tools(config, root, task, system_extra, "Read,Grep,Glob,LS", false, on_event)
+    run_with_tools(config, root, Launch { task, system_extra, allowed: "Read,Grep,Glob,LS", collect_edits: false, resume: None }, on_event)
+}
+
+/// Continues a session — after a question was answered — with `prompt`
+/// as the next message; the same tools as [`run`].
+pub fn resume(
+    config: &Config,
+    root: &Path,
+    session_id: &str,
+    prompt: &str,
+    system_extra: Option<&str>,
+    on_event: &mut dyn FnMut(Event),
+) -> Result<Run, String> {
+    run_with_tools(config, root, Launch { task: prompt, system_extra, allowed: &allowed_tools(), collect_edits: true, resume: Some(session_id) }, on_event)
+}
+
+/// How one `claude -p` is launched.
+struct Launch<'a> {
+    task: &'a str,
+    system_extra: Option<&'a str>,
+    allowed: &'a str,
+    collect_edits: bool,
+    /// A session to continue instead of starting one.
+    resume: Option<&'a str>,
 }
 
 fn run_with_tools(
     config: &Config,
     root: &Path,
-    task: &str,
-    system_extra: Option<&str>,
-    allowed: &str,
-    collect_edits: bool,
+    launch: Launch<'_>,
     on_event: &mut dyn FnMut(Event),
 ) -> Result<Run, String> {
+    let Launch { task, system_extra, allowed, collect_edits, resume } = launch;
     let program = program().ok_or(
         "Claude Code is not installed on this machine (the `claude` command was not found).",
     )?;
@@ -204,6 +225,9 @@ fn run_with_tools(
     let model = config.model.trim();
     if !model.is_empty() && model != "default" {
         cmd.arg("--model").arg(model);
+    }
+    if let Some(id) = resume {
+        cmd.arg("--resume").arg(id);
     }
     if let Some(extra) = system_extra.map(str::trim).filter(|s| !s.is_empty()) {
         cmd.arg("--append-system-prompt").arg(extra);
@@ -297,6 +321,7 @@ fn run_with_tools(
         log,
         truncated: outcome.truncated,
         turns: outcome.turns,
+        session: outcome.session_id,
         usage: outcome.usage,
     })
 }
@@ -305,6 +330,7 @@ fn run_with_tools(
 #[derive(Default)]
 struct Outcome {
     result: Option<String>,
+    session_id: Option<String>,
     is_error: bool,
     truncated: bool,
     turns: usize,
@@ -318,6 +344,9 @@ fn parse_line(line: &str, root: &Path, outcome: &mut Outcome) -> Vec<Event> {
         return Vec::new();
     };
     let kind = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    if let Some(id) = value.get("session_id").and_then(|s| s.as_str()) {
+        outcome.session_id = Some(id.to_string());
+    }
     let mut events = Vec::new();
     match kind {
         "assistant" => {

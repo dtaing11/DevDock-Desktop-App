@@ -752,7 +752,7 @@ fn agent_card(app: &mut App, ui: &mut egui::Ui, key: &str) {
     let expanded = app.backlog.expanded.as_deref() == Some(key);
     let Some(run) = app.backlog.runs.get_mut(key) else { return };
     let title = run.title.clone();
-    match run_card(ui, key, &title, run, expanded, "backlog-log") {
+    match run_card(ui, key, &title, run, expanded, "backlog-log", &mut app.screenshots) {
         CardAction::None => {}
         CardAction::ToggleLog => app.backlog.expanded = if expanded { None } else { Some(key.to_string()) },
         CardAction::OpenAttempt(branch) => app.open_attempt_in_vscode(&branch),
@@ -762,6 +762,30 @@ fn agent_card(app: &mut App, ui: &mut egui::Ui, key: &str) {
                 q.answer();
             }
         }
+    }
+}
+
+/// Screenshots decoded once and kept as textures, by path.
+#[derive(Default)]
+pub struct Screenshots {
+    textures: BTreeMap<std::path::PathBuf, Option<egui::TextureHandle>>,
+}
+
+impl Screenshots {
+    /// The texture for a PNG on disk, decoded on first use; `None` when the
+    /// file cannot be read or is not an image.
+    pub fn get(&mut self, ctx: &egui::Context, path: &std::path::Path) -> Option<egui::TextureHandle> {
+        if let Some(cached) = self.textures.get(path) {
+            return cached.clone();
+        }
+        let loaded = std::fs::read(path).ok().and_then(|bytes| image::load_from_memory(&bytes).ok()).map(|img| {
+            let rgba = img.to_rgba8();
+            let size = [rgba.width() as usize, rgba.height() as usize];
+            let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+            ctx.load_texture(path.display().to_string(), color, egui::TextureOptions::LINEAR)
+        });
+        self.textures.insert(path.to_path_buf(), loaded.clone());
+        loaded
     }
 }
 
@@ -780,7 +804,7 @@ pub(super) enum CardAction {
 /// One agent's card: its state, what it is doing or did, its log on
 /// request, and — when it is done — the pull request and the files. Shared
 /// by the backlog dialog and the Agent tab's worktree runs.
-pub(super) fn run_card(ui: &mut egui::Ui, key: &str, title: &str, run: &mut TicketRun, expanded: bool, salt: &str) -> CardAction {
+pub(super) fn run_card(ui: &mut egui::Ui, key: &str, title: &str, run: &mut TicketRun, expanded: bool, salt: &str, shots: &mut Screenshots) -> CardAction {
     let (state_label, color) = match &run.state {
         RunState::Queued => ("queued", theme::fg_dim()),
         RunState::Running => ("running", theme::ember()),
@@ -900,6 +924,23 @@ pub(super) fn run_card(ui: &mut egui::Ui, key: &str, title: &str, run: &mut Tick
                     }
                     let summary_short: String = fixed.summary.lines().take(6).collect::<Vec<_>>().join("\n");
                     wrapped(ui, RichText::new(summary_short).size(theme::SMALL));
+                    for path in &fixed.screenshots {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("What it looks like").font(theme::semibold(theme::SMALL)).color(theme::fg_dim()));
+                            if ui.small_button("Open").on_hover_text(path.display().to_string()).clicked() {
+                                let _ = open::that(path);
+                            }
+                        });
+                        if let Some(texture) = shots.get(ui.ctx(), path) {
+                            let max_w = (ui.available_width() - 20.0).max(120.0);
+                            let size = texture.size_vec2();
+                            let scale = (max_w / size.x).min(1.0);
+                            ui.add(egui::Image::from_texture(&texture).fit_to_exact_size(size * scale).corner_radius(theme::RADIUS_MD as f32));
+                        } else {
+                            ui.label(RichText::new(format!("(could not read {})", path.display())).size(theme::SMALL).color(theme::fg_dim()));
+                        }
+                    }
                 }
                 RunState::Failed(e) => {
                     ui.add_space(4.0);

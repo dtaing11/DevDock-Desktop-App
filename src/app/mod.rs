@@ -943,6 +943,8 @@ pub struct App {
     /// Repositories opened earlier in this window, with their state, keyed
     /// by path. See [`RepoSession`].
     pub sessions: std::collections::HashMap<String, RepoSession>,
+    /// Screenshots decoded for the run cards.
+    pub screenshots: backlog::Screenshots,
     /// An AI-proposed split of the working tree into separate commits.
     pub split: SplitState,
     /// An AI-proposed tidy-up of the branch's commits.
@@ -1084,6 +1086,7 @@ impl App {
             editor: Default::default(),
             coding: Default::default(),
             sessions: Default::default(),
+            screenshots: Default::default(),
             split: Default::default(),
             tidy: Default::default(),
             #[cfg(unix)]
@@ -6148,6 +6151,7 @@ mod tests {
             rounds: 1,
             reviewed_by: None,
             skipped: vec![],
+            screenshots: vec![],
         };
         app.handle(Msg::BacklogDone { key: "T-1".into(), result: Ok(Box::new(fixed)) });
         assert_eq!(app.backlog.done(), 1);
@@ -6248,6 +6252,7 @@ mod tests {
             rounds: 1,
             reviewed_by: None,
             skipped: vec![],
+            screenshots: vec![],
         };
         app.handle(Msg::AgentRunDone { key: "agent/add-a-json-flag".into(), result: Ok(Box::new(fixed)) });
         assert_eq!(app.coding.worktree.done(), 1);

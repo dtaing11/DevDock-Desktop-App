@@ -1390,6 +1390,7 @@ dependencies = [
  "dirs",
  "eframe",
  "egui",
+ "image",
  "libc",
  "open",
  "regex",

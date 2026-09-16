@@ -155,6 +155,16 @@ now, and — on **Log** — everything it did: every file read, every edit, ever
 check, the commit, the push. A finished card lists the files it changed with
 line counts, its summary, and the pull request.
 
+### A screenshot of the result
+
+When the repository holds a Flutter app, a run that passes its checks
+renders the app's first frame — through a generated golden test, with the
+SDK's real fonts, on a 1280×800 surface, where the checks ran — and keeps
+the image under DevDock's own directory. The card shows it under "What it
+looks like", with Open for the file. The generated test and image never
+enter the change. An app whose `main` cannot start in a widget test (it
+waits on a service, say) gets no screenshot, and the log says so.
+
 ### Questions
 
 A fixer that is genuinely unsure asks you: the question appears on the

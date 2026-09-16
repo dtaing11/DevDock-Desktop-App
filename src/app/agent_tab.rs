@@ -927,7 +927,7 @@ fn worktree_runs(app: &mut App, ui: &mut egui::Ui) {
             let expanded = app.coding.worktree.expanded.as_deref() == Some(key.as_str());
             let Some(run) = app.coding.worktree.runs.get_mut(&key) else { continue };
             let title = run.title.clone();
-            match super::backlog::run_card(ui, &key, &title, run, expanded, "agent-worktree-log") {
+            match super::backlog::run_card(ui, &key, &title, run, expanded, "agent-worktree-log", &mut app.screenshots) {
                 super::backlog::CardAction::None => {}
                 super::backlog::CardAction::ToggleLog => {
                     app.coding.worktree.expanded = if expanded { None } else { Some(key.clone()) };

@@ -18,6 +18,12 @@
 //! - [`ollama`]: local Ollama client that turns diffs into commit messages.
 //! - [`app`]: the egui desktop application built on top of the layers above.
 
+/// This build, for `--version` and Settings: package version, commit,
+/// date. `unknown` when built outside a git checkout.
+pub fn build_description() -> String {
+    format!("{} ({} · built {})", env!("CARGO_PKG_VERSION"), env!("DEVDOCK_COMMIT"), env!("DEVDOCK_BUILD_DATE"))
+}
+
 pub mod agent;
 pub mod app;
 pub mod claude;

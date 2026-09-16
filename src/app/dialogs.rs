@@ -2890,6 +2890,15 @@ fn settings(app: &mut App, ctx: &egui::Context, open: &mut bool) {
     modal(ctx, "Settings", open, |ui| {
         fit_width(ui, 420.0);
 
+        ui.label(
+            RichText::new(format!("DevDock {}", crate::build_description()))
+                .size(theme::SMALL)
+                .color(theme::fg_dim()),
+        )
+        .on_hover_text(
+            std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default(),
+        );
+        ui.add_space(theme::UNIT);
         ui.label(theme::overline("APPEARANCE"));
         ui.horizontal(|ui| {
             let light = app.config.light_theme;

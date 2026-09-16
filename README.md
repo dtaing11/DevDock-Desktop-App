@@ -6,6 +6,11 @@ macOS/Windows since egui is cross-platform).
 
 ![Rust](https://img.shields.io/badge/rust-stable-orange) ![License](https://img.shields.io/badge/license-MIT-blue)
 
+> Building from source? After `cargo build --release` (or `devdock push`,
+> which builds it), run `target/release/devdock self-install` so the
+> `devdock` on your PATH is the build you just made. `devdock version`
+> says which build is running.
+
 ## Features
 
 - **Changes view**: see modified/added/deleted/renamed files, check exactly which

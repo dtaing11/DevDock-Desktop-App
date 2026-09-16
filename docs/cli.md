@@ -91,6 +91,8 @@ Unassigned Jira tickets, judged for what an agent could fix, and the fixing.
 See [jira-tickets.md](jira-tickets.md#working-the-backlog).
 
 ```
+devdock version                   # which build: version, commit, date, path
+target/release/devdock self-install   # after building: copy over ~/.local/bin/devdock
 devdock backlog --project ABC                 # list + judge (the only project needs no flag)
 devdock backlog fix ABC-7 ABC-12              # one agent each, in parallel worktrees
 devdock backlog fix ABC-7 --parallel 2 --sandbox lima             # a Lima VM of its own

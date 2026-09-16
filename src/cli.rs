@@ -31,10 +31,12 @@ pub fn run(args: &[String]) -> Option<ExitCode> {
             print_help();
             ExitCode::SUCCESS
         }
-        "--version" | "-V" => {
-            println!("devdock {}", env!("CARGO_PKG_VERSION"));
+        "--version" | "-V" | "version" => {
+            println!("devdock {}", crate::build_description());
+            println!("running from {}", std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default());
             ExitCode::SUCCESS
         }
+        "self-install" => cmd_self_install(rest),
         other => {
             eprintln!("devdock: unknown command \"{other}\"\n");
             print_help();
@@ -64,6 +66,8 @@ fn print_help() {
         ("commit -m MSG", "stage everything and commit"),
         ("commit --ai", "AI message with accept/regenerate/edit review"),
         ("push", "push current branch, gated by local CI"),
+        ("self-install [PATH]", "copy this build over the devdock on your PATH (default ~/.local/bin/devdock)"),
+        ("version", "which build this is: version, commit, date, and where it runs from"),
         ("push --force", "force push (--force-with-lease)"),
         ("push --no-verify", "skip the local CI gate"),
         ("pr -t TITLE [-b BODY]", "CI gate, push, open PR into main"),
@@ -1011,6 +1015,50 @@ fn cmd_stash(rest: &[String]) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Copies the running binary over the installed one. After `devdock push`
+/// in DevDock's own repository, `target/release/devdock self-install` is
+/// how the fix reaches the `devdock` you actually launch — without it, an
+/// old build on the PATH quietly keeps every bug you just fixed.
+fn cmd_self_install(rest: &[String]) -> ExitCode {
+    let target = match rest.first() {
+        Some(p) => std::path::PathBuf::from(p),
+        None => match dirs::home_dir() {
+            Some(home) => home.join(".local/bin/devdock"),
+            None => {
+                eprintln!("devdock: no home directory; give a path");
+                return ExitCode::from(2);
+            }
+        },
+    };
+    let me = match std::env::current_exe().and_then(|p| p.canonicalize()) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("devdock: cannot tell where this binary is: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if target.canonicalize().ok().as_deref() == Some(me.as_path()) {
+        println!("{} is already this build ({}).", target.display(), crate::build_description());
+        return ExitCode::SUCCESS;
+    }
+    if let Some(dir) = target.parent() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("devdock: cannot create {}: {e}", dir.display());
+            return ExitCode::from(1);
+        }
+    }
+    // Write beside, then rename: a running copy keeps its old inode, and a
+    // half-written binary is never what the PATH finds.
+    let staging = target.with_extension("new");
+    if let Err(e) = std::fs::copy(&me, &staging).and_then(|_| std::fs::rename(&staging, &target)) {
+        eprintln!("devdock: could not install to {}: {e}", target.display());
+        let _ = std::fs::remove_file(&staging);
+        return ExitCode::from(1);
+    }
+    println!("installed devdock {} at {}", crate::build_description(), target.display());
+    ExitCode::SUCCESS
 }
 
 fn cmd_push(rest: &[String]) -> ExitCode {

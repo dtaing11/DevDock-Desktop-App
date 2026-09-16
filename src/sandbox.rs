@@ -255,6 +255,44 @@ impl Sandbox {
         Ok(Sandbox { kind, name, root, inner_root: MOUNT.into(), image: image.to_string() })
     }
 
+    /// Installs what the repository's toolchains need and the sandbox does
+    /// not have — Flutter for a `pubspec.yaml`, Rust for a `Cargo.toml`,
+    /// Node, Python, Go — into the sandbox's home, where it stays for the
+    /// next run. `programs` are the commands the checks and toolchains use.
+    /// A plain Ubuntu image knows none of them; this is what makes it able
+    /// to build and test the repository.
+    pub fn provision(&self, programs: &[&str], log: &mut dyn FnMut(String)) -> Result<(), String> {
+        let missing: Vec<&str> = {
+            let probe = programs.iter().map(|p| format!("command -v {p} >/dev/null 2>&1 || echo MISSING:{p}")).collect::<Vec<_>>().join("; ");
+            if probe.is_empty() {
+                return Ok(());
+            }
+            let out = self.exec(&probe, "", &[], Some(Duration::from_secs(60)))?;
+            out.stdout.lines().filter_map(|l| l.strip_prefix("MISSING:")).map(|p| p.trim()).filter(|p| !p.is_empty()).map(|p| programs.iter().copied().find(|q| *q == p).unwrap_or("")).filter(|p| !p.is_empty()).collect()
+        };
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let mut done = std::collections::BTreeSet::new();
+        for program in &missing {
+            let Some(recipe) = recipe_for(program) else {
+                log(format!("sandbox: no recipe to install `{program}`; the agent can install it itself"));
+                continue;
+            };
+            if !done.insert(recipe.name) {
+                continue;
+            }
+            log(format!("sandbox: installing {} (missing `{program}`; the first time takes a while, then it is kept)", recipe.name));
+            let out = self.exec(recipe.script, "", &[], Some(Duration::from_secs(1_800)))?;
+            if !out.success {
+                let tail: String = out.stderr.lines().rev().take(15).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+                return Err(format!("could not install {} in the sandbox:\n{tail}", recipe.name));
+            }
+            log(format!("sandbox: {} installed", recipe.name));
+        }
+        Ok(())
+    }
+
     /// One line for logs and pull requests.
     pub fn describe(&self) -> String {
         match self.kind {
@@ -329,6 +367,81 @@ impl Drop for Sandbox {
     }
 }
 
+/// How to install one toolchain in a Debian-family sandbox, as root or
+/// through passwordless sudo (a Lima VM's user has it).
+struct Recipe {
+    name: &'static str,
+    script: &'static str,
+}
+
+/// `apt-get` with the right prefix, as a shell fragment the recipes share.
+const APT: &str = r#"
+set -e
+if [ "$(id -u)" = 0 ]; then SUDO=""; else SUDO="sudo -n"; fi
+export DEBIAN_FRONTEND=noninteractive
+apt_install() { $SUDO apt-get update -qq >/dev/null 2>&1 || true; $SUDO apt-get install -y -qq "$@" >/dev/null; }
+add_path() { grep -qs "$1" "$HOME/.profile" 2>/dev/null || printf 'export PATH="%s:$PATH"
+' "$1" >> "$HOME/.profile"; export PATH="$1:$PATH"; }
+"#;
+
+/// The recipe that provides `program`, if there is one.
+fn recipe_for(program: &str) -> Option<Recipe> {
+    let (name, body): (&'static str, &'static str) = match program {
+        "flutter" | "dart" => ("Flutter", r#"
+apt_install git curl unzip xz-utils zip libglu1-mesa ca-certificates
+if [ ! -d "$HOME/flutter" ]; then git clone --quiet --depth 1 -b stable https://github.com/flutter/flutter.git "$HOME/flutter"; fi
+add_path "$HOME/flutter/bin"
+add_path "$HOME/.pub-cache/bin"
+git config --global --add safe.directory "$HOME/flutter" || true
+flutter --version >/dev/null
+"#),
+        "cargo" | "rustc" | "rustfmt" => ("Rust", r#"
+apt_install curl build-essential pkg-config libssl-dev ca-certificates
+if [ ! -x "$HOME/.cargo/bin/cargo" ]; then curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path >/dev/null; fi
+add_path "$HOME/.cargo/bin"
+cargo --version >/dev/null
+"#),
+        "node" | "npm" | "npx" | "pnpm" | "yarn" => ("Node.js", r#"
+apt_install nodejs npm ca-certificates
+$SUDO npm install -g --silent corepack >/dev/null 2>&1 || true
+corepack enable >/dev/null 2>&1 || $SUDO corepack enable >/dev/null 2>&1 || true
+node --version >/dev/null
+"#),
+        "python" | "python3" | "pip" | "pytest" | "uv" | "ruff" => ("Python", r#"
+apt_install python3 python3-pip python3-venv
+python3 -m pip install --user --quiet --break-system-packages pytest uv ruff >/dev/null 2>&1 || python3 -m pip install --user --quiet pytest uv ruff >/dev/null
+add_path "$HOME/.local/bin"
+python3 --version >/dev/null
+"#),
+        "go" | "gofmt" => ("Go", r#"
+apt_install golang-go
+go version >/dev/null
+"#),
+        "mix" | "elixir" => ("Elixir", r#"
+apt_install elixir
+mix --version >/dev/null
+"#),
+        "bundle" | "ruby" | "rspec" | "rake" => ("Ruby", r#"
+apt_install ruby-full build-essential
+gem install --user-install --no-document bundler rspec >/dev/null 2>&1 || true
+add_path "$(ruby -e 'puts Gem.user_dir')/bin"
+ruby --version >/dev/null
+"#),
+        "make" => ("build tools", r#"
+apt_install build-essential
+"#),
+        "gradle" | "./gradlew" | "mvn" | "./mvnw" | "java" => ("Java", r#"
+apt_install default-jdk gradle maven
+java -version >/dev/null 2>&1
+"#),
+        _ => return None,
+    };
+    // Leaked once per distinct recipe: a handful of static strings.
+    let script: &'static str = Box::leak(format!("{APT}
+{body}").into_boxed_str());
+    Some(Recipe { name, script })
+}
+
 fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
@@ -382,6 +495,46 @@ mod tests {
         assert!(err.contains(kind.label()) && err.contains("not installed"), "{err}");
     }
 
+    #[test]
+    fn every_toolchain_has_a_recipe_that_sh_accepts() {
+        for program in ["flutter", "dart", "cargo", "npm", "python3", "pytest", "go", "mix", "bundle", "make", "gradle"] {
+            let recipe = recipe_for(program).unwrap_or_else(|| panic!("no recipe for {program}"));
+            assert!(recipe.script.contains("set -e"));
+            // `sh -n` parses without running.
+            let out = Command::new("sh").arg("-n").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().and_then(|mut child| {
+                use std::io::Write as _;
+                child.stdin.take().unwrap().write_all(recipe.script.as_bytes())?;
+                child.wait_with_output()
+            }).unwrap();
+            assert!(out.status.success(), "{program}: {}", String::from_utf8_lossy(&out.stderr));
+        }
+        assert!(recipe_for("frobnicate").is_none());
+        assert_eq!(recipe_for("dart").unwrap().name, "Flutter");
+    }
+
+    /// Flutter, the toolchain a plain image is least likely to have,
+    /// installed into the sandbox and found by a login shell — the case of
+    /// a Flutter repository's `dart analyze` check. Slow the first time.
+    /// `cargo test --lib sandbox::tests::live_flutter -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_flutter_is_provisioned_and_dart_analyze_runs() {
+        if installed().is_empty() {
+            eprintln!("no runtime installed; skipping");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("pubspec.yaml"), "name: rules\nenvironment:\n  sdk: ^3.0.0\n").unwrap();
+        std::fs::create_dir_all(tmp.path().join("lib")).unwrap();
+        std::fs::write(tmp.path().join("lib/rules.dart"), "int twice(int x) => x * 2;\n").unwrap();
+        let sandbox = Sandbox::start(&Spec::default(), tmp.path(), &mut |l| println!("  {l}")).unwrap();
+        sandbox.provision(&["dart"], &mut |l| println!("  {l}")).unwrap();
+        let out = sandbox.exec("dart --version && dart pub get && dart analyze", "", &[], Some(Duration::from_secs(600))).unwrap();
+        println!("{}{}", out.stdout, out.stderr);
+        assert!(out.success, "{}{}", out.stdout, out.stderr);
+        assert!(out.stdout.contains("No issues found") || out.stderr.contains("No issues found"), "{}{}", out.stdout, out.stderr);
+    }
+
     /// A real sandbox on whatever runtime is installed: the network is on,
     /// a command runs in the worktree, root is available, and something
     /// installed in one command is there for the next.
@@ -416,6 +569,12 @@ mod tests {
         assert!(out.stdout.contains("env=bar baz"), "{}", out.stdout);
         let out = sandbox.exec("sleep 30", "", &[], Some(Duration::from_secs(2))).unwrap();
         assert!(!out.success, "a timeout is a failure");
+        // Provisioning: a toolchain the sandbox lacks is installed and then
+        // found by a login shell, as a check would find it.
+        sandbox.provision(&["python3", "pytest"], &mut |l| println!("  {l}")).unwrap();
+        let out = sandbox.exec("python3 -c 'print(1+1)' && pytest --version", "", &[], Some(Duration::from_secs(120))).unwrap();
+        assert!(out.success, "{}{}", out.stdout, out.stderr);
+        assert!(out.stdout.contains('2'));
         println!("describe: {}", sandbox.describe());
     }
 }

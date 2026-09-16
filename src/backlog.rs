@@ -457,7 +457,18 @@ fn work(
     // The sandbox, when there is one: started once, shared by the agent's
     // commands and the verification here, gone when this returns.
     let sandbox = match job.sandbox {
-        Some(spec) => Some(std::sync::Arc::new(crate::sandbox::Sandbox::start(spec, wt.path(), on_event)?)),
+        Some(spec) => {
+            let sandbox = crate::sandbox::Sandbox::start(spec, wt.path(), on_event)?;
+            // What the checks and the repository's toolchains run, installed
+            // where they will run. A plain image has none of it.
+            let mut programs: Vec<&str> = crate::local_ci::toolchain_commands(wt.path());
+            let firsts: Vec<String> = jobs.iter().flat_map(|j| j.commands.iter()).filter_map(|c| c.split_whitespace().next()).filter(|w| *w != "cd").map(str::to_string).collect();
+            programs.extend(firsts.iter().map(String::as_str));
+            programs.sort_unstable();
+            programs.dedup();
+            sandbox.provision(&programs, on_event)?;
+            Some(std::sync::Arc::new(sandbox))
+        }
         None => None,
     };
     let mut runners = crate::local_ci::runner::RunnerRegistry::with_builtins();
@@ -570,6 +581,16 @@ fn work(
             on_event(format!("{} {}", j.name, if result.ok { "passed" } else { "FAILED" }));
             checks.push(CheckOutcome { name: j.name.clone(), ok: result.ok });
             if !result.ok {
+                // A program the check needs is not there: the environment's
+                // fault, not the change's. Saying so beats another round.
+                if let Some(program) = missing_program(&result.output) {
+                    return Err(format!(
+                        "the check `{}` needs `{program}`, which is not installed where the checks run{}.\n{}",
+                        j.name,
+                        if sandbox.is_some() { " (the sandbox)" } else { " (this machine; DevDock uses your login shell's PATH)" },
+                        result.output.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")
+                    ));
+                }
                 let tail: String = result
                     .output
                     .lines()
@@ -839,6 +860,21 @@ fn keep_attempt(dir: &Path, task: &Task, why: &str) -> Option<String> {
     ))
 }
 
+/// The program a shell said it could not find, from a check's output:
+/// `sh: 1: dart: not found`, `bash: flutter: command not found`.
+pub fn missing_program(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_suffix(": not found").or_else(|| line.strip_suffix(": command not found")) {
+            let program = rest.rsplit(':').next().unwrap_or(rest).trim();
+            if !program.is_empty() && !program.contains(' ') {
+                return Some(program.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn branch_has_commits(repo: &Repo, branch: &str, base: &str) -> bool {
     repo.git(&["rev-list", "--count", &format!("{base}..{branch}")])
         .ok()
@@ -1029,6 +1065,27 @@ mod tests {
         assert!(log.iter().any(|l| l.contains("changed lib.py +1 -1")), "{log:?}");
         let subject = repo.log(1, Some("fix/abc-7-total-is-off-by-one")).unwrap()[0].subject.clone();
         assert_eq!(subject, "ABC-7: total() is off by one");
+    }
+
+    #[test]
+    fn a_missing_program_fails_the_run_as_the_environments_fault() {
+        assert_eq!(missing_program("--- stderr ---\nsh: 1: dart: not found\n").as_deref(), Some("dart"));
+        assert_eq!(missing_program("bash: flutter: command not found").as_deref(), Some("flutter"));
+        assert_eq!(missing_program("error: test failed\nassertion `left == right`").as_deref(), None);
+
+        let (_tmp, repo) = setup("no-such-program-xyz analyze");
+        let engine = Engine::Harness(Box::new(fixing_provider()));
+        let mut log = Vec::new();
+        let err = fix(
+            &repo,
+            &engine,
+            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox: None, claim: None, rounds: 3, reviewer: None },
+            &fake_pr,
+            &mut |line| log.push(line),
+        )
+        .unwrap_err();
+        assert!(err.contains("needs `no-such-program-xyz`, which is not installed"), "{err}");
+        assert!(!log.iter().any(|l| l == "round 2 of 3"), "no round was spent on it: {log:?}");
     }
 
     #[test]

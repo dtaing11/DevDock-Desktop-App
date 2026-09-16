@@ -143,6 +143,10 @@ impl Runner for HostRunner {
     fn exec(&self, request: &ExecRequest<'_>) -> Result<ExecOutput, String> {
         let mut cmd = Command::new("sh");
         cmd.args(["-c", request.script]).current_dir(request.workdir());
+        // An app opened from the Finder or a launcher gets a bare PATH;
+        // the checks need the one the developer's terminal has, where
+        // flutter, cargo and node live.
+        cmd.env("PATH", login_path());
         for (key, value) in request.env {
             cmd.env(key, value);
         }
@@ -161,6 +165,37 @@ impl Runner for HostRunner {
         let pid = child.id();
         wait_with_timeout(child, request.timeout, || kill_group(pid))
     }
+}
+
+/// The PATH the developer's login shell has, read once: this process's
+/// own PATH is a bare default when the app was started from the Finder.
+pub fn login_path() -> String {
+    static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let own = std::env::var("PATH").unwrap_or_default();
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        let from_shell = Command::new(&shell)
+            .args(["-lc", "printf %s \"$PATH\""])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        if from_shell.is_empty() {
+            return own;
+        }
+        // The shell's first, then anything this process had that it lacks.
+        let mut merged: Vec<&str> = from_shell.split(':').filter(|p| !p.is_empty()).collect();
+        for p in own.split(':') {
+            if !p.is_empty() && !merged.contains(&p) {
+                merged.push(p);
+            }
+        }
+        merged.join(":")
+    })
+    .clone()
 }
 
 /// Ends every process in `pid`'s group; on other platforms the child alone

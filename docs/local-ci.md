@@ -603,6 +603,9 @@ list rather than failing. Claude models all support it.
 
 ### The checks the coding agent can run
 
+Checks on this machine run with your login shell's `PATH`, so an app opened
+from the Finder finds `flutter`, `cargo` and `node` where your terminal does.
+
 The jobs you declare here are what the
 [coding agent](editor-and-agent.md#the-coding-agent) treats as the
 definition of done. In "let it iterate" mode it may call `run_check` with a

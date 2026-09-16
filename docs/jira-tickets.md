@@ -204,6 +204,13 @@ Three runtimes, whichever is installed (the picker shows which):
 - **Docker**: one long-lived container per run, so `apt-get install` in one
   command is there for the next.
 
+When the sandbox starts, DevDock installs what the repository's toolchains
+and checks need and the sandbox lacks — Flutter and Dart for a
+`pubspec.yaml`, Rust for a `Cargo.toml`, Node, Python, Go, Ruby, Java —
+into the sandbox's home, where it stays for the next run. The log says
+what it installed. A check that still fails because a program is missing
+ends the run with that message, without spending a round on the agent.
+
 The container runtimes mount the worktree at `/work` and keep toolchains in
 a named volume, `devdock-toolchains`, with `HOME` inside it; `docker volume
 rm devdock-toolchains` clears it. The base image is plain Ubuntu unless you

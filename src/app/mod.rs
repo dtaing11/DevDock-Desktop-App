@@ -4356,6 +4356,39 @@ impl App {
         }
     }
 
+    /// Turns a kept attempt into a real commit and a draft pull request:
+    /// the WIP commit reworded to the task's subject, pushed, opened.
+    pub fn publish_attempt(&mut self, branch: &str) {
+        let Some(repo) = self.repo.clone() else { return };
+        if github::Client::from_store().is_none() {
+            self.toast("Sign in to GitHub first: the attempt ends as a pull request.", true);
+            return;
+        }
+        let branch = branch.to_string();
+        let token = self.gh_token();
+        let subject = repo
+            .kept_attempts()
+            .ok()
+            .and_then(|a| a.into_iter().find(|a| a.branch == branch).map(|a| a.title))
+            .unwrap_or_else(|| branch.clone());
+        self.worktrees.busy = true;
+        self.worker.spawn(move || {
+            let result = (|| -> Result<String, String> {
+                let client = github::Client::from_store().ok_or("Not signed in to GitHub")?;
+                let slug = views::origin_slug(&repo).ok_or("No github.com remote found")?;
+                let base = crate::stack::default_branch(&repo);
+                let body = "Started by DevDock's coding agent and finished by hand from its kept attempt.";
+                repo.finish_attempt(&branch, &subject, body, token.as_deref()).map_err(|e| e.to_string())?;
+                let pr = client
+                    .create_draft_pull_request(&slug, &subject, &format!("{body}\n\nReview before marking ready."), &branch, &base)
+                    .map_err(|e| e.to_string())?;
+                let _ = open::that(&pr.html_url);
+                Ok(format!("Draft PR #{} opened from {branch}.", pr.number))
+            })();
+            Msg::WorktreeDone { message: result, open: None }
+        });
+    }
+
     /// The worktree for a kept attempt, made under `<repo>-attempts/` if
     /// it is not there yet.
     pub fn check_out_attempt(&mut self, branch: &str) -> Result<std::path::PathBuf, String> {

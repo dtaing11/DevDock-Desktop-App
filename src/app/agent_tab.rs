@@ -896,6 +896,7 @@ fn worktree_runs(app: &mut App, ui: &mut egui::Ui) {
                     app.coding.worktree.expanded = if expanded { None } else { Some(key.clone()) };
                 }
                 super::backlog::CardAction::OpenAttempt(branch) => app.open_attempt_in_vscode(&branch),
+                super::backlog::CardAction::PublishAttempt(branch) => app.publish_attempt(&branch),
             }
             ui.add_space(theme::UNIT);
         }

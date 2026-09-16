@@ -417,6 +417,13 @@ pub fn dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                         app.open_attempt_in_vscode(&attempt.branch);
                     }
                     if ui
+                        .add_enabled(!busy, egui::Button::new("Open as PR").small())
+                        .on_hover_text("Rewords the WIP commit to the task's title, pushes the branch, and opens a draft pull request.")
+                        .clicked()
+                    {
+                        app.publish_attempt(&attempt.branch);
+                    }
+                    if ui
                         .add_enabled(!busy, egui::Button::new("Clear").small())
                         .on_hover_text("Deletes this attempt: its worktree and its branch.")
                         .clicked()

@@ -214,7 +214,7 @@ pub struct LoadedConfigs {
 /// each job runs in its project's directory, named after it.
 pub fn inferred_jobs(repo_root: &Path) -> Vec<Job> {
     let mut dirs: Vec<PathBuf> = Vec::new();
-    collect_project_dirs(repo_root, 0, &mut dirs);
+    collect_project_dirs(repo_root, 0, &mut dirs, &|dir| !inferred_jobs_in(dir).is_empty());
     let mut jobs = Vec::new();
     for dir in dirs {
         let rel = dir.strip_prefix(repo_root).unwrap_or(&dir).to_string_lossy().replace('\\', "/");
@@ -235,8 +235,9 @@ pub fn inferred_jobs(repo_root: &Path) -> Vec<Job> {
 /// the checks: building, formatting, fetching dependencies, all with the
 /// tool the project already relies on.
 pub fn toolchain_commands(repo_root: &Path) -> Vec<&'static str> {
+    const MARKERS: &[&str] = &["pubspec.yaml", "Cargo.toml", "go.mod", "package.json", "pyproject.toml", "setup.py", "pytest.ini", "requirements.txt", "mix.exs", "Gemfile", "Makefile", "build.gradle", "build.gradle.kts", "pom.xml"];
     let mut dirs: Vec<PathBuf> = Vec::new();
-    collect_project_dirs(repo_root, 0, &mut dirs);
+    collect_project_dirs(repo_root, 0, &mut dirs, &|dir| MARKERS.iter().any(|m| dir.join(m).exists()));
     let mut out: Vec<&'static str> = Vec::new();
     for dir in dirs {
         let has = |name: &str| dir.join(name).exists();
@@ -276,15 +277,66 @@ pub fn toolchain_commands(repo_root: &Path) -> Vec<&'static str> {
     out
 }
 
-/// Directories that look like a project, nearest the root first. Stops
+/// What has to happen before a project's checks can run at all: fetching
+/// its dependencies. One job per project directory that needs it, run in
+/// that directory, named after what it does. Nothing here is a check — a
+/// failure means the worktree is not ready, not that the change is wrong.
+/// `installing` allows steps that install into the environment (pip),
+/// which are for a sandbox, not the developer's machine.
+pub fn prepare_jobs(repo_root: &Path, installing: bool) -> Vec<Job> {
+    const MARKERS: &[&str] = &["pubspec.yaml", "package.json", "Gemfile", "mix.exs", "requirements.txt"];
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    collect_project_dirs(repo_root, 0, &mut dirs, &|dir| MARKERS.iter().any(|m| dir.join(m).exists()));
+    let mut jobs = Vec::new();
+    for dir in dirs {
+        let rel = dir.strip_prefix(repo_root).unwrap_or(&dir).to_string_lossy().replace('\\', "/");
+        let has = |name: &str| dir.join(name).exists();
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_default();
+        let mut step = |what: &str, command: &str| {
+            let name = if rel.is_empty() { what.to_string() } else { format!("{what} ({rel})") };
+            jobs.push(Job { name, commands: vec![command.to_string()], dir: rel.clone(), ..Default::default() });
+        };
+        if has("pubspec.yaml") {
+            let pubspec = read("pubspec.yaml");
+            if pubspec.contains("sdk: flutter") || pubspec.contains("flutter:") {
+                step("flutter pub get", "flutter pub get");
+            } else {
+                step("dart pub get", "dart pub get");
+            }
+        }
+        if has("package.json") {
+            if has("pnpm-lock.yaml") {
+                step("pnpm install", "pnpm install --frozen-lockfile");
+            } else if has("yarn.lock") {
+                step("yarn install", "yarn install --frozen-lockfile");
+            } else if has("package-lock.json") {
+                step("npm ci", "npm ci");
+            } else {
+                step("npm install", "npm install");
+            }
+        }
+        if has("Gemfile") {
+            step("bundle install", "bundle install");
+        }
+        if has("mix.exs") {
+            step("mix deps.get", "mix deps.get");
+        }
+        if installing && has("requirements.txt") {
+            step("pip install", "python3 -m pip install -q -r requirements.txt");
+        }
+    }
+    jobs
+}
+
+/// Directories `is_project` accepts, nearest the root first. Stops
 /// descending once one is found: a project's own subdirectories are its
 /// business, and dependency and build trees are never projects.
-fn collect_project_dirs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+fn collect_project_dirs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>, is_project: &dyn Fn(&Path) -> bool) {
     const SKIP: &[&str] = &[
         "node_modules", "target", "build", "dist", "vendor", ".dart_tool", ".git", "ios",
         "android", "macos", "linux", "windows", "web", "Pods", "__pycache__", ".venv", "venv",
     ];
-    if !inferred_jobs_in(dir).is_empty() {
+    if is_project(dir) {
         out.push(dir.to_path_buf());
         return;
     }
@@ -304,7 +356,7 @@ fn collect_project_dirs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
         .collect();
     children.sort();
     for child in children {
-        collect_project_dirs(&child, depth + 1, out);
+        collect_project_dirs(&child, depth + 1, out, is_project);
     }
 }
 
@@ -324,6 +376,12 @@ fn inferred_jobs_in(repo_root: &Path) -> Vec<Job> {
             jobs.push(job("analyze", &["flutter analyze"]));
             if has("test") {
                 jobs.push(job("test", &["flutter test"]));
+            }
+            // A build that needs no device and no platform SDK: the Dart
+            // code compiled and the assets bundled. The cheapest proof the
+            // app still starts.
+            if has("lib/main.dart") {
+                jobs.push(job("build", &["flutter build bundle"]));
             }
         } else {
             jobs.push(job("analyze", &["dart analyze"]));
@@ -1046,6 +1104,17 @@ mod tests {
         let jobs = inferred_jobs(tmp.path());
         let commands: Vec<&str> = jobs.iter().flat_map(|j| j.commands.iter().map(String::as_str)).collect();
         assert_eq!(commands, ["flutter analyze", "flutter test"]);
+        // An app — it has a main — gets a device-free build as a smoke step.
+        std::fs::create_dir_all(tmp.path().join("lib")).unwrap();
+        std::fs::write(tmp.path().join("lib/main.dart"), "void main() {}\n").unwrap();
+        let commands: Vec<String> = inferred_jobs(tmp.path()).iter().flat_map(|j| j.commands.clone()).collect();
+        assert_eq!(commands, ["flutter analyze", "flutter test", "flutter build bundle"]);
+        // And what has to happen before any of them: its dependencies.
+        let prepare: Vec<String> = prepare_jobs(tmp.path(), false).iter().map(|j| j.name.clone()).collect();
+        assert_eq!(prepare, ["flutter pub get"]);
+        std::fs::write(tmp.path().join("requirements.txt"), "requests\n").unwrap();
+        assert!(!prepare_jobs(tmp.path(), false).iter().any(|j| j.name.starts_with("pip")), "pip installs only in a sandbox");
+        assert!(prepare_jobs(tmp.path(), true).iter().any(|j| j.name.starts_with("pip")));
 
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("package.json"), r#"{"scripts": {"test": "jest", "lint": "eslint ."}}"#).unwrap();

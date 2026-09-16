@@ -481,6 +481,26 @@ fn work(
     }
     let runners = std::sync::Arc::new(runners);
 
+    // The worktree made ready: dependencies fetched, where the checks will
+    // run. A failure here is the environment's, reported as such, before
+    // any round is spent.
+    for mut step in crate::local_ci::prepare_jobs(wt.path(), sandbox.is_some()) {
+        if sandbox.is_some() {
+            step.runner = Some(crate::sandbox::RUNNER_ID.into());
+        }
+        step.timeout_secs = Some(900);
+        on_event(format!("preparing: {}", step.name));
+        let result = crate::local_ci::run_job_with(&runners, wt.path(), &step);
+        if !result.ok {
+            let tail: String = result.output.lines().rev().take(12).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+            return Err(format!(
+                "the worktree could not be prepared: `{}` failed{}. The change was not attempted.\n{tail}",
+                step.name,
+                if sandbox.is_some() { " in the sandbox" } else { "" }
+            ));
+        }
+    }
+
     let tracked = wt.tracked_files().map_err(|e| e.to_string())?;
     let mut workspace = Workspace::new(wt.path(), tracked.clone(), Access::ReadWrite)?
         .with_write_mode(WriteMode::Live)
@@ -1086,6 +1106,56 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("needs `no-such-program-xyz`, which is not installed"), "{err}");
         assert!(!log.iter().any(|l| l == "round 2 of 3"), "no round was spent on it: {log:?}");
+    }
+
+    #[test]
+    fn a_worktree_comes_with_its_submodules_and_its_dependencies_fetched() {
+        let (tmp, repo) = setup("test -f schemas/schema.txt && test -f node_modules/.devdock-prepared");
+        // A submodule, and a package.json whose install step the run must do.
+        let sub = tmp.path().join("schemas-src");
+        fs::create_dir_all(&sub).unwrap();
+        sh(&sub, &["init", "-q", "-b", "main"]);
+        sh(&sub, &["config", "user.email", "t@t.io"]);
+        sh(&sub, &["config", "user.name", "T"]);
+        fs::write(sub.join("schema.txt"), "schema\n").unwrap();
+        sh(&sub, &["add", "-A"]);
+        sh(&sub, &["commit", "-q", "-m", "schema"]);
+        // A local-path submodule needs git's file transport allowed, for
+        // this add and for the worktree's update: the environment reaches
+        // both.
+        std::env::set_var("GIT_CONFIG_COUNT", "1");
+        std::env::set_var("GIT_CONFIG_KEY_0", "protocol.file.allow");
+        std::env::set_var("GIT_CONFIG_VALUE_0", "always");
+        sh(repo.path(), &["submodule", "add", "-q", sub.to_str().unwrap(), "schemas"]);
+        // "npm install" here is a script that leaves a marker, so the test
+        // needs no Node.
+        fs::create_dir_all(repo.path().join("bin")).unwrap();
+        fs::write(repo.path().join("bin/npm"), "#!/bin/sh\nmkdir -p node_modules && touch node_modules/.devdock-prepared\n").unwrap();
+        fs::write(repo.path().join("package.json"), "{\"name\": \"x\"}\n").unwrap();
+        fs::write(repo.path().join(".gitignore"), "node_modules/\n").unwrap();
+        sh(repo.path(), &["add", "-A"]);
+        sh(repo.path(), &["commit", "-q", "-m", "submodule and package"]);
+        sh(repo.path(), &["push", "-q", "origin", "main"]);
+        let bin = repo.path().join("bin");
+        std::fs::set_permissions(bin.join("npm"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        // The check and the prepare step both need the fake npm on PATH.
+        std::env::set_var("PATH", &path);
+
+        let engine = Engine::Harness(Box::new(fixing_provider()));
+        let mut log = Vec::new();
+        let fixed = fix(
+            &repo,
+            &engine,
+            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox: None, claim: None, rounds: 1, reviewer: None },
+            &fake_pr,
+            &mut |line| log.push(line),
+        )
+        .unwrap_or_else(|e| panic!("{e}\n{log:#?}"));
+        assert!(log.iter().any(|l| l == "preparing: npm install"), "{log:?}");
+        assert_eq!(fixed.checks, [CheckOutcome { name: "tests".into(), ok: true }]);
+        let paths: Vec<&str> = fixed.changes.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, ["lib.py"], "neither the submodule nor node_modules is part of the change");
     }
 
     #[test]

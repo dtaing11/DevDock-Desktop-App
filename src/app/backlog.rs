@@ -709,6 +709,7 @@ fn agent_card(app: &mut App, ui: &mut egui::Ui, key: &str) {
         CardAction::None => {}
         CardAction::ToggleLog => app.backlog.expanded = if expanded { None } else { Some(key.to_string()) },
         CardAction::OpenAttempt(branch) => app.open_attempt_in_vscode(&branch),
+        CardAction::PublishAttempt(branch) => app.publish_attempt(&branch),
     }
 }
 
@@ -718,6 +719,8 @@ pub(super) enum CardAction {
     ToggleLog,
     /// Check the kept branch out and open it in Visual Studio Code.
     OpenAttempt(String),
+    /// Reword the kept attempt's commit, push it, open a draft pull request.
+    PublishAttempt(String),
 }
 
 /// One agent's card: its state, what it is doing or did, its log on
@@ -835,6 +838,13 @@ pub(super) fn run_card(ui: &mut egui::Ui, key: &str, title: &str, run: &TicketRu
                                 .clicked()
                             {
                                 action = CardAction::OpenAttempt(branch.clone());
+                            }
+                            if ui
+                                .button("Open as PR")
+                                .on_hover_text("When the attempt turned out fine: rewords its WIP commit, pushes, and opens a draft pull request.")
+                                .clicked()
+                            {
+                                action = CardAction::PublishAttempt(branch.clone());
                             }
                             ui.label(RichText::new(format!("kept on {branch}, not pushed")).monospace().size(theme::SMALL).color(theme::fg_dim()));
                         });

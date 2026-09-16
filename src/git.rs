@@ -1466,6 +1466,13 @@ impl Repo {
             Some(base) => self.git(&["worktree", "add", "-b", branch, &path_str, base])?,
             None => self.git(&["worktree", "add", &path_str, branch])?,
         };
+        // A worktree comes without its submodules' content; a build that
+        // needs a schemas/ or vendor/ submodule fails on an empty directory.
+        if path.join(".gitmodules").exists() {
+            if let Ok(wt) = Repo::open(&path) {
+                wt.git(&["submodule", "update", "--init", "--recursive", "--quiet"])?;
+            }
+        }
         let wanted = std::fs::canonicalize(&path).unwrap_or(path.clone());
         self.worktrees()?
             .into_iter()
@@ -1473,6 +1480,25 @@ impl Repo {
             .ok_or_else(|| {
                 GitError::Command(format!("git added the worktree at {} but does not list it", path.display()))
             })
+    }
+
+    /// Turns a kept attempt into a real commit on its branch and pushes it:
+    /// the WIP commit is reworded to `subject`/`body` in the attempt's
+    /// worktree (made under `<repo>-attempts/` if it is not there), then the
+    /// branch goes to `origin`. Returns the worktree's path.
+    pub fn finish_attempt(&self, branch: &str, subject: &str, body: &str, auth: Option<&str>) -> Result<PathBuf> {
+        let dir = self.attempt_worktree_path(branch);
+        if !dir.exists() {
+            self.worktree_add(&dir, branch, None)?;
+        }
+        let wt = Repo::open(&dir)?;
+        if wt.current_branch() != branch {
+            return Err(GitError::Command(format!("{} is on {}, not {branch}", dir.display(), wt.current_branch())));
+        }
+        wt.stage_all()?;
+        wt.git(&["commit", "--amend", "-q", "-m", subject, "-m", body])?;
+        wt.push_branch(branch, false, auth)?;
+        Ok(dir)
     }
 
     /// Removes the worktree at `path`, deleting its directory. Refused when

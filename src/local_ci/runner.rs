@@ -170,11 +170,10 @@ impl Runner for HostRunner {
 /// The PATH the developer's login shell has, read once: this process's
 /// own PATH is a bare default when the app was started from the Finder.
 pub fn login_path() -> String {
-    static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PATH.get_or_init(|| {
-        let own = std::env::var("PATH").unwrap_or_default();
+    static SHELL_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let from_shell = SHELL_PATH.get_or_init(|| {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-        let from_shell = Command::new(&shell)
+        Command::new(&shell)
             .args(["-lc", "printf %s \"$PATH\""])
             .stdin(Stdio::null())
             .stderr(Stdio::null())
@@ -182,20 +181,19 @@ pub fn login_path() -> String {
             .ok()
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default();
-        if from_shell.is_empty() {
-            return own;
+            .unwrap_or_default()
+    });
+    // This process's PATH first — it is right when the app was started
+    // from a terminal, and a caller may have put something in front —
+    // then whatever the login shell has that it lacks.
+    let own = std::env::var("PATH").unwrap_or_default();
+    let mut merged: Vec<&str> = own.split(':').filter(|p| !p.is_empty()).collect();
+    for p in from_shell.split(':') {
+        if !p.is_empty() && !merged.contains(&p) {
+            merged.push(p);
         }
-        // The shell's first, then anything this process had that it lacks.
-        let mut merged: Vec<&str> = from_shell.split(':').filter(|p| !p.is_empty()).collect();
-        for p in own.split(':') {
-            if !p.is_empty() && !merged.contains(&p) {
-                merged.push(p);
-            }
-        }
-        merged.join(":")
-    })
-    .clone()
+    }
+    merged.join(":")
 }
 
 /// Ends every process in `pid`'s group; on other platforms the child alone

@@ -97,6 +97,11 @@ pub enum Msg {
     BacklogProgress { key: String, line: String },
     /// A ticket's fix finished, one way or the other.
     BacklogDone { key: String, result: Result<Box<crate::backlog::Fixed>, String> },
+    /// A message for one repository's state: the one the window shows, or
+    /// one kept aside while another is open. Agents keep running on a
+    /// repository after the window moves on, and their messages must not
+    /// land in the wrong one.
+    Routed { repo: String, msg: Box<Msg> },
     /// A line from an Agent-tab run in its own worktree, keyed by branch.
     AgentRunProgress { key: String, line: String },
     /// An Agent-tab worktree run finished.
@@ -234,11 +239,24 @@ impl AiTarget {
 pub struct Progress {
     tx: Sender<Msg>,
     ctx: egui::Context,
+    /// The repository the job belongs to, when its messages must reach
+    /// that repository's state whichever one the window shows.
+    repo: Option<String>,
 }
 
 impl Progress {
+    /// Tags every message from here on with the repository it is for.
+    pub fn for_repo(mut self, repo: String) -> Self {
+        self.repo = Some(repo);
+        self
+    }
+
     /// Delivers one message to the UI thread and asks for a repaint.
     pub fn send(&self, msg: Msg) {
+        let msg = match &self.repo {
+            Some(repo) => Msg::Routed { repo: repo.clone(), msg: Box::new(msg) },
+            None => msg,
+        };
         let _ = self.tx.send(msg);
         self.ctx.request_repaint();
     }
@@ -259,7 +277,13 @@ impl Worker {
 
     /// A progress handle for jobs that report as they go.
     pub fn progress(&self) -> Progress {
-        Progress { tx: self.tx.clone(), ctx: self.ctx.clone() }
+        Progress { tx: self.tx.clone(), ctx: self.ctx.clone(), repo: None }
+    }
+
+    /// Like [`Self::spawn`], with the job's message tagged for `repo`, so
+    /// it lands in that repository's state even if another is open by then.
+    pub fn spawn_for(&self, repo: String, job: impl FnOnce() -> Msg + Send + 'static) {
+        self.spawn(move || Msg::Routed { repo, msg: Box::new(job()) })
     }
 
     /// Runs `job` on a new thread and delivers its message to the UI.

@@ -213,7 +213,8 @@ impl App {
         self.backlog.error = None;
         self.backlog.triage.clear();
         self.backlog.triage_log.clear();
-        self.worker.spawn(move || {
+        let repo_key = self.repo_key();
+        self.worker.spawn_for(repo_key, move || {
             let result = crate::jira::Client::from_store()
                 .ok_or_else(|| "Not connected to Jira.".to_string())
                 .and_then(|c| c.unassigned_backlog(&project, max).map_err(|e| e.to_string()));
@@ -240,11 +241,12 @@ impl App {
         };
         let issues = self.backlog.issues.clone();
         let url = self.effective_ollama_url();
-        let progress = self.worker.progress();
+        let repo_key = self.repo_key();
+        let progress = self.worker.progress().for_repo(repo_key.clone());
         self.backlog.triaging = true;
         self.backlog.error = None;
         self.backlog.triage_log.clear();
-        self.worker.spawn(move || {
+        self.worker.spawn_for(repo_key, move || {
             let result = (|| -> Result<Vec<Triage>, String> {
                 let provider = super::agent_provider(&sel, &url)?;
                 let tracked = strerr(repo.tracked_files())?;
@@ -339,13 +341,14 @@ impl App {
             self.ai_selection(worker::AiTarget::Review).unwrap_or_else(|| sel.clone())
         });
         let project = self.backlog.project.clone();
-        let progress = self.worker.progress();
+        let repo_key = self.repo_key();
+        let progress = self.worker.progress().for_repo(repo_key.clone());
         if let Some(run) = self.backlog.runs.get_mut(&key) {
             run.state = RunState::Running;
             run.started = Some(Instant::now());
         }
         let done_key = key.clone();
-        self.worker.spawn(move || {
+        self.worker.spawn_for(repo_key, move || {
             let result = (|| -> Result<crate::backlog::Fixed, String> {
                 let engine = super::agent_engine(&sel, &url)?;
                 let reviewer = match &review_sel {

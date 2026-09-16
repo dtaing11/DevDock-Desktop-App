@@ -276,6 +276,20 @@ fn repo_menu(app: &mut App, ui: &mut egui::Ui) {
                         app.open_repo(path);
                         ui.close();
                     }
+                    // Agents at work there, so a repository left with a
+                    // run going is not forgotten.
+                    let running = if is_current {
+                        app.agents_running()
+                    } else {
+                        app.sessions.get(path).map(|s| s.agents_running()).unwrap_or(0)
+                    };
+                    if running > 0 {
+                        ui.label(
+                            RichText::new(format!("{running} agent(s) running"))
+                                .small()
+                                .color(theme::ember()),
+                        );
+                    }
                 } else {
                     // Missing on disk: offer repair or removal.
                     ui.label(

@@ -60,6 +60,16 @@ the worktree is removed when it is done — this window's tree is never
 touched, and the runs are tracked as cards in the tab. See
 [docs/editor-and-agent.md](editor-and-agent.md#in-a-fresh-worktree).
 
+## Two repositories at once
+
+Switching repositories from the toolbar keeps everything the one you leave
+had going: its Agent tab and worktree runs, its backlog dialog, ticket
+drafts, editor buffers, review and conflict state, its stack. Come back and
+it is all there. Agents started on it keep running while the other
+repository is on screen, and report to the right one; the repository menu
+shows how many are running on each. Think of it as one window with a seat
+saved for every project, not as one project at a time.
+
 ## Removing one
 
 **Remove** deletes the worktree's directory and is refused if it has

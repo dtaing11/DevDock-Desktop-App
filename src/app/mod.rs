@@ -802,6 +802,39 @@ impl LocalCiState {
 }
 
 /// Top-level application state.
+/// Everything that belongs to one repository and is kept while another is
+/// open: the agent tab and its runs, the backlog, tickets, the editor's
+/// buffers, review and conflict state, the stack, checks. Switching
+/// repositories puts the current one here and takes the next one out, so
+/// juggling two projects loses nothing on either — and agents started on
+/// one keep running and reporting to it while the other is on screen.
+#[derive(Default)]
+pub struct RepoSession {
+    pub coding: agent_tab::CodingState,
+    pub backlog: backlog::BacklogState,
+    pub tickets: TicketsState,
+    pub agent: AgentState,
+    pub conflicts: ConflictState,
+    pub review: ReviewState,
+    pub stack: StackState,
+    pub local_ci: LocalCiState,
+    pub editor: editor::EditorState,
+    pub pr: PrState,
+    pub worktrees: worktrees::WorktreeState,
+    pub graph: Vec<graph::GraphNode>,
+    pub graph_open: bool,
+}
+
+impl RepoSession {
+    /// Agents at work on this repository right now.
+    pub fn agents_running(&self) -> usize {
+        usize::from(self.coding.running)
+            + self.coding.worktree.running()
+            + self.backlog.running()
+            + usize::from(self.agent.running)
+    }
+}
+
 pub struct App {
     pub worker: Worker,
     rx: Receiver<Msg>,
@@ -907,6 +940,9 @@ pub struct App {
     pub editor: editor::EditorState,
     /// The coding agent's tab: task, transcript, and pending changes.
     pub coding: agent_tab::CodingState,
+    /// Repositories opened earlier in this window, with their state, keyed
+    /// by path. See [`RepoSession`].
+    pub sessions: std::collections::HashMap<String, RepoSession>,
     /// An AI-proposed split of the working tree into separate commits.
     pub split: SplitState,
     /// An AI-proposed tidy-up of the branch's commits.
@@ -1047,6 +1083,7 @@ impl App {
             agent: Default::default(),
             editor: Default::default(),
             coding: Default::default(),
+            sessions: Default::default(),
             split: Default::default(),
             tidy: Default::default(),
             #[cfg(unix)]
@@ -1114,6 +1151,54 @@ impl App {
             error,
             until: Instant::now() + Duration::from_secs(if error { 6 } else { 3 }),
         });
+    }
+
+    /// The key a repository's session and messages go by: its path.
+    pub fn repo_key(&self) -> String {
+        self.repo.as_ref().map(|r| r.path().display().to_string()).unwrap_or_default()
+    }
+
+    /// Agents at work on the repository the window shows.
+    pub fn agents_running(&self) -> usize {
+        usize::from(self.coding.running)
+            + self.coding.worktree.running()
+            + self.backlog.running()
+            + usize::from(self.agent.running)
+    }
+
+    /// Moves the current repository's state out, leaving defaults behind.
+    fn take_session(&mut self) -> RepoSession {
+        RepoSession {
+            coding: std::mem::take(&mut self.coding),
+            backlog: std::mem::take(&mut self.backlog),
+            tickets: std::mem::take(&mut self.tickets),
+            agent: std::mem::take(&mut self.agent),
+            conflicts: std::mem::take(&mut self.conflicts),
+            review: std::mem::take(&mut self.review),
+            stack: std::mem::take(&mut self.stack),
+            local_ci: std::mem::take(&mut self.local_ci),
+            editor: std::mem::take(&mut self.editor),
+            pr: std::mem::take(&mut self.pr),
+            worktrees: std::mem::take(&mut self.worktrees),
+            graph: std::mem::take(&mut self.graph),
+            graph_open: std::mem::replace(&mut self.graph_open, false),
+        }
+    }
+
+    fn restore_session(&mut self, session: RepoSession) {
+        self.coding = session.coding;
+        self.backlog = session.backlog;
+        self.tickets = session.tickets;
+        self.agent = session.agent;
+        self.conflicts = session.conflicts;
+        self.review = session.review;
+        self.stack = session.stack;
+        self.local_ci = session.local_ci;
+        self.editor = session.editor;
+        self.pr = session.pr;
+        self.worktrees = session.worktrees;
+        self.graph = session.graph;
+        self.graph_open = session.graph_open;
     }
 
     pub fn open_repo(&mut self, path: &str) {
@@ -1624,9 +1709,42 @@ impl App {
 
     fn handle(&mut self, msg: Msg) {
         match msg {
+            Msg::Routed { repo, msg } => {
+                if repo == self.repo_key() || !self.sessions.contains_key(&repo) {
+                    self.handle(*msg);
+                } else {
+                    // For a repository kept aside: bring its state in, let
+                    // the message do what it does, put it back.
+                    let mine = self.take_session();
+                    let theirs = self.sessions.remove(&repo).unwrap_or_default();
+                    self.restore_session(theirs);
+                    self.handle(*msg);
+                    let theirs = self.take_session();
+                    self.sessions.insert(repo, theirs);
+                    self.restore_session(mine);
+                }
+            }
             Msg::RepoOpened(Ok(path)) => match Repo::open(&path) {
                 Ok(repo) => {
                     self.config.remember_repo(&path);
+                    // The repository being left keeps everything of its
+                    // own — agent tab, backlog, tickets, editor buffers,
+                    // proposals awaiting confirmation, stack, checks — in
+                    // a session, and gets it back when opened again. Its
+                    // agents keep running meanwhile. Nothing of it stays
+                    // here: those states hold repo-relative paths, and
+                    // applying one project's edits to another is the bug
+                    // this prevents.
+                    let previous = self.repo.as_ref().map(|r| r.path().display().to_string());
+                    let switching = previous.as_deref() != Some(path.as_str());
+                    if switching {
+                        if let Some(previous) = previous {
+                            let session = self.take_session();
+                            self.sessions.insert(previous, session);
+                        }
+                        let session = self.sessions.remove(&path).unwrap_or_default();
+                        self.restore_session(session);
+                    }
                     self.repo = Some(repo);
                     self.dialog = Dialog::None;
                     self.status = None;
@@ -1635,30 +1753,21 @@ impl App {
                     self.diff_title.clear();
                     self.unchecked.clear();
                     self.branch_checks = None;
-                    // CI state and history belong to the previous repo.
-                    self.local_ci = Default::default();
                     self.load_local_ci();
-                    // So do any AI proposals and conflict resolutions still
-                    // waiting for confirmation. Their paths are
-                    // repo-relative, so applying them after a repository
-                    // switch would write one project's edits into another.
-                    self.agent = Default::default();
-                    self.conflicts = Default::default();
-                    self.review = Default::default();
-                    // A stack is a chain of branches in one repository; the
-                    // next one has its own.
-                    self.stack = Default::default();
-                    // Graph belongs to the previous repo too.
-                    self.graph.clear();
-                    self.graph_open = false;
-                    // Language servers are per-workspace: stop the previous
-                    // repository's and start fresh, and drop its buffers.
-                    self.lsp.shutdown_all();
-                    self.lsp = std::sync::Arc::new(crate::lsp::Manager::new(
-                        std::path::Path::new(&path),
-                        Some(repaint_handle(&self.ctx)),
-                    ));
-                    self.editor = Default::default();
+                    if switching {
+                        // Language servers are per-workspace: stop the
+                        // previous repository's, start this one's, and tell
+                        // it about the buffers the session brought back.
+                        self.lsp.shutdown_all();
+                        self.lsp = std::sync::Arc::new(crate::lsp::Manager::new(
+                            std::path::Path::new(&path),
+                            Some(repaint_handle(&self.ctx)),
+                        ));
+                        let open: Vec<std::path::PathBuf> = self.editor.files.iter().map(|f| f.path.clone()).collect();
+                        for file in open {
+                            self.lsp_open(&file);
+                        }
+                    }
                     self.refresh();
                 }
                 Err(e) => self.toast(e.to_string(), true),
@@ -2859,12 +2968,13 @@ impl App {
         let types = self.tickets.type_names();
         let url = self.effective_ollama_url();
         let ctx = self.ctx.clone();
-        let tx = self.worker.sender();
+        let repo_key = self.repo_key();
+        let progress = self.worker.progress().for_repo(repo_key.clone());
 
         self.tickets.drafting = true;
         self.tickets.error = None;
         self.tickets.log.clear();
-        self.worker.spawn(move || {
+        self.worker.spawn_for(repo_key, move || {
             let result = (|| -> Result<crate::agent::tickets::Proposal, String> {
                 let provider = agent_provider(&sel, &url)?;
                 let tracked = strerr(repo.tracked_files())?;
@@ -2880,7 +2990,7 @@ impl App {
                     &types,
                     None,
                     &mut |event| {
-                        let _ = tx.send(Msg::AgentEvent {
+                        progress.send(Msg::AgentEvent {
                             kind: worker::AgentKind::Tickets,
                             line: event.line(),
                         });
@@ -3818,8 +3928,9 @@ impl App {
         self.coding.live = false;
         self.coding.task = task;
 
-        let progress = self.worker.progress();
-        self.worker.spawn(move || {
+        let repo_key = self.repo_key();
+        let progress = self.worker.progress().for_repo(repo_key.clone());
+        self.worker.spawn_for(repo_key, move || {
             let result = (|| -> Result<AgentReport, String> {
                 let provider = agent_provider(&sel, &url)?;
                 let tracked = strerr(repo.tracked_files())?;
@@ -4066,9 +4177,10 @@ impl App {
         self.coding.live = live;
         self.tab = Tab::Agent;
 
-        let progress = self.worker.progress();
+        let repo_key = self.repo_key();
+        let progress = self.worker.progress().for_repo(repo_key.clone());
         let run_task = task.clone();
-        self.worker.spawn(move || {
+        self.worker.spawn_for(repo_key, move || {
             let result = (|| -> Result<AgentReport, String> {
                 let engine = agent_engine(&sel, &url)?;
                 let tracked = strerr(repo.tracked_files())?;
@@ -4193,9 +4305,10 @@ impl App {
         self.coding.worktree.branch.clear();
         self.tab = Tab::Agent;
 
-        let progress = self.worker.progress();
+        let repo_key = self.repo_key();
+        let progress = self.worker.progress().for_repo(repo_key.clone());
         let done_key = key.clone();
-        self.worker.spawn(move || {
+        self.worker.spawn_for(repo_key, move || {
             let result = (|| -> Result<crate::backlog::Fixed, String> {
                 let engine = agent_engine(&sel, &url)?;
                 let reviewer = match &review_sel {
@@ -4231,19 +4344,29 @@ impl App {
     /// all of them are in one place and the Worktrees dialog can remove
     /// them — and opens Visual Studio Code on it.
     pub fn open_attempt_in_vscode(&mut self, branch: &str) {
-        let Some(repo) = self.repo.clone() else { return };
-        let dir = repo.attempt_worktree_path(branch);
-        if !dir.exists() {
-            if let Err(e) = repo.worktree_add(&dir, branch, None) {
-                self.toast(format!("Could not check {branch} out: {e}"), true);
+        let dir = match self.check_out_attempt(branch) {
+            Ok(dir) => dir,
+            Err(e) => {
+                self.toast(e, true);
                 return;
             }
-        }
+        };
         match views::open_in_vscode(&dir) {
             Ok(()) => self.toast(format!("Opened {} in Visual Studio Code.", dir.display()), false),
             Err(e) => self.toast(format!("The worktree is at {}, but Visual Studio Code did not open: {e}", dir.display()), true),
         }
-        self.refresh();
+    }
+
+    /// The worktree for a kept attempt, made under `<repo>-attempts/` if
+    /// it is not there yet.
+    pub fn check_out_attempt(&mut self, branch: &str) -> Result<std::path::PathBuf, String> {
+        let repo = self.repo.clone().ok_or("no repository is open")?;
+        let dir = repo.attempt_worktree_path(branch);
+        if !dir.exists() {
+            repo.worktree_add(&dir, branch, None).map_err(|e| format!("Could not check {branch} out: {e}"))?;
+            self.refresh();
+        }
+        Ok(dir)
     }
 
     fn on_agent_run_progress(&mut self, key: String, line: String) {
@@ -4498,8 +4621,9 @@ impl App {
         };
         self.dialog = Dialog::Conflicts;
 
-        let progress = self.worker.progress();
-        self.worker.spawn(move || {
+        let repo_key = self.repo_key();
+        let progress = self.worker.progress().for_repo(repo_key.clone());
+        self.worker.spawn_for(repo_key, move || {
             let result = (|| -> Result<AgentReport, String> {
                 let provider = agent_provider(&sel, &url)?;
                 let tracked = strerr(repo.tracked_files())?;
@@ -6048,8 +6172,9 @@ mod tests {
         app.coding.worktree.runs.insert("agent/kept-one".into(), run);
         app.handle(Msg::AgentRunDone { key: "agent/kept-one".into(), result: Err("after 1 round(s) the change still fails a check.\n\nthe attempt is kept on branch agent/kept-one (2 file(s), not pushed): check it out to finish it, or delete the branch".into()) });
         assert_eq!(app.coding.worktree.runs["agent/kept-one"].kept.as_deref(), Some("agent/kept-one"));
-        app.open_attempt_in_vscode("agent/kept-one");
-        let dir = repo.attempt_worktree_path("agent/kept-one");
+        // Checked out, not opened: a test must not launch an editor.
+        let dir = app.check_out_attempt("agent/kept-one").unwrap();
+        assert_eq!(dir, repo.attempt_worktree_path("agent/kept-one"));
         assert!(dir.display().to_string().ends_with("-attempts/agent-kept-one"), "{}", dir.display());
         assert!(dir.join(".git").exists(), "the worktree exists at {}", dir.display());
         assert!(repo.worktrees().unwrap().iter().any(|w| w.path == dir), "listed with the other worktrees");
@@ -6103,6 +6228,71 @@ mod tests {
         assert!(!app.coding.running);
         app.coding.worktree.clear_finished();
         assert!(app.coding.worktree.runs.is_empty());
+    }
+
+    /// Switching repositories keeps each one's state — agent tab, runs,
+    /// backlog — in a session and brings it back; an agent's messages for a
+    /// repository that is not on screen reach that repository's session.
+    #[test]
+    fn each_repository_keeps_its_own_state_and_its_agents_report_to_it() {
+        use backlog::{RunState, TicketRun};
+        let (_tmp, mut app, _file) = app_with_repo();
+        let a = app.repo_key();
+        app.coding.task = "task for A".into();
+        app.coding.history.push(agent_tab::Exchange { task: "earlier".into(), summary: "done".into(), changed: 1 });
+        let mut run = TicketRun::queued("run on A");
+        run.state = RunState::Running;
+        run.started = Some(Instant::now());
+        app.coding.worktree.runs.insert("agent/a".into(), run);
+        app.backlog.project = "ABC".into();
+
+        // A second repository.
+        let tmp_b = tempfile::tempdir().unwrap();
+        let sh = |args: &[&str]| {
+            let out = Command::new("git").args(args).current_dir(tmp_b.path()).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        };
+        sh(&["init", "-q", "-b", "main"]);
+        sh(&["config", "user.email", "t@t"]);
+        sh(&["config", "user.name", "t"]);
+        std::fs::write(tmp_b.path().join("b.txt"), "b\n").unwrap();
+        sh(&["add", "-A"]);
+        sh(&["commit", "-q", "-m", "init"]);
+        let b = Repo::open(tmp_b.path()).unwrap().path().display().to_string();
+
+        app.handle(Msg::RepoOpened(Ok(b.clone())));
+        assert_eq!(app.repo_key(), b);
+        assert!(app.coding.task.is_empty(), "B starts clean");
+        assert!(app.coding.worktree.runs.is_empty());
+        assert!(app.backlog.project.is_empty());
+        assert_eq!(app.sessions[&a].coding.task, "task for A");
+        assert_eq!(app.sessions[&a].agents_running(), 1);
+
+        // A's agent reports while B is on screen: it lands in A's session.
+        app.handle(Msg::Routed { repo: a.clone(), msg: Box::new(Msg::AgentRunProgress { key: "agent/a".into(), line: "· read x.rs".into() }) });
+        assert!(app.coding.worktree.runs.is_empty(), "nothing of A's shows in B");
+        assert_eq!(app.sessions[&a].coding.worktree.runs["agent/a"].log, ["· read x.rs"]);
+        // And B's own messages land here.
+        app.handle(Msg::Routed { repo: b.clone(), msg: Box::new(Msg::AgentEvent { kind: AgentKind::Coding, line: "· hello B".into() }) });
+        assert_eq!(app.coding.log, ["· hello B"]);
+
+        // Back to A: everything is as it was left, and B is kept.
+        app.coding.task = "task for B".into();
+        app.handle(Msg::RepoOpened(Ok(a.clone())));
+        assert_eq!(app.repo_key(), a);
+        assert_eq!(app.coding.task, "task for A");
+        assert_eq!(app.coding.history.len(), 1);
+        assert_eq!(app.coding.worktree.runs["agent/a"].log, ["· read x.rs"]);
+        assert_eq!(app.backlog.project, "ABC");
+        assert_eq!(app.sessions[&b].coding.task, "task for B");
+        assert_eq!(app.sessions[&b].coding.log, ["· hello B"]);
+        // Reopening the same repository changes nothing.
+        app.handle(Msg::RepoOpened(Ok(a.clone())));
+        assert_eq!(app.coding.task, "task for A");
+        assert!(!app.sessions.contains_key(&a));
+
+        // The repository menu draws with a run going elsewhere.
+        theme::run_test_ctx(|ctx| views::toolbar(&mut app, ctx));
     }
 
     /// Creating a worktree from the dialog puts the branch in its own

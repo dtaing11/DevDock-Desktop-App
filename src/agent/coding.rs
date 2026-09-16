@@ -72,6 +72,15 @@ How to work:
 
 Finish with a short Markdown summary: what you changed and why, one bullet per file; then a line starting "Verified:" naming exactly which checks and diagnostics you ran and what they said — or "Verified: nothing" and why; then anything you deliberately left alone."#;
 
+/// The standard every change is held to, whatever the language: the fixer
+/// is told to write to it, and the reviewer to send back what does not.
+pub const CODE_STANDARD: &str = r#"The code you write, whatever the language or the task:
+- Reusable over ad hoc: when the same logic is needed twice, it lives once — a function, a method, a type — and is called from both places. Never paste a block with small variations. When the repository already has a helper, a base type, or a pattern for what you are doing, use it rather than writing another.
+- One responsibility per unit: a function does one thing and its name says which; a type owns one concept and its data stays behind its methods. Where the language has classes or traits, put behaviour with the data it belongs to rather than in free-floating procedures over bare fields. Prefer composition; keep interfaces small.
+- Clean: names that say what a thing is or does, no abbreviations a stranger would have to decode; no magic numbers — a named constant; no deep nesting — return early; no dead code, commented-out code, TODOs, or debugging output; errors handled where they occur, not swallowed.
+- Consistent with the code around it: match the repository's conventions, module layout, error handling, and test style, so the diff reads as if the maintainer wrote it.
+- Tested: behaviour you add or fix gets a test in the repository's own style, and a bug fix gets the test that would have caught it."#;
+
 const READ_TOOLS: &str = r#"
 Reading the repository: list_files, read_file, and search (literal or regex, optionally with context lines) see every file git tracks."#;
 
@@ -99,6 +108,8 @@ pub fn system_prompt(
     extra_instructions: Option<&str>,
 ) -> String {
     let mut prompt = String::from(BASE_PROMPT);
+    prompt.push_str("\n\n");
+    prompt.push_str(CODE_STANDARD);
     prompt.push_str("\n\nYour tools:\n");
     prompt.push_str(READ_TOOLS);
     prompt.push_str(match write_mode {
@@ -242,6 +253,8 @@ fn run_claude_code(
          so and change nothing. Finish with a short summary: what you changed and why, one \
          bullet per file, then a line starting \"Verified:\" naming what you ran.",
     );
+    extra.push_str("\n\n");
+    extra.push_str(CODE_STANDARD);
     let checks = workspace.check_commands();
     extra.push_str("\n\n");
     extra.push_str(&claude_code::allowed_commands_note(workspace.root(), &checks));
@@ -320,6 +333,7 @@ mod tests {
         let full = system_prompt(WriteMode::Live, true, true, true, Some("Never touch vendor/."));
         assert!(full.contains("The language server:") && full.contains("run_check"));
         assert!(full.contains("run_command") && full.contains("cannot commit, push"));
+        assert!(bare.contains("Reusable over ad hoc") && full.contains("One responsibility per unit"), "the standard is in every prompt");
         assert!(full.contains("write to the developer's working tree immediately"));
         assert!(full.contains("Never touch vendor/."));
     }

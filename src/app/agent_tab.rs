@@ -803,9 +803,12 @@ fn worktree_options(app: &mut App, ui: &mut egui::Ui) {
     });
     ui.horizontal(|ui| {
         ui.label(RichText::new("rounds").small().color(theme::fg_dim()));
-        ui.add(egui::Slider::new(&mut app.coding.worktree.rounds, 1..=5).show_value(true)).on_hover_text(
+        ui.add(egui::Slider::new(&mut app.coding.worktree.rounds, 1..=10).show_value(true)).on_hover_text(
             "How many attempts. A failed check, or a reviewer asking for changes, goes \
-             back to the agent with the reason. No pull request while a check fails.",
+             back to the agent with the reason and a second agent's advice on what went \
+             wrong; an agent that gave up is sent back too, unless the second agent agrees \
+             it needs a person. Stops early when a round changes nothing new. No pull \
+             request while a check fails.",
         );
     });
     ui.checkbox(&mut app.coding.worktree.review, "Second agent reviews").on_hover_text(

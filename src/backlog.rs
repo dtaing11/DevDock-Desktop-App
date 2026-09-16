@@ -9,6 +9,15 @@
 //! produced nothing, or whose changes failed the repository's checks, leaves
 //! nothing behind but its log — no branch, no worktree.
 //!
+//! A round that does not get through is not the end. The agents confer:
+//! when the fixer changed nothing or a check failed, a second agent — the
+//! reviewer's engine, or the fixer's own in a fresh session — reads the
+//! attempt and the repository and says what to do next, or that a person is
+//! needed; the fixer's next round gets that, with the thread so far. It
+//! stops when the checks pass and the reviewer approves, when the rounds
+//! run out, when the advisor says it needs a person, or when a round
+//! changes nothing the previous one did not.
+//!
 //! Jira is written to only through a [`Claimer`], and only if the caller
 //! gives one: assigning the ticket to the developer, putting it in the
 //! active sprint, moving it to In Progress when the agent starts, and
@@ -439,7 +448,12 @@ fn work(
         .with_sandbox(job.sandbox_image.map(str::to_string));
     let base_task = task_text(job.task);
     let rounds = job.rounds.max(1);
+    // The advisor: whoever reviews, else the fixer's engine in a fresh
+    // session — a second pair of eyes on the same model still helps.
+    let advisor = job.reviewer.unwrap_or(engine);
     let mut feedback: Option<String> = None;
+    let mut history: Vec<coding::Turn> = Vec::new();
+    let mut last_diff: Option<String> = None;
     let mut turns = 0;
     let mut summary;
     let mut checks: Vec<CheckOutcome> = Vec::new();
@@ -463,15 +477,55 @@ fn work(
                 branch: Some(branch),
                 instructions: job.instructions,
                 context: Some("This is an unattended run on a fresh worktree of the repository."),
+                history: &history,
                 ..coding::Request::new(&task)
             },
             &mut |event: Event| on_event(event.line()),
         )?;
         turns += run.turns;
         summary = run.text;
+        history.push(coding::Turn {
+            task: feedback.clone().unwrap_or_else(|| "(the task above)".into()),
+            summary: summary.clone(),
+        });
+
+        // Nothing changed: the agent gave up, or thinks it needs a person.
+        // Before believing it, a second agent looks.
         if changed_files(&wt)?.is_empty() {
-            return Err(format!("the agent changed nothing: {}", first_line(&summary)));
+            if round >= rounds {
+                return Err(format!("the agent changed nothing: {}", first_line(&summary)));
+            }
+            on_event(format!("the agent changed nothing; asking {} what to do", advisor.label()));
+            let happened = format!("The agent made no edits. It said:\n{summary}");
+            let advice = advise_with(advisor, wt.path(), &tracked, &job.task.brief, &happened, "", on_event)?;
+            if !advice.doable {
+                return Err(format!(
+                    "the agent changed nothing, and {} agreed it needs a person: {}\n\nThe agent said: {}",
+                    advisor.label(),
+                    advice.advice,
+                    first_line(&summary)
+                ));
+            }
+            on_event(format!("advice: {}", first_line(&advice.advice)));
+            feedback = Some(format!(
+                "You changed nothing and said:\n{summary}\n\nA senior engineer read the \
+                 repository and says it is doable without a person:\n{}",
+                advice.advice
+            ));
+            continue;
         }
+
+        // A round that produced exactly the last round's change is not
+        // going anywhere; more rounds would only cost.
+        let diff = wt.git(&["diff", job.base]).map_err(|e| e.to_string())?;
+        if last_diff.as_deref() == Some(diff.as_str()) {
+            return Err(format!(
+                "no progress: round {round} left the tree exactly as round {} did.\n{}",
+                round - 1,
+                feedback.as_deref().unwrap_or("")
+            ));
+        }
+        last_diff = Some(diff.clone());
 
         // The checks, run here. The agent's word that they passed is not
         // what a draft pull request should rest on.
@@ -501,15 +555,27 @@ fn work(
             if round >= rounds {
                 return Err(format!("after {rounds} round(s) the change still fails a check.\n{why}"));
             }
+            // The failure, and a diagnosis of it from a second agent that
+            // reads the code rather than only the output.
+            on_event(format!("check failed; asking {} what went wrong", advisor.label()));
+            let happened = format!("{why}\n\nThe agent's account of the attempt:\n{summary}");
+            let advice = advise_with(advisor, wt.path(), &tracked, &job.task.brief, &happened, &diff, on_event)?;
+            if !advice.doable {
+                return Err(format!(
+                    "a check fails, and {} says fixing it needs a person: {}\n{why}",
+                    advisor.label(),
+                    advice.advice
+                ));
+            }
+            on_event(format!("advice: {}", first_line(&advice.advice)));
             on_event("sending the failure back to the agent".into());
-            feedback = Some(why);
+            feedback = Some(format!("{why}\n\nA senior engineer read the code and says:\n{}", advice.advice));
             continue;
         }
 
         // A second opinion, before anyone else sees it.
         if let Some(reviewer) = job.reviewer {
             on_event(format!("review by {}", reviewer.label()));
-            let diff = wt.git(&["diff", job.base]).map_err(|e| e.to_string())?;
             let verdict = review_with(reviewer, wt.path(), &tracked, &job.task.brief, &diff, on_event)?;
             if verdict.approve {
                 on_event(format!("approved: {}", first_line(&verdict.feedback)));
@@ -596,6 +662,41 @@ fn review_with(
                 &mut |e| on_event(e.line()),
             )?;
             Ok(crate::agent::backlog::parse_verdict(&run.text))
+        }
+    }
+}
+
+/// Asks a second agent what to do about a round that did not get through:
+/// the harness over a read-only workspace, or Claude Code reading only.
+fn advise_with(
+    advisor: &Engine,
+    root: &Path,
+    tracked: &[String],
+    brief: &str,
+    happened: &str,
+    diff: &str,
+    on_event: &mut dyn FnMut(String),
+) -> Result<crate::agent::backlog::Advice, String> {
+    match advisor {
+        Engine::Harness(provider) => {
+            let mut workspace = Workspace::new(root, tracked.to_vec(), Access::ReadOnly)?;
+            crate::agent::backlog::advise(provider.as_ref(), &mut workspace, brief, happened, diff, &mut |e| on_event(e.line()))
+        }
+        Engine::ClaudeCode(config) => {
+            let task = crate::agent::backlog::advise_task(brief, happened, diff);
+            let run = crate::agent::claude_code::run_readonly(
+                config,
+                root,
+                &task,
+                Some(
+                    "You are the senior engineer pairing with an unattended coding agent whose \
+                     last attempt did not get through. Read the repository, work out what went \
+                     wrong, and say exactly what to do next. Answer with JSON only: \
+                     {\"doable\": true | false, \"advice\": \"…\"}",
+                ),
+                &mut |e| on_event(e.line()),
+            )?;
+            Ok(crate::agent::backlog::parse_advice(&run.text))
         }
     }
 }
@@ -861,6 +962,8 @@ mod tests {
             Reply { text: String::new(), calls: vec![ToolCall { id: "1".into(), name: "edit_file".into(), input: serde_json::json!({"path": "lib.py", "old_text": "sum(xs) + 1", "new_text": "sum(xs)"}) }], ..Default::default() },
             Reply { text: String::new(), calls: vec![ToolCall { id: "c".into(), name: "run_check".into(), input: serde_json::json!({"name": "tests"}) }], ..Default::default() },
             Reply { text: "first try".into(), ..Default::default() },
+            // The same engine, as the advisor, in a fresh session.
+            Reply { text: r#"{"doable": true, "advice": "The check greps for `return 0`; make total() return 0."}"#.into(), ..Default::default() },
             Reply { text: String::new(), calls: vec![ToolCall { id: "2".into(), name: "edit_file".into(), input: serde_json::json!({"path": "lib.py", "old_text": "return sum(xs)", "new_text": "return 0"}) }], ..Default::default() },
             Reply { text: String::new(), calls: vec![ToolCall { id: "c".into(), name: "run_check".into(), input: serde_json::json!({"name": "tests"}) }], ..Default::default() },
             Reply { text: "second try".into(), ..Default::default() },
@@ -877,6 +980,8 @@ mod tests {
         assert_eq!(fixed.rounds, 2);
         assert_eq!(fixed.summary, "second try");
         assert!(log.iter().any(|l| l == "sending the failure back to the agent"), "{log:?}");
+        assert!(log.iter().any(|l| l.starts_with("check failed; asking DevDock harness")), "{log:?}");
+        assert!(log.iter().any(|l| l.starts_with("advice: The check greps")), "{log:?}");
         assert!(log.iter().any(|l| l == "round 2 of 3"));
         assert_eq!(fixed.checks, [CheckOutcome { name: "tests".into(), ok: true }]);
     }
@@ -927,6 +1032,65 @@ mod tests {
         let err = fix(&repo, &fixer, &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 1, reviewer: Some(&reviewer) }, &fake_pr, &mut |_| {}).unwrap_err();
         assert!(err.contains("reviewer still asked for changes"), "{err}");
         assert!(!repo.branches().unwrap().local.iter().any(|b| b.name.starts_with("fix/")));
+    }
+
+    #[test]
+    fn an_agent_that_gives_up_is_sent_back_with_advice_and_can_finish() {
+        let (_tmp, repo) = setup("grep -q 'return sum(xs)$' lib.py");
+        let engine = Engine::Harness(Box::new(Scripted(RefCell::new(vec![
+            // Round 1: nothing done, "needs a decision".
+            Reply { text: "This needs a product decision about rounding.".into(), ..Default::default() },
+            // The advisor (same engine, fresh session) disagrees.
+            Reply { text: r#"{"doable": true, "advice": "No decision is needed: total() adds a stray 1 in lib.py line 2. Remove it and run the tests."}"#.into(), ..Default::default() },
+            // Round 2, with the advice.
+            Reply { text: String::new(), calls: vec![ToolCall { id: "1".into(), name: "edit_file".into(), input: serde_json::json!({"path": "lib.py", "old_text": "sum(xs) + 1", "new_text": "sum(xs)"}) }], ..Default::default() },
+            Reply { text: String::new(), calls: vec![ToolCall { id: "c".into(), name: "run_check".into(), input: serde_json::json!({"name": "tests"}) }], ..Default::default() },
+            Reply { text: "Removed the stray + 1.".into(), ..Default::default() },
+        ]))));
+        let mut log = Vec::new();
+        let fixed = fix(
+            &repo,
+            &engine,
+            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 3, reviewer: None },
+            &fake_pr,
+            &mut |line| log.push(line),
+        )
+        .unwrap_or_else(|e| panic!("{e}\n{log:#?}"));
+        assert_eq!(fixed.rounds, 2);
+        assert_eq!(fixed.summary, "Removed the stray + 1.");
+        assert!(log.iter().any(|l| l == "the agent changed nothing; asking DevDock harness · scripted what to do"), "{log:?}");
+        assert!(log.iter().any(|l| l.starts_with("advice: No decision is needed")), "{log:?}");
+
+        // When the advisor agrees a person is needed, that is the end, and
+        // both opinions are in the reason.
+        let (_tmp, repo) = setup("true");
+        let engine = Engine::Harness(Box::new(Scripted(RefCell::new(vec![
+            Reply { text: "Needs a designer.".into(), ..Default::default() },
+            Reply { text: r#"{"doable": false, "advice": "The ticket asks for a visual choice nobody has made."}"#.into(), ..Default::default() },
+        ]))));
+        let err = fix(&repo, &engine, &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 3, reviewer: None }, &fake_pr, &mut |_| {}).unwrap_err();
+        assert!(err.contains("agreed it needs a person: The ticket asks for a visual choice"), "{err}");
+        assert!(err.contains("The agent said: Needs a designer."), "{err}");
+        assert!(!repo.branches().unwrap().local.iter().any(|b| b.name.starts_with("fix/")));
+    }
+
+    #[test]
+    fn a_round_that_repeats_the_last_change_stops_the_run() {
+        // The check can never pass; the agent makes the same edit twice.
+        let (_tmp, repo) = setup("grep -q 'return 0$' lib.py");
+        let edit = || Reply { text: String::new(), calls: vec![ToolCall { id: "1".into(), name: "edit_file".into(), input: serde_json::json!({"path": "lib.py", "old_text": "sum(xs) + 1", "new_text": "sum(xs)"}) }], ..Default::default() };
+        let check = || Reply { text: String::new(), calls: vec![ToolCall { id: "c".into(), name: "run_check".into(), input: serde_json::json!({"name": "tests"}) }], ..Default::default() };
+        let engine = Engine::Harness(Box::new(Scripted(RefCell::new(vec![
+            edit(), check(), Reply { text: "try 1".into(), ..Default::default() },
+            Reply { text: r#"{"doable": true, "advice": "return 0"}"#.into(), ..Default::default() },
+            // Round 2: the same edit, which is now a no-op.
+            edit(), check(), Reply { text: "try 2".into(), ..Default::default() },
+        ]))));
+        let mut log = Vec::new();
+        let err = fix(&repo, &engine, &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox_image: None, claim: None, rounds: 5, reviewer: None }, &fake_pr, &mut |line| log.push(line)).unwrap_err();
+        assert!(err.starts_with("no progress: round 2 left the tree exactly as round 1 did"), "{err}\n{log:#?}");
+        assert!(!repo.branches().unwrap().local.iter().any(|b| b.name.starts_with("fix/")));
+        assert_eq!(repo.worktrees().unwrap().len(), 1);
     }
 
     /// What a claimer was told, in order.

@@ -616,10 +616,12 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
     });
     ui.horizontal_wrapped(|ui| {
         ui.label("Rounds");
-        ui.add(egui::Slider::new(&mut app.backlog.rounds, 1..=5).show_value(true)).on_hover_text(
+        ui.add(egui::Slider::new(&mut app.backlog.rounds, 1..=10).show_value(true)).on_hover_text(
             "How many attempts a ticket gets. A failed check, or a reviewer asking for \
-             changes, goes back to the agent with the reason. No draft pull request is \
-             opened while a check fails.",
+             changes, goes back to the agent with the reason and a second agent's advice \
+             on what went wrong; an agent that gave up is sent back too, unless the second \
+             agent agrees it needs a person. Stops early when a round changes nothing new. \
+             No draft pull request is opened while a check fails.",
         );
         ui.add_space(theme::UNIT);
         ui.checkbox(&mut app.backlog.review, "Second agent reviews").on_hover_text(
@@ -740,6 +742,11 @@ pub(super) fn run_card(ui: &mut egui::Ui, key: &str, title: &str, run: &TicketRu
                     let toggle = if expanded { "Hide log".to_string() } else { format!("Log ({})", run.log.len()) };
                     if ui.small_button(toggle).clicked() {
                         toggled = true;
+                    }
+                    if !run.log.is_empty()
+                        && ui.small_button("Copy log").on_hover_text("The whole log, to paste somewhere").clicked()
+                    {
+                        ui.ctx().copy_text(run.log.join("\n"));
                     }
                 });
             });

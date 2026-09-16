@@ -111,9 +111,16 @@ under **At once**, the rest queued. Each agent:
    `mobile/`), and each check runs in its project's directory; the log
    says they were inferred;
 4. if a check fails, sends the failure back to the agent for another
-   **round**, up to the number set in the dialog (three by default). No
-   pull request is opened while a check fails; a ticket that still fails
-   after the last round is a failure, with the check's output on its card;
+   **round**, up to the number set in the dialog (three by default, up to
+   ten). The failure does not go back alone: a second agent — the
+   reviewer's engine, or the fixer's own in a fresh session — reads the
+   attempt, the output, and the code, and says what went wrong and what to
+   do; the fixer gets both, with the thread of every round so far. The
+   same happens when the agent changed nothing and said it needs a person:
+   the second agent looks, and either sends it back with instructions or
+   agrees, which ends the run with both opinions on the card. A round that
+   leaves the tree exactly as the last one did ends the run too. No pull
+   request is opened while a check fails;
 5. once the checks pass, has a **second agent review** the ticket and the
    diff — the code-review model, which can be Claude Code — and answer
    approve or revise. Revise is another round with the feedback; approve
@@ -127,7 +134,15 @@ under **At once**, the rest queued. Each agent:
 
 A ticket the agent changed nothing for, or whose change fails a check,
 leaves nothing behind: the worktree is removed and the branch deleted. The
-card in the dialog says why.
+card in the dialog says why, and **Copy log** puts the whole log on the
+clipboard.
+
+Both agents are held to one standard whatever the language: reusable over
+ad hoc (logic needed twice lives once; a helper the repository has is used,
+not rewritten), one responsibility per function and type with behaviour
+kept with its data, clear names and no magic numbers or dead code, the
+repository's own conventions, and a test for what changed. The fixer is
+told to write to it; the reviewer sends back what does not meet it.
 
 The dialog is the place to watch: every agent has a card with its state
 (queued, running, done, failed), how long it has run, what it is doing right

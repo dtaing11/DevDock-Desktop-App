@@ -40,11 +40,74 @@ Decide:
 - Is it correct? Look for the bug the ticket describes and check the fix actually removes it; look for edge cases the change ignores; check callers and tests.
 - Does it fit the code around it, and leave no debugging output, TODOs, or unrelated edits?
 - Is it verified: does the repository's own test or check cover it, and if the ticket is a bug, is there a test that would have caught it?
+- Is it written to the standard below? Duplicated logic, a pasted block with variations, a helper the repository already has rewritten, a function doing several things, behaviour kept apart from the data it belongs to, unclear names, magic numbers, dead code: each is a reason to revise, with the file and line.
 
 Be strict. "revise" when anything above is not so, with feedback the agent can act on: what is wrong, where, and what to do. "approve" only when you would merge it.
 
 Answer with JSON only:
 {"verdict": "approve" | "revise", "feedback": "…"}"#;
+
+/// The senior engineer an agent turns to when a round did not get
+/// through: reads what happened and says what to do next, or that it needs
+/// a person.
+const ADVISE_SYSTEM_PROMPT: &str = r#"You are the senior engineer pairing with an unattended coding agent working in this repository. Its last attempt did not get through — it changed nothing, or a check failed — and the message says how. You have read-only access to the repository with its attempt applied, if there was one; the diff is in the message.
+
+Work it out before you answer: read the code the task is about, find the failing test or the error's cause, name files and functions. Then decide:
+- doable: can the agent finish this without a person deciding anything? false only when it genuinely needs a product or design decision, credentials, or a system the agent does not have. "Hard", "unclear at first glance", or "the agent gave up" are not reasons; make the reasonable assumption and say what it is.
+- advice: concrete instructions for the next attempt — what the failure means, which files and functions to change and how, what to run to verify. Write to the standard below, and say so where the attempt did not.
+
+Answer with JSON only:
+{"doable": true | false, "advice": "…"}"#;
+
+/// What an advisor said about a failed round.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Advice {
+    pub doable: bool,
+    pub advice: String,
+}
+
+/// The advisor's task: what was asked, what happened, and the diff so far.
+pub fn advise_task(brief: &str, happened: &str, diff: &str) -> String {
+    let diff = cap(diff, 60_000);
+    let diff_part = if diff.trim().is_empty() {
+        "The tree is unchanged: the agent made no edits.".to_string()
+    } else {
+        format!("The change so far, as a diff against the branch it started from:\n```diff\n{diff}\n```")
+    };
+    format!(
+        "What was asked:\n{}\n\nWhat happened in the last attempt:\n{}\n\n{diff_part}\n\nRead the repository as needed, then answer.",
+        cap(brief, MAX_DESCRIPTION),
+        cap(happened, 12_000)
+    )
+}
+
+/// Parses an advisor's reply; a reply that is not JSON is taken as advice
+/// to keep going — the opposite default from a verdict, because giving up
+/// is the failure this exists to prevent.
+pub fn parse_advice(text: &str) -> Advice {
+    let json = text.find('{').and_then(|start| text.rfind('}').map(|end| &text[start..=end]));
+    if let Some(value) = json.and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok()) {
+        let doable = value.get("doable").and_then(|v| v.as_bool()).unwrap_or(true);
+        let advice = value.get("advice").and_then(|f| f.as_str()).unwrap_or("").trim().to_string();
+        return Advice { doable, advice };
+    }
+    Advice { doable: true, advice: text.trim().to_string() }
+}
+
+/// Asks the built-in harness, over a read-only workspace on the tree as the
+/// agent left it, what to do about a round that did not get through.
+pub fn advise(
+    provider: &dyn Provider,
+    workspace: &mut Workspace,
+    brief: &str,
+    happened: &str,
+    diff: &str,
+    on_event: &mut dyn FnMut(Event),
+) -> Result<Advice, String> {
+    let system = format!("{ADVISE_SYSTEM_PROMPT}\n\n{}", super::coding::CODE_STANDARD);
+    let run = super::run(provider, workspace, &system, &advise_task(brief, happened, diff), limits(2), on_event)?;
+    Ok(parse_advice(&run.text))
+}
 
 /// A reviewer's answer about a change.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,7 +165,8 @@ pub fn review(
     diff: &str,
     on_event: &mut dyn FnMut(Event),
 ) -> Result<Verdict, String> {
-    let run = super::run(provider, workspace, REVIEW_SYSTEM_PROMPT, &review_task(brief, diff), limits(2), on_event)?;
+    let system = format!("{REVIEW_SYSTEM_PROMPT}\n\n{}", super::coding::CODE_STANDARD);
+    let run = super::run(provider, workspace, &system, &review_task(brief, diff), limits(2), on_event)?;
     Ok(parse_verdict(&run.text))
 }
 
@@ -310,6 +374,17 @@ mod tests {
         let task = review_task(&issue("B-1", "x").prompt_text(1_000), &"+line\n".repeat(100_000));
         assert!(task.contains("[diff truncated"));
         assert!(task.starts_with("What was asked:\nB-1: x"), "{task}");
+
+        // Advice: no JSON means keep going, and "doable" defaults to true.
+        let a = parse_advice(r#"{"doable": false, "advice": "needs a product call"}"#);
+        assert!(!a.doable);
+        let a = parse_advice("Look at lib.py line 2.");
+        assert!(a.doable);
+        assert_eq!(a.advice, "Look at lib.py line 2.");
+        let t = advise_task("fix it", "the check failed:\nE  assert 4 == 3", "");
+        assert!(t.contains("The tree is unchanged"), "{t}");
+        let t = advise_task("fix it", "changed nothing", "+x");
+        assert!(t.contains("```diff\n+x"), "{t}");
     }
 
     #[test]

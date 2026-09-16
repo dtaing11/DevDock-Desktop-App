@@ -315,6 +315,12 @@ You still review every change at the end; the buttons become **Keep** and
 **Revert**, and reverting restores exactly what was there before the run,
 including deleting files it created.
 
+Whatever the mode, the engine, or the language, the agent is held to one
+standard, and the reviewing agent of a worktree run enforces it: reusable
+over ad hoc, one responsibility per function and type with behaviour kept
+with its data, clear names, no magic numbers or dead code, the repository's
+own conventions, and a test for what changed.
+
 Use propose for anything you want to inspect first. Use iterate when the task
 has a definition of done the machine can check — "make the tests pass",
 "fix the build", "add a flag and cover it with a test".
@@ -330,7 +336,12 @@ ticket, and leaves this window's tree alone:
 2. the chosen engine, live, in that worktree, with the repository's checks
    (declared, or inferred from the toolchain);
 3. the checks run again by DevDock, not on the agent's word; a failure goes
-   back to the agent with the output, for up to **rounds** attempts;
+   back to the agent for up to **rounds** attempts (up to ten), with the
+   output and a second agent's diagnosis of it — the code-review model, or
+   the same engine in a fresh session, reads the code and says what to do.
+   An agent that changed nothing and said it needs a person is sent back the
+   same way, unless the second agent agrees. A round that leaves the tree as
+   the last one did ends the run;
 4. optionally a **second agent** — the code-review model — reading the prompt
    and the diff, and sending it back with feedback until it approves;
 5. a commit, a push, and a **draft pull request**;

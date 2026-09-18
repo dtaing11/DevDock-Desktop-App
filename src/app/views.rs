@@ -1506,8 +1506,7 @@ fn commit_box(app: &mut App, ui: &mut egui::Ui) {
     } else {
         format!("Commit to {branch}")
     };
-    let commit_btn = egui::Button::new(RichText::new(label).strong().color(Color32::BLACK))
-        .fill(theme::ember())
+    let commit_btn = theme::primary_button(RichText::new(label).strong())
         .min_size(egui::vec2(ui.available_width(), 32.0));
     if ui.add_enabled(can_commit, commit_btn).clicked() {
         app.do_commit();

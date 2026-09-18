@@ -431,7 +431,7 @@ fn pull_requests(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                 && !app.pr.title.trim().is_empty()
                 && app.pr.head != app.pr.base;
             if ui
-                .add_enabled(create_enabled, egui::Button::new("Create PR").fill(theme::ember()))
+                .add_enabled(create_enabled, theme::primary_button("Create PR"))
                 .clicked()
             {
                 // Runs the AI reviewer first when `[review] run = true`;
@@ -603,8 +603,7 @@ fn tickets_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
             if ui
                 .add_enabled(
                     can_draft,
-                    egui::Button::new(RichText::new(label).strong())
-                        .fill(theme::ember())
+                    theme::primary_button(RichText::new(label).strong())
                         .min_size(egui::vec2(0.0, theme::CONTROL_MD)),
                 )
                 .on_hover_text(
@@ -720,8 +719,7 @@ pub(super) fn jira_connect(app: &mut App, ui: &mut egui::Ui) {
 
     ui.add_space(theme::UNIT * 2.0);
     ui.horizontal(|ui| {
-        let connect = egui::Button::new(RichText::new("Connect").strong())
-            .fill(theme::ember())
+        let connect = theme::primary_button(RichText::new("Connect").strong())
             .min_size(egui::vec2(0.0, theme::CONTROL_MD));
         if ui.add_enabled(!app.tickets.connecting, connect).clicked() {
             app.connect_jira();
@@ -814,8 +812,7 @@ fn ticket_actions(app: &mut App, ui: &mut egui::Ui) {
         } else {
             format!("Create {pending} in {}", app.tickets.project)
         };
-        let create = egui::Button::new(RichText::new(label).strong())
-            .fill(theme::ember())
+        let create = theme::primary_button(RichText::new(label).strong())
             .min_size(egui::vec2(0.0, theme::CONTROL_MD));
         if ui
             .add_enabled(ready, create)
@@ -1150,8 +1147,7 @@ fn stack_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                 {
                     app.stack_push();
                 }
-                let submit = egui::Button::new(RichText::new("Submit stack").strong())
-                    .fill(theme::ember())
+                let submit = theme::primary_button(RichText::new("Submit stack").strong())
                     .min_size(egui::vec2(0.0, theme::CONTROL_MD));
                 let response = ui.add_enabled(ready_for_action && stale == 0, submit);
                 let response = if stale > 0 {
@@ -1720,7 +1716,7 @@ fn conflict_resolver(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                 );
                 ui.horizontal(|ui| {
                     if ui
-                        .add(egui::Button::new("Accept AI merge").fill(theme::ember()))
+                        .add(theme::primary_button("Accept AI merge"))
                         .on_hover_text(
                             "Writes the reviewed content (including your edits) \
                              to the file and marks it resolved",
@@ -1802,7 +1798,7 @@ fn conflict_resolver(app: &mut App, ctx: &egui::Context, open: &mut bool) {
             if ui
                 .add_enabled(
                     all_resolved || app.conflicts.files.is_empty(),
-                    egui::Button::new("Finish (continue merge/rebase)").fill(theme::ember()),
+                    theme::primary_button("Finish (continue merge/rebase)"),
                 )
                 .clicked()
             {
@@ -2196,7 +2192,7 @@ fn ci_config_review(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                 format!("Save {}", crate::local_ci::CONFIG_FILE)
             };
             if ui
-                .add_enabled(parsed.is_ok(), egui::Button::new(save_label).fill(theme::ember()))
+                .add_enabled(parsed.is_ok(), theme::primary_button(save_label))
                 .clicked()
             {
                 if let Some(repo) = app.repo.as_ref() {
@@ -2266,7 +2262,7 @@ fn agent_panel(app: &mut App, ui: &mut egui::Ui) {
         } else if ui
             .add_enabled(
                 enabled,
-                egui::Button::new("Resolve all with AI").fill(theme::ember()),
+                theme::primary_button("Resolve all with AI"),
             )
             .on_hover_text(
                 "Gives the model read access to every tracked file and lets it \
@@ -2432,8 +2428,7 @@ fn agent_changes(app: &mut App, ctx: &egui::Context, open: &mut bool) {
             if ui
                 .add_enabled(
                     pending > 0,
-                    egui::Button::new(format!("Apply {pending} selected change(s)"))
-                        .fill(theme::ember()),
+                    theme::primary_button(format!("Apply {pending} selected change(s)")),
                 )
                 .on_hover_text(
                     "Writes only the ticked files. Conflicted files are staged as \
@@ -2660,8 +2655,7 @@ fn split_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
             if ui
                 .add_enabled(
                     ready,
-                    egui::Button::new(format!("Make {} commit(s)", app.split.groups.len()))
-                        .fill(theme::ember()),
+                    theme::primary_button(format!("Make {} commit(s)", app.split.groups.len())),
                 )
                 .clicked()
             {
@@ -2731,11 +2725,10 @@ fn tidy_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         ui.horizontal(|ui| {
             if ui
                 .add(
-                    egui::Button::new(format!(
+                    theme::primary_button(format!(
                         "Rewrite {folded} commit(s) as {}",
                         plan.groups.len()
-                    ))
-                    .fill(theme::ember()),
+                    )),
                 )
                 .on_hover_text("Replays the commits; refuses if anything is uncommitted")
                 .clicked()
@@ -2866,7 +2859,7 @@ fn rename_dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             let clicked = ui
-                .add_enabled(valid, egui::Button::new("Rename").fill(theme::ember()))
+                .add_enabled(valid, theme::primary_button("Rename"))
                 .on_hover_text("Every change is shown for review before anything is written")
                 .clicked();
             if clicked || (submit && valid) {
@@ -3536,7 +3529,7 @@ fn add_remote(app: &mut App, ctx: &egui::Context, open: &mut bool) {
         ui.horizontal(|ui| {
             let can_add = !app.remote_url_input.trim().is_empty();
             if ui
-                .add_enabled(can_add, egui::Button::new("Add remote and publish").fill(theme::ember()))
+                .add_enabled(can_add, theme::primary_button("Add remote and publish"))
                 .clicked()
             {
                 let url = app.remote_url_input.trim().to_string();

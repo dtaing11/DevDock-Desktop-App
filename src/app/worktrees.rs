@@ -511,8 +511,7 @@ pub fn dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                 "A second DevDock on the new worktree, with its own agent and terminal. \
                  Unticked, this window switches to it.",
             );
-            let create = egui::Button::new(RichText::new("Create worktree").strong())
-                .fill(theme::ember());
+            let create = theme::primary_button(RichText::new("Create worktree").strong());
             if ui.add_enabled(!busy && !branch.is_empty(), create).clicked() {
                 app.worktree_create();
             }

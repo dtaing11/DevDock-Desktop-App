@@ -1,9 +1,10 @@
 //! Visual identity for DevDock.
 //!
-//! Direction: a "dock at night" instrument panel. Deep indigo base, a single
-//! ember accent spent only on primary actions and the current selection,
-//! teal reserved for remote/informational accents. Everything else stays
-//! quiet: muted text, hairline borders, generous spacing.
+//! Direction: a "dock at night" instrument panel. Deep indigo base, an ember
+//! accent spent only on the current selection and branch names, green for
+//! the one button on a screen that does the thing, teal reserved for
+//! remote/informational accents. Everything else stays quiet: muted text,
+//! hairline borders, generous spacing.
 //!
 //! The design system lives here: color tokens, a 4px spacing grid, a type
 //! scale, and shared component constants. Views should consume these
@@ -31,6 +32,13 @@ pub struct Palette {
     pub fg_dim: Color32,
     pub ember: Color32,
     pub ember_deep: Color32,
+    /// Fill of the primary action button. Green, because that is what a
+    /// "go" button looks like everywhere else; the ember accent read as a
+    /// warning on a button.
+    pub primary: Color32,
+    /// Text on a `primary` fill: the fill is picked per palette, so the text
+    /// that carries on it is too.
+    pub on_primary: Color32,
     pub teal: Color32,
     pub danger: Color32,
     pub add: Color32,
@@ -51,6 +59,8 @@ pub const DARK: Palette = Palette {
     fg_dim: Color32::from_rgb(0x8a, 0x93, 0xa6),
     ember: Color32::from_rgb(0xff, 0x9d, 0x4d),
     ember_deep: Color32::from_rgb(0xe0, 0x7b, 0x2a),
+    primary: Color32::from_rgb(0x3f, 0xb9, 0x50),
+    on_primary: Color32::BLACK,
     teal: Color32::from_rgb(0x3d, 0xdb, 0xd9),
     danger: Color32::from_rgb(0xff, 0x6b, 0x6b),
     add: Color32::from_rgb(0x7e, 0xe7, 0x87),
@@ -73,6 +83,8 @@ pub const LIGHT: Palette = Palette {
     fg_dim: Color32::from_rgb(0x69, 0x70, 0x7e),
     ember: Color32::from_rgb(0xc2, 0x5b, 0x0a),
     ember_deep: Color32::from_rgb(0x9c, 0x45, 0x05),
+    primary: Color32::from_rgb(0x1a, 0x7f, 0x37),
+    on_primary: Color32::WHITE,
     teal: Color32::from_rgb(0x0d, 0x71, 0x74),
     danger: Color32::from_rgb(0xc0, 0x2a, 0x2a),
     add: Color32::from_rgb(0x1c, 0x7a, 0x33),
@@ -129,6 +141,12 @@ pub fn ember() -> Color32 {
 }
 pub fn ember_deep() -> Color32 {
     palette().ember_deep
+}
+pub fn primary() -> Color32 {
+    palette().primary
+}
+pub fn on_primary() -> Color32 {
+    palette().on_primary
 }
 pub fn teal() -> Color32 {
     palette().teal
@@ -187,6 +205,15 @@ pub fn heading(text: &str, size: f32) -> egui::RichText {
 /// Emphasised body text: the same size as its surroundings, heavier.
 pub fn strong(text: &str) -> egui::RichText {
     egui::RichText::new(text).font(semibold(TEXT)).color(fg())
+}
+
+/// The primary action of a screen or dialog: Commit, Create PR, Run.
+///
+/// One per view, filled with [`primary`] and lettered to carry on it. Any
+/// weight or size already on `label` is kept; only its colour is set here,
+/// so a view cannot pair the fill with text that vanishes on it.
+pub fn primary_button(label: impl Into<egui::RichText>) -> egui::Button<'static> {
+    egui::Button::new(label.into().color(on_primary())).fill(primary())
 }
 
 // The type scale. Sizes are named so a view asks for a role rather than a
@@ -390,6 +417,21 @@ mod tests {
                 contrast > distance(palette.fg, palette.bg),
                 "{name}: emphasis is closer to the background than body text",
             );
+        }
+    }
+
+    /// The primary button's lettering has to carry on its fill in both
+    /// palettes, and the fill has to stand out from the panel it sits on.
+    #[test]
+    fn primary_button_is_readable_in_both_palettes() {
+        for (name, palette) in [("dark", DARK), ("light", LIGHT)] {
+            let lettering = distance(palette.on_primary, palette.primary);
+            assert!(
+                lettering > 0.4,
+                "{name}: primary button text is {lettering:.2} from its fill",
+            );
+            let fill = distance(palette.primary, palette.panel);
+            assert!(fill > 0.3, "{name}: primary button is {fill:.2} from the panel");
         }
     }
 

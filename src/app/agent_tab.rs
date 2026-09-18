@@ -779,7 +779,7 @@ fn task_panel(app: &mut App, ui: &mut egui::Ui) {
             ui.label(RichText::new("working…").size(theme::TEXT).color(theme::fg_dim()));
         } else if app.coding.worktree.enabled {
             if ui
-                .add_enabled(ready, egui::Button::new("Run in a worktree").fill(theme::ember()))
+                .add_enabled(ready, theme::primary_button("Run in a worktree"))
                 .on_hover_text(
                     "A fresh branch and worktree, the agent, the checks, a commit, a push, \
                      a draft pull request, and the worktree removed. This tree is untouched.",
@@ -789,7 +789,7 @@ fn task_panel(app: &mut App, ui: &mut egui::Ui) {
                 app.start_worktree_run();
             }
         } else if ui
-            .add_enabled(ready, egui::Button::new("Run").fill(theme::ember()))
+            .add_enabled(ready, theme::primary_button("Run"))
             .on_hover_text("Send the task to the selected model")
             .clicked()
         {
@@ -970,7 +970,7 @@ fn question_box(app: &mut App, ui: &mut egui::Ui) {
                 super::views::prose_box(ui, &mut q.draft, 2, "Your answer — it is waiting");
                 ui.horizontal(|ui| {
                     let ready = !q.draft.trim().is_empty();
-                    if ui.add_enabled(ready, egui::Button::new("Answer").fill(theme::ember())).clicked() {
+                    if ui.add_enabled(ready, theme::primary_button("Answer")).clicked() {
                         answer = true;
                     }
                     if ui.small_button("Let it decide").clicked() {
@@ -1231,7 +1231,7 @@ fn apply_bar(app: &mut App, ui: &mut egui::Ui) {
             if ui
                 .add_enabled(
                     app.coding.awaiting_review(),
-                    egui::Button::new("Keep everything").fill(theme::ember()),
+                    theme::primary_button("Keep everything"),
                 )
                 .on_hover_text("Leaves every change in place and clears this list")
                 .clicked()
@@ -1241,7 +1241,7 @@ fn apply_bar(app: &mut App, ui: &mut egui::Ui) {
         } else if ui
             .add_enabled(
                 pending > 0,
-                egui::Button::new(format!("Apply {pending} selected")).fill(theme::ember()),
+                theme::primary_button(format!("Apply {pending} selected")),
             )
             .on_hover_text("Writes only the ticked files")
             .clicked()

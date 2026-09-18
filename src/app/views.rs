@@ -976,6 +976,25 @@ pub fn origin_slug(repo: &crate::git::Repo) -> Option<crate::github::RepoSlug> {
 }
 
 fn state_banner(app: &mut App, ui: &mut egui::Ui) {
+    if app.newer_build_installed {
+        ui.add_space(6.0);
+        egui::Frame::new()
+            .fill(theme::warn().linear_multiply(0.15))
+            .stroke(egui::Stroke::new(1.0_f32, theme::warn()))
+            .corner_radius(8.0)
+            .inner_margin(8.0)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "A newer DevDock was installed over this one. This window is still running {}; quit and open DevDock again to use the new build.",
+                            crate::build_description()
+                        ))
+                        .color(theme::warn()),
+                    );
+                });
+            });
+    }
     let Some(state) = app.status.as_ref().map(|s| s.state) else { return };
     if state == RepoState::Clean {
         return;

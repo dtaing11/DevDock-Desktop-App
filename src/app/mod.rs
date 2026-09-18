@@ -802,6 +802,14 @@ impl LocalCiState {
 }
 
 /// Top-level application state.
+/// The running binary's size and modification time, to notice a newer
+/// build installed over it.
+fn exe_stamp() -> Option<(u64, std::time::SystemTime)> {
+    let exe = std::env::current_exe().ok()?;
+    let meta = std::fs::metadata(exe).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
+}
+
 /// Everything that belongs to one repository and is kept while another is
 /// open: the agent tab and its runs, the backlog, tickets, the editor's
 /// buffers, review and conflict state, the stack, checks. Switching
@@ -947,6 +955,12 @@ pub struct App {
     pub screenshots: backlog::Screenshots,
     /// The models OpenCode lists, `provider/model`, read once at start.
     pub opencode_models: Vec<String>,
+    /// The running binary as it was at start (size, modified), and whether
+    /// a newer one has since been installed over it — this window would
+    /// keep running the old code until relaunched, and should say so.
+    pub exe_stamp: Option<(u64, std::time::SystemTime)>,
+    pub newer_build_installed: bool,
+    pub last_exe_check: Instant,
     /// An AI-proposed split of the working tree into separate commits.
     pub split: SplitState,
     /// An AI-proposed tidy-up of the branch's commits.
@@ -1090,6 +1104,9 @@ impl App {
             sessions: Default::default(),
             screenshots: Default::default(),
             opencode_models: Vec::new(),
+            exe_stamp: exe_stamp(),
+            newer_build_installed: false,
+            last_exe_check: Instant::now(),
             split: Default::default(),
             tidy: Default::default(),
             #[cfg(unix)]
@@ -5161,6 +5178,13 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Once a minute: has a newer build been installed over this one?
+        if self.last_exe_check.elapsed() > Duration::from_secs(60) {
+            self.last_exe_check = Instant::now();
+            if let (Some(then), Some(now)) = (self.exe_stamp, exe_stamp()) {
+                self.newer_build_installed = then != now;
+            }
+        }
         self.handle_messages();
         self.handle_shortcuts(ctx);
 

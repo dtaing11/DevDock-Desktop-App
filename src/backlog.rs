@@ -394,6 +394,7 @@ pub fn fix(
         return Err(format!("{branch:?} is not a valid branch name"));
     }
     let dir = repo.worktree_default_path(&branch);
+    on_event(format!("devdock {}", crate::build_description()));
     on_event(format!("branch {branch} from {}", job.base));
 
     // 1. Worktree.
@@ -1251,7 +1252,8 @@ mod tests {
         assert_eq!(fixed.checks, [CheckOutcome { name: "tests".into(), ok: true }]);
         assert!(fixed.pr.title.starts_with("ABC-7: total() is off by one"));
         assert_eq!(fixed.engine, "DevDock harness · scripted");
-        assert_eq!(log.first().map(String::as_str), Some("branch fix/abc-7-total-is-off-by-one from main"));
+        assert!(log[0].starts_with("devdock 0."), "the build comes first: {}", log[0]);
+        assert_eq!(log.get(1).map(String::as_str), Some("branch fix/abc-7-total-is-off-by-one from main"));
         assert!(log.iter().any(|l| l == "engine: DevDock harness · scripted"), "{log:?}");
 
         // The branch is on the remote, the main checkout is untouched, and

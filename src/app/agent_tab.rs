@@ -78,6 +78,9 @@ pub struct CodingState {
     pub question: Option<super::backlog::PendingQuestion>,
     /// Images attached to the next task.
     pub images: Vec<PromptImage>,
+    /// What the last run's result looks like, photographed in a sandbox.
+    pub screenshots: Vec<std::path::PathBuf>,
+    pub screenshotting: bool,
 }
 
 /// An image attached to the task box, with its thumbnail once decoded.
@@ -263,6 +266,7 @@ pub fn agent_viewport(app: &mut App, ui: &mut egui::Ui) {
         .auto_shrink([false, false])
         .id_salt("agent-viewport-body")
         .show(ui, |ui| {
+            result_screenshots(app, ui);
             if !app.coding.summary.trim().is_empty() {
                 let summary = app.coding.summary.clone();
                 ui.add_space(theme::UNIT * 2.0);
@@ -910,6 +914,44 @@ fn worktree_options(app: &mut App, ui: &mut egui::Ui) {
     ui.horizontal_wrapped(|ui| {
         let wt = &mut app.coding.worktree;
         super::views::sandbox_controls(ui, "agent", &mut wt.sandbox, &mut wt.sandbox_kind, &mut wt.sandbox_image);
+    });
+}
+
+/// What the last run's result looks like: photographed in a sandbox over
+/// this tree once the run finished, shown here, never opened on screen.
+fn result_screenshots(app: &mut App, ui: &mut egui::Ui) {
+    if app.coding.screenshotting {
+        ui.add_space(theme::UNIT);
+        ui.horizontal(|ui| {
+            ui.add(egui::Spinner::new().size(theme::SPINNER));
+            ui.label(RichText::new("photographing the result in the sandbox…").small().color(theme::fg_dim()));
+        });
+    }
+    if app.coding.screenshots.is_empty() {
+        return;
+    }
+    ui.add_space(theme::UNIT);
+    ui.label(theme::overline("WHAT IT LOOKS LIKE"));
+    let shots = app.coding.screenshots.clone();
+    let ctx = ui.ctx().clone();
+    ui.horizontal_wrapped(|ui| {
+        for path in &shots {
+            ui.vertical(|ui| {
+                if let Some(texture) = app.screenshots.get(&ctx, path) {
+                    let size = texture.size_vec2();
+                    let scale = (420.0 / size.x).min(1.0);
+                    ui.add(egui::Image::from_texture(&texture).fit_to_exact_size(size * scale).corner_radius(theme::RADIUS_MD as f32))
+                        .on_hover_text(path.display().to_string());
+                }
+                ui.horizontal(|ui| {
+                    let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                    ui.label(RichText::new(name).small().color(theme::fg_dim()));
+                    if ui.small_button("Open").clicked() {
+                        let _ = open::that(path);
+                    }
+                });
+            });
+        }
     });
 }
 

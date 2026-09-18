@@ -40,4 +40,5 @@ pub mod secure_store;
 pub mod stack;
 pub mod backlog;
 pub mod sandbox;
+pub mod screenshots;
 pub mod terminal;

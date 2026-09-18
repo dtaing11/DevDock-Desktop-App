@@ -157,13 +157,28 @@ line counts, its summary, and the pull request.
 
 ### A screenshot of the result
 
-When the repository holds a Flutter app, a run that passes its checks
-renders the app's first frame — through a generated golden test, with the
-SDK's real fonts, on a 1280×800 surface, where the checks ran — and keeps
-the image under DevDock's own directory. The card shows it under "What it
-looks like", with Open for the file. The generated test and image never
-enter the change. An app whose `main` cannot start in a widget test (it
-waits on a service, say) gets no screenshot, and the log says so.
+A run that passes its checks photographs what it changed, where the
+checks ran — in the sandbox, never on your screen — and shows the images
+on its card under "What it looks like", with Open for the file. Nothing
+generated for this enters the change.
+
+- **A Flutter app's first frame**, through a generated golden test with
+  the SDK's real fonts and the debug banner off, at 1280×800.
+- **The root widget** when `main` cannot start in a test (it waits on a
+  service first): the widget `runApp` is given, read from `main.dart`, is
+  pumped directly.
+- **Screens the agent names.** The agent is told it may write
+  `.devdock/screens.json` naming the widgets it changed, or the paths of a
+  web app, and each is rendered — so a fix deep inside a flow shows that
+  screen, not the start screen. The file is never committed.
+- **Web front ends**, in the sandbox: a Flutter web build, a `package.json`
+  with a build script, or a plain `index.html` is built, served on a local
+  port inside, and photographed by a headless Chromium (installed there
+  the first time, kept after). The agent's named paths, or `/`.
+
+A run in your own tree gets the same after it finishes, through a sandbox
+over that tree, and the Agent tab shows the images above the summary. It
+needs a sandbox runtime installed; without one, no screenshot is taken.
 
 ### Questions
 

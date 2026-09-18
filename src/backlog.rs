@@ -591,7 +591,8 @@ fn work(
         workspace = workspace.with_mcp(servers);
     }
     let base_task = task_text(job.task, job.ask.is_some());
-    let mut context = String::from("This is an unattended run on a fresh worktree of the repository.");
+    let mut context = String::from("This is an unattended run on a fresh worktree of the repository. ");
+    context.push_str(crate::screenshots::SCREENS_NOTE);
     if !baseline.is_empty() {
         context.push_str(&format!(
             " These checks already fail on {} before any change: {}. If the task is about \
@@ -817,7 +818,7 @@ fn work(
     // What it looks like, for a change to something with a screen: taken
     // where the checks ran, kept outside the repository, never part of
     // the change.
-    let screenshots = capture_screenshots(&wt, &runners, sandbox.is_some(), branch, on_event);
+    let screenshots = crate::screenshots::capture(wt.path(), &runners, sandbox.as_deref(), branch, on_event);
 
     // Commit and push.
     stage_change(&wt)?;
@@ -851,161 +852,6 @@ fn work(
         skipped,
         screenshots,
     })
-}
-
-/// Renders the first frame of every Flutter app in the tree through a
-/// generated golden test — real fonts from the SDK's cache, a 1280×800
-/// surface — and copies the image out to DevDock's own directory. The
-/// generated test and its image are removed again. Anything that goes
-/// wrong is logged and the run carries on: a screenshot is a courtesy.
-fn capture_screenshots(
-    wt: &Repo,
-    runners: &crate::local_ci::runner::RunnerRegistry,
-    sandboxed: bool,
-    branch: &str,
-    on_event: &mut dyn FnMut(String),
-) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for (rel, package) in flutter_apps(wt.path()) {
-        let dir = if rel.is_empty() { wt.path().to_path_buf() } else { wt.path().join(&rel) };
-        let test_dir = dir.join("test");
-        let test_file = test_dir.join("devdock_smoke_test.dart");
-        let image = test_dir.join("devdock_smoke.png");
-        if std::fs::create_dir_all(&test_dir).is_err() || std::fs::write(&test_file, smoke_test_source(&package)).is_err() {
-            continue;
-        }
-        let job = crate::local_ci::Job {
-            name: if rel.is_empty() { "screenshot".into() } else { format!("screenshot ({rel})") },
-            commands: vec!["flutter test --update-goldens test/devdock_smoke_test.dart".into()],
-            dir: rel.clone(),
-            runner: sandboxed.then(|| crate::sandbox::RUNNER_ID.to_string()),
-            timeout_secs: Some(600),
-            ..Default::default()
-        };
-        on_event(format!("taking a screenshot of {}", if rel.is_empty() { "the app".to_string() } else { rel.clone() }));
-        let result = crate::local_ci::run_job_with(runners, wt.path(), &job);
-        let _ = std::fs::remove_file(&test_file);
-        if !result.ok || !image.exists() {
-            let why = result
-                .output
-                .lines()
-                .rev()
-                .find(|l| l.contains("Error") || l.contains("error") || l.contains("Exception"))
-                .or_else(|| result.output.lines().rev().find(|l| !l.trim().is_empty()))
-                .unwrap_or("no output")
-                .trim();
-            on_event(format!("no screenshot: the app did not render in a test ({})", why.chars().take(160).collect::<String>()));
-            let _ = std::fs::remove_file(&image);
-            continue;
-        }
-        let keep = crate::secure_store::config_dir().join("screenshots");
-        let _ = std::fs::create_dir_all(&keep);
-        let name = format!("{}{}.png", slugify(branch, 60), if rel.is_empty() { String::new() } else { format!("-{}", slugify(&rel, 30)) });
-        let dest = keep.join(name);
-        match std::fs::copy(&image, &dest) {
-            Ok(_) => {
-                on_event(format!("screenshot: {}", dest.display()));
-                out.push(dest);
-            }
-            Err(e) => on_event(format!("could not keep the screenshot: {e}")),
-        }
-        let _ = std::fs::remove_file(&image);
-    }
-    out
-}
-
-/// Flutter apps in the tree — a `pubspec.yaml` with the Flutter SDK and a
-/// `lib/main.dart` — as (directory relative to the root, package name).
-fn flutter_apps(root: &Path) -> Vec<(String, String)> {
-    let mut apps = Vec::new();
-    let mut stack = vec![(root.to_path_buf(), 0usize)];
-    while let Some((dir, depth)) = stack.pop() {
-        let pubspec = dir.join("pubspec.yaml");
-        if let Ok(text) = std::fs::read_to_string(&pubspec) {
-            if (text.contains("sdk: flutter") || text.contains("flutter:")) && dir.join("lib/main.dart").exists() {
-                let name = text.lines().find_map(|l| l.strip_prefix("name:")).map(|n| n.trim().trim_matches('"').trim_matches('\'').to_string());
-                if let Some(name) = name.filter(|n| !n.is_empty()) {
-                    let rel = dir.strip_prefix(root).map(|p| p.to_string_lossy().replace('\\', "/")).unwrap_or_default();
-                    apps.push((rel, name));
-                }
-            }
-            continue;
-        }
-        if depth >= 3 {
-            continue;
-        }
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-        for entry in entries.filter_map(|e| e.ok()) {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
-            if path.is_dir() && !name.starts_with('.') && !matches!(name.as_str(), "build" | "node_modules" | "ios" | "android" | "macos" | "linux" | "windows" | "web" | "test") {
-                stack.push((path, depth + 1));
-            }
-        }
-    }
-    apps.sort();
-    apps
-}
-
-/// The test that renders the app's first frame to `devdock_smoke.png`.
-fn smoke_test_source(package: &str) -> String {
-    format!(
-        r#"// Generated by DevDock for one screenshot; removed afterwards.
-import 'dart:io';
-import 'dart:typed_data';
-import 'package:flutter/services.dart';
-import 'package:flutter/widgets.dart';
-import 'package:flutter_test/flutter_test.dart';
-import 'package:{package}/main.dart' as app;
-
-Future<void> _loadFonts() async {{
-  final root = Platform.environment['FLUTTER_ROOT'];
-  if (root == null) return;
-  final dir = '$root/bin/cache/artifacts/material_fonts';
-  Future<void> load(String family, String file) async {{
-    final f = File('$dir/$file');
-    if (!await f.exists()) return;
-    final bytes = await f.readAsBytes();
-    final loader = FontLoader(family)..addFont(Future.value(ByteData.view(bytes.buffer)));
-    await loader.load();
-  }}
-  await load('Roboto', 'Roboto-Regular.ttf');
-  await load('Roboto', 'Roboto-Medium.ttf');
-  await load('Roboto', 'Roboto-Bold.ttf');
-  await load('MaterialIcons', 'MaterialIcons-Regular.otf');
-}}
-
-void main() {{
-  testWidgets('devdock smoke screenshot', (tester) async {{
-    WidgetsApp.debugAllowBannerOverride = false;
-    tester.view.physicalSize = const Size(1280, 800);
-    tester.view.devicePixelRatio = 1.0;
-    addTearDown(tester.view.reset);
-    // Real I/O — font files, whatever main awaits — only completes outside
-    // the test's fake-async zone.
-    await tester.runAsync(() async {{
-      try {{
-        await _loadFonts();
-      }} catch (_) {{}}
-      try {{
-        // Through dynamic: main may return void or a Future, either is fine.
-        final dynamic started = (app.main as dynamic)();
-        if (started is Future) {{
-          await started.timeout(const Duration(seconds: 15));
-        }}
-      }} catch (_) {{}}
-    }});
-    await tester.pump();
-    try {{
-      await tester.pumpAndSettle(const Duration(milliseconds: 100), EnginePhase.sendSemanticsUpdate, const Duration(seconds: 10));
-    }} catch (_) {{}}
-    final root = find.byType(WidgetsApp);
-    expect(root, findsWidgets, reason: 'the app put no WidgetsApp on screen');
-    await expectLater(root.first, matchesGoldenFile('devdock_smoke.png'));
-  }});
-}}
-"#
-    )
 }
 
 /// Reviews the change with whichever engine: the harness over a read-only
@@ -1502,62 +1348,6 @@ mod tests {
         assert!(log.iter().any(|l| l == "MCP: adder started with 1 tool(s): add"), "{log:?}");
         assert!(log.iter().any(|l| l.starts_with("· adder: add")), "{log:?}");
         assert_eq!(fixed.changes.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(), ["lib.py"]);
-    }
-
-    #[test]
-    fn flutter_apps_are_found_and_the_smoke_test_names_their_package() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        fs::create_dir_all(root.join("mobile/lib")).unwrap();
-        fs::write(root.join("mobile/pubspec.yaml"), "name: farm_app\ndependencies:\n  flutter:\n    sdk: flutter\n").unwrap();
-        fs::write(root.join("mobile/lib/main.dart"), "void main() {}\n").unwrap();
-        fs::create_dir_all(root.join("rules/lib")).unwrap();
-        fs::write(root.join("rules/pubspec.yaml"), "name: rules\nenvironment:\n  sdk: ^3.0.0\n").unwrap();
-        assert_eq!(flutter_apps(root), [("mobile".to_string(), "farm_app".to_string())], "a pure Dart package has no screen");
-        let source = smoke_test_source("farm_app");
-        assert!(source.contains("import 'package:farm_app/main.dart' as app;"));
-        assert!(source.contains("matchesGoldenFile('devdock_smoke.png')"));
-        assert!(source.contains("Roboto-Regular.ttf"), "real fonts, not boxes");
-    }
-
-    /// A real Flutter app's first frame, rendered in the sandbox by the
-    /// generated golden test and kept as a PNG DevDock can show.
-    /// `cargo test --lib backlog::tests::live_screenshot -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn live_screenshot_of_a_flutter_app_is_taken_in_the_sandbox() {
-        if crate::sandbox::installed().is_empty() {
-            eprintln!("no sandbox runtime; skipping");
-            return;
-        }
-        let (_tmp, repo) = setup("true");
-        let root = repo.path().to_path_buf();
-        fs::create_dir_all(root.join("lib")).unwrap();
-        fs::write(root.join("pubspec.yaml"), "name: hello_app\nenvironment:\n  sdk: ^3.0.0\ndependencies:\n  flutter:\n    sdk: flutter\ndev_dependencies:\n  flutter_test:\n    sdk: flutter\nflutter:\n  uses-material-design: true\n").unwrap();
-        fs::write(root.join("lib/main.dart"), "import 'package:flutter/material.dart';\n\nvoid main() => runApp(const HelloApp());\n\nclass HelloApp extends StatelessWidget {\n  const HelloApp({super.key});\n  @override\n  Widget build(BuildContext context) => MaterialApp(\n    home: Scaffold(\n      appBar: AppBar(title: const Text('Hello from DevDock')),\n      body: const Center(child: Text('The first frame, rendered in the sandbox.', style: TextStyle(fontSize: 24))),\n      floatingActionButton: FloatingActionButton(onPressed: () {}, child: const Icon(Icons.camera_alt)),\n    ),\n  );\n}\n").unwrap();
-        sh(&root, &["add", "-A"]);
-        sh(&root, &["commit", "-q", "-m", "a flutter app"]);
-        let mut log = |l: String| println!("  {l}");
-        let sandbox = crate::sandbox::Sandbox::start(&crate::sandbox::Spec::default(), &root, &mut log).unwrap();
-        sandbox.provision(&["flutter"], &mut log).unwrap();
-        let sandbox = std::sync::Arc::new(sandbox);
-        let mut runners = crate::local_ci::runner::RunnerRegistry::with_builtins();
-        runners.register(Box::new(crate::sandbox::SandboxRunner(sandbox.clone())));
-        for mut step in crate::local_ci::prepare_jobs(&root, true) {
-            step.runner = Some(crate::sandbox::RUNNER_ID.into());
-            let r = crate::local_ci::run_job_with(&runners, &root, &step);
-            assert!(r.ok, "{}: {}", step.name, r.output);
-        }
-        let shots = capture_screenshots(&repo, &runners, true, "agent/live-screenshot", &mut log);
-        assert_eq!(shots.len(), 1, "one app, one screenshot");
-        let bytes = fs::read(&shots[0]).unwrap();
-        let img = image::load_from_memory(&bytes).expect("a PNG");
-        println!("screenshot {} is {}x{}", shots[0].display(), img.width(), img.height());
-        assert!(img.width() >= 800 && img.height() >= 500, "{}x{}", img.width(), img.height());
-        assert!(!root.join("test/devdock_smoke_test.dart").exists() && !root.join("test/devdock_smoke.png").exists(), "the generated files are gone");
-        let status = repo.git(&["status", "--porcelain"]).unwrap();
-        assert!(!status.contains("devdock_smoke"), "the generated files are gone: {status}");
-        assert!(!status.lines().any(|l| l.starts_with(" M") || l.starts_with("M ")), "nothing tracked changed: {status}");
     }
 
     #[test]

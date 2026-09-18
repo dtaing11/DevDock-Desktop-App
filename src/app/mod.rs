@@ -2081,6 +2081,18 @@ impl App {
             Msg::AgentRunProgress { key, line } => self.on_agent_run_progress(key, line),
             Msg::AgentRunDone { key, result } => self.on_agent_run_done(key, result),
             Msg::AgentQuestion { key, question, reply } => self.on_agent_question(key, question, reply),
+            Msg::AgentScreenshots(result) => {
+                self.coding.screenshotting = false;
+                match result {
+                    Ok(shots) => {
+                        if shots.is_empty() {
+                            self.coding.log.push("no screenshot: nothing in this tree rendered".into());
+                        }
+                        self.coding.screenshots = shots;
+                    }
+                    Err(e) => self.coding.log.push(format!("no screenshot: {e}")),
+                }
+            }
 
             Msg::Worktrees(result) => self.on_worktrees(result),
             Msg::WorktreeDone { message, open } => self.on_worktree_done(message, open),
@@ -4204,6 +4216,10 @@ impl App {
                         }
                     }
                 }
+                if live {
+                    context.push_str(crate::screenshots::SCREENS_NOTE);
+                    context.push('\n');
+                }
                 if let Ok(status) = repo.status() {
                     if !status.files.is_empty() {
                         let paths: Vec<&str> =
@@ -4286,6 +4302,45 @@ impl App {
     /// Guidance for the coding agent: the repository's own review
     /// instructions, which is where a project already writes down how its
     /// code is supposed to look.
+    /// Photographs what the in-tab run left in this tree, in a sandbox
+    /// over it — the browser and the test runner live there, and nothing
+    /// opens on the developer's screen. Skipped when no sandbox runtime is
+    /// installed or the tree has nothing with a screen.
+    pub fn photograph_result(&mut self) {
+        let Some(repo) = self.repo.clone() else { return };
+        if crate::sandbox::installed().is_empty() {
+            return;
+        }
+        let root = repo.path().to_path_buf();
+        if crate::screenshots::flutter_apps(&root).is_empty() && crate::screenshots::web_targets(&root).is_empty() {
+            return;
+        }
+        self.coding.screenshots.clear();
+        self.coding.screenshotting = true;
+        let repo_key = self.repo_key();
+        let progress = self.worker.progress().for_repo(repo_key.clone());
+        let label = format!("agent-{}", self.status.as_ref().map(|s| s.branch.clone()).unwrap_or_else(|| "tree".into()));
+        self.worker.spawn_for(repo_key, move || {
+            let result = (|| -> Result<Vec<std::path::PathBuf>, String> {
+                let mut log = |line: String| progress.send(Msg::AgentEvent { kind: AgentKind::Coding, line });
+                let sandbox = std::sync::Arc::new(crate::sandbox::Sandbox::start(&crate::sandbox::Spec::default(), &root, &mut log)?);
+                let programs: Vec<&str> = crate::local_ci::toolchain_commands(&root);
+                sandbox.provision(&programs, &mut log)?;
+                let mut runners = crate::local_ci::runner::RunnerRegistry::with_builtins();
+                runners.register(Box::new(crate::sandbox::SandboxRunner(sandbox.clone())));
+                for mut step in crate::local_ci::prepare_jobs(&root, true) {
+                    step.runner = Some(crate::sandbox::RUNNER_ID.into());
+                    let r = crate::local_ci::run_job_with(&runners, &root, &step);
+                    if !r.ok {
+                        return Err(format!("{} failed in the sandbox", step.name));
+                    }
+                }
+                Ok(crate::screenshots::capture(&root, &runners, Some(&sandbox), &label, &mut log))
+            })();
+            Msg::AgentScreenshots(result)
+        });
+    }
+
     /// Attaches an image file to the next task, or says why it cannot.
     pub fn attach_image(&mut self, path: &std::path::Path) {
         match agent_tab::PromptImage::from_file(path) {
@@ -4505,6 +4560,9 @@ impl App {
                 // A live run already changed the working tree.
                 if self.coding.live {
                     self.refresh();
+                    if !self.coding.edits.is_empty() {
+                        self.photograph_result();
+                    }
                 }
             }
             Err(e) => {

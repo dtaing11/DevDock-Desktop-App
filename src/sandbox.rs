@@ -263,7 +263,14 @@ impl Sandbox {
     /// to build and test the repository.
     pub fn provision(&self, programs: &[&str], log: &mut dyn FnMut(String)) -> Result<(), String> {
         let missing: Vec<&str> = {
-            let probe = programs.iter().map(|p| format!("command -v {p} >/dev/null 2>&1 || echo MISSING:{p}")).collect::<Vec<_>>().join("; ");
+            let probe = programs
+                .iter()
+                .map(|p| match recipe_for(p).and_then(|r| r.check) {
+                    Some(check) => format!("( {check} ) >/dev/null 2>&1 || echo MISSING:{p}"),
+                    None => format!("command -v {p} >/dev/null 2>&1 || echo MISSING:{p}"),
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
             if probe.is_empty() {
                 return Ok(());
             }
@@ -463,6 +470,10 @@ impl Drop for Sandbox {
 struct Recipe {
     name: &'static str,
     script: &'static str,
+    /// A shell test that says the recipe's result is there, for programs
+    /// that are not commands on the PATH (an npm package, say). `None`
+    /// means `command -v <program>`.
+    check: Option<&'static str>,
 }
 
 /// `apt-get` with the right prefix, as a shell fragment the recipes share.
@@ -477,6 +488,7 @@ add_path() { grep -qs "$1" "$HOME/.profile" 2>/dev/null || printf 'export PATH="
 
 /// The recipe that provides `program`, if there is one.
 fn recipe_for(program: &str) -> Option<Recipe> {
+    let mut check: Option<&'static str> = None;
     let (name, body): (&'static str, &'static str) = match program {
         "flutter" | "dart" => ("Flutter", r#"
 apt_install git curl unzip xz-utils zip libglu1-mesa ca-certificates
@@ -524,6 +536,17 @@ if ! command -v claude >/dev/null 2>&1 && [ ! -x "$HOME/.local/bin/claude" ]; th
 add_path "$HOME/.local/bin"
 claude --version >/dev/null
 "#),
+        "playwright" => {
+            check = Some(r#"test -x "$HOME/.devdock-playwright/node_modules/.bin/playwright" && ls "$HOME/.cache/ms-playwright" 2>/dev/null | grep -q chromium"#);
+            ("a headless browser (Playwright Chromium)", r#"
+apt_install nodejs npm ca-certificates python3
+mkdir -p "$HOME/.devdock-playwright" && cd "$HOME/.devdock-playwright"
+[ -f package.json ] || npm init -y >/dev/null 2>&1
+[ -x node_modules/.bin/playwright ] || npm install --no-audit --no-fund playwright >/dev/null
+npx playwright install --with-deps chromium >/dev/null
+npx playwright --version >/dev/null
+"#)
+        }
         "make" => ("build tools", r#"
 apt_install build-essential
 "#),
@@ -536,7 +559,7 @@ java -version >/dev/null 2>&1
     // Leaked once per distinct recipe: a handful of static strings.
     let script: &'static str = Box::leak(format!("{APT}
 {body}").into_boxed_str());
-    Some(Recipe { name, script })
+    Some(Recipe { name, script, check })
 }
 
 /// Claude Code's own credentials on this machine, as the JSON its Linux
@@ -630,7 +653,7 @@ mod tests {
 
     #[test]
     fn every_toolchain_has_a_recipe_that_sh_accepts() {
-        for program in ["flutter", "dart", "cargo", "npm", "python3", "pytest", "go", "mix", "bundle", "make", "gradle", "claude"] {
+        for program in ["flutter", "dart", "cargo", "npm", "python3", "pytest", "go", "mix", "bundle", "make", "gradle", "claude", "playwright"] {
             let recipe = recipe_for(program).unwrap_or_else(|| panic!("no recipe for {program}"));
             assert!(recipe.script.contains("set -e"));
             // `sh -n` parses without running.

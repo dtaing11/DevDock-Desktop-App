@@ -563,6 +563,33 @@ fn work(
     if let Some(ask) = &job.ask {
         workspace = workspace.with_asker(ask.clone());
     }
+    // The repository's MCP servers, started where the checks run. One that
+    // cannot start is logged and left out; the run goes on without it.
+    let host_launcher = crate::agent::mcp::HostLauncher;
+    let sandbox_launcher = sandbox.as_ref().map(|s| crate::sandbox::SandboxRunner(s.clone()));
+    let launcher: &dyn crate::agent::mcp::Launcher = match &sandbox_launcher {
+        Some(l) => l,
+        None => &host_launcher,
+    };
+    let mut servers = Vec::new();
+    for spec in crate::agent::mcp::declared(wt.path()) {
+        let name = spec.name.clone();
+        match crate::agent::mcp::Server::start(spec, launcher, wt.path()) {
+            Ok(server) => {
+                on_event(format!(
+                    "MCP: {name} started{} with {} tool(s): {}",
+                    if sandbox.is_some() { " in the sandbox" } else { "" },
+                    server.tools().len(),
+                    server.tools().iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")
+                ));
+                servers.push(server);
+            }
+            Err(e) => on_event(format!("MCP: {name} not started: {e}")),
+        }
+    }
+    if !servers.is_empty() {
+        workspace = workspace.with_mcp(servers);
+    }
     let base_task = task_text(job.task, job.ask.is_some());
     let mut context = String::from("This is an unattended run on a fresh worktree of the repository.");
     if !baseline.is_empty() {
@@ -1447,6 +1474,34 @@ mod tests {
         assert_eq!(fixed.skipped, ["lint"]);
         assert_eq!(fixed.checks, [CheckOutcome { name: "tests".into(), ok: true }]);
         assert!(fixed.pr.number == 42);
+    }
+
+    #[test]
+    fn a_declared_mcp_servers_tool_is_used_by_the_fixer() {
+        let (_tmp, repo) = setup("grep -q 'return sum(xs)$' lib.py");
+        fs::write(repo.path().join("adder_mcp.py"), crate::agent::mcp::tests::ADDER).unwrap();
+        fs::write(repo.path().join(".mcp.json"), r#"{"mcpServers": {"adder": {"command": "python3", "args": ["adder_mcp.py"]}}}"#).unwrap();
+        sh(repo.path(), &["add", "-A"]);
+        sh(repo.path(), &["commit", "-q", "-m", "an mcp server"]);
+        sh(repo.path(), &["push", "-q", "origin", "main"]);
+        let engine = Engine::Harness(Box::new(Scripted(RefCell::new(vec![
+            Reply { text: String::new(), calls: vec![ToolCall { id: "m".into(), name: "mcp__adder__add".into(), input: serde_json::json!({"a": 40, "b": 2}) }], ..Default::default() },
+            Reply { text: String::new(), calls: vec![ToolCall { id: "1".into(), name: "edit_file".into(), input: serde_json::json!({"path": "lib.py", "old_text": "sum(xs) + 1", "new_text": "sum(xs)"}) }], ..Default::default() },
+            Reply { text: String::new(), calls: vec![ToolCall { id: "c".into(), name: "run_check".into(), input: serde_json::json!({"name": "tests"}) }], ..Default::default() },
+            Reply { text: "fixed; the adder said 42".into(), ..Default::default() },
+        ]))));
+        let mut log = Vec::new();
+        let fixed = fix(
+            &repo,
+            &engine,
+            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox: None, claim: None, rounds: 1, reviewer: None, ask: None },
+            &fake_pr,
+            &mut |line| log.push(line),
+        )
+        .unwrap_or_else(|e| panic!("{e}\n{log:#?}"));
+        assert!(log.iter().any(|l| l == "MCP: adder started with 1 tool(s): add"), "{log:?}");
+        assert!(log.iter().any(|l| l.starts_with("· adder: add")), "{log:?}");
+        assert_eq!(fixed.changes.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(), ["lib.py"]);
     }
 
     #[test]

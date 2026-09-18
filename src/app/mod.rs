@@ -4230,6 +4230,21 @@ impl App {
                 .with_checks(checks)
                 .with_commands(live)
                 .with_asker(progress.asker(None));
+                // The repository's MCP servers, on this machine.
+                let mut servers = Vec::new();
+                for spec in crate::agent::mcp::declared(repo.path()) {
+                    let name = spec.name.clone();
+                    match crate::agent::mcp::Server::start(spec, &crate::agent::mcp::HostLauncher, repo.path()) {
+                        Ok(server) => {
+                            progress.send(Msg::AgentEvent { kind: AgentKind::Coding, line: format!("MCP: {name} started with {} tool(s)", server.tools().len()) });
+                            servers.push(server);
+                        }
+                        Err(e) => progress.send(Msg::AgentEvent { kind: AgentKind::Coding, line: format!("MCP: {name} not started: {e}") }),
+                    }
+                }
+                if !servers.is_empty() {
+                    workspace = workspace.with_mcp(servers);
+                }
 
                 let engine_label = engine.label();
                 let run = crate::agent::coding::run_with(

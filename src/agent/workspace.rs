@@ -195,6 +195,10 @@ pub struct Workspace {
     /// A line to the developer, when someone is there to answer.
     asker: Option<super::Asker>,
     questions: usize,
+    /// The repository's MCP servers, running, their tools on offer as
+    /// `mcp__<server>__<tool>`.
+    mcp: Vec<super::mcp::Server>,
+    mcp_calls: usize,
     /// Files edited since the model last asked for their diagnostics.
     undiagnosed: BTreeSet<String>,
     /// The file most recently read, for a nudge that needs to name one.
@@ -236,6 +240,8 @@ impl Workspace {
             runners: std::sync::Arc::new(crate::local_ci::runner::RunnerRegistry::with_builtins()),
             asker: None,
             questions: 0,
+            mcp: Vec::new(),
+            mcp_calls: 0,
             undiagnosed: BTreeSet::new(),
             last_read: None,
             edited_since_check: false,
@@ -284,6 +290,20 @@ impl Workspace {
             job.image = None;
         }
         self
+    }
+
+    /// Offers the tools of these running MCP servers to the model.
+    pub fn with_mcp(mut self, servers: Vec<super::mcp::Server>) -> Self {
+        self.mcp = servers;
+        self
+    }
+
+    /// The MCP tools on offer, as the model sees them.
+    pub fn mcp_tool_names(&self) -> Vec<String> {
+        self.mcp
+            .iter()
+            .flat_map(|s| s.tools().iter().map(move |t| super::mcp::tool_name(&s.spec.name, &t.name)))
+            .collect()
     }
 
     /// Lets the model ask the developer something and wait for the answer.
@@ -685,6 +705,17 @@ impl Workspace {
             });
         }
 
+        for server in &self.mcp {
+            for tool in server.tools() {
+                // Leaked once per tool per workspace: a handful of small strings.
+                let name: &'static str = Box::leak(super::mcp::tool_name(&server.spec.name, &tool.name).into_boxed_str());
+                let description: &'static str = Box::leak(
+                    format!("(MCP tool from the repository's `{}` server) {}", server.spec.name, tool.description).into_boxed_str(),
+                );
+                tools.push(ToolSpec { name, description, schema: tool.schema.clone() });
+            }
+        }
+
         if self.asker.is_some() {
             tools.push(ToolSpec {
                 name: "ask_developer",
@@ -830,6 +861,7 @@ impl Workspace {
             "run_check" if !self.checks.is_empty() => self.run_check(&call.input),
             "run_command" if self.commands_available() => self.run_command(&call.input),
             "ask_developer" if self.asker.is_some() => self.ask_developer(&call.input),
+            name if name.starts_with("mcp__") => self.call_mcp(name, &call.input),
             "run_command" if self.commands => Err(
                 "This run proposes changes without writing them, so a command would see the \
                  old code. Report what you changed instead."
@@ -1665,6 +1697,32 @@ impl Workspace {
         ))
     }
 
+    fn call_mcp(&mut self, name: &str, input: &serde_json::Value) -> Result<String, String> {
+        const MAX_MCP_CALLS: usize = 60;
+        const MAX_OUTPUT: usize = 12_000;
+        let Some((server_name, tool)) = super::mcp::split_name(name) else {
+            return Err(format!("No such tool: {name}"));
+        };
+        let Some(server) = self.mcp.iter().find(|s| s.spec.name == server_name) else {
+            return Err(format!("No MCP server named {server_name}. Available: {}", self.mcp_tool_names().join(", ")));
+        };
+        if !server.tools().iter().any(|t| t.name == tool) {
+            return Err(format!("The {server_name} server has no tool named {tool}. Its tools: {}", server.tools().iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")));
+        }
+        if self.mcp_calls >= MAX_MCP_CALLS {
+            return Err(format!("MCP call budget spent ({MAX_MCP_CALLS}). Finish with what you know."));
+        }
+        self.mcp_calls += 1;
+        let arguments = if input.is_object() { input.clone() } else { serde_json::json!({}) };
+        let mut text = server.call(tool, arguments)?;
+        if text.len() > MAX_OUTPUT {
+            let end = (0..=MAX_OUTPUT).rev().find(|i| text.is_char_boundary(*i)).unwrap_or(0);
+            text.truncate(end);
+            text.push_str("\n[output trimmed]");
+        }
+        Ok(text)
+    }
+
     fn ask_developer(&mut self, input: &serde_json::Value) -> Result<String, String> {
         const MAX_QUESTIONS: usize = 5;
         let question = self.arg_str(input, "question")?.trim().to_string();
@@ -1906,6 +1964,11 @@ pub fn summarize(call: &ToolCall) -> String {
         "find_symbol" => format!("find symbol {}", arg("query")),
         "run_check" => format!("run check {}", arg("name")),
         "ask_developer" => format!("asked you: {}", arg("question")),
+        name if name.starts_with("mcp__") => {
+            let (server, tool) = super::mcp::split_name(name).unwrap_or(("mcp", name));
+            let args: String = call.input.to_string().chars().take(80).collect();
+            format!("{server}: {tool} {args}")
+        }
         "run_command" => {
             // `cd somewhere && the command`: the command is the news.
             let command = arg("command");
@@ -2653,6 +2716,31 @@ mod tests {
         let (_tmp, ws) = fixture(Access::ReadOnly);
         let ws = ws.with_commands(true).with_write_mode(WriteMode::Live);
         assert!(!ws.tools().iter().any(|t| t.name == "run_command"));
+    }
+
+    #[test]
+    fn an_mcp_servers_tools_are_offered_and_called() {
+        let repo = super::super::mcp::tests::adder_repo();
+        let tracked = vec!["adder_mcp.py".to_string(), ".mcp.json".to_string()];
+        let ws = Workspace::new(repo.path(), tracked, Access::ReadWrite).unwrap();
+        assert!(ws.mcp_tool_names().is_empty(), "no servers started, no tools");
+        let servers: Vec<super::super::mcp::Server> = super::super::mcp::declared(repo.path())
+            .into_iter()
+            .map(|spec| super::super::mcp::Server::start(spec, &super::super::mcp::HostLauncher, repo.path()).unwrap())
+            .collect();
+        let mut ws = ws.with_mcp(servers);
+        assert_eq!(ws.mcp_tool_names(), ["mcp__adder__add"]);
+        let spec = ws.tools().into_iter().find(|t| t.name == "mcp__adder__add").expect("offered");
+        assert!(spec.description.contains("`adder` server") && spec.description.contains("Adds two integers"));
+        assert_eq!(spec.schema["required"], serde_json::json!(["a", "b"]));
+        let out = ws.dispatch(&call("mcp__adder__add", serde_json::json!({"a": 40, "b": 2})), 10);
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(out.content, "42");
+        let out = ws.dispatch(&call("mcp__adder__nope", serde_json::json!({})), 10);
+        assert!(out.is_error && out.content.contains("no tool named nope"), "{}", out.content);
+        let out = ws.dispatch(&call("mcp__ghost__x", serde_json::json!({})), 10);
+        assert!(out.is_error && out.content.contains("No MCP server named ghost"), "{}", out.content);
+        assert!(summarize(&call("mcp__adder__add", serde_json::json!({"a": 1, "b": 2}))).starts_with("adder: add {"));
     }
 
     #[test]

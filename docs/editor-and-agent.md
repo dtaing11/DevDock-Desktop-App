@@ -373,6 +373,19 @@ It needs GitHub sign-in, because the outcome is a pull request. A prompt that
 needs a decision from you is not a fit: the agent is told nobody can answer,
 and to change nothing rather than guess.
 
+### MCP tools
+
+A repository that declares MCP servers in its `.mcp.json` gives them to
+both engines. The built-in harness starts each stdio server when a run
+begins — inside the sandbox when there is one, so a server that touches
+files or runs commands touches the same tree the checks do — and offers
+its tools to the model as `mcp__<server>__<tool>`, next to its own; they
+are stopped when the run ends. Claude Code is given the same file and every
+declared server's tools up front; a plugin's or user-level server it finds
+on its own is allowed the first time one of its tools is refused. Servers
+reached by URL rather than a command are Claude Code's only: the harness
+speaks stdio.
+
 ### Images in the prompt
 
 Some things words describe badly: a screenshot of the bug, a mockup of what

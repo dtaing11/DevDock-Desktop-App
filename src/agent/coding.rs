@@ -99,6 +99,9 @@ The project's checks: run_check runs one of the commands this repository already
 const COMMAND_TOOLS: &str = r#"
 Commands: run_command runs a shell command in the repository root — the toolchain (build, a single test, a formatter, a linter), installing dependencies, a script — anything the named checks do not cover. Prefer it over guessing whether something compiles. It cannot commit, push, or rewrite git history; that is done for you. Stay inside the repository."#;
 
+const MCP_TOOLS: &str = r#"
+MCP tools: tools named mcp__<server>__<tool> come from the servers this repository declares in .mcp.json, running for this run. They know this project — a package manager, an analyzer, a database — so prefer one over reconstructing the same thing in the shell. Their output comes back as text."#;
+
 const ASK_TOOLS: &str = r#"
 Asking: ask_developer puts one question to the developer and waits for the answer. Use it only when something genuinely uncertain would change what you build — a product choice, two reasonable readings of the task, a value nobody wrote down — and ask it specifically, with the options you see. Everything else you decide and state in your summary. If no answer comes you are told; then proceed on your best assumption."#;
 
@@ -151,6 +154,7 @@ pub fn system_prompt(
     has_checks: bool,
     has_commands: bool,
     has_ask: bool,
+    has_mcp: bool,
     extra_instructions: Option<&str>,
 ) -> String {
     let mut prompt = String::from(BASE_PROMPT);
@@ -170,6 +174,9 @@ pub fn system_prompt(
     }
     if has_commands {
         prompt.push_str(COMMAND_TOOLS);
+    }
+    if has_mcp {
+        prompt.push_str(MCP_TOOLS);
     }
     if has_ask {
         prompt.push_str(ASK_TOOLS);
@@ -401,6 +408,7 @@ pub fn run(
         tools.contains(&"run_check"),
         tools.contains(&"run_command"),
         tools.contains(&"ask_developer"),
+        tools.iter().any(|t| t.starts_with("mcp__")),
         (!instructions.is_empty()).then_some(instructions.as_str()),
     );
     let overview = workspace.overview();
@@ -426,7 +434,7 @@ mod tests {
 
     #[test]
     fn the_prompt_describes_only_the_tools_that_exist() {
-        let bare = system_prompt(WriteMode::Overlay, false, false, false, false, None);
+        let bare = system_prompt(WriteMode::Overlay, false, false, false, false, false, None);
         assert!(bare.contains("list_files"));
         assert!(bare.contains("show_changes"));
         assert!(!bare.contains("The language server:"), "no language server was offered");
@@ -434,7 +442,8 @@ mod tests {
         assert!(!bare.contains("run_command"), "no commands were offered");
         assert!(bare.contains("nothing reaches disk"));
 
-        let full = system_prompt(WriteMode::Live, true, true, true, true, Some("Never touch vendor/."));
+        let full = system_prompt(WriteMode::Live, true, true, true, true, true, Some("Never touch vendor/."));
+        assert!(!bare.contains("MCP tools:") && full.contains("mcp__<server>__<tool>"));
         assert!(!bare.contains("ask_developer") && full.contains("ask_developer"));
         assert_eq!(question_in("I did x.\n\nQUESTION: Red or blue?").as_deref(), Some("Red or blue?"));
         assert_eq!(question_in("QUESTION: only this"), Some("only this".into()));

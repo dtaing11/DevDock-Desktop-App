@@ -346,6 +346,48 @@ impl Sandbox {
         crate::local_ci::runner::wait_with_timeout(child, timeout, || crate::local_ci::runner::kill_group(pid))
     }
 
+    /// A command that runs `program args…` inside the sandbox, in `subdir`
+    /// of the worktree, with `env` — stdin and stdout left for the caller
+    /// to pipe. For a long-lived process such as an MCP server, where
+    /// [`Sandbox::exec`]'s run-to-completion does not fit.
+    pub fn command(&self, program: &str, args: &[String], env: &std::collections::BTreeMap<String, String>, subdir: &str) -> Command {
+        let workdir = if subdir.is_empty() { self.inner_root.clone() } else { format!("{}/{subdir}", self.inner_root) };
+        match self.kind {
+            Kind::Lima => {
+                let mut c = Command::new("limactl");
+                c.args(["shell", "--workdir", &workdir, &self.name]);
+                let mut script = String::new();
+                for (k, v) in env {
+                    script.push_str(&format!("export {k}={}; ", shell_quote(v)));
+                }
+                script.push_str("exec ");
+                script.push_str(&shell_quote(program));
+                for a in args {
+                    script.push(' ');
+                    script.push_str(&shell_quote(a));
+                }
+                c.args(["sh", "-lc", &script]);
+                c
+            }
+            Kind::Docker | Kind::AppleContainer => {
+                let mut c = Command::new(if self.kind == Kind::Docker { "docker" } else { "container" });
+                c.args(["exec", "-i", "-w", &workdir]);
+                for (k, v) in env {
+                    c.arg("-e").arg(format!("{k}={v}"));
+                }
+                // Through a login shell, so what provisioning put on PATH is found.
+                let mut script = String::from("exec ");
+                script.push_str(&shell_quote(program));
+                for a in args {
+                    script.push(' ');
+                    script.push_str(&shell_quote(a));
+                }
+                c.arg(&self.name).args(["sh", "-lc", &script]);
+                c
+            }
+        }
+    }
+
     /// The host path of the worktree this sandbox is over.
     pub fn root(&self) -> &Path {
         &self.root
@@ -444,6 +486,15 @@ java -version >/dev/null 2>&1
 
 fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+/// The sandbox as a place to start an MCP server: the server's process
+/// runs inside, over the worktree at its inner path.
+impl crate::agent::mcp::Launcher for SandboxRunner {
+    fn command(&self, program: &str, args: &[String], env: &std::collections::BTreeMap<String, String>, workdir: &Path) -> Command {
+        let subdir = workdir.strip_prefix(self.0.root()).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        self.0.command(program, args, env, &subdir)
+    }
 }
 
 /// The sandbox as a check runner: jobs with `runner = "sandbox"` execute

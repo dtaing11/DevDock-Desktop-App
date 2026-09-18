@@ -512,7 +512,7 @@ pub fn dialog(app: &mut App, ctx: &egui::Context, open: &mut bool) {
                  Unticked, this window switches to it.",
             );
             let create = egui::Button::new(RichText::new("Create worktree").strong())
-                .fill(theme::ember());
+                .fill(theme::green());
             if ui.add_enabled(!busy && !branch.is_empty(), create).clicked() {
                 app.worktree_create();
             }

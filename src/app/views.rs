@@ -1382,7 +1382,7 @@ fn select_file(app: &mut App, path: &str, staged: bool) {
 fn mode_button(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
     let button = if active {
         egui::Button::new(RichText::new(label).color(theme::bg()).strong())
-            .fill(theme::ember())
+            .fill(theme::green())
     } else {
         egui::Button::new(RichText::new(label).color(theme::fg()))
     };
@@ -1526,7 +1526,7 @@ fn commit_box(app: &mut App, ui: &mut egui::Ui) {
         format!("Commit to {branch}")
     };
     let commit_btn = egui::Button::new(RichText::new(label).strong().color(Color32::BLACK))
-        .fill(theme::ember())
+        .fill(theme::green())
         .min_size(egui::vec2(ui.available_width(), 32.0));
     if ui.add_enabled(can_commit, commit_btn).clicked() {
         app.do_commit();
@@ -1562,8 +1562,8 @@ pub fn ai_controls(
     label: &str,
 ) {
     const HEIGHT: f32 = 28.0;
-    let fill = theme::teal().linear_multiply(0.25);
-    let fill_hover = theme::teal().linear_multiply(0.35);
+    let fill = theme::button_fill();
+    let fill_hover = theme::button_fill_hover();
 
     ui.scope(|ui| {
         // One interact height and one fill for both widgets.

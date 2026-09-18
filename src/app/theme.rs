@@ -1,9 +1,10 @@
 //! Visual identity for DevDock.
 //!
-//! Direction: a "dock at night" instrument panel. Deep indigo base, a single
-//! ember accent spent only on primary actions and the current selection,
-//! teal reserved for remote/informational accents. Everything else stays
-//! quiet: muted text, hairline borders, generous spacing.
+//! Direction: a "dock at night" instrument panel. Deep indigo base, green on
+//! every button, an ember accent for the current selection and for the
+//! markers that pick something out, teal reserved for remote/informational
+//! accents. Everything else stays quiet: muted text, hairline borders,
+//! generous spacing.
 //!
 //! The design system lives here: color tokens, a 4px spacing grid, a type
 //! scale, and shared component constants. Views should consume these
@@ -31,6 +32,12 @@ pub struct Palette {
     pub fg_dim: Color32,
     pub ember: Color32,
     pub ember_deep: Color32,
+    /// Buttons. Every button in the app is painted from this pair: the solid
+    /// fill of a primary action, and the deeper shade the quieter buttons and
+    /// the pressed state are washed from. Destructive actions keep `danger`
+    /// — a green button that throws work away is a mislabelled one.
+    pub green: Color32,
+    pub green_deep: Color32,
     pub teal: Color32,
     pub danger: Color32,
     pub add: Color32,
@@ -51,6 +58,8 @@ pub const DARK: Palette = Palette {
     fg_dim: Color32::from_rgb(0x8a, 0x93, 0xa6),
     ember: Color32::from_rgb(0xff, 0x9d, 0x4d),
     ember_deep: Color32::from_rgb(0xe0, 0x7b, 0x2a),
+    green: Color32::from_rgb(0x2f, 0xa8, 0x62),
+    green_deep: Color32::from_rgb(0x1d, 0x6e, 0x40),
     teal: Color32::from_rgb(0x3d, 0xdb, 0xd9),
     danger: Color32::from_rgb(0xff, 0x6b, 0x6b),
     add: Color32::from_rgb(0x7e, 0xe7, 0x87),
@@ -73,6 +82,8 @@ pub const LIGHT: Palette = Palette {
     fg_dim: Color32::from_rgb(0x69, 0x70, 0x7e),
     ember: Color32::from_rgb(0xc2, 0x5b, 0x0a),
     ember_deep: Color32::from_rgb(0x9c, 0x45, 0x05),
+    green: Color32::from_rgb(0x1f, 0x8f, 0x52),
+    green_deep: Color32::from_rgb(0x14, 0x66, 0x3a),
     teal: Color32::from_rgb(0x0d, 0x71, 0x74),
     danger: Color32::from_rgb(0xc0, 0x2a, 0x2a),
     add: Color32::from_rgb(0x1c, 0x7a, 0x33),
@@ -130,6 +141,9 @@ pub fn ember() -> Color32 {
 pub fn ember_deep() -> Color32 {
     palette().ember_deep
 }
+pub fn green() -> Color32 {
+    palette().green
+}
 pub fn teal() -> Color32 {
     palette().teal
 }
@@ -150,6 +164,49 @@ pub fn hover_wash() -> Color32 {
 }
 pub fn select_wash() -> Color32 {
     palette().select_wash
+}
+
+/// How far the quieter buttons are washed from `green_deep`. They are a tint
+/// over the panel rather than a solid fill, so a primary action still reads as
+/// the one to press while every button is recognisably green.
+const BUTTON_WASH: f32 = 0.30;
+const BUTTON_WASH_HOVER: f32 = 0.45;
+const BUTTON_WASH_PRESSED: f32 = 0.60;
+
+impl Palette {
+    /// The fill of a button that is not a primary action.
+    pub fn button_fill(&self) -> Color32 {
+        self.green_deep.linear_multiply(BUTTON_WASH)
+    }
+
+    /// The same button under the pointer.
+    pub fn button_fill_hover(&self) -> Color32 {
+        self.green_deep.linear_multiply(BUTTON_WASH_HOVER)
+    }
+
+    /// The same button while it is held down.
+    pub fn button_fill_pressed(&self) -> Color32 {
+        self.green_deep.linear_multiply(BUTTON_WASH_PRESSED)
+    }
+}
+
+/// The fill of a button that is not a primary action, in the palette in force.
+///
+/// [`apply`] gives every button this by default; a view that restyles a group
+/// of controls by hand asks for it here so, say, a combo box beside a button
+/// matches it rather than inventing a second green.
+pub fn button_fill() -> Color32 {
+    palette().button_fill()
+}
+
+/// The same button under the pointer.
+pub fn button_fill_hover() -> Color32 {
+    palette().button_fill_hover()
+}
+
+/// The same button while it is held down.
+pub fn button_fill_pressed() -> Color32 {
+    palette().button_fill_pressed()
 }
 
 // ---------------------------------------------------------------------------
@@ -262,15 +319,25 @@ pub fn apply(ctx: &egui::Context) {
     visuals.widgets.inactive.bg_fill = panel2();
     visuals.widgets.inactive.corner_radius = CornerRadius::same(RADIUS_MD);
     visuals.widgets.hovered.bg_fill = panel2();
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, teal());
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, green());
     visuals.widgets.hovered.corner_radius = CornerRadius::same(RADIUS_MD);
     // Pressed state: clearly different from hover so clicks visibly land.
-    visuals.widgets.active.bg_fill = ember_deep().linear_multiply(0.45);
-    visuals.widgets.active.weak_bg_fill = ember_deep().linear_multiply(0.45);
-    visuals.widgets.active.bg_stroke = Stroke::new(2.0_f32, ember());
+    visuals.widgets.active.bg_fill = button_fill_pressed();
+    visuals.widgets.active.bg_stroke = Stroke::new(2.0_f32, green());
     visuals.widgets.active.corner_radius = CornerRadius::same(RADIUS_MD);
     visuals.widgets.active.expansion = -1.0; // slight press-down effect
     visuals.widgets.open.bg_fill = panel2();
+
+    // Buttons are green. egui paints a button from `weak_bg_fill` — one per
+    // interaction state — so setting the three here is what makes every
+    // button in the app green without each view having to say so. The ones
+    // that carry a colour of their own pass `.fill()`: `green` for a primary
+    // action, `danger` for anything destructive.
+    visuals.widgets.inactive.weak_bg_fill = button_fill();
+    visuals.widgets.hovered.weak_bg_fill = button_fill_hover();
+    visuals.widgets.active.weak_bg_fill = button_fill_pressed();
+    // A menu button keeps its fill while its menu is open.
+    visuals.widgets.open.weak_bg_fill = button_fill_hover();
 
     visuals.selection.bg_fill = ember_deep().linear_multiply(0.35);
     visuals.selection.stroke = Stroke::new(1.0_f32, ember());
@@ -390,6 +457,50 @@ mod tests {
                 contrast > distance(palette.fg, palette.bg),
                 "{name}: emphasis is closer to the background than body text",
             );
+        }
+    }
+
+    /// A colour reads as green when its green channel leads the other two.
+    fn is_green(color: Color32) -> bool {
+        let [r, g, b, _] = color.to_srgba_unmultiplied();
+        g > r && g > b
+    }
+
+    /// Every button fill is green, in both palettes and in every state.
+    #[test]
+    fn buttons_are_green_in_both_palettes() {
+        for (name, palette) in [("dark", DARK), ("light", LIGHT)] {
+            for (role, fill) in [
+                ("primary", palette.green),
+                ("quiet", palette.button_fill()),
+                ("hovered", palette.button_fill_hover()),
+                ("pressed", palette.button_fill_pressed()),
+            ] {
+                assert!(is_green(fill), "{name}/{role}: button fill is {fill:?}");
+            }
+        }
+    }
+
+    /// And [`apply`] is what puts them on the buttons that never ask.
+    ///
+    /// egui paints a button from `weak_bg_fill`, one per interaction state, so
+    /// a view that says nothing gets whatever the theme left there. Leaving
+    /// egui's own grey would make "buttons are green" true only of the handful
+    /// that pass an explicit fill.
+    #[test]
+    fn apply_gives_every_button_the_green_fill() {
+        let ctx = egui::Context::default();
+        apply(&ctx);
+        let widgets = ctx.style().visuals.widgets.clone();
+        let here = palette();
+        for (state, fill, expected) in [
+            ("inactive", widgets.inactive.weak_bg_fill, here.button_fill()),
+            ("hovered", widgets.hovered.weak_bg_fill, here.button_fill_hover()),
+            ("open", widgets.open.weak_bg_fill, here.button_fill_hover()),
+            ("active", widgets.active.weak_bg_fill, here.button_fill_pressed()),
+        ] {
+            assert_eq!(fill, expected, "{state}: button fill is not the theme's");
+            assert!(is_green(fill), "{state}: button fill is {fill:?}");
         }
     }
 

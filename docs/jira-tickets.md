@@ -110,7 +110,11 @@ under **At once**, the rest queued. Each agent:
    found at the root or up to three directories down (a Flutter app under
    `mobile/`), and each check runs in its project's directory; the log
    says they were inferred;
-4. runs the checks on the untouched tree first. A check that already
+4. runs the checks on the untouched tree first, naming each as it starts,
+   saying how long it took, and — for a suite that takes a while in a
+   small machine — that it is still running, every five minutes. Every
+   check runs with `CI=true`, so a test runner runs once and exits rather
+   than watching for changes. A check that already
    fails on the base branch, and fails the same way after the change, is
    the repository's problem and is not held against the change — the log,
    the reviewer and the pull request all say so. A failure that is new or

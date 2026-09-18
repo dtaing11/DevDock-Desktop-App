@@ -392,14 +392,11 @@ fn inferred_jobs_in(repo_root: &Path) -> Vec<Job> {
         let pubspec = read("pubspec.yaml");
         if pubspec.contains("sdk: flutter") || pubspec.contains("flutter:") {
             jobs.push(job("analyze", &["flutter analyze"]));
+            // No `flutter build bundle`: it compiles the whole app a second
+            // time, minutes in a small machine, and the tests and the
+            // screenshot already prove it builds.
             if has("test") {
                 jobs.push(job("test", &["flutter test"]));
-            }
-            // A build that needs no device and no platform SDK: the Dart
-            // code compiled and the assets bundled. The cheapest proof the
-            // app still starts.
-            if has("lib/main.dart") {
-                jobs.push(job("build", &["flutter build bundle"]));
             }
         } else {
             jobs.push(job("analyze", &["dart analyze"]));
@@ -967,9 +964,14 @@ pub fn run_job_with(registry: &RunnerRegistry, repo_root: &Path, job: &Job) -> J
         return fail(message);
     }
 
-    // 2. Resolve environment (config env + secrets).
+    // 2. Resolve environment (config env + secrets). `CI` is set unless the
+    // job sets it: test runners read it to run once and exit rather than
+    // watch for changes, which under a gate is a check that never ends.
     let mut env: Vec<(String, String)> =
         job.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    if !job.env.contains_key("CI") {
+        env.push(("CI".into(), "true".into()));
+    }
     match resolve_secrets(repo_root, job) {
         Ok(secrets) => env.extend(secrets),
         Err(message) => return fail(message),
@@ -1126,7 +1128,7 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("lib")).unwrap();
         std::fs::write(tmp.path().join("lib/main.dart"), "void main() {}\n").unwrap();
         let commands: Vec<String> = inferred_jobs(tmp.path()).iter().flat_map(|j| j.commands.clone()).collect();
-        assert_eq!(commands, ["flutter analyze", "flutter test", "flutter build bundle"]);
+        assert_eq!(commands, ["flutter analyze", "flutter test"]);
         // And what has to happen before any of them: its dependencies.
         let prepare: Vec<String> = prepare_jobs(tmp.path(), false).iter().map(|j| j.name.clone()).collect();
         assert_eq!(prepare, ["flutter pub get"]);

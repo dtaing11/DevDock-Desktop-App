@@ -166,6 +166,9 @@ files contributed when there is more than one.
 - Run manually, a failing check does **not** block anything; you get a clear
   red warning and decide what to do. Configure `[on_push]` below to make
   failures actually gate a push.
+- Every job runs with `CI=true` in its environment unless it sets `CI`
+  itself, so test runners that watch for changes by default (jest,
+  vitest) run once and exit.
 
 ## Gating pushes and pull requests
 

@@ -521,7 +521,7 @@ fn work(
         }
         step.timeout_secs = Some(900);
         on_event(format!("preparing: {}", step.name));
-        let result = crate::local_ci::run_job_with(&runners, wt.path(), &step);
+        let result = run_job_watched(&runners, wt.path(), &step, on_event);
         if !result.ok {
             let tail: String = result.output.lines().rev().take(12).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
             return Err(format!(
@@ -540,8 +540,10 @@ fn work(
     if !jobs.is_empty() {
         on_event("running the checks on the untouched tree first".into());
         for j in &jobs {
+            on_event(format!("checking `{}` on the untouched tree", j.name));
             let result = run_check(&runners, wt.path(), j, on_event);
             if result.ok {
+                on_event(format!("`{}` passes on {} ({})", j.name, job.base, took(result.duration_secs)));
                 continue;
             }
             if let Some(why) = machine_failure(&result.output) {
@@ -557,8 +559,11 @@ fn work(
             }
             let first = result.output.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
             on_event(format!(
-                "`{}` already fails on {} before any change: {}",
-                j.name, job.base, first.chars().take(140).collect::<String>()
+                "`{}` already fails on {} before any change ({}): {}",
+                j.name,
+                job.base,
+                took(result.duration_secs),
+                first.chars().take(140).collect::<String>()
             ));
             baseline.insert(j.name.clone(), normalize_output(&result.output));
         }
@@ -714,7 +719,7 @@ fn work(
                     }
                 }
             }
-            on_event(format!("{} {}", j.name, if result.ok { "passed" } else { "FAILED" }));
+            on_event(format!("{} {} ({})", j.name, if result.ok { "passed" } else { "FAILED" }, took(result.duration_secs)));
             checks.push(CheckOutcome { name: j.name.clone(), ok: result.ok });
             if !result.ok {
                 // The machine's fault — a linker killed for memory, a full
@@ -1181,7 +1186,7 @@ fn machine_failure_message(check: &str, why: &str, output: &str) -> String {
 /// code's — once more after a pause, one build job at a time: a link
 /// that was one of several may fit in memory on its own.
 fn run_check(runners: &crate::local_ci::runner::RunnerRegistry, root: &Path, j: &crate::local_ci::Job, on_event: &mut dyn FnMut(String)) -> crate::local_ci::JobResult {
-    let result = crate::local_ci::run_job_with(runners, root, j);
+    let result = run_job_watched(runners, root, j, on_event);
     if result.ok {
         return result;
     }
@@ -1192,7 +1197,48 @@ fn run_check(runners: &crate::local_ci::runner::RunnerRegistry, root: &Path, j: 
     for (k, v) in [("CARGO_BUILD_JOBS", "1"), ("MAKEFLAGS", "-j1"), ("GOFLAGS", "-p=1")] {
         gently.env.entry(k.into()).or_insert_with(|| v.into());
     }
-    crate::local_ci::run_job_with(runners, root, &gently)
+    run_job_watched(runners, root, &gently, on_event)
+}
+
+/// Runs a job and, while it runs, says so every five minutes: a test
+/// suite that takes half an hour in a small machine is a line every so
+/// often, not a card that seems stuck.
+fn run_job_watched(runners: &crate::local_ci::runner::RunnerRegistry, root: &Path, j: &crate::local_ci::Job, on_event: &mut dyn FnMut(String)) -> crate::local_ci::JobResult {
+    const EVERY: u64 = 300;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let _ = tx.send(crate::local_ci::run_job_with(runners, root, j));
+        });
+        let started = std::time::Instant::now();
+        let mut next = EVERY;
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                Ok(result) => break result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let secs = started.elapsed().as_secs();
+                    if secs >= next {
+                        on_event(format!("`{}` still running, {} min in", j.name, secs / 60));
+                        next += EVERY;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    break crate::local_ci::JobResult {
+                        name: j.name.clone(),
+                        ok: false,
+                        output: "the check's thread ended without a result".into(),
+                        duration_secs: started.elapsed().as_secs_f32(),
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// A duration for a log line: `4:12`, or `0:03`.
+fn took(secs: f32) -> String {
+    let s = secs.round() as u64;
+    format!("{}:{:02}", s / 60, s % 60)
 }
 
 /// The marker in a cargo config DevDock wrote, so it is recognised and
@@ -1596,7 +1642,7 @@ mod tests {
             &mut |line| log.push(line),
         )
         .unwrap_or_else(|e| panic!("{e}\n{log:#?}"));
-        assert!(log.iter().any(|l| l.starts_with("`lint` already fails on main before any change: lib.py:1: style")), "{log:?}");
+        assert!(log.iter().any(|l| l.starts_with("`lint` already fails on main before any change (") && l.contains("): lib.py:1: style")), "{log:?}");
         assert!(log.iter().any(|l| l == "lint fails exactly as it did before the change; not counted"), "{log:?}");
         assert_eq!(fixed.skipped, ["lint"]);
         assert_eq!(fixed.checks, [CheckOutcome { name: "tests".into(), ok: true }]);

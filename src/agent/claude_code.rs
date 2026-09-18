@@ -262,7 +262,50 @@ pub fn run_readonly(
     system_extra: Option<&str>,
     on_event: &mut dyn FnMut(Event),
 ) -> Result<Run, String> {
-    run_with_tools(config, root, Launch { task, system_extra, allowed: "Read,Grep,Glob,LS", collect_edits: false, resume: None }, on_event).map(|(run, _)| run)
+    let allowed = reviewer_tools(root);
+    run_with_tools(config, root, Launch { task, system_extra, allowed: &allowed, collect_edits: false, resume: None }, on_event).map(|(run, _)| run)
+}
+
+/// What a reviewer may run: the reading tools, and a shell for the
+/// repository's checks and read-only commands — a reviewer that cannot
+/// run the tests spends its turns being refused — but no edits.
+pub fn reviewer_tools(root: &Path) -> String {
+    let mut tools: Vec<String> = ["Read", "Grep", "Glob", "LS"].iter().map(|s| s.to_string()).collect();
+    for program in toolchain(root, &[]) {
+        tools.push(format!("Bash({program}:*)"));
+    }
+    for cmd in ["ls", "cat", "head", "tail", "wc", "grep", "rg", "find", "pwd", "echo", "diff", "sort", "uniq", "tree", "stat", "file", "git status", "git diff", "git log", "git show", "git ls-files", "git grep", "git blame", "git branch", "git rev-parse"] {
+        tools.push(format!("Bash({cmd}:*)"));
+    }
+    tools.join(",")
+}
+
+/// Directories Claude Code may read besides the worktree: the caches
+/// where a dependency's source lives — cargo's registry, pub's cache, the
+/// Flutter SDK, Go's module cache — so "how does this crate's type work"
+/// is a read, not a refusal. Only the ones that exist.
+pub fn extra_read_dirs(sandbox: Option<&crate::sandbox::Sandbox>) -> Vec<String> {
+    const RELATIVE: &[&str] = &[".cargo/registry/src", ".cargo/git/checkouts", ".rustup/toolchains", ".pub-cache", "flutter", "go/pkg/mod", ".npm/_npx", ".gem"];
+    match sandbox {
+        Some(sandbox) => {
+            let probe = RELATIVE.iter().map(|d| format!("test -d \"$HOME/{d}\" && echo \"$HOME/{d}\"")).collect::<Vec<_>>().join("; ");
+            let probe = format!("{probe}; test -n \"$FLUTTER_ROOT\" && test -d \"$FLUTTER_ROOT\" && echo \"$FLUTTER_ROOT\"; true");
+            sandbox
+                .exec(&probe, "", &[], Some(std::time::Duration::from_secs(20)))
+                .map(|o| o.stdout.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+                .unwrap_or_default()
+        }
+        None => {
+            let Some(home) = dirs::home_dir() else { return Vec::new() };
+            let mut dirs: Vec<String> = RELATIVE.iter().map(|d| home.join(d)).filter(|p| p.is_dir()).map(|p| p.display().to_string()).collect();
+            if let Ok(root) = std::env::var("FLUTTER_ROOT") {
+                if Path::new(&root).is_dir() && !dirs.contains(&root) {
+                    dirs.push(root);
+                }
+            }
+            dirs
+        }
+    }
 }
 
 /// Continues a session — after a question was answered — with `prompt`
@@ -341,6 +384,9 @@ fn run_with_tools(
     }
     if let Some(id) = resume {
         cmd.arg("--resume").arg(id);
+    }
+    for dir in extra_read_dirs(config.sandbox.as_deref()) {
+        cmd.arg("--add-dir").arg(dir);
     }
     if let Some(extra) = system_extra.map(str::trim).filter(|s| !s.is_empty()) {
         cmd.arg("--append-system-prompt").arg(extra);
@@ -718,6 +764,12 @@ mod tests {
         assert!(note.contains("do not retry one"));
         assert!(note.contains("never `sleep`"), "polling with sleep is refused by the CLI: {note}");
         assert!(note.contains("MCP tools"), "{note}");
+        // A reviewer may run the checks and read, not edit.
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let reviewer = reviewer_tools(root);
+        assert!(reviewer.contains("Bash(cargo:*)") && reviewer.contains("Bash(git diff:*)") && reviewer.contains("Bash(tail:*)"), "{reviewer}");
+        assert!(!reviewer.contains("Edit") && !reviewer.contains("Write"), "{reviewer}");
+        let _ = extra_read_dirs(None);
 
         // A repository with an .mcp.json: its servers are loaded and allowed.
         let launch = mcp_launch(root);

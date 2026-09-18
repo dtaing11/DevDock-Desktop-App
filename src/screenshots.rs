@@ -31,6 +31,11 @@ pub struct Screen {
     pub widget: Option<String>,
     pub import: Option<String>,
     pub path: Option<String>,
+    /// A shell command that writes a PNG to `{out}`: anything with a
+    /// screen — a desktop app with its own screenshot harness, say.
+    pub command: Option<String>,
+    pub env: std::collections::BTreeMap<String, String>,
+    pub dir: String,
 }
 
 /// Where the agent lists its screens, relative to the worktree.
@@ -40,9 +45,13 @@ pub const SCREENS_FILE: &str = ".devdock/screens.json";
 pub const SCREENS_NOTE: &str = "If your change is something a person would look at, write .devdock/screens.json \
     naming what to photograph, and DevDock renders it after the checks: \
     [{\"name\": \"settings\", \"widget\": \"SettingsPage()\", \"import\": \"package:app/settings.dart\"}] \
-    for a Flutter widget (it is wrapped in a MaterialApp; give it any arguments it needs), or \
-    [{\"name\": \"about\", \"path\": \"/about\"}] for a page of a web app. The file is never \
-    committed. Without it the app's first screen is photographed.";
+    for a Flutter widget (it is wrapped in a MaterialApp; give it any arguments it needs); \
+    [{\"name\": \"about\", \"path\": \"/about\"}] for a page of a web app; or \
+    [{\"name\": \"main window\", \"command\": \"cargo run --example shot -- {out}\", \"env\": {\"TAB\": \"agent\"}}] \
+    for anything with a screen, where the command writes a PNG to {out} under a virtual display. \
+    Several entries give several pictures. The file is never committed. Without it the \
+    repository's own [[screenshot]] entries in .git-manage-ci.toml, or the app's first \
+    screen, are photographed.";
 
 /// The screens listed in `.devdock/screens.json`, if any: a list, or an
 /// object with a `screens` list.
@@ -53,10 +62,26 @@ pub fn declared_screens(root: &Path) -> Vec<Screen> {
     list.iter()
         .filter_map(|s| {
             let text = |k: &str| s.get(k).and_then(|v| v.as_str()).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
-            let screen = Screen { name: text("name")?, widget: text("widget"), import: text("import"), path: text("path") };
-            (screen.widget.is_some() || screen.path.is_some()).then_some(screen)
+            let env = s
+                .get("env")
+                .and_then(|e| e.as_object())
+                .map(|e| e.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string()))).collect())
+                .unwrap_or_default();
+            let screen = Screen { name: text("name")?, widget: text("widget"), import: text("import"), path: text("path"), command: text("command"), env, dir: text("dir").unwrap_or_default() };
+            (screen.widget.is_some() || screen.path.is_some() || screen.command.is_some()).then_some(screen)
         })
         .take(8)
+        .collect()
+}
+
+/// The repository's own `[[screenshot]]` entries, as screens.
+pub fn configured_screens(root: &Path) -> Vec<Screen> {
+    let Ok(text) = std::fs::read_to_string(root.join(crate::local_ci::CONFIG_FILE)) else { return Vec::new() };
+    toml::from_str::<crate::local_ci::Config>(&text)
+        .map(|c| c.screenshots)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|j| Screen { name: j.name, command: Some(j.command), env: j.env.into_iter().collect(), dir: j.dir, ..Default::default() })
         .collect()
 }
 
@@ -318,12 +343,74 @@ pub fn capture(
     log: &mut dyn FnMut(String),
 ) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    let screens = declared_screens(root);
+    let mut screens = declared_screens(root);
     if !screens.is_empty() {
         log(format!("screens named by the agent: {}", screens.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")));
     }
+    let configured = configured_screens(root);
+    if !configured.is_empty() {
+        log(format!("screens the repository declares: {}", configured.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")));
+        screens.extend(configured);
+    }
     let runner = sandbox.map(|_| crate::sandbox::RUNNER_ID.to_string());
     let label = slug(label);
+
+    // Commands that write a picture themselves: under a virtual display in
+    // the sandbox, so nothing opens on anyone's screen.
+    let commands: Vec<&Screen> = screens.iter().filter(|s| s.command.is_some()).collect();
+    if !commands.is_empty() {
+        let display_ok = match sandbox {
+            Some(sandbox) => {
+                let mut sandbox_log = |l: String| log(l);
+                sandbox.provision(&["xvfb-run"], &mut sandbox_log).map_err(|e| log(format!("no virtual display: {e}"))).is_ok()
+            }
+            None => false,
+        };
+        let shots_dir = root.join(".devdock/shots");
+        let _ = std::fs::create_dir_all(&shots_dir);
+        for screen in commands {
+            let name = slug(&screen.name);
+            let file = shots_dir.join(format!("{name}.png"));
+            let out_path = match sandbox {
+                Some(sandbox) => format!("{}/.devdock/shots/{name}.png", sandbox.inner_root()),
+                None => file.display().to_string(),
+            };
+            let command = screen.command.as_deref().unwrap_or_default().replace("{out}", &shell_quote(&out_path));
+            let command = if display_ok { format!("xvfb-run -a -s '-screen 0 1600x1000x24' sh -c {}", shell_quote(&command)) } else { command };
+            if sandbox.is_none() {
+                log(format!("screenshot `{}` needs the sandbox's virtual display; not taken here", screen.name));
+                continue;
+            }
+            let job = Job {
+                name: format!("screenshot {}", screen.name),
+                commands: vec![command],
+                dir: screen.dir.clone(),
+                env: screen.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                runner: runner.clone(),
+                timeout_secs: Some(1_200),
+                ..Default::default()
+            };
+            log(format!("photographing {} by its own command", screen.name));
+            let result = run_job_with(runners, root, &job);
+            if file.exists() {
+                let dest = keep_dir().join(format!("{label}-{name}.png"));
+                if std::fs::copy(&file, &dest).is_ok() {
+                    log(format!("screenshot ({name}): {}", dest.display()));
+                    out.push(dest);
+                }
+                let _ = std::fs::remove_file(&file);
+            } else {
+                let last = result.output.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("no output").trim();
+                log(format!("no screenshot of {}: the command wrote nothing ({})", screen.name, last.chars().take(160).collect::<String>()));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&shots_dir);
+        if let Ok(mut entries) = std::fs::read_dir(root.join(".devdock")) {
+            if entries.next().is_none() {
+                let _ = std::fs::remove_dir(root.join(".devdock"));
+            }
+        }
+    }
 
     for (rel, package) in flutter_apps(root) {
         let dir = if rel.is_empty() { root.to_path_buf() } else { root.join(&rel) };
@@ -505,7 +592,12 @@ mod tests {
         assert!(web.iter().any(|t| t.dir == "site" && t.build.as_deref() == Some("npm run build") && t.out == "dist"));
         assert!(web.iter().any(|t| t.dir == "docs" && t.build.is_none() && t.out == "."));
         let screens = declared_screens(root);
-        assert_eq!(screens.len(), 2, "an entry with neither widget nor path is dropped: {screens:?}");
+        assert_eq!(screens.len(), 2, "an entry with neither widget, path nor command is dropped: {screens:?}");
+        std::fs::write(root.join(".git-manage-ci.toml"), "[[screenshot]]\nname = \"main window\"\ncommand = \"cargo run --example shot -- {out}\"\nenv = { TAB = \"agent\" }\n").unwrap();
+        let configured = configured_screens(root);
+        assert_eq!(configured.len(), 1);
+        assert_eq!(configured[0].command.as_deref(), Some("cargo run --example shot -- {out}"));
+        assert_eq!(configured[0].env.get("TAB").map(String::as_str), Some("agent"));
         assert_eq!(screens[0].widget.as_deref(), Some("SettingsPage()"));
         assert_eq!(screens[1].path.as_deref(), Some("/about"));
 

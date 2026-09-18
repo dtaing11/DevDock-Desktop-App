@@ -171,6 +171,13 @@ generated for this enters the change.
   `.devdock/screens.json` naming the widgets it changed, or the paths of a
   web app, and each is rendered — so a fix deep inside a flow shows that
   screen, not the start screen. The file is never committed.
+- **Anything with a screen**, by a command: the repository declares
+  `[[screenshot]]` entries in `.git-manage-ci.toml` — a name and a command
+  that writes a PNG to `{out}` — or the agent names one in its screens file
+  with a `command`. It runs under a virtual display in the sandbox (Xvfb
+  with Mesa, installed there the first time), so a desktop app's own
+  screenshot harness works and nothing opens on your screen. This
+  repository declares three of its own tabs that way.
 - **Web front ends**, in the sandbox: a Flutter web build, a `package.json`
   with a build script, or a plain `index.html` is built, served on a local
   port inside, and photographed by a headless Chromium (installed there

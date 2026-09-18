@@ -284,7 +284,10 @@ Two things follow from what Claude Code is:
   up front; a plugin's or a user-level server that DevDock could not list
   is allowed the first time the model is refused one of its tools, and
   the session is resumed — one refusal per server, not one per call. With
-  a sandbox, Claude Code and its servers run inside it.
+  a sandbox, Claude Code and its servers run inside it. The reviewer, run
+  with reading tools, may also run the repository's checks and read-only
+  commands, and may read dependency sources (cargo's registry, pub's
+  cache, the Flutter SDK), but not edit.
 
 The model under it is a Claude Code alias (`default`, `sonnet`, `opus`,
 `haiku` — the latest of each family) or any model id your account has,

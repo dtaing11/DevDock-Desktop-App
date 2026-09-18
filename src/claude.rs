@@ -812,6 +812,18 @@ fn urlencode(s: &str) -> String {
 }
 
 #[cfg(test)]
+mod live_probe {
+    /// Says which kind of Claude credential DevDock has, never the secret.
+    /// `cargo test --lib claude::live_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_which_credential_kind_is_stored() {
+        let c = super::CredentialStore::load();
+        println!("api_key: {}, oauth: {}", c.api_key.as_ref().map(|k| format!("yes ({} chars, starts {})", k.len(), &k[..k.len().min(7)])).unwrap_or("no".into()), c.oauth.is_some());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn the_payload_marks_cache_breakpoints() {

@@ -1,8 +1,10 @@
 # DevDock
 
-A **native desktop git client** (no webview) with GitHub and Ollama integration.
-Built in Rust with [egui](https://github.com/emilk/egui). Runs on Linux (also
-macOS/Windows since egui is cross-platform).
+A **native desktop git client** (no webview) that runs coding agents on your
+repositories: in your tree, in worktrees of their own, on the Jira backlog,
+inside a Linux sandbox, with two engines — its own harness, or Claude Code.
+Built in Rust with [egui](https://github.com/emilk/egui). Runs on macOS and
+Linux (Windows too, egui being cross-platform).
 
 ![Rust](https://img.shields.io/badge/rust-stable-orange) ![License](https://img.shields.io/badge/license-MIT-blue)
 
@@ -34,10 +36,28 @@ macOS/Windows since egui is cross-platform).
   save, and workspace rename. Servers start on demand (rust-analyzer, pyright,
   gopls, clangd, and more) and can be configured per repository.
 - **Coding agent**: give it a task and it reads, edits, asks the language
-  server what it broke, and runs your own checks until it works. Every change
-  it makes is reviewed as a diff and applied — or reverted — by you. Or hand
-  the same task to **Claude Code**, run headless in the tree with its commands
-  limited to your checks, and review its work the same way.
+  server what it broke, runs your own checks and any shell command it needs,
+  and asks *you* — in a box on the run's card — when something genuinely
+  needs a decision. Attach images to the task: a screenshot, a mockup. Every
+  change is reviewed as a diff and applied — or reverted — by you.
+- **Two engines**: DevDock's own harness (any Claude model, or Ollama), or
+  **Claude Code** run headless — with the repository's MCP servers, the
+  same questions and images, and a session resumed with your answer. Pick
+  per task in Settings; the fixer and the reviewer can be different engines.
+- **A sandbox that is a machine of the run's own**: a Lima VM, an Apple
+  container, or Docker — network on, root shell, toolchains installed by
+  DevDock (Flutter, Rust, Node, Python, Go…) and kept between runs. Checks,
+  the agent's commands, MCP servers, and Claude Code itself run inside.
+- **What it looks like**: after a run passes its checks, the result is
+  photographed where the checks ran — a Flutter app's first frame or root
+  widget, the screens the agent names, a web page in a headless browser, or
+  any app with a screenshot command under a virtual display — and shown on
+  the card. Never on your screen.
+- **Nothing is lost**: a run that does not get through keeps its attempt on
+  its branch, unpushed; open it in VS Code, finish it, or turn it into a pull
+  request with one click. A check that already fails on the base branch is
+  not held against the change. Each repository keeps its own agent state
+  while another is open.
 - **GitHub**: sign in via browser device flow or a personal access token,
   authenticated push/pull/fetch, list and **create pull requests**
   (with an AI-generated title and description written from **every commit on
@@ -57,6 +77,8 @@ macOS/Windows since egui is cross-platform).
   every tool call, the files it changed. Worktrees are removed when done;
   a ticket an agent starts is assigned to you, moved to the active sprint,
   and marked In Progress, and gets a comment with the pull request.
+  Agents confer between rounds: a failed check or a give-up goes to a second
+  agent for a diagnosis before the next attempt.
   See [docs/jira-tickets.md](docs/jira-tickets.md#working-the-backlog).
 - **Prompts in a worktree of their own**: tick *In a fresh worktree* in the
   Agent tab and a prompt runs like a backlog ticket — its own branch and
@@ -109,9 +131,11 @@ Optional targets:
 
 ## AI setup
 
-AI features (commit messages, PR text, conflict resolution, and the
-[code reviewer](docs/local-ci.md#ai-code-review)) need a model. Set up either
-provider — DevDock does not ship one.
+AI features (commit messages, PR text, conflict resolution, the
+[code reviewer](docs/local-ci.md#ai-code-review), and the agents) need a
+model. Set up either provider — DevDock does not ship one — or install the
+`claude` command and pick **Claude Code agent** as the engine for coding,
+the backlog, or review.
 
 ### Ollama (local)
 
@@ -142,7 +166,9 @@ stay on a large model consistently.
 
 The same binary is a full CLI: `devdock status`, `log`, `branches`,
 `stash`, `commit --ai`, `push` (CI-gated), `pr --ai` (opens a pull
-request), `ci`, and `hook`. See [docs/cli.md](docs/cli.md).
+request), `ci`, `hook`, `worktree`, `backlog` (list, judge, and fix
+tickets in parallel sandboxed worktrees), `version`, and `self-install`.
+See [docs/cli.md](docs/cli.md).
 
 ## Local CI (checks before a PR)
 
@@ -196,12 +222,21 @@ src/
   git.rs       Typed wrapper around the git CLI (library, reusable)
   github.rs    Device-flow auth + PR REST API (library, reusable)
   jira.rs      Jira Cloud: credentials, projects, issue creation, backlog, ADF
-  backlog.rs   Fixing a ticket unattended: worktree, agent, checks, draft PR
+  backlog.rs   Fixing a task unattended: worktree, agent, rounds, advisor,
+               reviewer, checks, draft PR; kept attempts
+  sandbox.rs   A machine of the run's own: Lima, Apple container, Docker;
+               toolchain recipes; Claude Code and MCP servers inside
+  screenshots.rs  What the result looks like: Flutter, web, and command
+               screenshots, taken where the checks ran
   ollama.rs    Commit-message generation client (library, reusable)
   review.rs    The AI review gate: config, prompts, findings, thresholds
   stack.rs     Stacked pull requests: a typed wrapper over `gh stack`
-  agent/       Tool-use harness: read, edit, language server, and check
-               tools; the conflict resolver and the coding agent run on it
+  agent/       Tool-use harness: read, edit, language server, check, shell,
+               ask-the-developer and MCP tools; images in the prompt; the
+               conflict resolver and the coding agent run on it
+               claude_code.rs  Claude Code as an engine: permissions, MCP,
+               questions with session resume, in the sandbox
+               mcp.rs  A stdio MCP client for the harness
   lsp/         Language server client: JSON-RPC over stdio, one process per
                server, diagnostics and navigation for the editor and agent
   app/
@@ -214,7 +249,8 @@ src/
     backlog.rs Jira backlog: judged tickets, and the agents fixing them
     editor.rs  Code editor: buffers, highlighting, LSP interactions
     agent_tab.rs The coding agent's task panel and change review
-    worker.rs  Background thread runner
+    worker.rs  Background thread runner; messages routed per repository
+build.rs     Stamps the build with its commit and date
 tests/
   workflow.rs  End-to-end git workflow tests against throwaway repos
   stack.rs     Stacked PRs through gh stack (skipped when it is not installed)
@@ -224,8 +260,9 @@ tests/
   lsp.rs       Language server client, against a real child process
 ```
 
-The `git_manage` library (git/github/ollama modules) has no UI dependencies and
-can be reused to build other clients.
+The `git_manage` library (everything outside `app/`) has no UI dependencies
+and can be reused to build other clients; `devdock backlog fix` is the same
+pipeline the app runs, from a terminal.
 
 ## Development
 

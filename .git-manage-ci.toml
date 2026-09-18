@@ -58,3 +58,20 @@ mislabel a user's work.
 - A new destructive or hard-to-reverse action that does not route through the
   existing confirmation gate.
 """
+
+# What the coding agent's runs photograph of this app, under a virtual
+# display in the sandbox: the screenshot example renders a tab or a dialog
+# to a PNG. `{out}` is the file DevDock expects.
+[[screenshot]]
+name = "changes tab"
+command = "cargo run --example app_shot -- . changes {out} 1400 900"
+
+[[screenshot]]
+name = "agent tab"
+command = "cargo run --example app_shot -- . agent {out} 1400 900"
+env = { AGENT_DEMO = "changes" }
+
+[[screenshot]]
+name = "settings"
+command = "cargo run --example app_shot -- . changes {out} 1400 900"
+env = { DIALOG = "settings" }

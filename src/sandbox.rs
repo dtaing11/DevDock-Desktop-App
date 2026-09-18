@@ -366,9 +366,20 @@ impl Sandbox {
         &self.inner_root
     }
 
+    /// Environment every command inside gets: a cargo target directory of
+    /// the sandbox's own, per worktree, so a Linux build never lands in the
+    /// host's `target/` and is there again next run.
+    fn base_env(&self) -> Vec<(String, String)> {
+        let slug: String = self.inner_root.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+        vec![("CARGO_TARGET_DIR".into(), format!("$HOME/.devdock-cargo-target/{}", slug.trim_matches('-')))]
+    }
+
     /// Runs `script` with `sh -lc` in `subdir` of the worktree, inside.
     pub fn exec(&self, script: &str, subdir: &str, env: &[(String, String)], timeout: Option<Duration>) -> Result<ExecOutput, String> {
         let workdir = if subdir.is_empty() { self.inner_root.clone() } else { format!("{}/{subdir}", self.inner_root) };
+        let base = self.base_env();
+        let env: Vec<(String, String)> = base.into_iter().chain(env.iter().cloned()).collect();
+        let env = &env[..];
         let mut cmd = match self.kind {
             Kind::Lima => {
                 let mut c = Command::new("limactl");
@@ -376,7 +387,12 @@ impl Sandbox {
                 // Environment goes in the script: ssh does not carry it.
                 let mut prefix = String::new();
                 for (k, v) in env {
-                    prefix.push_str(&format!("export {k}={}; ", shell_quote(v)));
+                    // `$HOME`-relative values expand; anything else is quoted.
+                    if let Some(rest) = v.strip_prefix("$HOME/") {
+                        prefix.push_str(&format!("export {k}=\"$HOME\"/{}; ", shell_quote(rest)));
+                    } else {
+                        prefix.push_str(&format!("export {k}={}; ", shell_quote(v)));
+                    }
                 }
                 c.args(["sh", "-lc", &format!("{prefix}{script}")]);
                 c
@@ -384,10 +400,15 @@ impl Sandbox {
             Kind::Docker | Kind::AppleContainer => {
                 let mut c = Command::new(if self.kind == Kind::Docker { "docker" } else { "container" });
                 c.args(["exec", "-w", &workdir]);
+                let mut prefix = String::new();
                 for (k, v) in env {
-                    c.arg("-e").arg(format!("{k}={v}"));
+                    if let Some(rest) = v.strip_prefix("$HOME/") {
+                        prefix.push_str(&format!("export {k}=\"$HOME\"/{}; ", shell_quote(rest)));
+                    } else {
+                        c.arg("-e").arg(format!("{k}={v}"));
+                    }
                 }
-                c.arg(&self.name).args(["sh", "-lc", script]);
+                c.arg(&self.name).args(["sh", "-lc", &format!("{prefix}{script}")]);
                 c
             }
         };
@@ -547,6 +568,10 @@ npx playwright install --with-deps chromium >/dev/null
 npx playwright --version >/dev/null
 "#)
         }
+        "xvfb-run" => ("a virtual display (Xvfb with Mesa)", r#"
+apt_install xvfb libgl1 libegl1 libgl1-mesa-dri libxkbcommon0 libxkbcommon-x11-0 libxi6 libxcursor1 libxrandr2 libxinerama1 libx11-xcb1 libxcb-render0 libxcb-shape0 libxcb-xfixes0 libwayland-client0 libfontconfig1 fonts-dejavu-core
+xvfb-run --help >/dev/null 2>&1 || true
+"#),
         "make" => ("build tools", r#"
 apt_install build-essential
 "#),
@@ -653,7 +678,7 @@ mod tests {
 
     #[test]
     fn every_toolchain_has_a_recipe_that_sh_accepts() {
-        for program in ["flutter", "dart", "cargo", "npm", "python3", "pytest", "go", "mix", "bundle", "make", "gradle", "claude", "playwright"] {
+        for program in ["flutter", "dart", "cargo", "npm", "python3", "pytest", "go", "mix", "bundle", "make", "gradle", "claude", "playwright", "xvfb-run"] {
             let recipe = recipe_for(program).unwrap_or_else(|| panic!("no recipe for {program}"));
             assert!(recipe.script.contains("set -e"));
             // `sh -n` parses without running.
@@ -689,6 +714,30 @@ mod tests {
         let out = cmd.stdin(Stdio::null()).output().unwrap();
         assert!(String::from_utf8_lossy(&out.stdout).contains("Claude Code"));
         println!("claude inside: {}", out.stdout.iter().map(|b| *b as char).collect::<String>().trim());
+    }
+
+    /// This repository's own `[[screenshot]]` entries rendered in the
+    /// sandbox: Rust provisioned, the app built for Linux under Xvfb, three
+    /// PNGs out. Slow the first time (a full build in the VM).
+    /// `cargo test --lib sandbox::tests::live_devdock -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_devdock_photographs_itself_in_the_sandbox() {
+        if installed().is_empty() {
+            eprintln!("no runtime installed; skipping");
+            return;
+        }
+        let root = std::env::current_dir().unwrap();
+        let mut log = |l: String| println!("  {l}");
+        let sandbox = std::sync::Arc::new(Sandbox::start(&Spec::default(), &root, &mut log).unwrap());
+        sandbox.provision(&["cargo", "xvfb-run"], &mut log).unwrap();
+        let mut runners = crate::local_ci::runner::RunnerRegistry::with_builtins();
+        runners.register(Box::new(SandboxRunner(sandbox.clone())));
+        let shots = crate::screenshots::capture(&root, &runners, Some(&sandbox), "live-devdock", &mut log);
+        let names: Vec<String> = shots.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        println!("{names:?}");
+        assert_eq!(names.len(), 3, "{names:?}");
+        assert!(!root.join(".devdock").exists());
     }
 
     /// Flutter, the toolchain a plain image is least likely to have,

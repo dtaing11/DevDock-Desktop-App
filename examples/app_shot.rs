@@ -118,12 +118,17 @@ impl eframe::App for Shot {
             });
             if let Some(image) = shot {
                 let bytes: Vec<u8> = image.pixels.iter().flat_map(|p| p.to_array()).collect();
-                std::fs::write(&self.out, &bytes).unwrap();
-                std::fs::write(
-                    format!("{}.size", self.out),
-                    format!("{} {}", image.width(), image.height()),
-                )
-                .unwrap();
+                if self.out.ends_with(".png") {
+                    // A PNG straight away, for DevDock's own screenshot runs.
+                    image::save_buffer(&self.out, &bytes, image.width() as u32, image.height() as u32, image::ColorType::Rgba8).unwrap();
+                } else {
+                    std::fs::write(&self.out, &bytes).unwrap();
+                    std::fs::write(
+                        format!("{}.size", self.out),
+                        format!("{} {}", image.width(), image.height()),
+                    )
+                    .unwrap();
+                }
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }

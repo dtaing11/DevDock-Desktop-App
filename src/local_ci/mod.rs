@@ -124,6 +124,24 @@ pub struct Config {
     /// AI code review gate, run after the jobs pass. See [`crate::review`].
     #[serde(default)]
     pub review: crate::review::ReviewConfig,
+    /// How to photograph this repository's screens, for the coding
+    /// agent's runs: commands that write a PNG at `{out}`. See
+    /// [`crate::screenshots`].
+    #[serde(default, rename = "screenshot")]
+    pub screenshots: Vec<ScreenshotJob>,
+}
+
+/// One declared screenshot: a command that writes a PNG to `{out}`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct ScreenshotJob {
+    pub name: String,
+    /// A shell command; `{out}` is replaced with the PNG's path.
+    pub command: String,
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+    /// Directory to run in, relative to the repository root.
+    #[serde(default)]
+    pub dir: String,
 }
 
 /// How local CI hooks into pushing.

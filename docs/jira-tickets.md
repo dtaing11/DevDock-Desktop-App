@@ -128,9 +128,12 @@ under **At once**, the rest queued. Each agent:
    request is opened while a check fails;
 6. once the checks pass, has a **second agent review** the ticket and the
    diff — the code-review model, which can be Claude Code — and answer
-   approve or revise. Revise is another round with the feedback; approve
-   is recorded in the pull request. Untick **Second agent reviews** to
-   skip this;
+   approve or revise. The reviewer, like the advisor, may run anything the
+   fixer may — the checks, the tools, a sandbox's status — so it is never
+   refused mid-review; it has no editing tools, and whatever a command of
+   its changed in the tree is put back before the change goes on. Revise
+   is another round with the feedback; approve is recorded in the pull
+   request. Untick **Second agent reviews** to skip this;
 7. commits, pushes, and opens a **draft pull request** that quotes the
    ticket, the agent's summary, which checks passed, and who approved it
    after how many rounds;

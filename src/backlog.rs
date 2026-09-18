@@ -860,8 +860,44 @@ fn work(
     })
 }
 
+/// The worktree as a git tree object, everything staged: what a second
+/// agent's run is checked against afterwards, and put back to.
+fn tree_snapshot(wt: &Repo) -> Result<String, String> {
+    wt.stage_all().map_err(|e| e.to_string())?;
+    wt.git(&["write-tree"]).map(|t| t.trim().to_string()).map_err(|e| e.to_string())
+}
+
+/// Puts the worktree back to `tree`: files it had are restored, files
+/// made since are removed.
+fn restore_tree(wt: &Repo, tree: &str) -> Result<(), String> {
+    wt.git(&["read-tree", "--reset", "-u", tree]).map_err(|e| e.to_string())?;
+    wt.git(&["clean", "-fd"]).map(drop).map_err(|e| e.to_string())
+}
+
+/// Runs a second agent — a reviewer, an advisor — over the tree and keeps
+/// the tree as it was: such an agent may run anything, so it can run the
+/// checks and look around without being refused, and whatever it changed
+/// is put back afterwards. Its answer counts; its edits do not.
+fn with_tree_kept<T>(
+    root: &Path,
+    who: &str,
+    on_event: &mut dyn FnMut(String),
+    run: impl FnOnce(&mut dyn FnMut(String)) -> Result<T, String>,
+) -> Result<T, String> {
+    let wt = Repo::open(root).map_err(|e| e.to_string())?;
+    let before = tree_snapshot(&wt)?;
+    let result = run(on_event);
+    let after = tree_snapshot(&wt)?;
+    if after != before {
+        on_event(format!("{who} changed the tree; what it said counts, what it changed is put back"));
+        restore_tree(&wt, &before)?;
+    }
+    result
+}
+
 /// Reviews the change with whichever engine: the harness over a read-only
-/// workspace on the changed tree, or Claude Code with reading tools only.
+/// workspace on the changed tree, or Claude Code or OpenCode over the
+/// tree, which is kept as it was.
 fn review_with(
     reviewer: &Engine,
     root: &Path,
@@ -870,7 +906,7 @@ fn review_with(
     diff: &str,
     on_event: &mut dyn FnMut(String),
 ) -> Result<crate::agent::backlog::Verdict, String> {
-    match reviewer {
+    with_tree_kept(root, "the reviewer", on_event, |on_event| match reviewer {
         Engine::Harness(provider) => {
             let mut workspace = Workspace::new(root, tracked.to_vec(), Access::ReadOnly)?;
             crate::agent::backlog::review(provider.as_ref(), &mut workspace, brief, diff, &mut |e| on_event(e.line()))
@@ -913,11 +949,12 @@ fn review_with(
             )?;
             Ok(crate::agent::backlog::parse_verdict(&run.text))
         }
-    }
+    })
 }
 
 /// Asks a second agent what to do about a round that did not get through:
-/// the harness over a read-only workspace, or Claude Code reading only.
+/// the harness over a read-only workspace, or Claude Code or OpenCode over
+/// the tree, which is kept as it was.
 fn advise_with(
     advisor: &Engine,
     root: &Path,
@@ -927,7 +964,7 @@ fn advise_with(
     diff: &str,
     on_event: &mut dyn FnMut(String),
 ) -> Result<crate::agent::backlog::Advice, String> {
-    match advisor {
+    with_tree_kept(root, "the advisor", on_event, |on_event| match advisor {
         Engine::Harness(provider) => {
             let mut workspace = Workspace::new(root, tracked.to_vec(), Access::ReadOnly)?;
             crate::agent::backlog::advise(provider.as_ref(), &mut workspace, brief, happened, diff, &mut |e| on_event(e.line()))
@@ -970,7 +1007,7 @@ fn advise_with(
             )?;
             Ok(crate::agent::backlog::parse_advice(&run.text))
         }
-    }
+    })
 }
 
 /// What the worktree has changed against its commit, per git, so the
@@ -1167,6 +1204,35 @@ mod tests {
         sh(&work, &["commit", "-q", "-m", "init"]);
         sh(&work, &["push", "-q", "origin", "main"]);
         (tmp, Repo::open(&work).unwrap())
+    }
+
+    /// A reviewer that edits, deletes and creates: after it, the tree is
+    /// exactly what the fixer left, and its answer still comes back.
+    #[test]
+    fn a_second_agents_edits_are_put_back() {
+        let (_tmp, repo) = setup("true");
+        let root = repo.path().to_path_buf();
+        fs::write(root.join("lib.py"), "def total(xs):\n    return sum(xs)\n").unwrap();
+        fs::write(root.join("new.py"), "x = 1\n").unwrap();
+        let mut log = Vec::new();
+        let got = with_tree_kept(&root, "the reviewer", &mut |l| log.push(l), |_| {
+            fs::write(root.join("lib.py"), "broken").unwrap();
+            fs::remove_file(root.join("new.py")).unwrap();
+            fs::create_dir_all(root.join("notes")).unwrap();
+            fs::write(root.join("notes/junk.txt"), "reviewer was here").unwrap();
+            Ok::<_, String>("approve")
+        })
+        .unwrap();
+        assert_eq!(got, "approve");
+        assert_eq!(fs::read_to_string(root.join("lib.py")).unwrap(), "def total(xs):\n    return sum(xs)\n");
+        assert_eq!(fs::read_to_string(root.join("new.py")).unwrap(), "x = 1\n");
+        assert!(!root.join("notes").exists(), "what the reviewer made is gone");
+        assert!(log.iter().any(|l| l.starts_with("the reviewer changed the tree")), "{log:?}");
+
+        // One that only reads leaves no line.
+        let mut log = Vec::new();
+        with_tree_kept(&root, "the reviewer", &mut |l| log.push(l), |_| Ok::<_, String>(())).unwrap();
+        assert!(log.is_empty(), "{log:?}");
     }
 
     struct Scripted(RefCell<Vec<Reply>>);

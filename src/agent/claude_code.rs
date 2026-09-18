@@ -253,8 +253,9 @@ pub fn run(
     Ok(run)
 }
 
-/// Runs Claude Code with reading tools only — no edits, no commands — and
-/// returns what it said. For a review.
+/// Runs Claude Code to read and run, not edit — no editing tools, and told
+/// that any change it makes is put back — and returns what it said. For a
+/// review, or advice. The caller keeps the tree.
 pub fn run_readonly(
     config: &Config,
     root: &Path,
@@ -262,22 +263,26 @@ pub fn run_readonly(
     system_extra: Option<&str>,
     on_event: &mut dyn FnMut(Event),
 ) -> Result<Run, String> {
-    let allowed = reviewer_tools(root);
-    run_with_tools(config, root, Launch { task, system_extra, allowed: &allowed, collect_edits: false, resume: None }, on_event).map(|(run, _)| run)
+    let allowed = reviewer_tools();
+    let mut system = String::from(
+        "Read the repository and run what you need — the checks, the tools, anything that \
+         answers a question — but do not edit: you have no editing tools, and any change \
+         a command of yours makes to the tree is put back after you answer.",
+    );
+    if let Some(extra) = system_extra.map(str::trim).filter(|s| !s.is_empty()) {
+        system.push_str("\n\n");
+        system.push_str(extra);
+    }
+    run_with_tools(config, root, Launch { task, system_extra: Some(&system), allowed: &allowed, collect_edits: false, resume: None }, on_event).map(|(run, _)| run)
 }
 
-/// What a reviewer may run: the reading tools, and a shell for the
-/// repository's checks and read-only commands — a reviewer that cannot
-/// run the tests spends its turns being refused — but no edits.
-pub fn reviewer_tools(root: &Path) -> String {
-    let mut tools: Vec<String> = ["Read", "Grep", "Glob", "LS"].iter().map(|s| s.to_string()).collect();
-    for program in toolchain(root, &[]) {
-        tools.push(format!("Bash({program}:*)"));
-    }
-    for cmd in ["ls", "cat", "head", "tail", "wc", "grep", "rg", "find", "pwd", "echo", "diff", "sort", "uniq", "tree", "stat", "file", "git status", "git diff", "git log", "git show", "git ls-files", "git grep", "git blame", "git branch", "git rev-parse"] {
-        tools.push(format!("Bash({cmd}:*)"));
-    }
-    tools.join(",")
+/// What a reviewer may use: the reading tools and the whole shell, less
+/// [`DENIED_TOOLS`]. A list of permitted commands was tried first, and
+/// every review found one it needed that was not on it — a pipeline, a VM's
+/// status — and spent its turns being refused. Edits are the caller's to
+/// undo, and are.
+pub fn reviewer_tools() -> String {
+    ["Read", "Grep", "Glob", "LS", "Bash"].join(",")
 }
 
 /// Directories Claude Code may read besides the worktree: the caches
@@ -806,8 +811,8 @@ mod tests {
         assert!(note.contains("MCP tools"), "{note}");
         // A reviewer may run the checks and read, not edit.
         std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
-        let reviewer = reviewer_tools(root);
-        assert!(reviewer.contains("Bash(cargo:*)") && reviewer.contains("Bash(git diff:*)") && reviewer.contains("Bash(tail:*)"), "{reviewer}");
+        let reviewer = reviewer_tools();
+        assert!(reviewer.split(',').any(|t| t == "Bash"), "the whole shell: {reviewer}");
         assert!(!reviewer.contains("Edit") && !reviewer.contains("Write"), "{reviewer}");
         let _ = extra_read_dirs(None);
 

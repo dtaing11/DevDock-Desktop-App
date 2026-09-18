@@ -863,7 +863,7 @@ pub(super) fn run_card(ui: &mut egui::Ui, key: &str, title: &str, run: &mut Tick
                         super::views::prose_box(ui, &mut q.draft, 2, "Your answer — it is waiting");
                         ui.horizontal(|ui| {
                             let ready = !q.draft.trim().is_empty();
-                            if ui.add_enabled(ready, egui::Button::new("Answer").fill(theme::ember())).clicked() {
+                            if ui.add_enabled(ready, egui::Button::new("Answer").fill(theme::green())).clicked() {
                                 action = CardAction::Answer;
                             }
                             if ui.small_button("Let it decide").on_hover_text("Sends no answer; the agent decides and states its assumption.").clicked() {
@@ -993,7 +993,7 @@ fn tickets(app: &mut App, ui: &mut egui::Ui) {
             let n = app.backlog.selected.len();
             let can = n > 0;
             let fix = egui::Button::new(RichText::new(format!("Fix {n} selected")).strong())
-                .fill(theme::ember())
+                .fill(theme::green())
                 .min_size(egui::vec2(0.0, theme::CONTROL_MD));
             if ui
                 .add_enabled(can, fix)

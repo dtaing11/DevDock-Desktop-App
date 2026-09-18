@@ -419,7 +419,7 @@ pub fn fix(
         }
     }
 
-    let mut result = work(engine, job, &branch, &dir, publish, on_event);
+    let mut result = work(repo, engine, job, &branch, &dir, publish, on_event);
 
     // A failed run's attempt is not thrown away: it is committed on the
     // branch, unpushed, so there is something to finish by hand or to send
@@ -458,6 +458,7 @@ pub fn fix(
 }
 
 fn work(
+    repo: &Repo,
     engine: &Engine,
     job: &Job<'_>,
     branch: &str,
@@ -466,6 +467,11 @@ fn work(
     on_event: &mut dyn FnMut(String),
 ) -> Result<Fixed, String> {
     let wt = Repo::open(dir).map_err(|e| e.to_string())?;
+    if job.sandbox.is_none() {
+        if let Some(line) = share_cargo_target(wt.path(), repo.path()) {
+            on_event(line);
+        }
+    }
     let mut jobs = crate::local_ci::discover_configs(wt.path())
         .map(|c| c.config.jobs)
         .unwrap_or_default();
@@ -534,9 +540,12 @@ fn work(
     if !jobs.is_empty() {
         on_event("running the checks on the untouched tree first".into());
         for j in &jobs {
-            let result = crate::local_ci::run_job_with(&runners, wt.path(), j);
+            let result = run_check(&runners, wt.path(), j, on_event);
             if result.ok {
                 continue;
+            }
+            if let Some(why) = machine_failure(&result.output) {
+                return Err(machine_failure_message(&j.name, why, &result.output));
             }
             if let Some(program) = missing_program(&result.output) {
                 return Err(format!(
@@ -695,7 +704,7 @@ fn work(
         let mut failed: Option<String> = None;
         for j in &jobs {
             on_event(format!("verifying: {}", j.name));
-            let result = crate::local_ci::run_job_with(&runners, wt.path(), j);
+            let result = run_check(&runners, wt.path(), j, on_event);
             if !result.ok {
                 if let Some(before) = baseline.get(&j.name) {
                     if *before == normalize_output(&result.output) {
@@ -708,8 +717,13 @@ fn work(
             on_event(format!("{} {}", j.name, if result.ok { "passed" } else { "FAILED" }));
             checks.push(CheckOutcome { name: j.name.clone(), ok: result.ok });
             if !result.ok {
-                // A program the check needs is not there: the environment's
-                // fault, not the change's. Saying so beats another round.
+                // The machine's fault — a linker killed for memory, a full
+                // disk — or a program the check needs that is not there:
+                // the environment's, not the change's. Saying so beats
+                // another round that fails the same way.
+                if let Some(why) = machine_failure(&result.output) {
+                    return Err(machine_failure_message(&j.name, why, &result.output));
+                }
                 if let Some(program) = missing_program(&result.output) {
                     return Err(format!(
                         "the check `{}` needs `{program}`, which is not installed where the checks run{}.\n{}",
@@ -1061,6 +1075,7 @@ fn unstage_artifacts(wt: &Repo) -> Result<(), String> {
             path.split('/').any(|part| ARTIFACT_DIRS.contains(&part))
                 || ARTIFACT_EXTENSIONS.iter().any(|ext| path.ends_with(ext))
                 || GENERATED.iter().any(|g| path.ends_with(g))
+                || is_devdock_cargo_config(wt, path)
         })
         .collect();
     if artifacts.is_empty() {
@@ -1116,6 +1131,72 @@ pub fn missing_program(output: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// A check that failed because of the machine it ran on, not the code:
+/// a linker or compiler killed for memory, a full disk. What to say.
+pub fn machine_failure(output: &str) -> Option<&'static str> {
+    if output.contains("No space left on device") {
+        return Some("the disk is full");
+    }
+    if output.contains("signal: 9") || output.contains("SIGKILL") || output.lines().any(|l| l.trim() == "Killed") {
+        return Some("a process was killed, which is the machine running out of memory");
+    }
+    if output.contains("linking with `cc` failed") || output.contains("linker command failed") {
+        return Some("the linker failed, which on a busy machine is usually memory");
+    }
+    None
+}
+
+fn machine_failure_message(check: &str, why: &str, output: &str) -> String {
+    let tail: String = output.lines().rev().take(12).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+    format!(
+        "the check `{check}` failed because of this machine, not the change: {why}. It was run twice. \
+         Close what you can and run the task again; the attempt is kept.\n{tail}"
+    )
+}
+
+/// Runs a check, and a check that fails the machine's way — not the
+/// code's — once more after a pause, in case the pressure has passed.
+fn run_check(runners: &crate::local_ci::runner::RunnerRegistry, root: &Path, j: &crate::local_ci::Job, on_event: &mut dyn FnMut(String)) -> crate::local_ci::JobResult {
+    let result = crate::local_ci::run_job_with(runners, root, j);
+    if result.ok {
+        return result;
+    }
+    let Some(why) = machine_failure(&result.output) else { return result };
+    on_event(format!("{} failed the machine's way ({why}); waiting, then running it once more", j.name));
+    std::thread::sleep(std::time::Duration::from_secs(if cfg!(test) { 0 } else { 20 }));
+    crate::local_ci::run_job_with(runners, root, j)
+}
+
+/// The marker in a cargo config DevDock wrote, so it is recognised and
+/// never staged.
+const CARGO_CONFIG_MARK: &str = "# Written by DevDock for this worktree; not part of the change.";
+
+/// Points a Rust worktree's cargo at the repository's own `target/`, so an
+/// attempt does not build every dependency from nothing — ten minutes a
+/// round for an app like this one, three rounds for a colour — but reuses
+/// what the repository has already built. Written only where the
+/// worktree has no cargo config of its own; the sandbox has its own
+/// target directory and needs none of this.
+fn share_cargo_target(wt: &Path, repo: &Path) -> Option<String> {
+    if !wt.join("Cargo.toml").exists() {
+        return None;
+    }
+    let config = wt.join(".cargo/config.toml");
+    if config.exists() || wt.join(".cargo/config").exists() {
+        return None;
+    }
+    let target = repo.join("target");
+    let text = format!("{CARGO_CONFIG_MARK}\n[build]\ntarget-dir = {:?}\n", target.display().to_string());
+    std::fs::create_dir_all(wt.join(".cargo")).ok()?;
+    std::fs::write(&config, text).ok()?;
+    Some(format!("cargo builds into {}, shared with the repository", target.display()))
+}
+
+/// Whether a staged `.cargo/config.toml` is the one DevDock wrote.
+fn is_devdock_cargo_config(wt: &Repo, path: &str) -> bool {
+    path == ".cargo/config.toml" && std::fs::read_to_string(wt.path().join(path)).is_ok_and(|t| t.starts_with(CARGO_CONFIG_MARK))
 }
 
 fn branch_has_commits(repo: &Repo, branch: &str, base: &str) -> bool {
@@ -1338,6 +1419,58 @@ mod tests {
         assert!(log.iter().any(|l| l.contains("changed lib.py +1 -1")), "{log:?}");
         let subject = repo.log(1, Some("fix/abc-7-total-is-off-by-one")).unwrap()[0].subject.clone();
         assert_eq!(subject, "ABC-7: total() is off by one");
+    }
+
+    #[test]
+    fn a_failure_of_the_machine_ends_the_run_without_spending_rounds() {
+        assert_eq!(machine_failure("error: linking with `cc` failed: exit status: 1\n  |\n  = note: clang: error: linker command failed"), Some("the linker failed, which on a busy machine is usually memory"));
+        assert_eq!(machine_failure("error: could not compile `x` (lib test)\nCaused by: process didn't exit successfully: `rustc …` (signal: 9, SIGKILL: kill)"), Some("a process was killed, which is the machine running out of memory"));
+        assert_eq!(machine_failure("write error: No space left on device"), Some("the disk is full"));
+        assert_eq!(machine_failure("error: test failed\nassertion `left == right`"), None);
+
+        // A check that fails the machine's way both times: the run ends at
+        // once with the reason, no round spent, no advisor asked.
+        let (_tmp, repo) = setup(r#"sh -c \"echo 'clang: error: linker command failed with exit code 1' >&2; exit 1\""#);
+        let engine = Engine::Harness(Box::new(fixing_provider()));
+        let mut log = Vec::new();
+        let err = fix(
+            &repo,
+            &engine,
+            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox: None, claim: None, rounds: 3, reviewer: None, ask: None },
+            &fake_pr,
+            &mut |line| log.push(line),
+        )
+        .unwrap_err();
+        assert!(err.contains("because of this machine, not the change") && err.contains("the linker failed"), "{err}");
+        assert!(log.iter().any(|l| l.contains("running it once more")), "{log:?}");
+        assert!(!log.iter().any(|l| l.starts_with("round 1")), "no round was spent: {log:?}");
+    }
+
+    #[test]
+    fn a_rust_worktree_builds_into_the_repositorys_target() {
+        let (_tmp, repo) = setup("true");
+        let wt = tempfile::tempdir().unwrap();
+        assert_eq!(share_cargo_target(wt.path(), repo.path()), None, "not a Rust tree");
+        fs::write(wt.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let line = share_cargo_target(wt.path(), repo.path()).unwrap();
+        assert!(line.contains("shared with the repository"), "{line}");
+        let text = fs::read_to_string(wt.path().join(".cargo/config.toml")).unwrap();
+        assert!(text.starts_with(CARGO_CONFIG_MARK) && text.contains("target-dir") && text.contains("target\""), "{text}");
+        // A tree with its own config keeps it.
+        fs::write(wt.path().join(".cargo/config.toml"), "[build]\nrustflags = []\n").unwrap();
+        assert_eq!(share_cargo_target(wt.path(), repo.path()), None);
+        assert_eq!(fs::read_to_string(wt.path().join(".cargo/config.toml")).unwrap(), "[build]\nrustflags = []\n");
+
+        // The one DevDock wrote is never part of the change; one the agent wrote is.
+        fs::write(repo.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        share_cargo_target(repo.path(), repo.path()).unwrap();
+        stage_change(&repo).unwrap();
+        let staged = repo.git(&["diff", "--cached", "--name-only"]).unwrap();
+        assert!(staged.contains("Cargo.toml") && !staged.contains(".cargo/config.toml"), "{staged}");
+        fs::write(repo.path().join(".cargo/config.toml"), "[build]\nrustflags = [\"-D\", \"warnings\"]\n").unwrap();
+        stage_change(&repo).unwrap();
+        let staged = repo.git(&["diff", "--cached", "--name-only"]).unwrap();
+        assert!(staged.contains(".cargo/config.toml"), "{staged}");
     }
 
     #[test]

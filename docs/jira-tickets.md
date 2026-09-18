@@ -158,6 +158,21 @@ now, and — on **Log** — everything it did: every file read, every edit, ever
 check, the commit, the push. A finished card lists the files it changed with
 line counts, its summary, and the pull request.
 
+### When the machine, not the change, fails a check
+
+A check that fails the machine's way — a linker or compiler killed for
+memory, a full disk — is run once more after a pause, and if it fails the
+same way the run ends at once with the reason, no round spent and no
+advisor asked. The attempt is kept on its branch; close what you can and
+run the task again.
+
+A Rust worktree builds into the repository's own `target/`, through a
+`.cargo/config.toml` DevDock writes in the worktree and never stages, so
+an attempt reuses every dependency the repository has already built
+instead of compiling them all from nothing each round. A worktree that
+has a cargo config of its own keeps it; the sandbox has a target
+directory of its own.
+
 ### A screenshot of the result
 
 A run that passes its checks photographs what it changed, where the

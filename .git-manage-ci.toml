@@ -72,6 +72,11 @@ command = "cargo run --example app_shot -- . agent {out} 1400 900"
 env = { AGENT_DEMO = "changes" }
 
 [[screenshot]]
+name = "runs tab"
+command = "cargo run --example app_shot -- . runs {out} 1400 900"
+env = { AGENT_DEMO = "runs" }
+
+[[screenshot]]
 name = "settings"
 command = "cargo run --example app_shot -- . changes {out} 1400 900"
 env = { DIALOG = "settings" }

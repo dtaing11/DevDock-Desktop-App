@@ -17,6 +17,7 @@ pub mod editor;
 pub mod graph;
 pub mod markdown;
 pub mod palette;
+pub mod runs_tab;
 pub mod shortcuts;
 pub mod syntax;
 #[cfg(unix)]
@@ -282,6 +283,8 @@ pub enum Tab {
     Editor,
     /// The coding agent.
     Agent,
+    /// Every agent run, in every repository.
+    Runs,
 }
 
 /// Which modal dialog is open, if any.
@@ -956,6 +959,8 @@ pub struct App {
     pub sessions: std::collections::HashMap<String, RepoSession>,
     /// Screenshots decoded for the run cards.
     pub screenshots: backlog::Screenshots,
+    /// The Runs tab: which card is unfolded, which runs are shown.
+    pub runs_view: runs_tab::RunsView,
     /// The models OpenCode lists, `provider/model`, read once at start.
     pub opencode_models: Vec<String>,
     /// The running binary as it was at start (size, modified), and whether
@@ -1107,6 +1112,7 @@ impl App {
             coding: Default::default(),
             sessions: Default::default(),
             screenshots: Default::default(),
+            runs_view: Default::default(),
             opencode_models: Vec::new(),
             exe_stamp: exe_stamp(),
             newer_build_installed: false,
@@ -4473,7 +4479,23 @@ impl App {
     /// all of them are in one place and the Worktrees dialog can remove
     /// them — and opens Visual Studio Code on it.
     pub fn open_attempt_in_vscode(&mut self, branch: &str) {
-        let dir = match self.check_out_attempt(branch) {
+        let key = self.repo_key();
+        self.open_attempt_in_vscode_of(&key, branch);
+    }
+
+    /// The repository at `key`: the one on screen, or one kept aside —
+    /// the Runs tab acts on any of them without switching.
+    fn repo_at(&self, key: &str) -> Result<Repo, String> {
+        match &self.repo {
+            Some(repo) if repo.path().display().to_string() == key => Ok(repo.clone()),
+            _ if key.is_empty() => Err("no repository is open".into()),
+            _ => Repo::open(key).map_err(|e| e.to_string()),
+        }
+    }
+
+    /// [`Self::open_attempt_in_vscode`] for the repository at `key`.
+    pub fn open_attempt_in_vscode_of(&mut self, key: &str, branch: &str) {
+        let dir = match self.check_out_attempt_of(key, branch) {
             Ok(dir) => dir,
             Err(e) => {
                 self.toast(e, true);
@@ -4489,7 +4511,20 @@ impl App {
     /// Turns a kept attempt into a real commit and a draft pull request:
     /// the WIP commit reworded to the task's subject, pushed, opened.
     pub fn publish_attempt(&mut self, branch: &str) {
-        let Some(repo) = self.repo.clone() else { return };
+        let key = self.repo_key();
+        self.publish_attempt_of(&key, branch);
+    }
+
+    /// [`Self::publish_attempt`] for the repository at `key`; the outcome
+    /// is routed to that repository's state, on screen or not.
+    pub fn publish_attempt_of(&mut self, key: &str, branch: &str) {
+        let repo = match self.repo_at(key) {
+            Ok(repo) => repo,
+            Err(e) => {
+                self.toast(e, true);
+                return;
+            }
+        };
         if github::Client::from_store().is_none() {
             self.toast("Sign in to GitHub first: the attempt ends as a pull request.", true);
             return;
@@ -4501,8 +4536,10 @@ impl App {
             .ok()
             .and_then(|a| a.into_iter().find(|a| a.branch == branch).map(|a| a.title))
             .unwrap_or_else(|| branch.clone());
-        self.worktrees.busy = true;
-        self.worker.spawn(move || {
+        if key == self.repo_key() {
+            self.worktrees.busy = true;
+        }
+        self.worker.spawn_for(key.to_string(), move || {
             let result = (|| -> Result<String, String> {
                 let client = github::Client::from_store().ok_or("Not signed in to GitHub")?;
                 let slug = views::origin_slug(&repo).ok_or("No github.com remote found")?;
@@ -4522,11 +4559,19 @@ impl App {
     /// The worktree for a kept attempt, made under `<repo>-attempts/` if
     /// it is not there yet.
     pub fn check_out_attempt(&mut self, branch: &str) -> Result<std::path::PathBuf, String> {
-        let repo = self.repo.clone().ok_or("no repository is open")?;
+        let key = self.repo_key();
+        self.check_out_attempt_of(&key, branch)
+    }
+
+    /// [`Self::check_out_attempt`] for the repository at `key`.
+    pub fn check_out_attempt_of(&mut self, key: &str, branch: &str) -> Result<std::path::PathBuf, String> {
+        let repo = self.repo_at(key)?;
         let dir = repo.attempt_worktree_path(branch);
         if !dir.exists() {
             repo.worktree_add(&dir, branch, None).map_err(|e| format!("Could not check {branch} out: {e}"))?;
-            self.refresh();
+            if key == self.repo_key() {
+                self.refresh();
+            }
         }
         Ok(dir)
     }

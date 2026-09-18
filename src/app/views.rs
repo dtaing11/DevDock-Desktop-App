@@ -1146,6 +1146,17 @@ fn sidebar_body(app: &mut App, ui: &mut egui::Ui) {
                 if ui.selectable_label(app.tab == Tab::Agent, agent_label).clicked() {
                     app.tab = Tab::Agent;
                 }
+                let runs_label = match super::runs_tab::running_everywhere(app) {
+                    0 => "Runs".to_string(),
+                    n => format!("Runs ({n})"),
+                };
+                if ui
+                    .selectable_label(app.tab == Tab::Runs, runs_label)
+                    .on_hover_text("Every agent run, in every repository this window has open")
+                    .clicked()
+                {
+                    app.tab = Tab::Runs;
+                }
                 let checks_label = match (&app.local_ci.running, app.local_ci.history.first()) {
                     (true, _) => "Checks (running)".to_string(),
                     (false, Some(run)) if run.passed => "Checks (pass)".to_string(),
@@ -1166,6 +1177,7 @@ fn sidebar_body(app: &mut App, ui: &mut egui::Ui) {
                 Tab::Checks => checks_tab(app, ui),
                 Tab::Editor => super::editor::editor_sidebar(app, ui),
                 Tab::Agent => super::agent_tab::agent_sidebar(app, ui),
+                Tab::Runs => super::runs_tab::runs_sidebar(app, ui),
             }
         }
     }
@@ -2462,6 +2474,7 @@ pub fn diff_panel(app: &mut App, ctx: &egui::Context) {
                         let title = match app.tab {
                             Tab::Editor => "Editor",
                             Tab::Agent => "Coding agent",
+                            Tab::Runs => "Agent runs, everywhere",
                             _ if app.diff_title.is_empty() => "Select a file to view its diff",
                             _ => &app.diff_title,
                         };
@@ -2469,7 +2482,7 @@ pub fn diff_panel(app: &mut App, ctx: &egui::Context) {
                         // File-level controls only when a working file is
                         // selected and the viewport is showing its diff.
                         if app.selected_file.is_some()
-                            && !matches!(app.tab, Tab::Editor | Tab::Agent)
+                            && !matches!(app.tab, Tab::Editor | Tab::Agent | Tab::Runs)
                         {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -2558,14 +2571,15 @@ pub fn diff_panel(app: &mut App, ctx: &egui::Context) {
             // active tab: their content is a file and a set of diffs, and
             // neither belongs in a 340pt sidebar.
             match app.tab {
-                Tab::Editor | Tab::Agent => {
-                    // The diff view draws its own margins; these two need
+                Tab::Editor | Tab::Agent | Tab::Runs => {
+                    // The diff view draws its own margins; these need
                     // their own, or their right edge is flush with the
                     // window and the buttons there are clipped.
                     egui::Frame::new()
                         .inner_margin(egui::Margin::symmetric(12, 8))
                         .show(ui, |ui| match app.tab {
                             Tab::Editor => super::editor::editor_viewport(app, ui),
+                            Tab::Runs => super::runs_tab::runs_viewport(app, ui),
                             _ => super::agent_tab::agent_viewport(app, ui),
                         });
                     return;
@@ -3275,7 +3289,7 @@ mod tests {
 
         let mut widths = Vec::new();
         use crate::app::Tab;
-        for tab in [Tab::Changes, Tab::History, Tab::Checks, Tab::Editor, Tab::Agent] {
+        for tab in [Tab::Changes, Tab::History, Tab::Checks, Tab::Editor, Tab::Agent, Tab::Runs] {
             app.tab = tab;
             // Twice: the first pass lays out, the second reads back what the
             // first stored, which is where the growth used to show up.

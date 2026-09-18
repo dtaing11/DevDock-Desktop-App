@@ -389,6 +389,24 @@ It needs GitHub sign-in, because the outcome is a pull request. A prompt that
 needs a decision from you is not a fit: the agent is told nobody can answer,
 and to change nothing rather than guess.
 
+### Every run, in one tab
+
+The **Runs** tab lists every agent run the window knows of: the runs in
+the repository on screen and in every repository kept aside — worktree
+runs, backlog tickets, and the run in each tree. Its label counts what is
+running everywhere. The sidebar filters — all, running, waiting on you,
+failed, done — and shows each repository's counts; the viewport groups the
+cards by repository, the one on screen first, with a Show button for the
+others.
+
+A card is the same one the Agent tab and the backlog show: it unfolds to
+its log; one with a question takes your answer there; a failed one offers
+**Open in VS Code** for its kept attempt and **Open as PR** to finish it
+as a pull request — for any repository, without switching to it. The run
+in a tree has a card too, with a button to its Agent tab. **Clear
+finished everywhere** drops the done and failed cards in every
+repository; kept attempts stay on their branches.
+
 ### MCP tools
 
 A repository that declares MCP servers in its `.mcp.json` gives them to

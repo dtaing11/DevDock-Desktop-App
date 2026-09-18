@@ -55,6 +55,9 @@ Linux (Windows too, egui being cross-platform).
   any app with a screenshot command under a virtual display — and shown on
   the card, kept in DevDock's own screenshots folder. A run without a
   sandbox gets one started for the pictures alone. Never on your screen.
+- **Every run in one tab**: the Runs tab lists every agent across every
+  repository the window has open — running, waiting on you, failed, done —
+  each a card that unfolds to its log, with the same buttons as elsewhere.
 - **Nothing is lost**: a run that does not get through keeps its attempt on
   its branch, unpushed; open it in VS Code, finish it, or turn it into a pull
   request with one click. A check that already fails on the base branch is

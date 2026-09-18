@@ -6,8 +6,9 @@
 //!
 //! `DIALOG=stack|worktrees|pr|tickets` opens a dialog over the app before the
 //! picture is taken.
-//! `AGENT_DEMO=running|changes` fills the coding agent with state, since a
-//! real run needs a model and a screenshot needs neither.
+//! `AGENT_DEMO=running|changes|worktree|runs` fills the coding agent with
+//! state, since a real run needs a model and a screenshot needs neither;
+//! `runs` adds a second repository kept aside, for the Runs tab.
 //! `COMMIT_DEMO=1` fills the commit box with a long generated message.
 
 use eframe::egui;
@@ -331,11 +332,31 @@ fn seed_tickets(app: &mut App) {
 fn seed_agent(app: &mut App, mode: &str) {
     use git_manage::agent::{PendingEdit, PlanStep};
     let step = |text: &str, done: bool| PlanStep { text: text.into(), done };
-    app.tab = Tab::Agent;
-    if mode == "worktree" {
+    if mode != "runs" {
+        app.tab = Tab::Agent;
+    }
+    if mode == "worktree" || mode == "runs" {
         // Two prompts sent to worktrees of their own: the tab's tree idle,
-        // the runs in the viewport.
+        // the runs in the viewport. For the Runs tab, a second repository
+        // kept aside with a failed ticket and one waiting on an answer.
         use git_manage::app::backlog::{RunState, TicketRun};
+        if mode == "runs" {
+            let mut session = git_manage::app::RepoSession::default();
+            let mut failed = TicketRun::queued("ABC-12: the invoice total ignores discounts");
+            failed.state = RunState::Failed("after 3 round(s) the reviewer still asked for changes:\nthe attempt is kept on branch fix/abc-12-invoice-total (2 file(s), not pushed)".into());
+            failed.kept = Some("fix/abc-12-invoice-total".into());
+            failed.log = ["branch fix/abc-12-invoice-total from main", "round 1 of 3", "· edit lib/invoice.py", "tests passed", "review by Claude Code agent (claude-opus-5)", "revise: the discount is applied before tax; the spec says after", "round 3 of 3", "failed: the reviewer still asked for changes"].iter().map(|l| l.to_string()).collect();
+            failed.took = Some(std::time::Duration::from_secs(412));
+            session.backlog.runs.insert("ABC-12".into(), failed);
+            let mut asking = TicketRun::queued("ABC-15: export the report as CSV");
+            asking.state = RunState::Running;
+            asking.started = Some(std::time::Instant::now() - std::time::Duration::from_secs(77));
+            asking.log = ["branch fix/abc-15-export-csv from main", "· read lib/report.py", "· asked you: Should the CSV include the archived rows too?"].iter().map(|l| l.to_string()).collect();
+            let (tx, _rx) = std::sync::mpsc::channel();
+            asking.question = Some(git_manage::app::backlog::PendingQuestion { question: "Should the CSV include the archived rows too?".into(), draft: String::new(), reply: tx });
+            session.backlog.runs.insert("ABC-15".into(), asking);
+            app.sessions.insert("/Users/dina/Documents/billing-api".into(), session);
+        }
         app.coding.worktree.enabled = true;
         app.coding.task = "make `devdock branches --json` list upstreams too".into();
         let run = |title: &str, state: RunState, log: &[&str]| TicketRun {
@@ -459,6 +480,7 @@ fn main() -> eframe::Result<()> {
                 "checks" => Tab::Checks,
                 "editor" => Tab::Editor,
                 "agent" => Tab::Agent,
+                "runs" => Tab::Runs,
                 _ => Tab::Changes,
             };
             let shoot_at: u32 = std::env::var("SHOOT_AT")

@@ -2105,13 +2105,17 @@ impl App {
             Msg::AgentScreenshots(result) => {
                 self.coding.screenshotting = false;
                 match result {
-                    Ok(shots) => {
-                        if shots.is_empty() {
+                    Ok(report) => {
+                        if report.shots.is_empty() && report.missed.is_empty() {
                             self.coding.log.push("no screenshot: nothing in this tree rendered".into());
                         }
-                        self.coding.screenshots = shots;
+                        self.coding.screenshots = report.shots;
+                        self.coding.no_screenshots = report.missed;
                     }
-                    Err(e) => self.coding.log.push(format!("no screenshot: {e}")),
+                    Err(e) => {
+                        self.coding.log.push(format!("no screenshot: {e}"));
+                        self.coding.no_screenshots = vec![format!("no screenshot: {e}")];
+                    }
                 }
             }
 
@@ -4333,16 +4337,17 @@ impl App {
             return;
         }
         let root = repo.path().to_path_buf();
-        if crate::screenshots::flutter_apps(&root).is_empty() && crate::screenshots::web_targets(&root).is_empty() {
+        if !crate::screenshots::has_subjects(&root) {
             return;
         }
         self.coding.screenshots.clear();
+        self.coding.no_screenshots.clear();
         self.coding.screenshotting = true;
         let repo_key = self.repo_key();
         let progress = self.worker.progress().for_repo(repo_key.clone());
         let label = format!("agent-{}", self.status.as_ref().map(|s| s.branch.clone()).unwrap_or_else(|| "tree".into()));
         self.worker.spawn_for(repo_key, move || {
-            let result = (|| -> Result<Vec<std::path::PathBuf>, String> {
+            let result = (|| -> Result<crate::screenshots::Report, String> {
                 let mut log = |line: String| progress.send(Msg::AgentEvent { kind: AgentKind::Coding, line });
                 let sandbox = std::sync::Arc::new(crate::sandbox::Sandbox::start(&crate::sandbox::Spec::default(), &root, &mut log)?);
                 let programs: Vec<&str> = crate::local_ci::toolchain_commands(&root);
@@ -6285,6 +6290,7 @@ mod tests {
             reviewed_by: None,
             skipped: vec![],
             screenshots: vec![],
+            no_screenshots: vec![],
         };
         app.handle(Msg::BacklogDone { key: "T-1".into(), result: Ok(Box::new(fixed)) });
         assert_eq!(app.backlog.done(), 1);
@@ -6386,6 +6392,7 @@ mod tests {
             reviewed_by: None,
             skipped: vec![],
             screenshots: vec![],
+            no_screenshots: vec![],
         };
         app.handle(Msg::AgentRunDone { key: "agent/add-a-json-flag".into(), result: Ok(Box::new(fixed)) });
         assert_eq!(app.coding.worktree.done(), 1);

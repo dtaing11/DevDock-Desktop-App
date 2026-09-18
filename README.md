@@ -53,7 +53,8 @@ Linux (Windows too, egui being cross-platform).
   photographed where the checks ran — a Flutter app's first frame or root
   widget, the screens the agent names, a web page in a headless browser, or
   any app with a screenshot command under a virtual display — and shown on
-  the card. Never on your screen.
+  the card, kept in DevDock's own screenshots folder. A run without a
+  sandbox gets one started for the pictures alone. Never on your screen.
 - **Nothing is lost**: a run that does not get through keeps its attempt on
   its branch, unpushed; open it in VS Code, finish it, or turn it into a pull
   request with one click. A check that already fails on the base branch is

@@ -78,6 +78,9 @@ pub struct Fixed {
     /// Screenshots of the result, for a change to something with a screen:
     /// a Flutter app's first frame, rendered where the checks ran.
     pub screenshots: Vec<PathBuf>,
+    /// For each screenshot that could not be taken, why: shown on the
+    /// card where the picture would have been.
+    pub no_screenshots: Vec<String>,
 }
 
 /// Marks a ticket as taken while an agent works on it, and says how it
@@ -817,9 +820,10 @@ fn work(
     }
 
     // What it looks like, for a change to something with a screen: taken
-    // where the checks ran, kept outside the repository, never part of
-    // the change.
-    let screenshots = crate::screenshots::capture(wt.path(), &runners, sandbox.as_deref(), branch, on_event);
+    // where the checks ran — or in a sandbox started for it when the run
+    // had none and the tree needs one — kept outside the repository,
+    // never part of the change.
+    let shots = crate::screenshots::capture_anywhere(wt.path(), &runners, sandbox.clone(), branch, on_event);
 
     // Commit and push.
     stage_change(&wt)?;
@@ -851,7 +855,8 @@ fn work(
         rounds: round,
         reviewed_by,
         skipped,
-        screenshots,
+        screenshots: shots.shots,
+        no_screenshots: shots.missed,
     })
 }
 

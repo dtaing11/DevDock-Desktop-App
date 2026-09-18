@@ -744,7 +744,7 @@ mod tests {
         sandbox.provision(&["cargo", "xvfb-run"], &mut log).unwrap();
         let mut runners = crate::local_ci::runner::RunnerRegistry::with_builtins();
         runners.register(Box::new(SandboxRunner(sandbox.clone())));
-        let shots = crate::screenshots::capture(&root, &runners, Some(&sandbox), "live-devdock", &mut log);
+        let shots = crate::screenshots::capture(&root, &runners, Some(&sandbox), "live-devdock", &mut log).shots;
         let names: Vec<String> = shots.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
         println!("{names:?}");
         assert_eq!(names.len(), 3, "{names:?}");

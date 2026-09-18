@@ -140,7 +140,7 @@ pub enum Msg {
     /// OpenCode's model list, from `opencode models`.
     OpenCodeModels(Vec<String>),
     /// Screenshots of the in-tab run's result, taken in a sandbox afterwards.
-    AgentScreenshots(Result<Vec<std::path::PathBuf>, String>),
+    AgentScreenshots(Result<crate::screenshots::Report, String>),
     /// An agent has a question for the developer and is waiting. `key` is
     /// the worktree run's branch, or `None` for the Agent tab's own run.
     /// The answer goes back through `reply`.

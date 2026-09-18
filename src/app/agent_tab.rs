@@ -80,6 +80,8 @@ pub struct CodingState {
     pub images: Vec<PromptImage>,
     /// What the last run's result looks like, photographed in a sandbox.
     pub screenshots: Vec<std::path::PathBuf>,
+    /// Why a picture was not taken, for each that was not.
+    pub no_screenshots: Vec<String>,
     pub screenshotting: bool,
 }
 
@@ -927,11 +929,17 @@ fn result_screenshots(app: &mut App, ui: &mut egui::Ui) {
             ui.label(RichText::new("photographing the result in the sandbox…").small().color(theme::fg_dim()));
         });
     }
-    if app.coding.screenshots.is_empty() {
+    if app.coding.screenshots.is_empty() && app.coding.no_screenshots.is_empty() {
         return;
     }
     ui.add_space(theme::UNIT);
-    ui.label(theme::overline("WHAT IT LOOKS LIKE"));
+    ui.horizontal(|ui| {
+        ui.label(theme::overline("WHAT IT LOOKS LIKE"));
+        screenshots_folder_button(ui);
+    });
+    for why in &app.coding.no_screenshots {
+        ui.add(egui::Label::new(RichText::new(why).small().color(theme::fg_dim())).wrap());
+    }
     let shots = app.coding.screenshots.clone();
     let ctx = ui.ctx().clone();
     ui.horizontal_wrapped(|ui| {
@@ -953,6 +961,15 @@ fn result_screenshots(app: &mut App, ui: &mut egui::Ui) {
             });
         }
     });
+}
+
+/// Opens the folder every screenshot is kept in: DevDock's own, so they
+/// outlive the worktree and never enter a change.
+pub fn screenshots_folder_button(ui: &mut egui::Ui) {
+    let dir = crate::screenshots::keep_dir();
+    if ui.small_button("Folder").on_hover_text(format!("Screenshots are kept in {}", dir.display())).clicked() {
+        let _ = open::that(&dir);
+    }
 }
 
 /// The in-tab run's question, when it is waiting on one.

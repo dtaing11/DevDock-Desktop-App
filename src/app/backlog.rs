@@ -924,10 +924,21 @@ pub(super) fn run_card(ui: &mut egui::Ui, key: &str, title: &str, run: &mut Tick
                     }
                     let summary_short: String = fixed.summary.lines().take(6).collect::<Vec<_>>().join("\n");
                     wrapped(ui, RichText::new(summary_short).size(theme::SMALL));
-                    for path in &fixed.screenshots {
+                    if !fixed.screenshots.is_empty() || !fixed.no_screenshots.is_empty() {
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("What it looks like").font(theme::semibold(theme::SMALL)).color(theme::fg_dim()));
+                            super::agent_tab::screenshots_folder_button(ui);
+                        });
+                    }
+                    for why in &fixed.no_screenshots {
+                        wrapped(ui, RichText::new(why).size(theme::SMALL).color(theme::fg_dim()));
+                    }
+                    for path in &fixed.screenshots {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                            ui.label(RichText::new(name).size(theme::SMALL).color(theme::fg_dim()));
                             if ui.small_button("Open").on_hover_text(path.display().to_string()).clicked() {
                                 let _ = open::that(path);
                             }

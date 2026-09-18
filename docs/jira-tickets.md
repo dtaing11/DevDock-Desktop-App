@@ -159,8 +159,20 @@ line counts, its summary, and the pull request.
 
 A run that passes its checks photographs what it changed, where the
 checks ran — in the sandbox, never on your screen — and shows the images
-on its card under "What it looks like", with Open for the file. Nothing
-generated for this enters the change.
+on its card under "What it looks like", with Open for the file and Folder
+for where they all are. The files are kept in DevDock's own directory,
+`screenshots/` under its config folder (on macOS
+`~/Library/Application Support/devdock/screenshots`, on Linux
+`~/.config/devdock/screenshots`), named after the branch, so they outlive
+the worktree. Nothing generated for this enters the change.
+
+A picture that could not be taken says why, in the same place: a
+screenshot command that wrote nothing, a page that did not render, a
+build that failed. A run without a sandbox gets one started for the
+screenshots alone when the tree needs it — a screenshot command or a
+web page — so turning the sandbox off does not turn the pictures off.
+Only a machine with no sandbox runtime at all takes none, and the card
+says so.
 
 - **A Flutter app's first frame**, through a generated golden test with
   the SDK's real fonts and the debug banner off, at 1280×800.
@@ -184,8 +196,10 @@ generated for this enters the change.
   the first time, kept after). The agent's named paths, or `/`.
 
 A run in your own tree gets the same after it finishes, through a sandbox
-over that tree, and the Agent tab shows the images above the summary. It
-needs a sandbox runtime installed; without one, no screenshot is taken.
+over that tree, and the Agent tab shows the images above the summary,
+with the same Folder button and the same reasons when a picture is
+missing. It needs a sandbox runtime installed; without one, no screenshot
+is taken.
 
 ### Questions
 

@@ -326,23 +326,90 @@ fn slug(text: &str) -> String {
 }
 
 /// Where kept screenshots go: DevDock's own directory, never the repository.
-fn keep_dir() -> PathBuf {
+pub fn keep_dir() -> PathBuf {
     let dir = crate::secure_store::config_dir().join("screenshots");
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
 
+/// What a capture left: the PNGs kept, and for each picture that could
+/// not be taken, why — shown where the picture would have been, so a
+/// missing screenshot is never a silent one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Report {
+    pub shots: Vec<PathBuf>,
+    pub missed: Vec<String>,
+}
+
+impl Report {
+    fn miss(&mut self, log: &mut dyn FnMut(String), why: String) {
+        log(why.clone());
+        self.missed.push(why);
+    }
+}
+
+/// Whether the tree at `root` has anything a capture could photograph.
+pub fn has_subjects(root: &Path) -> bool {
+    !flutter_apps(root).is_empty() || !web_targets(root).is_empty() || !configured_screens(root).is_empty() || !declared_screens(root).is_empty()
+}
+
+/// Whether photographing the tree at `root` needs a sandbox: commands run
+/// under its virtual display, web pages are served and browsed inside it.
+/// A Flutter golden test renders wherever Flutter is.
+pub fn needs_sandbox(root: &Path) -> bool {
+    !web_targets(root).is_empty()
+        || configured_screens(root).iter().chain(declared_screens(root).iter()).any(|s| s.command.is_some())
+}
+
+/// [`capture`] with a sandbox found for it: the run's own when it had
+/// one, otherwise one started here when the tree needs it (a screenshot
+/// command, a web page) and a runtime is installed. A tree that needs no
+/// sandbox is photographed with the runners given.
+pub fn capture_anywhere(
+    root: &Path,
+    runners: &RunnerRegistry,
+    sandbox: Option<std::sync::Arc<crate::sandbox::Sandbox>>,
+    label: &str,
+    log: &mut dyn FnMut(String),
+) -> Report {
+    if sandbox.is_some() || !needs_sandbox(root) {
+        return capture(root, runners, sandbox.as_deref(), label, log);
+    }
+    if !has_subjects(root) {
+        return Report::default();
+    }
+    log("the run had no sandbox; starting one for the screenshots".into());
+    let started = crate::sandbox::Sandbox::start(&crate::sandbox::Spec::default(), root, log).and_then(|sandbox| {
+        let programs: Vec<&str> = crate::local_ci::toolchain_commands(root);
+        sandbox.provision(&programs, log)?;
+        Ok(std::sync::Arc::new(sandbox))
+    });
+    match started {
+        Ok(sandbox) => {
+            let mut runners = RunnerRegistry::with_builtins();
+            runners.register(Box::new(crate::sandbox::SandboxRunner(sandbox.clone())));
+            capture(root, &runners, Some(&sandbox), label, log)
+        }
+        Err(e) => {
+            let mut report = Report::default();
+            report.miss(log, format!("no screenshots: the run had no sandbox and none could be started for them ({e}); turn the sandbox on for the run, or install Lima, Apple's container runtime, or Docker"));
+            report
+        }
+    }
+}
+
 /// Everything that can be photographed in the tree at `root`, in the
 /// sandbox when `sandbox` is given (web pages need it: the browser lives
-/// there). `label` names the files. Returns the PNGs kept.
+/// there). `label` names the files. Returns the PNGs kept and, for each
+/// that was not, why.
 pub fn capture(
     root: &Path,
     runners: &RunnerRegistry,
     sandbox: Option<&crate::sandbox::Sandbox>,
     label: &str,
     log: &mut dyn FnMut(String),
-) -> Vec<PathBuf> {
-    let mut out = Vec::new();
+) -> Report {
+    let mut out = Report::default();
     let mut screens = declared_screens(root);
     if !screens.is_empty() {
         log(format!("screens named by the agent: {}", screens.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")));
@@ -362,7 +429,7 @@ pub fn capture(
         let display_ok = match sandbox {
             Some(sandbox) => {
                 let mut sandbox_log = |l: String| log(l);
-                sandbox.provision(&["xvfb-run"], &mut sandbox_log).map_err(|e| log(format!("no virtual display: {e}"))).is_ok()
+                sandbox.provision(&["xvfb-run"], &mut sandbox_log).is_ok()
             }
             None => false,
         };
@@ -377,8 +444,11 @@ pub fn capture(
             };
             let command = screen.command.as_deref().unwrap_or_default().replace("{out}", &shell_quote(&out_path));
             let command = if display_ok { format!("xvfb-run -a -s '-screen 0 1600x1000x24' sh -c {}", shell_quote(&command)) } else { command };
-            if sandbox.is_none() {
-                log(format!("screenshot `{}` needs the sandbox's virtual display; not taken here", screen.name));
+            if !display_ok {
+                out.miss(
+                    log,
+                    format!("no screenshot of {}: it runs under the sandbox's virtual display, and this run had no sandbox with one", screen.name),
+                );
                 continue;
             }
             let job = Job {
@@ -396,12 +466,12 @@ pub fn capture(
                 let dest = keep_dir().join(format!("{label}-{name}.png"));
                 if std::fs::copy(&file, &dest).is_ok() {
                     log(format!("screenshot ({name}): {}", dest.display()));
-                    out.push(dest);
+                    out.shots.push(dest);
                 }
                 let _ = std::fs::remove_file(&file);
             } else {
                 let last = result.output.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("no output").trim();
-                log(format!("no screenshot of {}: the command wrote nothing ({})", screen.name, last.chars().take(160).collect::<String>()));
+                out.miss(log, format!("no screenshot of {}: the command wrote nothing ({})", screen.name, last.chars().take(160).collect::<String>()));
             }
         }
         let _ = std::fs::remove_dir_all(&shots_dir);
@@ -445,7 +515,7 @@ pub fn capture(
                 let dest = keep_dir().join(format!("{label}{}-{what}.png", if rel.is_empty() { String::new() } else { format!("-{}", slug(&rel)) }));
                 if std::fs::copy(&file, &dest).is_ok() {
                     log(format!("screenshot ({what}): {}", dest.display()));
-                    out.push(dest);
+                    out.shots.push(dest);
                     got += 1;
                 }
                 let _ = std::fs::remove_file(&file);
@@ -460,21 +530,23 @@ pub fn capture(
                 .or_else(|| result.output.lines().rev().find(|l| !l.trim().is_empty()))
                 .unwrap_or("no output")
                 .trim();
-            log(format!("no screenshot of {}: nothing rendered in a test ({})", package, why.chars().take(160).collect::<String>()));
+            out.miss(log, format!("no screenshot of {}: nothing rendered in a test ({})", package, why.chars().take(160).collect::<String>()));
         }
     }
 
     let web = web_targets(root);
     if !web.is_empty() {
         match sandbox {
-            None => log("web pages are photographed in the sandbox only; none here".into()),
+            None => out.miss(log, "no screenshot of the web pages: they are served and browsed inside the sandbox, and this run had none".into()),
             Some(sandbox) => {
                 let mut sandbox_log = |l: String| log(l);
                 if let Err(e) = sandbox.provision(&["playwright"], &mut sandbox_log) {
-                    log(format!("no web screenshots: {e}"));
+                    out.miss(log, format!("no web screenshots: {e}"));
                 } else {
                     for target in web {
-                        out.extend(capture_web(root, runners, sandbox, &target, &screens, &label, log));
+                        let web = capture_web(root, runners, sandbox, &target, &screens, &label, log);
+                        out.shots.extend(web.shots);
+                        out.missed.extend(web.missed);
                     }
                 }
             }
@@ -493,8 +565,8 @@ fn capture_web(
     screens: &[Screen],
     label: &str,
     log: &mut dyn FnMut(String),
-) -> Vec<PathBuf> {
-    let mut out = Vec::new();
+) -> Report {
+    let mut out = Report::default();
     let where_ = if target.dir.is_empty() { "the web app".to_string() } else { target.dir.clone() };
     if let Some(build) = &target.build {
         log(format!("building {where_}: {build}"));
@@ -509,7 +581,7 @@ fn capture_web(
         let result = run_job_with(runners, root, &job);
         if !result.ok {
             let last = result.output.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
-            log(format!("no web screenshots of {where_}: the build failed ({})", last.chars().take(160).collect::<String>()));
+            out.miss(log, format!("no web screenshots of {where_}: the build failed ({})", last.chars().take(160).collect::<String>()));
             return out;
         }
     }
@@ -538,7 +610,7 @@ fn capture_web(
     log(format!("photographing {where_} at {}", paths.iter().map(|(_, p)| p.as_str()).collect::<Vec<_>>().join(", ")));
     let result = sandbox.exec(&script, "", &[], Some(std::time::Duration::from_secs(300)));
     if let Err(e) = result {
-        log(format!("no web screenshots of {where_}: {e}"));
+        out.miss(log, format!("no web screenshots of {where_}: {e}"));
     }
     for (name, _) in &paths {
         let file = shots_dir.join(format!("{name}.png"));
@@ -546,10 +618,10 @@ fn capture_web(
             let dest = keep_dir().join(format!("{label}-web-{name}.png"));
             if std::fs::copy(&file, &dest).is_ok() {
                 log(format!("screenshot (web {name}): {}", dest.display()));
-                out.push(dest);
+                out.shots.push(dest);
             }
         } else {
-            log(format!("no screenshot of {where_} {name}: the page did not render"));
+            out.miss(log, format!("no screenshot of {where_} {name}: the page did not render"));
         }
     }
     let _ = std::fs::remove_dir_all(&shots_dir);
@@ -615,6 +687,57 @@ mod tests {
         assert_eq!(slug("Settings page!"), "settings-page");
     }
 
+    /// A tree with a screenshot command and a web page, photographed
+    /// without a sandbox: nothing renders, and each picture that was not
+    /// taken says why — on the card, not only in the log.
+    #[test]
+    fn without_a_sandbox_every_missing_picture_says_why() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        assert!(!has_subjects(root) && !needs_sandbox(root));
+        std::fs::write(root.join(".git-manage-ci.toml"), "[[screenshot]]\nname = \"main window\"\ncommand = \"true {out}\"\n").unwrap();
+        std::fs::write(root.join("index.html"), "<h1>hi</h1>").unwrap();
+        assert!(has_subjects(root) && needs_sandbox(root));
+
+        let runners = RunnerRegistry::with_builtins();
+        let mut log = Vec::new();
+        let report = capture(root, &runners, None, "test", &mut |l| log.push(l));
+        assert!(report.shots.is_empty());
+        assert_eq!(report.missed.len(), 2, "{:?}", report.missed);
+        assert!(report.missed[0].starts_with("no screenshot of main window: it runs under the sandbox's virtual display"), "{:?}", report.missed);
+        assert!(report.missed[1].starts_with("no screenshot of the web pages:"), "{:?}", report.missed);
+        assert!(report.missed.iter().all(|m| log.contains(m)), "every reason is in the log too");
+        assert!(!root.join(".devdock").exists(), "nothing generated is left behind");
+
+        // A Flutter app needs no sandbox: its golden test runs wherever Flutter is.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("lib")).unwrap();
+        std::fs::write(tmp.path().join("pubspec.yaml"), "name: app\ndependencies:\n  flutter:\n    sdk: flutter\n").unwrap();
+        std::fs::write(tmp.path().join("lib/main.dart"), "void main() { runApp(App()); }").unwrap();
+        assert!(has_subjects(tmp.path()) && !needs_sandbox(tmp.path()));
+    }
+
+    /// This repository, photographed by a run that had no sandbox: one is
+    /// started for the screenshots alone, and the three tabs it declares
+    /// come back.
+    /// `cargo test --lib screenshots::tests::live_no_sandbox -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_no_sandbox_run_still_gets_its_screenshots() {
+        if crate::sandbox::installed().is_empty() {
+            eprintln!("no sandbox runtime; skipping");
+            return;
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let runners = RunnerRegistry::with_builtins();
+        let mut log = |l: String| eprintln!("  {l}");
+        let report = capture_anywhere(root, &runners, None, "live-anywhere", &mut log);
+        let names: Vec<String> = report.shots.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        println!("{names:?} missed: {:?}", report.missed);
+        assert!(report.missed.is_empty(), "{:?}", report.missed);
+        assert_eq!(names.len(), 3, "{names:?}");
+    }
+
     /// A real Flutter app inside the sandbox: `main` waits on something a
     /// test cannot provide, so the first frame fails, the root widget
     /// renders, and a screen the agent named renders too.
@@ -644,7 +767,7 @@ mod tests {
             step.runner = Some(crate::sandbox::RUNNER_ID.into());
             assert!(run_job_with(&runners, root, &step).ok);
         }
-        let shots = capture(root, &runners, Some(&sandbox), "live-deep", &mut log);
+        let shots = capture(root, &runners, Some(&sandbox), "live-deep", &mut log).shots;
         let names: Vec<String> = shots.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
         println!("{names:?}");
         assert!(names.iter().any(|n| n.contains("root-widget")), "the root widget rendered although main hangs: {names:?}");
@@ -672,7 +795,7 @@ mod tests {
         let sandbox = std::sync::Arc::new(crate::sandbox::Sandbox::start(&crate::sandbox::Spec::default(), root, &mut log).unwrap());
         let mut runners = RunnerRegistry::with_builtins();
         runners.register(Box::new(crate::sandbox::SandboxRunner(sandbox.clone())));
-        let shots = capture(root, &runners, Some(&sandbox), "live-web", &mut log);
+        let shots = capture(root, &runners, Some(&sandbox), "live-web", &mut log).shots;
         let names: Vec<String> = shots.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
         println!("{names:?}");
         assert!(names.iter().any(|n| n.contains("web-about")), "{names:?}");

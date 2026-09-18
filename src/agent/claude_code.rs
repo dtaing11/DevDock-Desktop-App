@@ -39,6 +39,9 @@ pub const PROVIDER: &str = "claude-code";
 /// How a run is bounded.
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Run `claude` inside this sandbox instead of on this machine: its
+    /// shell, its file edits and its MCP servers are then contained too.
+    pub sandbox: Option<std::sync::Arc<crate::sandbox::Sandbox>>,
     /// A model alias or id; empty or "default" leaves the CLI's choice.
     pub model: String,
     pub max_turns: usize,
@@ -47,7 +50,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { model: String::new(), max_turns: 60, timeout: Duration::from_secs(30 * 60) }
+        Self { model: String::new(), max_turns: 60, timeout: Duration::from_secs(30 * 60), sandbox: None }
     }
 }
 
@@ -304,7 +307,12 @@ fn run_with_tools(
     let repo = Repo::open(root).map_err(|e| e.to_string())?;
     let before = if collect_edits { snapshot(&repo)? } else { Default::default() };
 
-    let mut cmd = Command::new(&program);
+    // Inside the sandbox, `claude` is the one provisioned there and the
+    // worktree is at its inner path; on the host, the installed one.
+    let mut cmd = match &config.sandbox {
+        Some(sandbox) => sandbox.command("claude", &[], &Default::default(), ""),
+        None => Command::new(&program),
+    };
     cmd.arg("-p")
         .arg(task)
         .args(["--output-format", "stream-json", "--verbose"])
@@ -320,7 +328,11 @@ fn run_with_tools(
     // wholesale. Plugins and user-level servers load as they do for the
     // developer, and are allowed on first refusal by `run`.
     let mcp = mcp_launch(root);
-    if let Some(config_path) = &mcp.config {
+    if mcp.config.is_some() {
+        let config_path = match &config.sandbox {
+            Some(sandbox) => format!("{}/.mcp.json", sandbox.inner_root()),
+            None => root.join(".mcp.json").display().to_string(),
+        };
         cmd.arg("--mcp-config").arg(config_path);
     }
     let model = config.model.trim();
@@ -333,8 +345,10 @@ fn run_with_tools(
     if let Some(extra) = system_extra.map(str::trim).filter(|s| !s.is_empty()) {
         cmd.arg("--append-system-prompt").arg(extra);
     }
-    cmd.current_dir(root)
-        .stdin(Stdio::null())
+    if config.sandbox.is_none() {
+        cmd.current_dir(root);
+    }
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // Not our terminal, and not an interactive session's settings.

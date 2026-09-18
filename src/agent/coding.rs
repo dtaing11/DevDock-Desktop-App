@@ -342,7 +342,16 @@ fn run_claude_code(
         }
         prompt.push_str(&image_note(&paths));
     }
-    let config = claude_code::Config { max_turns: request.limits.max_turns, ..config.clone() };
+    let mut config = claude_code::Config { max_turns: request.limits.max_turns, ..config.clone() };
+    // With a sandbox, Claude Code itself runs inside it: installed there
+    // the first time, signed in with this machine's sign-in, kept after.
+    if let Some(sandbox) = workspace.sandbox() {
+        let mut log = |line: String| on_event(Event::Tool { summary: line, is_error: false });
+        sandbox.provision(&["claude"], &mut log)?;
+        sandbox.seed_claude_credentials(&mut log)?;
+        log("Claude Code runs inside the sandbox".into());
+        config.sandbox = Some(sandbox);
+    }
     let outcome = claude_code::run(&config, workspace.root(), &prompt, Some(&extra), &checks, on_event);
     if !request.images.is_empty() {
         let _ = std::fs::remove_dir_all(&image_dir);
@@ -652,6 +661,13 @@ mod tests {
             .with_write_mode(WriteMode::Live)
             .with_commands(true)
             .with_asker(asker);
+        // `LIVE_SANDBOX=1`: the whole run — Claude Code included — inside.
+        if std::env::var("LIVE_SANDBOX").is_ok() {
+            let sandbox = std::sync::Arc::new(crate::sandbox::Sandbox::start(&crate::sandbox::Spec::default(), repo.path(), &mut |l| println!("  {l}")).unwrap());
+            let mut runners = crate::local_ci::runner::RunnerRegistry::with_builtins();
+            runners.register(Box::new(crate::sandbox::SandboxRunner(sandbox.clone())));
+            ws = ws.with_sandbox(sandbox, std::sync::Arc::new(runners));
+        }
         let engine = match std::env::var("LIVE_ENGINE").as_deref() {
             Ok("claude-code") => Engine::ClaudeCode(claude_code::Config::default()),
             _ => match crate::claude::Client::from_store("claude-haiku-4-5-20251001") {

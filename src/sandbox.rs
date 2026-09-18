@@ -293,6 +293,55 @@ impl Sandbox {
         Ok(())
     }
 
+    /// Gives the sandbox's Claude Code the developer's sign-in, once: the
+    /// credentials Claude Code keeps in the macOS Keychain, written to the
+    /// file it reads on Linux, in the sandbox's home (mode 600). Nothing is
+    /// copied when the sandbox already has them. `Ok(true)` when seeded.
+    ///
+    /// Without a sign-in on this machine, the way in is a one-time
+    /// `claude` login inside the sandbox, and the error says so.
+    pub fn seed_claude_credentials(&self, log: &mut dyn FnMut(String)) -> Result<bool, String> {
+        let probe = self.exec("test -s \"$HOME/.claude/.credentials.json\" && echo HAVE", "", &[], Some(Duration::from_secs(30)))?;
+        if probe.stdout.contains("HAVE") {
+            return Ok(false);
+        }
+        let json = host_claude_credentials().ok_or_else(|| {
+            format!(
+                "the sandbox's Claude Code is not signed in, and no Claude Code sign-in was found on \
+                 this machine to copy. Sign in once inside it: `{}` then `/login`.",
+                self.login_hint()
+            )
+        })?;
+        let mut cmd = self.command(
+            "sh",
+            &["-c".to_string(), "mkdir -p \"$HOME/.claude\" && umask 077 && cat > \"$HOME/.claude/.credentials.json\"".to_string()],
+            &Default::default(),
+            "",
+        );
+        cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
+        let mut child = cmd.spawn().map_err(|e| format!("could not seed credentials: {e}"))?;
+        {
+            use std::io::Write as _;
+            let mut stdin = child.stdin.take().ok_or("no stdin")?;
+            stdin.write_all(json.as_bytes()).map_err(|e| e.to_string())?;
+        }
+        let out = child.wait_with_output().map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(format!("could not seed credentials: {}", String::from_utf8_lossy(&out.stderr).trim()));
+        }
+        log("sandbox: Claude Code signed in with this machine's Claude Code credentials".into());
+        Ok(true)
+    }
+
+    /// How to open a shell in the sandbox, for a message.
+    fn login_hint(&self) -> String {
+        match self.kind {
+            Kind::Lima => format!("limactl shell {} claude", self.name),
+            Kind::Docker => format!("docker exec -it {} claude", self.name),
+            Kind::AppleContainer => format!("container exec -it {} claude", self.name),
+        }
+    }
+
     /// One line for logs and pull requests.
     pub fn describe(&self) -> String {
         match self.kind {
@@ -469,6 +518,12 @@ gem install --user-install --no-document bundler rspec >/dev/null 2>&1 || true
 add_path "$(ruby -e 'puts Gem.user_dir')/bin"
 ruby --version >/dev/null
 "#),
+        "claude" => ("Claude Code", r#"
+apt_install curl ca-certificates git
+if ! command -v claude >/dev/null 2>&1 && [ ! -x "$HOME/.local/bin/claude" ]; then curl -fsSL https://claude.ai/install.sh | bash >/dev/null 2>&1; fi
+add_path "$HOME/.local/bin"
+claude --version >/dev/null
+"#),
         "make" => ("build tools", r#"
 apt_install build-essential
 "#),
@@ -482,6 +537,33 @@ java -version >/dev/null 2>&1
     let script: &'static str = Box::leak(format!("{APT}
 {body}").into_boxed_str());
     Some(Recipe { name, script })
+}
+
+/// Claude Code's own credentials on this machine, as the JSON its Linux
+/// build reads from `~/.claude/.credentials.json`: from the file when
+/// there is one, else from the macOS Keychain item it keeps them in.
+fn host_claude_credentials() -> Option<String> {
+    if let Some(home) = dirs::home_dir() {
+        if let Ok(text) = std::fs::read_to_string(home.join(".claude/.credentials.json")) {
+            if text.contains("claudeAiOauth") || text.contains("apiKey") {
+                return Some(text);
+            }
+        }
+    }
+    if cfg!(target_os = "macos") {
+        let out = Command::new("security")
+            .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+            .stdin(Stdio::null())
+            .output()
+            .ok()?;
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if serde_json::from_str::<serde_json::Value>(&text).is_ok() {
+                return Some(text);
+            }
+        }
+    }
+    None
 }
 
 fn shell_quote(text: &str) -> String {
@@ -548,7 +630,7 @@ mod tests {
 
     #[test]
     fn every_toolchain_has_a_recipe_that_sh_accepts() {
-        for program in ["flutter", "dart", "cargo", "npm", "python3", "pytest", "go", "mix", "bundle", "make", "gradle"] {
+        for program in ["flutter", "dart", "cargo", "npm", "python3", "pytest", "go", "mix", "bundle", "make", "gradle", "claude"] {
             let recipe = recipe_for(program).unwrap_or_else(|| panic!("no recipe for {program}"));
             assert!(recipe.script.contains("set -e"));
             // `sh -n` parses without running.
@@ -561,6 +643,29 @@ mod tests {
         }
         assert!(recipe_for("frobnicate").is_none());
         assert_eq!(recipe_for("dart").unwrap().name, "Flutter");
+    }
+
+    /// The Claude Code CLI provisioned inside the sandbox and runnable
+    /// from a login shell there. Credentials are the developer's to seed.
+    /// `cargo test --lib sandbox::tests::live_claude -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_claude_code_is_provisioned_in_the_sandbox() {
+        if installed().is_empty() {
+            eprintln!("no runtime installed; skipping");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::start(&Spec::default(), tmp.path(), &mut |l| println!("  {l}")).unwrap();
+        sandbox.provision(&["claude"], &mut |l| println!("  {l}")).unwrap();
+        let out = sandbox.exec("claude --version", "", &[], Some(Duration::from_secs(60))).unwrap();
+        assert!(out.success, "{}{}", out.stdout, out.stderr);
+        assert!(out.stdout.contains("Claude Code"), "{}", out.stdout);
+        // The launch command DevDock would use, without running a task.
+        let mut cmd = sandbox.command("claude", &["--version".into()], &Default::default(), "");
+        let out = cmd.stdin(Stdio::null()).output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("Claude Code"));
+        println!("claude inside: {}", out.stdout.iter().map(|b| *b as char).collect::<String>().trim());
     }
 
     /// Flutter, the toolchain a plain image is least likely to have,

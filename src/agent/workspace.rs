@@ -189,6 +189,8 @@ pub struct Workspace {
     /// Where checks and commands run when not on the host, for the tool
     /// text: "Lima VM devdock", "Docker (ubuntu:24.04)".
     sandbox: Option<String>,
+    /// The sandbox itself, for an engine that runs inside it.
+    sandbox_handle: Option<std::sync::Arc<crate::sandbox::Sandbox>>,
     /// Resolves each job's runner: the built-ins, plus the sandbox when
     /// there is one.
     runners: std::sync::Arc<crate::local_ci::runner::RunnerRegistry>,
@@ -237,6 +239,7 @@ impl Workspace {
             commands: false,
             command_runs: 0,
             sandbox: None,
+            sandbox_handle: None,
             runners: std::sync::Arc::new(crate::local_ci::runner::RunnerRegistry::with_builtins()),
             asker: None,
             questions: 0,
@@ -282,8 +285,9 @@ impl Workspace {
     /// Runs every check and command inside a sandbox — described by
     /// `note` for the model — whose runner is registered in `runners`
     /// under [`crate::sandbox::RUNNER_ID`]. The checks are pointed at it.
-    pub fn with_sandbox(mut self, note: String, runners: std::sync::Arc<crate::local_ci::runner::RunnerRegistry>) -> Self {
-        self.sandbox = Some(note);
+    pub fn with_sandbox(mut self, sandbox: std::sync::Arc<crate::sandbox::Sandbox>, runners: std::sync::Arc<crate::local_ci::runner::RunnerRegistry>) -> Self {
+        self.sandbox = Some(sandbox.describe());
+        self.sandbox_handle = Some(sandbox);
         self.runners = runners;
         for job in self.checks.iter_mut() {
             job.runner = Some(crate::sandbox::RUNNER_ID.into());
@@ -315,6 +319,11 @@ impl Workspace {
     /// The line to the developer, for an engine that asks its own way.
     pub fn asker(&self) -> Option<super::Asker> {
         self.asker.clone()
+    }
+
+    /// The sandbox this run's commands go to, when there is one.
+    pub fn sandbox(&self) -> Option<std::sync::Arc<crate::sandbox::Sandbox>> {
+        self.sandbox_handle.clone()
     }
 
     /// Whether run_command is on offer: enabled, on a live tree, for a run

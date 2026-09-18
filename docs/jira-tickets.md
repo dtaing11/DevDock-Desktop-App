@@ -244,9 +244,12 @@ Every check and command has a timeout, after which it is killed and the
 check fails; a run's container is removed when the run ends, and its
 worktree with it.
 
-Claude Code as the engine runs its own shell on this machine, not in the
-sandbox: the sandbox holds DevDock's checks and the built-in harness's
-commands.
+With Claude Code as the engine, Claude Code itself runs inside the
+sandbox: it is installed there the first time, signed in with this
+machine's Claude Code sign-in (copied once into the sandbox's home), and
+kept. Its shell, its edits and its MCP servers are then contained like the
+harness's. If this machine has no Claude Code sign-in to copy, sign in
+once inside: `limactl shell devdock claude`, then `/login`.
 
 ## What it does not do
 

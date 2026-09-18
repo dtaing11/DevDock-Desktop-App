@@ -558,7 +558,7 @@ fn work(
         .with_checks(jobs.clone())
         .with_commands(true);
     if let Some(sandbox) = &sandbox {
-        workspace = workspace.with_sandbox(sandbox.describe(), runners.clone());
+        workspace = workspace.with_sandbox(sandbox.clone(), runners.clone());
     }
     if let Some(ask) = &job.ask {
         workspace = workspace.with_asker(ask.clone());

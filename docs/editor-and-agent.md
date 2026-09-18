@@ -283,8 +283,8 @@ Two things follow from what Claude Code is:
   the repository declares in its `.mcp.json` with all their tools allowed
   up front; a plugin's or a user-level server that DevDock could not list
   is allowed the first time the model is refused one of its tools, and
-  the session is resumed — one refusal per server, not one per call. Those
-  servers run on this machine, not in the sandbox.
+  the session is resumed — one refusal per server, not one per call. With
+  a sandbox, Claude Code and its servers run inside it.
 
 The model under it is a Claude Code alias (`default`, `sonnet`, `opus`,
 `haiku` — the latest of each family) or any model id your account has,

@@ -1148,25 +1148,51 @@ pub fn machine_failure(output: &str) -> Option<&'static str> {
     None
 }
 
+/// The lines of a build's output that say what the machine did: the
+/// linker's and compiler's own words, which cargo prints as notes above
+/// its summary and the summary's last lines hide.
+fn machine_failure_detail(output: &str) -> String {
+    let telling: Vec<&str> = output
+        .lines()
+        .map(str::trim)
+        .filter(|l| {
+            l.starts_with("= note:") || l.starts_with("ld:") || l.starts_with("clang:") || l.contains("No space left") || l.contains("signal: 9") || l.contains("Killed")
+        })
+        .filter(|l| !l.contains("run with `RUST_BACKTRACE"))
+        .take(15)
+        .collect();
+    if telling.is_empty() {
+        output.lines().rev().take(12).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")
+    } else {
+        telling.join("\n")
+    }
+}
+
 fn machine_failure_message(check: &str, why: &str, output: &str) -> String {
-    let tail: String = output.lines().rev().take(12).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
     format!(
-        "the check `{check}` failed because of this machine, not the change: {why}. It was run twice. \
-         Close what you can and run the task again; the attempt is kept.\n{tail}"
+        "the check `{check}` failed because of this machine, not the change: {why}. It was run twice, \
+         the second time one build job at a time. Close what you can and run the task again; \
+         the attempt is kept.\n{}",
+        machine_failure_detail(output)
     )
 }
 
 /// Runs a check, and a check that fails the machine's way — not the
-/// code's — once more after a pause, in case the pressure has passed.
+/// code's — once more after a pause, one build job at a time: a link
+/// that was one of several may fit in memory on its own.
 fn run_check(runners: &crate::local_ci::runner::RunnerRegistry, root: &Path, j: &crate::local_ci::Job, on_event: &mut dyn FnMut(String)) -> crate::local_ci::JobResult {
     let result = crate::local_ci::run_job_with(runners, root, j);
     if result.ok {
         return result;
     }
     let Some(why) = machine_failure(&result.output) else { return result };
-    on_event(format!("{} failed the machine's way ({why}); waiting, then running it once more", j.name));
+    on_event(format!("{} failed the machine's way ({why}); waiting, then running it once more, one build job at a time", j.name));
     std::thread::sleep(std::time::Duration::from_secs(if cfg!(test) { 0 } else { 20 }));
-    crate::local_ci::run_job_with(runners, root, j)
+    let mut gently = j.clone();
+    for (k, v) in [("CARGO_BUILD_JOBS", "1"), ("MAKEFLAGS", "-j1"), ("GOFLAGS", "-p=1")] {
+        gently.env.entry(k.into()).or_insert_with(|| v.into());
+    }
+    crate::local_ci::run_job_with(runners, root, &gently)
 }
 
 /// The marker in a cargo config DevDock wrote, so it is recognised and
@@ -1442,7 +1468,12 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("because of this machine, not the change") && err.contains("the linker failed"), "{err}");
-        assert!(log.iter().any(|l| l.contains("running it once more")), "{log:?}");
+        assert!(err.contains("clang: error: linker command failed"), "the linker's own line is in the message: {err}");
+        assert!(log.iter().any(|l| l.contains("one build job at a time")), "{log:?}");
+        assert_eq!(
+            machine_failure_detail("   Compiling x\nerror: linking with `cc` failed: exit status: 1\n  |\n  = note: some arguments are omitted\n  = note: ld: out of memory\n\nerror: could not compile `x`\nwarning: build failed"),
+            "= note: some arguments are omitted\n= note: ld: out of memory"
+        );
         assert!(!log.iter().any(|l| l.starts_with("round 1")), "no round was spent: {log:?}");
     }
 

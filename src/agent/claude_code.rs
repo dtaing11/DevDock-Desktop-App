@@ -308,6 +308,22 @@ pub fn extra_read_dirs(sandbox: Option<&crate::sandbox::Sandbox>) -> Vec<String>
     }
 }
 
+/// What the file tools reach, for the system prompt: the worktree and
+/// the toolchain caches, nothing else on the machine.
+fn reach_note(extra_dirs: &[String]) -> String {
+    let caches = if extra_dirs.is_empty() {
+        String::new()
+    } else {
+        format!(" and, read-only in practice, the toolchain caches at {}", extra_dirs.join(", "))
+    };
+    format!(
+        "Your file and shell tools reach the working directory (this repository's worktree){caches}. \
+         Nothing else on this machine is in reach — other repositories, the home directory's \
+         configuration, VM or container state such as ~/.lima — and an attempt is refused, so do not \
+         make one. If the task needs something from outside, ask the developer for it."
+    )
+}
+
 /// Continues a session — after a question was answered — with `prompt`
 /// as the next message; the same tools as [`run`].
 pub fn resume(
@@ -386,14 +402,20 @@ fn run_with_tools(
         args.push("--resume".into());
         args.push(id.to_string());
     }
-    for dir in extra_read_dirs(config.sandbox.as_deref()) {
+    let extra_dirs = extra_read_dirs(config.sandbox.as_deref());
+    for dir in &extra_dirs {
         args.push("--add-dir".into());
-        args.push(dir);
+        args.push(dir.clone());
     }
+    // Said up front, so a run does not spend turns finding out by being
+    // refused: what its file tools can reach, and what they cannot.
+    let mut system = reach_note(&extra_dirs);
     if let Some(extra) = system_extra.map(str::trim).filter(|s| !s.is_empty()) {
-        args.push("--append-system-prompt".into());
-        args.push(extra.to_string());
+        system.push_str("\n\n");
+        system.push_str(extra);
     }
+    args.push("--append-system-prompt".into());
+    args.push(system);
     // Inside the sandbox, `claude` is the one provisioned there and the
     // worktree is at its inner path; on the host, the installed one.
     let mut cmd = match &config.sandbox {

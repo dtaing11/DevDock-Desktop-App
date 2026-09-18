@@ -461,7 +461,7 @@ impl Client {
             "title": title, "body": body, "head": head, "base": base, "draft": draft,
         });
         let value = self.post(&path, payload)?;
-        parse_pull_request(&value).ok_or_else(|| GhError("Unexpected PR response".into()))
+        parse_pull_request(&value).ok_or_else(|| not_a_pull_request(&value))
     }
 
     /// Summarizes GitHub Actions / check-run results for a commit or branch.
@@ -714,7 +714,7 @@ impl Client {
         }
         let path = format!("/repos/{}/{}/pulls/{number}", slug.owner, slug.repo);
         let value = self.patch(&path, serde_json::Value::Object(payload))?;
-        parse_pull_request(&value).ok_or_else(|| GhError("Unexpected PR response".into()))
+        parse_pull_request(&value).ok_or_else(|| not_a_pull_request(&value))
     }
 
     /// One pull request in full: the summary plus the body text and whether
@@ -731,7 +731,7 @@ impl Client {
             value.get("merged_at").map(|m| !m.is_null()).unwrap_or(false)
         });
         let pr = parse_pull_request(&value)
-            .ok_or_else(|| GhError("Unexpected PR response".into()))?;
+            .ok_or_else(|| not_a_pull_request(&value))?;
         Ok(PrDetail { pr, body, merged })
     }
 
@@ -763,17 +763,73 @@ impl Client {
     }
 }
 
+/// A pull request from GitHub's JSON. Only the number and the URL are
+/// required — they are what every caller acts on; the rest is filled in
+/// as far as the response goes, because a field GitHub leaves null (a
+/// deleted head, an author that is an app) must not turn a created pull
+/// request into an error.
 fn parse_pull_request(value: &serde_json::Value) -> Option<PullRequest> {
+    let text = |pointer: &str| value.pointer(pointer).and_then(|v| v.as_str()).unwrap_or_default().to_string();
     Some(PullRequest {
         number: value.get("number")?.as_u64()?,
-        title: value.get("title")?.as_str()?.to_string(),
         html_url: value.get("html_url")?.as_str()?.to_string(),
-        state: value.get("state")?.as_str()?.to_string(),
-        head: value.pointer("/head/ref")?.as_str()?.to_string(),
-        head_sha: value.pointer("/head/sha")?.as_str()?.to_string(),
-        base: value.pointer("/base/ref")?.as_str()?.to_string(),
-        user: value.pointer("/user/login")?.as_str()?.to_string(),
+        title: text("/title"),
+        state: text("/state"),
+        head: text("/head/ref"),
+        head_sha: text("/head/sha"),
+        base: text("/base/ref"),
+        user: text("/user/login"),
     })
+}
+
+/// The error for a response that is not a pull request, with enough of
+/// the body to see what it was instead.
+fn not_a_pull_request(value: &serde_json::Value) -> GhError {
+    let shown: String = value.to_string().chars().take(300).collect();
+    GhError(format!("Unexpected PR response (no number/html_url): {shown}"))
+}
+
+#[cfg(test)]
+mod live_probe {
+    /// `cargo test --lib github::live_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_an_existing_pull_request_parses_with_the_stored_token() {
+        let Some(client) = super::Client::from_store() else {
+            eprintln!("not signed in; skipping");
+            return;
+        };
+        let url = std::env::var("LIVE_REMOTE").unwrap_or_else(|_| "https://github.com/dtaing11/DevDock-Desktop-App".into());
+        let slug = super::parse_remote(&url).unwrap();
+        let path = format!("/repos/{}/{}/pulls?state=all&per_page=1", slug.owner, slug.repo);
+        let value = client.get(&path).unwrap();
+        let first = value.as_array().and_then(|a| a.first()).cloned().unwrap_or_default();
+        for field in ["/number", "/html_url", "/title", "/state", "/head/ref", "/head/sha", "/base/ref", "/user/login"] {
+            println!("{field}: {}", first.pointer(field).map(|v| v.to_string()).unwrap_or("MISSING".into()));
+        }
+        assert!(super::parse_pull_request(&first).is_some());
+    }
+}
+
+#[cfg(test)]
+mod pr_parse_tests {
+    use super::*;
+
+    #[test]
+    fn a_pull_request_with_null_fields_still_parses() {
+        let value = serde_json::json!({
+            "number": 7, "html_url": "https://github.com/a/b/pull/7", "title": "t", "state": "open",
+            "head": {"ref": "feature", "sha": "abc"}, "base": {"ref": "main"}, "user": null
+        });
+        let pr = parse_pull_request(&value).expect("a null user is not a broken pull request");
+        assert_eq!(pr.number, 7);
+        assert_eq!(pr.user, "");
+        assert_eq!(pr.head, "feature");
+        let odd = serde_json::json!({"message": "Not Found", "documentation_url": "x"});
+        assert!(parse_pull_request(&odd).is_none());
+        let err = not_a_pull_request(&odd).to_string();
+        assert!(err.contains("Not Found"), "the body is in the error: {err}");
+    }
 }
 
 /// Parses `owner/repo` from HTTPS and SSH github.com remote URLs.

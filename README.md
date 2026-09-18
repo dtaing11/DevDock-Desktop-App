@@ -40,8 +40,9 @@ Linux (Windows too, egui being cross-platform).
   and asks *you* — in a box on the run's card — when something genuinely
   needs a decision. Attach images to the task: a screenshot, a mockup. Every
   change is reviewed as a diff and applied — or reverted — by you.
-- **Two engines**: DevDock's own harness (any Claude model, or Ollama), or
-  **Claude Code** run headless — with the repository's MCP servers, the
+- **Three engines**: DevDock's own harness (any Claude model, or Ollama),
+  **Claude Code** run headless, or **OpenCode** (open source, any provider;
+  its own models are free) — all with the repository's MCP servers, the
   same questions and images, and a session resumed with your answer. Pick
   per task in Settings; the fixer and the reviewer can be different engines.
 - **A sandbox that is a machine of the run's own**: a Lima VM, an Apple

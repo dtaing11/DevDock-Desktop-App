@@ -572,6 +572,12 @@ npx playwright --version >/dev/null
 apt_install xvfb libgl1 libegl1 libgl1-mesa-dri libxkbcommon0 libxkbcommon-x11-0 libxi6 libxcursor1 libxrandr2 libxinerama1 libx11-xcb1 libxcb-render0 libxcb-shape0 libxcb-xfixes0 libwayland-client0 libfontconfig1 fonts-dejavu-core
 xvfb-run --help >/dev/null 2>&1 || true
 "#),
+        "opencode" => ("OpenCode", r#"
+apt_install curl ca-certificates git unzip
+if [ ! -x "$HOME/.opencode/bin/opencode" ]; then curl -fsSL https://opencode.ai/install | bash >/dev/null 2>&1; fi
+add_path "$HOME/.opencode/bin"
+opencode --version >/dev/null
+"#),
         "make" => ("build tools", r#"
 apt_install build-essential
 "#),
@@ -612,6 +618,11 @@ fn host_claude_credentials() -> Option<String> {
         }
     }
     None
+}
+
+/// `program args…` as one shell line, each word quoted.
+pub fn shell_words(words: &[String]) -> String {
+    words.iter().map(|w| shell_quote(w)).collect::<Vec<_>>().join(" ")
 }
 
 fn shell_quote(text: &str) -> String {
@@ -678,7 +689,7 @@ mod tests {
 
     #[test]
     fn every_toolchain_has_a_recipe_that_sh_accepts() {
-        for program in ["flutter", "dart", "cargo", "npm", "python3", "pytest", "go", "mix", "bundle", "make", "gradle", "claude", "playwright", "xvfb-run"] {
+        for program in ["flutter", "dart", "cargo", "npm", "python3", "pytest", "go", "mix", "bundle", "make", "gradle", "claude", "playwright", "xvfb-run", "opencode"] {
             let recipe = recipe_for(program).unwrap_or_else(|| panic!("no recipe for {program}"));
             assert!(recipe.script.contains("set -e"));
             // `sh -n` parses without running.

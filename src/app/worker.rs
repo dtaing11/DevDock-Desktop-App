@@ -137,6 +137,8 @@ pub enum Msg {
     /// An agentic run finished. Its edits are proposals: the user accepts or
     /// rejects each one before anything is written.
     AgentDone { kind: AgentKind, result: Result<crate::app::AgentReport, String> },
+    /// OpenCode's model list, from `opencode models`.
+    OpenCodeModels(Vec<String>),
     /// Screenshots of the in-tab run's result, taken in a sandbox afterwards.
     AgentScreenshots(Result<Vec<std::path::PathBuf>, String>),
     /// An agent has a question for the developer and is waiting. `key` is

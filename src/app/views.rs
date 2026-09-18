@@ -1599,15 +1599,18 @@ pub fn ai_controls(
 pub fn engine_toggle(app: &mut App, ui: &mut egui::Ui, target: crate::app::worker::AiTarget) {
     use crate::agent::claude_code;
     use crate::app::AiSelection;
+    use crate::agent::opencode;
     let current = app.ai_selection(target);
     let on_claude_code = current.as_ref().is_some_and(|s| s.provider == claude_code::PROVIDER);
+    let on_opencode = current.as_ref().is_some_and(|s| s.provider == opencode::PROVIDER);
+    let on_harness = !on_claude_code && !on_opencode;
     let installed = claude_code::available();
     ui.label(RichText::new("Engine").size(theme::SMALL).color(theme::fg_dim()));
     if ui
-        .selectable_label(!on_claude_code, "DevDock harness")
+        .selectable_label(on_harness, "DevDock harness")
         .on_hover_text("This app's own agent loop, driving the model picked here.")
         .clicked()
-        && on_claude_code
+        && !on_harness
     {
         match app.harness_default_selection() {
             Some(sel) => app.set_ai_selection(target, sel),
@@ -1631,6 +1634,27 @@ pub fn engine_toggle(app: &mut App, ui: &mut egui::Ui, target: crate::app::worke
             AiSelection { provider: claude_code::PROVIDER.into(), model: "default".into() },
         );
     }
+    let oc_installed = opencode::available();
+    let response = ui.add_enabled(oc_installed, egui::Button::selectable(on_opencode, "OpenCode agent"));
+    if !oc_installed {
+        response.on_disabled_hover_text(
+            "OpenCode is not installed on this machine: the `opencode` command was not \
+             found. Install it (curl -fsSL https://opencode.ai/install | bash) and restart DevDock.",
+        );
+    } else if response
+        .on_hover_text("OpenCode's open-source agent, with any model it knows — its own free ones need no sign-in.")
+        .clicked()
+        && !on_opencode
+    {
+        app.load_opencode_models();
+        let model = app
+            .opencode_models
+            .iter()
+            .find(|m| m.starts_with("anthropic/"))
+            .cloned()
+            .unwrap_or_else(|| opencode::DEFAULT_MODEL.to_string());
+        app.set_ai_selection(target, AiSelection { provider: opencode::PROVIDER.into(), model });
+    }
 }
 
 pub fn ai_model_picker(app: &mut App, ui: &mut egui::Ui, target: crate::app::worker::AiTarget) {
@@ -1647,6 +1671,7 @@ pub fn ai_model_picker(app: &mut App, ui: &mut egui::Ui, target: crate::app::wor
                 format!("Claude Code: {}", sel.model)
             }
         }
+        Some(sel) if sel.provider == crate::agent::opencode::PROVIDER => format!("OpenCode: {}", sel.model),
         Some(sel) => format!("Ollama: {}", sel.model),
         None => "Select a model…".into(),
     };
@@ -1708,6 +1733,34 @@ pub fn ai_model_picker(app: &mut App, ui: &mut egui::Ui, target: crate::app::wor
                 }
             }
             ui.separator();
+        }
+        let offers_opencode = crate::agent::opencode::available()
+            && matches!(target, crate::app::worker::AiTarget::Coding | crate::app::worker::AiTarget::Backlog | crate::app::worker::AiTarget::Review);
+        if offers_opencode {
+            {
+                app.load_opencode_models();
+                ui.label(theme::overline("OPENCODE AGENT (THIS MACHINE)"));
+                ui.label(
+                    RichText::new(
+                        "OpenCode's own agent via the opencode command, with any model it knows. \
+                         Its opencode/… models are free and need no sign-in; anthropic/… uses \
+                         DevDock's Claude sign-in.",
+                    )
+                    .size(theme::SMALL)
+                    .color(theme::fg_dim()),
+                );
+                let models = app.opencode_models.clone();
+                if models.is_empty() || models == ["…"] {
+                    ui.label(RichText::new("reading `opencode models`…").size(theme::SMALL).color(theme::fg_dim()));
+                }
+                for model in models.into_iter().filter(|m| m != "…") {
+                    let is_selected = current.as_ref().is_some_and(|s| s.provider == crate::agent::opencode::PROVIDER && s.model == model);
+                    if ui.selectable_label(is_selected, &model).clicked() {
+                        app.set_ai_selection(target, AiSelection { provider: crate::agent::opencode::PROVIDER.into(), model: model.clone() });
+                    }
+                }
+                ui.separator();
+            }
         }
         // Ollama section
         ui.label(theme::overline("OLLAMA (LOCAL)"));

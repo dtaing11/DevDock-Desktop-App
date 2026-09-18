@@ -25,6 +25,7 @@ use super::{claude_code, Event, Limits, Provider, Run, Workspace, WriteMode};
 pub enum Engine {
     Harness(Box<dyn Provider>),
     ClaudeCode(claude_code::Config),
+    OpenCode(crate::agent::opencode::Config),
 }
 
 impl Engine {
@@ -41,12 +42,19 @@ impl Engine {
                     format!("Claude Code agent ({})", c.model)
                 }
             }
+            Self::OpenCode(c) => {
+                if c.model.is_empty() {
+                    "OpenCode agent".into()
+                } else {
+                    format!("OpenCode agent ({})", c.model)
+                }
+            }
         }
     }
 
-    /// Claude Code writes to disk as it goes; it cannot propose.
+    /// Claude Code and OpenCode write to disk as they go; they cannot propose.
     pub fn needs_live_tree(&self) -> bool {
-        matches!(self, Self::ClaudeCode(_))
+        matches!(self, Self::ClaudeCode(_) | Self::OpenCode(_))
     }
 }
 
@@ -281,7 +289,125 @@ pub fn run_with(
     match engine {
         Engine::Harness(provider) => run(provider.as_ref(), workspace, request, on_event),
         Engine::ClaudeCode(config) => run_claude_code(config, workspace, request, on_event),
+        Engine::OpenCode(config) => run_opencode(config, workspace, request, on_event),
     }
+}
+
+/// The same request, handed to OpenCode: a live tree, guidance in the
+/// message, the repository's MCP servers in its config, images as
+/// attached files, a question answered by resuming the session, and the
+/// whole thing inside the sandbox when there is one.
+fn run_opencode(
+    config: &crate::agent::opencode::Config,
+    workspace: &Workspace,
+    request: Request<'_>,
+    on_event: &mut dyn FnMut(Event),
+) -> Result<Run, String> {
+    use crate::agent::opencode::{self, Launch, Permissions};
+    if request.task.trim().is_empty() {
+        return Err("Describe what you want done first.".into());
+    }
+    if workspace.write_mode() != WriteMode::Live {
+        return Err(
+            "OpenCode writes to the working tree as it works, so it needs \"Let it \
+             iterate\" on. Turn it on, or pick a model for the built-in agent."
+                .into(),
+        );
+    }
+    let mut extra = String::from(
+        "You are working unattended for a developer who reviews every change afterwards. \
+         Keep changes to what the task asks; no unrelated refactors, no leftover debugging \
+         output. Run the repository's checks before you finish, and do not weaken a test \
+         to make it pass. If the task cannot be done without a decision from a person, say \
+         so and change nothing. Finish with a short summary: what you changed and why, one \
+         bullet per file, then a line starting \"Verified:\" naming what you ran.",
+    );
+    extra.push_str("\n\n");
+    extra.push_str(CODE_STANDARD);
+    extra.push_str(
+        "\n\nCommands: you may run shell commands; git commands that commit, push, or rewrite \
+         history, and the web, are denied — do not retry a denied one. Do not commit or push: \
+         that is done for you. Run every command to completion in the foreground.",
+    );
+    let asker = workspace.asker();
+    if asker.is_some() {
+        extra.push_str("\n\n");
+        extra.push_str(CLAUDE_CODE_ASK);
+    }
+    if let Some(instructions) = request.instructions.map(str::trim).filter(|s| !s.is_empty()) {
+        extra.push_str("\n\nProject-specific instructions:\n");
+        extra.push_str(instructions);
+    }
+    let overview = workspace.overview();
+    let prompt = task_prompt(request.task, request.history, request.branch, Some(&overview), request.context);
+
+    let mut config = config.clone();
+    if let Some(sandbox) = workspace.sandbox() {
+        let mut log = |line: String| on_event(Event::Tool { summary: line, is_error: false });
+        sandbox.provision(&["opencode"], &mut log)?;
+        if config.model.starts_with("anthropic/") {
+            match opencode::seed_anthropic_auth(Some(&sandbox)) {
+                Ok(true) => log("sandbox: OpenCode signed in to Anthropic with DevDock's sign-in".into()),
+                Ok(false) => {}
+                Err(e) => log(format!("OpenCode sign-in not seeded: {e}")),
+            }
+        }
+        log("OpenCode runs inside the sandbox".into());
+        config.sandbox = Some(sandbox);
+    } else if config.model.starts_with("anthropic/") {
+        match opencode::seed_anthropic_auth(None) {
+            Ok(true) => on_event(Event::Tool { summary: "OpenCode signed in to Anthropic with DevDock's sign-in".into(), is_error: false }),
+            Ok(false) => {}
+            Err(e) => on_event(Event::Tool { summary: format!("OpenCode sign-in not seeded: {e}"), is_error: true }),
+        }
+    }
+
+    // Images: files where OpenCode runs, attached with --file, gone after.
+    let image_dir = workspace.root().join(IMAGE_DIR);
+    let mut files = Vec::new();
+    if !request.images.is_empty() {
+        std::fs::create_dir_all(&image_dir).map_err(|e| e.to_string())?;
+        for (i, image) in request.images.iter().enumerate() {
+            let name = format!("{}-{}.{}", i + 1, sanitize_name(&image.name), image.extension());
+            std::fs::write(image_dir.join(&name), image.bytes()).map_err(|e| e.to_string())?;
+            files.push(match &config.sandbox {
+                Some(sandbox) => format!("{}/{IMAGE_DIR}/{name}", sandbox.inner_root()),
+                None => image_dir.join(&name).display().to_string(),
+            });
+        }
+    }
+    let outcome = opencode::run(
+        &config,
+        workspace.root(),
+        Launch { task: &prompt, instructions: Some(&extra), permissions: Permissions::Full, files: &files, resume: None, collect_edits: true },
+        on_event,
+    );
+    if !request.images.is_empty() {
+        let _ = std::fs::remove_dir_all(&image_dir);
+        if let Some(parent) = image_dir.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
+    let mut run = outcome?;
+    if let Some(asker) = asker {
+        for _ in 0..5 {
+            let Some(question) = question_in(&run.text) else { break };
+            let Some(session) = run.session.clone() else { break };
+            on_event(Event::Tool { summary: format!("asked you: {question}"), is_error: false });
+            let answer = match asker(&question) {
+                Ok(a) if !a.trim().is_empty() => format!("The developer answered: {}\n\nContinue and finish the task.", a.trim()),
+                Ok(_) => "The developer sent no answer. Decide yourself, state the assumption in your summary, and finish the task.".to_string(),
+                Err(why) => format!("No answer came ({why}). Decide yourself, state the assumption in your summary, and finish the task."),
+            };
+            let more = opencode::run(&config, workspace.root(), Launch { task: &answer, instructions: None, permissions: Permissions::Full, files: &[], resume: Some(&session), collect_edits: true }, on_event)?;
+            run.text = more.text;
+            run.session = more.session;
+            run.turns += more.turns;
+            run.log.extend(more.log);
+            run.edits = more.edits;
+        }
+    }
+    Ok(run)
 }
 
 /// The same request, handed to Claude Code. The tree has to be live —
@@ -670,6 +796,7 @@ mod tests {
         }
         let engine = match std::env::var("LIVE_ENGINE").as_deref() {
             Ok("claude-code") => Engine::ClaudeCode(claude_code::Config::default()),
+            Ok("opencode") => Engine::OpenCode(crate::agent::opencode::Config { model: std::env::var("LIVE_MODEL").unwrap_or_else(|_| crate::agent::opencode::DEFAULT_MODEL.into()), ..Default::default() }),
             _ => match crate::claude::Client::from_store("claude-haiku-4-5-20251001") {
                 Some(c) => Engine::Harness(Box::new(c)),
                 None => {
@@ -726,6 +853,7 @@ mod tests {
             .with_commands(true);
         let engine = match std::env::var("LIVE_ENGINE").as_deref() {
             Ok("claude-code") => Engine::ClaudeCode(claude_code::Config::default()),
+            Ok("opencode") => Engine::OpenCode(crate::agent::opencode::Config { model: std::env::var("LIVE_MODEL").unwrap_or_else(|_| crate::agent::opencode::DEFAULT_MODEL.into()), ..Default::default() }),
             _ => match crate::claude::Client::from_store("claude-haiku-4-5-20251001") {
                 Some(c) => Engine::Harness(Box::new(c)),
                 None => return,

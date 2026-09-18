@@ -350,47 +350,65 @@ fn run_with_tools(
     let repo = Repo::open(root).map_err(|e| e.to_string())?;
     let before = if collect_edits { snapshot(&repo)? } else { Default::default() };
 
-    // Inside the sandbox, `claude` is the one provisioned there and the
-    // worktree is at its inner path; on the host, the installed one.
-    let mut cmd = match &config.sandbox {
-        Some(sandbox) => sandbox.command("claude", &[], &Default::default(), ""),
-        None => Command::new(&program),
-    };
-    cmd.arg("-p")
-        .arg(task)
-        .args(["--output-format", "stream-json", "--verbose"])
-        .args(["--permission-mode", "acceptEdits"])
-        .arg("--max-turns")
-        .arg(config.max_turns.to_string())
-        .arg("--allowedTools")
-        .arg(allowed)
-        .arg("--disallowedTools")
-        .arg(disallowed_tools());
-    // MCP: the repository's own servers, from its .mcp.json, passed
-    // explicitly so no approval prompt is waited on; each is allowed
-    // wholesale. Plugins and user-level servers load as they do for the
-    // developer, and are allowed on first refusal by `run`.
+    // Every argument first, then the command: through a sandbox the
+    // arguments must go into the inner script, not onto the shell that
+    // starts it.
+    let mut args: Vec<String> = vec![
+        "-p".into(),
+        task.to_string(),
+        "--output-format".into(),
+        "stream-json".into(),
+        "--verbose".into(),
+        "--permission-mode".into(),
+        "acceptEdits".into(),
+        "--max-turns".into(),
+        config.max_turns.to_string(),
+        "--allowedTools".into(),
+        allowed.to_string(),
+        "--disallowedTools".into(),
+        disallowed_tools(),
+    ];
     let mcp = mcp_launch(root);
     if mcp.config.is_some() {
         let config_path = match &config.sandbox {
             Some(sandbox) => format!("{}/.mcp.json", sandbox.inner_root()),
             None => root.join(".mcp.json").display().to_string(),
         };
-        cmd.arg("--mcp-config").arg(config_path);
+        args.push("--mcp-config".into());
+        args.push(config_path);
     }
     let model = config.model.trim();
     if !model.is_empty() && model != "default" {
-        cmd.arg("--model").arg(model);
+        args.push("--model".into());
+        args.push(model.to_string());
     }
     if let Some(id) = resume {
-        cmd.arg("--resume").arg(id);
+        args.push("--resume".into());
+        args.push(id.to_string());
     }
     for dir in extra_read_dirs(config.sandbox.as_deref()) {
-        cmd.arg("--add-dir").arg(dir);
+        args.push("--add-dir".into());
+        args.push(dir);
     }
     if let Some(extra) = system_extra.map(str::trim).filter(|s| !s.is_empty()) {
-        cmd.arg("--append-system-prompt").arg(extra);
+        args.push("--append-system-prompt".into());
+        args.push(extra.to_string());
     }
+    // Inside the sandbox, `claude` is the one provisioned there and the
+    // worktree is at its inner path; on the host, the installed one.
+    let mut cmd = match &config.sandbox {
+        Some(sandbox) => {
+            let mut env = std::collections::BTreeMap::new();
+            env.insert("CLAUDE_CODE_ENTRYPOINT".to_string(), "devdock".to_string());
+            env.insert("NO_COLOR".to_string(), "1".to_string());
+            sandbox.command("claude", &args, &env, "")
+        }
+        None => {
+            let mut c = Command::new(&program);
+            c.args(&args);
+            c
+        }
+    };
     if config.sandbox.is_none() {
         cmd.current_dir(root);
     }
@@ -614,7 +632,7 @@ fn parse_line(line: &str, root: &Path, outcome: &mut Outcome) -> Vec<Event> {
 
 /// One line for a Claude Code tool call, in the words the log uses, with
 /// paths relative to the repository the way the harness's are.
-fn summarize(name: &str, input: &serde_json::Value, root: &Path) -> String {
+pub(crate) fn summarize(name: &str, input: &serde_json::Value, root: &Path) -> String {
     let s = |key: &str| input.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string();
     let path = || {
         let p = s("file_path");
@@ -641,7 +659,7 @@ fn summarize(name: &str, input: &serde_json::Value, root: &Path) -> String {
 
 /// Content of every file that is already modified or untracked before the
 /// run, so a change it made can be told from one that was there.
-fn snapshot(repo: &Repo) -> Result<std::collections::BTreeMap<String, Option<String>>, String> {
+pub(crate) fn snapshot(repo: &Repo) -> Result<std::collections::BTreeMap<String, Option<String>>, String> {
     let status = repo.status().map_err(|e| e.to_string())?;
     let mut map = std::collections::BTreeMap::new();
     for file in status.files {
@@ -654,7 +672,7 @@ fn snapshot(repo: &Repo) -> Result<std::collections::BTreeMap<String, Option<Str
 /// keep or revert: `before` is what was on disk before the run for a file
 /// that was already dirty, `HEAD`'s content otherwise, and nothing for a
 /// file the run created.
-fn edits_since(
+pub(crate) fn edits_since(
     repo: &Repo,
     before: &std::collections::BTreeMap<String, Option<String>>,
 ) -> Result<Vec<PendingEdit>, String> {
@@ -692,7 +710,7 @@ fn edits_since(
     Ok(edits)
 }
 
-fn first_line(text: &str) -> String {
+pub(crate) fn first_line(text: &str) -> String {
     text.trim().lines().next().unwrap_or_default().to_string()
 }
 

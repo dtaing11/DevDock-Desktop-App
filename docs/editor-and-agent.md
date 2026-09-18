@@ -302,6 +302,19 @@ the strip above the summary repeats it next to the turn count. A backlog
 card and its draft pull request say the same. While Claude Code is
 running, `claude -p …` is a child process of DevDock, which `ps` will show.
 
+### A third engine: OpenCode
+
+**OpenCode agent** appears beside the other two when the `opencode` command
+is installed (`curl -fsSL https://opencode.ai/install | bash`). It is an
+open-source, provider-agnostic agent: pick any model it knows, in
+`provider/model` form — its own `opencode/…` models are free and need no
+sign-in, and `anthropic/…` models use DevDock's Claude sign-in, handed over
+as an access token for the run. DevDock runs it headless with the same
+rules as Claude Code: a full shell less git history and the web, the
+repository's `.mcp.json` servers in its config, images attached as files, a
+question answered by resuming the session, and inside the sandbox when
+there is one. It needs "Let it iterate", like Claude Code.
+
 ### Two modes: propose, or let it iterate
 
 **Propose** (default). The agent reads and edits, but its edits are held in

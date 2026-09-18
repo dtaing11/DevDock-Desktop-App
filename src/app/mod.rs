@@ -945,6 +945,8 @@ pub struct App {
     pub sessions: std::collections::HashMap<String, RepoSession>,
     /// Screenshots decoded for the run cards.
     pub screenshots: backlog::Screenshots,
+    /// The models OpenCode lists, `provider/model`, read once at start.
+    pub opencode_models: Vec<String>,
     /// An AI-proposed split of the working tree into separate commits.
     pub split: SplitState,
     /// An AI-proposed tidy-up of the branch's commits.
@@ -1087,6 +1089,7 @@ impl App {
             coding: Default::default(),
             sessions: Default::default(),
             screenshots: Default::default(),
+            opencode_models: Vec::new(),
             split: Default::default(),
             tidy: Default::default(),
             #[cfg(unix)]
@@ -2081,6 +2084,7 @@ impl App {
             Msg::AgentRunProgress { key, line } => self.on_agent_run_progress(key, line),
             Msg::AgentRunDone { key, result } => self.on_agent_run_done(key, result),
             Msg::AgentQuestion { key, question, reply } => self.on_agent_question(key, question, reply),
+            Msg::OpenCodeModels(models) => self.opencode_models = models,
             Msg::AgentScreenshots(result) => {
                 self.coding.screenshotting = false;
                 match result {
@@ -4341,6 +4345,15 @@ impl App {
         });
     }
 
+    /// Reads OpenCode's model list on a worker, once.
+    pub fn load_opencode_models(&mut self) {
+        if !self.opencode_models.is_empty() || !crate::agent::opencode::available() {
+            return;
+        }
+        self.opencode_models = vec!["…".into()];
+        self.worker.spawn(move || Msg::OpenCodeModels(crate::agent::opencode::models()));
+    }
+
     /// Attaches an image file to the next task, or says why it cannot.
     pub fn attach_image(&mut self, path: &std::path::Path) {
         match agent_tab::PromptImage::from_file(path) {
@@ -5231,6 +5244,15 @@ pub fn agent_engine(
             return Err("Claude Code is not installed (the `claude` command was not found).".into());
         }
         return Ok(crate::agent::coding::Engine::ClaudeCode(crate::agent::claude_code::Config {
+            model: sel.model.clone(),
+            ..Default::default()
+        }));
+    }
+    if sel.provider == crate::agent::opencode::PROVIDER {
+        if !crate::agent::opencode::available() {
+            return Err("OpenCode is not installed (the `opencode` command was not found).".into());
+        }
+        return Ok(crate::agent::coding::Engine::OpenCode(crate::agent::opencode::Config {
             model: sel.model.clone(),
             ..Default::default()
         }));

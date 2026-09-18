@@ -249,6 +249,16 @@ impl Client {
             .map(|key| Self { auth: Auth::ApiKey(key), model: normalize_model(model) })
     }
 
+    /// The OAuth access token and its expiry (unix seconds), for handing
+    /// to another client that speaks Anthropic's API — never the refresh
+    /// token. `None` for an API-key client.
+    pub fn oauth_access(&self) -> Option<(String, u64)> {
+        match &self.auth {
+            Auth::OAuth(tokens) => Some((tokens.access_token.clone(), tokens.expires_at)),
+            Auth::ApiKey(_) => None,
+        }
+    }
+
     /// Which sign-in method the stored credentials use, for the UI.
     pub fn auth_label() -> Option<&'static str> {
         let creds = CredentialStore::load();

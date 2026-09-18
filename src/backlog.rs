@@ -885,6 +885,28 @@ fn review_with(
             )?;
             Ok(crate::agent::backlog::parse_verdict(&run.text))
         }
+        Engine::OpenCode(config) => {
+            let task = crate::agent::backlog::review_task(brief, diff);
+            let run = crate::agent::opencode::run(
+                config,
+                root,
+                crate::agent::opencode::Launch {
+                    task: &task,
+                    instructions: Some(
+                        "You are reviewing a change an unattended coding agent made, before it \
+                         becomes a pull request. Read only; run the repository's checks if useful. \
+                         Be strict: revise unless you would merge it. Answer with JSON only: \
+                         {\"verdict\": \"approve\" | \"revise\", \"feedback\": \"…\"}",
+                    ),
+                    permissions: crate::agent::opencode::Permissions::ReadOnly,
+                    files: &[],
+                    resume: None,
+                    collect_edits: false,
+                },
+                &mut |e| on_event(e.line()),
+            )?;
+            Ok(crate::agent::backlog::parse_verdict(&run.text))
+        }
     }
 }
 
@@ -916,6 +938,28 @@ fn advise_with(
                      wrong, and say exactly what to do next. Answer with JSON only: \
                      {\"doable\": true | false, \"advice\": \"…\"}",
                 ),
+                &mut |e| on_event(e.line()),
+            )?;
+            Ok(crate::agent::backlog::parse_advice(&run.text))
+        }
+        Engine::OpenCode(config) => {
+            let task = crate::agent::backlog::advise_task(brief, happened, diff);
+            let run = crate::agent::opencode::run(
+                config,
+                root,
+                crate::agent::opencode::Launch {
+                    task: &task,
+                    instructions: Some(
+                        "You are the senior engineer pairing with an unattended coding agent whose \
+                         last attempt did not get through. Read the repository, work out what went \
+                         wrong, and say exactly what to do next. Answer with JSON only: \
+                         {\"doable\": true | false, \"advice\": \"…\"}",
+                    ),
+                    permissions: crate::agent::opencode::Permissions::ReadOnly,
+                    files: &[],
+                    resume: None,
+                    collect_edits: false,
+                },
                 &mut |e| on_event(e.line()),
             )?;
             Ok(crate::agent::backlog::parse_advice(&run.text))

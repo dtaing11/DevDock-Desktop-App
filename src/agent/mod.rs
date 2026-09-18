@@ -38,6 +38,7 @@ pub mod backlog;
 pub mod claude_code;
 pub mod coding;
 pub mod mcp;
+pub mod opencode;
 pub mod conflict;
 pub mod pr;
 pub mod rebase;

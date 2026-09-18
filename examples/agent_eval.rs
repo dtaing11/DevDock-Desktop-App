@@ -11,6 +11,7 @@
 //! cargo run --release --example agent_eval -- [task ...]
 //! EVAL_MODEL=claude-sonnet-5 EVAL_REPEATS=2 EVAL_OUT=results.json cargo run --example agent_eval
 //! EVAL_PROVIDER=claude-code cargo run --example agent_eval        # the claude CLI as the engine
+//! EVAL_PROVIDER=opencode EVAL_MODEL=opencode/big-pickle cargo run --example agent_eval  # OpenCode
 //! ```
 //!
 //! Needs Claude sign-in (the app's), `python3`, and `cargo`. Prints one row
@@ -737,6 +738,7 @@ fn main() {
     // the built-in harness, metered so the rows can say what was sent.
     let make_engine = |stats: std::sync::Arc<Stats>| -> Engine {
         match provider_name.as_str() {
+            "opencode" => Engine::OpenCode(git_manage::agent::opencode::Config { model: std::env::var("EVAL_MODEL").unwrap_or_else(|_| git_manage::agent::opencode::DEFAULT_MODEL.into()), ..Default::default() }),
             "claude-code" => Engine::ClaudeCode(git_manage::agent::claude_code::Config {
                 model: if model.starts_with("claude-haiku") { "default".into() } else { model.clone() },
                 ..Default::default()

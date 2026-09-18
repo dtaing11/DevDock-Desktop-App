@@ -1276,12 +1276,32 @@ fn changes_tab(app: &mut App, ui: &mut egui::Ui) {
         ui.separator();
     }
 
-    // File list fills the space above the commit box.
-    let commit_box_height = 215.0;
-    let list_height = (ui.available_height() - commit_box_height).max(60.0);
-    ScrollArea::vertical().max_height(list_height).auto_shrink([false, false]).show(
-        ui,
-        |ui| {
+    // The commit box takes the height it needs at the bottom — a generated
+    // description can be long — and the file list gets what is left above
+    // it. Its natural height is measured each frame and used the next, so
+    // the buttons never fall off the end of the sidebar whatever the
+    // description grew to; a window too short for the whole box scrolls
+    // it, and leaves the file list a share.
+    let room = ui.available_height();
+    let cap = (room - 40.0).max(140.0);
+    let want = app.commit_box_height.min(cap);
+    let list_height = (room - want - 18.0).max(0.0);
+    // `min_scrolled_height(0)`: a scroll area that has to scroll is
+    // otherwise never shorter than 64, and the extra came out of the box.
+    ScrollArea::vertical().id_salt("file-list").max_height(list_height).min_scrolled_height(0.0).auto_shrink([false, false]).show(ui, |ui| {
+        file_list(app, ui, &files);
+    });
+    ui.separator();
+    let out = ScrollArea::vertical().id_salt("commit-box-scroll").max_height(cap).auto_shrink([false, true]).show(ui, |ui| {
+        commit_box(app, ui, room);
+    });
+    app.commit_box_height = out.content_size.y;
+}
+
+/// The changed files, each with its checkbox, status, path and discard.
+fn file_list(app: &mut App, ui: &mut egui::Ui, files: &[crate::git::FileEntry]) {
+    {
+        {
             if files.is_empty() {
                 ui.add_space(16.0);
                 ui.vertical_centered(|ui| {
@@ -1294,7 +1314,7 @@ fn changes_tab(app: &mut App, ui: &mut egui::Ui) {
                     );
                 });
             }
-            for file in &files {
+            for file in files {
                 let mut checked = !app.unchecked.contains(&file.path);
                 ui.horizontal(|ui| {
                     if ui.checkbox(&mut checked, "").changed() {
@@ -1353,11 +1373,8 @@ fn changes_tab(app: &mut App, ui: &mut egui::Ui) {
                     });
                 });
             }
-        },
-    );
-
-    ui.separator();
-    commit_box(app, ui);
+        }
+    }
 }
 
 fn select_file(app: &mut App, path: &str, staged: bool) {
@@ -1498,7 +1515,9 @@ pub fn clear_diff_view(app: &mut App) {
     app.commit_file_list.clear();
 }
 
-fn commit_box(app: &mut App, ui: &mut egui::Ui) {
+/// The commit message and its buttons; `room` is the sidebar height the
+/// box shares with the file list.
+fn commit_box(app: &mut App, ui: &mut egui::Ui, room: f32) {
     ui.label(theme::overline("COMMIT"));
     ui.add(
         egui::TextEdit::singleline(&mut app.commit_summary)
@@ -1506,12 +1525,17 @@ fn commit_box(app: &mut App, ui: &mut egui::Ui) {
             .desired_width(f32::INFINITY),
     );
     // Grows with the text up to a cap, then scrolls, so a long description
-    // is readable without pushing the buttons below off screen.
-    ScrollArea::vertical().max_height(160.0).id_salt("commit-desc").show(ui, |ui| {
-        prose_box(ui, &mut app.commit_description, 3, "Description");
+    // is readable without pushing the buttons below off screen. The cap
+    // follows the window: what is left once the rest of the box — about
+    // 150 — and a few file rows above it have their share.
+    let cap = (room - 230.0).clamp(48.0, 160.0);
+    ScrollArea::vertical().max_height(cap).id_salt("commit-desc").show(ui, |ui| {
+        prose_box(ui, &mut app.commit_description, 2, "Description");
     });
 
-    ui.horizontal(|ui| {
+    // Wrapped: the picker and Amend do not fit beside the button at the
+    // sidebar's narrowest.
+    ui.horizontal_wrapped(|ui| {
         ai_controls(app, ui, crate::app::worker::AiTarget::Commit, "AI message");
         ui.checkbox(&mut app.amend, "Amend")
             .on_hover_text("Rewrite the last commit instead of creating a new one");

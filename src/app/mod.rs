@@ -872,6 +872,9 @@ pub struct App {
     // commit box
     pub commit_summary: String,
     pub commit_description: String,
+    /// The commit box's natural height last frame, so the file list above
+    /// it can be given exactly the rest.
+    pub commit_box_height: f32,
     pub amend: bool,
     pub ai_busy: bool,
 
@@ -1052,6 +1055,7 @@ impl App {
             selected_file: None,
             selected_commit: None,
             commit_summary: String::new(),
+            commit_box_height: 215.0,
             commit_description: String::new(),
             amend: false,
             ai_busy: false,

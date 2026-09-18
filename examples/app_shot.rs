@@ -8,6 +8,7 @@
 //! picture is taken.
 //! `AGENT_DEMO=running|changes` fills the coding agent with state, since a
 //! real run needs a model and a screenshot needs neither.
+//! `COMMIT_DEMO=1` fills the commit box with a long generated message.
 
 use eframe::egui;
 use git_manage::app::{views, App, ProposedEdit, Tab};
@@ -34,6 +35,15 @@ impl eframe::App for Shot {
             }
             if let Ok(mode) = std::env::var("AGENT_DEMO") {
                 seed_agent(&mut self.app, &mode);
+            }
+            // A generated commit message at its longest, the case that
+            // used to push Commit and Undo off the end of the sidebar.
+            if std::env::var("COMMIT_DEMO").is_ok() {
+                self.app.commit_summary = "feat: turn every button green across both palettes while keeping destructive ones red".into();
+                self.app.commit_description = (1..=14)
+                    .map(|i| format!("- Point {i} of a long generated description that goes on for a while, explaining a change in detail."))
+                    .collect::<Vec<_>>()
+                    .join("\n");
             }
             match std::env::var("DIALOG").as_deref() {
                 Ok("stack") => self.app.open_stack(),

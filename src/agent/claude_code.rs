@@ -101,6 +101,49 @@ pub const DENIED_TOOLS: &[&str] = &[
     "Bash(sudo:*)",
 ];
 
+/// What a run tells Claude Code about MCP: which config to load, and the
+/// allow rules for the servers in it.
+pub struct McpLaunch {
+    /// The `--mcp-config` value: the repository's `.mcp.json`, when it has one.
+    pub config: Option<String>,
+    /// `mcp__<server>` for each declared server: all of its tools.
+    pub allow_rules: Vec<String>,
+}
+
+/// The repository's `.mcp.json` servers, when the file is there and parses.
+pub fn mcp_servers(root: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(root.join(".mcp.json")) else { return Vec::new() };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else { return Vec::new() };
+    value
+        .get("mcpServers")
+        .and_then(|s| s.as_object())
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+pub fn mcp_launch(root: &Path) -> McpLaunch {
+    let servers = mcp_servers(root);
+    if servers.is_empty() {
+        return McpLaunch { config: None, allow_rules: Vec::new() };
+    }
+    McpLaunch {
+        config: Some(root.join(".mcp.json").display().to_string()),
+        allow_rules: servers.iter().map(|s| format!("mcp__{s}")).collect(),
+    }
+}
+
+/// The MCP server a permission refusal was about, from Claude Code's
+/// wording: "Claude requested permissions to use mcp__plugin_x_y__tool,
+/// but you haven't granted it yet."
+fn denied_mcp_server(text: &str) -> Option<String> {
+    let at = text.find("mcp__")?;
+    let name: String = text[at..].chars().take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')).collect();
+    // `mcp__<server>__<tool>`: the server is up to the second `__`.
+    let rest = name.strip_prefix("mcp__")?;
+    let server = rest.split("__").next().filter(|s| !s.is_empty())?;
+    Some(format!("mcp__{server}"))
+}
+
 /// The `--disallowedTools` value.
 pub fn disallowed_tools() -> String {
     DENIED_TOOLS.join(",")
@@ -145,9 +188,17 @@ pub fn allowed_commands_note(root: &Path, check_commands: &[String]) -> String {
          Run every command to completion in the foreground and read its output: never start \
          one in the background, never `sleep`, never poll a log in a loop — `sleep` is \
          refused here, and a refusal is final. A build or a test suite that takes minutes \
-         is fine to wait on. There are no MCP tools in this run; use the shell for what \
-         a plugin tool would do (pub, analyze, tests).",
+         is fine to wait on.",
     );
+    let servers = mcp_servers(root);
+    if servers.is_empty() {
+        note.push_str(" MCP tools, when you have any, may be used; one that is refused the first time is allowed and you are resumed — do not retry it yourself, carry on with the shell and it will be offered again.");
+    } else {
+        note.push_str(&format!(
+            " The repository's MCP servers are loaded and their tools allowed: {}. Any other MCP tool that is refused once is allowed on resume; do not retry it yourself.",
+            servers.join(", ")
+        ));
+    }
     note
 }
 
@@ -165,7 +216,38 @@ pub fn run(
     on_event: &mut dyn FnMut(Event),
 ) -> Result<Run, String> {
     let _ = check_commands;
-    run_with_tools(config, root, Launch { task, system_extra, allowed: &allowed_tools(), collect_edits: true, resume: None }, on_event)
+    let mut allowed = allowed_tools();
+    let (mut run, mut denied) = run_with_tools(config, root, Launch { task, system_extra, allowed: &allowed, collect_edits: true, resume: None }, on_event)?;
+    // A server DevDock could not list in advance — a plugin's, a user-level
+    // one — shows up as a refusal the first time the model reaches for it.
+    // Allow it and resume the same session, a few servers at most.
+    for _ in 0..3 {
+        if denied.is_empty() {
+            break;
+        }
+        let Some(session) = run.session.clone() else { break };
+        for server in &denied {
+            if !allowed.split(',').any(|a| a == server) {
+                allowed.push(',');
+                allowed.push_str(server);
+            }
+        }
+        on_event(Event::Tool { summary: format!("allowed MCP: {}; resuming", denied.join(", ")), is_error: false });
+        let prompt = format!(
+            "The MCP tools you were refused ({}) are allowed now. Continue the task, using them where they help.",
+            denied.join(", ")
+        );
+        let (more, denied_again) = run_with_tools(config, root, Launch { task: &prompt, system_extra, allowed: &allowed, collect_edits: true, resume: Some(&session) }, on_event)?;
+        run.text = more.text;
+        run.session = more.session;
+        run.turns += more.turns;
+        run.truncated = more.truncated;
+        run.usage = run.usage.plus(more.usage);
+        run.log.extend(more.log);
+        run.edits = more.edits;
+        denied = denied_again;
+    }
+    Ok(run)
 }
 
 /// Runs Claude Code with reading tools only — no edits, no commands — and
@@ -177,7 +259,7 @@ pub fn run_readonly(
     system_extra: Option<&str>,
     on_event: &mut dyn FnMut(Event),
 ) -> Result<Run, String> {
-    run_with_tools(config, root, Launch { task, system_extra, allowed: "Read,Grep,Glob,LS", collect_edits: false, resume: None }, on_event)
+    run_with_tools(config, root, Launch { task, system_extra, allowed: "Read,Grep,Glob,LS", collect_edits: false, resume: None }, on_event).map(|(run, _)| run)
 }
 
 /// Continues a session — after a question was answered — with `prompt`
@@ -190,7 +272,7 @@ pub fn resume(
     system_extra: Option<&str>,
     on_event: &mut dyn FnMut(Event),
 ) -> Result<Run, String> {
-    run_with_tools(config, root, Launch { task: prompt, system_extra, allowed: &allowed_tools(), collect_edits: true, resume: Some(session_id) }, on_event)
+    run_with_tools(config, root, Launch { task: prompt, system_extra, allowed: &allowed_tools(), collect_edits: true, resume: Some(session_id) }, on_event).map(|(run, _)| run)
 }
 
 /// How one `claude -p` is launched.
@@ -203,13 +285,19 @@ struct Launch<'a> {
     resume: Option<&'a str>,
 }
 
+/// One `claude -p`: the run, and the MCP servers it was refused.
 fn run_with_tools(
     config: &Config,
     root: &Path,
     launch: Launch<'_>,
     on_event: &mut dyn FnMut(Event),
-) -> Result<Run, String> {
+) -> Result<(Run, Vec<String>), String> {
     let Launch { task, system_extra, allowed, collect_edits, resume } = launch;
+    let allowed = {
+        let extra = mcp_launch(root).allow_rules;
+        if extra.is_empty() { allowed.to_string() } else { format!("{allowed},{}", extra.join(",")) }
+    };
+    let allowed = allowed.as_str();
     let program = program().ok_or(
         "Claude Code is not installed on this machine (the `claude` command was not found).",
     )?;
@@ -226,11 +314,15 @@ fn run_with_tools(
         .arg("--allowedTools")
         .arg(allowed)
         .arg("--disallowedTools")
-        .arg(disallowed_tools())
-        // No MCP servers: a plugin's tools (a Dart `pub` tool, say) would
-        // appear without being allowed, and every reach for one is a
-        // refusal that costs a turn. The shell does the same jobs.
-        .args(["--strict-mcp-config", "--mcp-config", r#"{"mcpServers":{}}"#]);
+        .arg(disallowed_tools());
+    // MCP: the repository's own servers, from its .mcp.json, passed
+    // explicitly so no approval prompt is waited on; each is allowed
+    // wholesale. Plugins and user-level servers load as they do for the
+    // developer, and are allowed on first refusal by `run`.
+    let mcp = mcp_launch(root);
+    if let Some(config_path) = &mcp.config {
+        cmd.arg("--mcp-config").arg(config_path);
+    }
     let model = config.model.trim();
     if !model.is_empty() && model != "default" {
         cmd.arg("--model").arg(model);
@@ -324,15 +416,19 @@ fn run_with_tools(
         }
     }
     let edits = if collect_edits { edits_since(&repo, &before)? } else { Vec::new() };
-    Ok(Run {
-        text: outcome.result.unwrap_or_default(),
-        edits,
-        log,
-        truncated: outcome.truncated,
-        turns: outcome.turns,
-        session: outcome.session_id,
-        usage: outcome.usage,
-    })
+    let denied = std::mem::take(&mut outcome.denied_mcp);
+    Ok((
+        Run {
+            text: outcome.result.unwrap_or_default(),
+            edits,
+            log,
+            truncated: outcome.truncated,
+            turns: outcome.turns,
+            session: outcome.session_id,
+            usage: outcome.usage,
+        },
+        denied,
+    ))
 }
 
 /// What the `result` event said.
@@ -340,6 +436,10 @@ fn run_with_tools(
 struct Outcome {
     result: Option<String>,
     session_id: Option<String>,
+    /// MCP servers whose tools the model reached for without permission
+    /// (`mcp__<server>__<tool>`), by server: a plugin's, or a user-level
+    /// server DevDock could not know about in advance.
+    denied_mcp: Vec<String>,
     is_error: bool,
     truncated: bool,
     turns: usize,
@@ -413,6 +513,11 @@ fn parse_line(line: &str, root: &Path, outcome: &mut Outcome) -> Vec<Event> {
                             .join(" "),
                         _ => String::new(),
                     };
+                    if let Some(server) = denied_mcp_server(&text) {
+                        if !outcome.denied_mcp.contains(&server) {
+                            outcome.denied_mcp.push(server);
+                        }
+                    }
                     events.push(Event::Tool { summary: format!("tool error: {}", first_line(&text)), is_error: true });
                 }
             }
@@ -568,6 +673,9 @@ mod tests {
         assert!(outcome.truncated);
         assert!(events[0].line().contains("turn budget spent"));
         assert!(parse_line("not json", root, &mut outcome).is_empty());
+        let refused = r#"{"type":"user","message":{"content":[{"type":"tool_result","is_error":true,"content":"Claude requested permissions to use mcp__plugin_dart-flutter_dart-mcp-server__pub, but you haven't granted it yet."}]}}"#;
+        parse_line(refused, root, &mut outcome);
+        assert_eq!(outcome.denied_mcp, ["mcp__plugin_dart-flutter_dart-mcp-server"]);
     }
 
     #[test]
@@ -595,6 +703,22 @@ mod tests {
         assert!(note.contains("driven with dart, flutter"), "{note}");
         assert!(note.contains("do not retry one"));
         assert!(note.contains("never `sleep`"), "polling with sleep is refused by the CLI: {note}");
+        assert!(note.contains("MCP tools"), "{note}");
+
+        // A repository with an .mcp.json: its servers are loaded and allowed.
+        let launch = mcp_launch(root);
+        assert!(launch.config.is_none());
+        assert!(launch.allow_rules.is_empty());
+        std::fs::write(root.join(".mcp.json"), r#"{"mcpServers": {"dart": {"command": "dart", "args": ["mcp-server"]}, "docs": {"url": "https://x"}}}"#).unwrap();
+        let launch = mcp_launch(root);
+        assert!(launch.config.as_deref().is_some_and(|c| c.ends_with(".mcp.json")));
+        assert_eq!(launch.allow_rules, ["mcp__dart", "mcp__docs"]);
+        assert_eq!(
+            denied_mcp_server("Claude requested permissions to use mcp__plugin_dart-flutter_dart-mcp-server__pub, but you haven't granted it yet.").as_deref(),
+            Some("mcp__plugin_dart-flutter_dart-mcp-server")
+        );
+        assert_eq!(denied_mcp_server("This command requires approval"), None);
+        assert!(allowed_commands_note(root, &[]).contains("dart, docs"));
     }
 
     #[test]

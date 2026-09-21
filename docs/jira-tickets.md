@@ -162,6 +162,19 @@ now, and — on **Log** — everything it did: every file read, every edit, ever
 check, the commit, the push. A finished card lists the files it changed with
 line counts, its summary, and the pull request.
 
+### When a check never finishes
+
+A command is over when it exits, not when its output pipes close: a
+Gradle or Dart daemon it started, adb, a kept ssh connection, can hold
+those open for hours, and DevDock reads what was written plus a few
+seconds more rather than waiting for them. A check that still runs past
+its timeout on the untouched tree — a dependency fetch that never
+resolves where the checks run — is stopped once, named in the log with
+its last line, and not run again in that run; the pull request says it
+did not finish rather than that it passed. Checks run with
+`GIT_TERMINAL_PROMPT=0`, so a private git dependency fails at once
+instead of waiting for a password nobody can type.
+
 ### When the machine, not the change, fails a check
 
 A check that fails the machine's way — a linker or compiler killed for

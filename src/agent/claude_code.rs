@@ -464,18 +464,13 @@ fn run_with_tools(
             }
         }
     });
-    let stderr = child.stderr.take().map(|mut pipe| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
-            String::from_utf8_lossy(&buf).into_owned()
-        })
-    });
+    let stderr = child.stderr.take().map(crate::local_ci::runner::PipeReader::start);
 
     let mut log: Vec<String> = Vec::new();
     let mut outcome = Outcome::default();
     let deadline = Instant::now() + config.timeout;
     let mut timed_out = false;
+    let mut exited: Option<Instant> = None;
     loop {
         match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(line) => {
@@ -485,7 +480,14 @@ fn run_with_tools(
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            // The process is over and has been quiet since: whatever still
+            // holds its stdout — a daemon a command of its started — is not
+            // going to say anything this run needs.
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if matches!(child.try_wait(), Ok(Some(_))) && exited.get_or_insert_with(Instant::now).elapsed() >= crate::local_ci::runner::PIPE_GRACE {
+                    break;
+                }
+            }
         }
         if Instant::now() >= deadline {
             timed_out = true;
@@ -499,7 +501,7 @@ fn run_with_tools(
         }
     }
     let status = child.wait().map_err(|e| e.to_string())?;
-    let stderr = stderr.and_then(|h| h.join().ok()).unwrap_or_default();
+    let stderr = stderr.map(|r| r.finish(Instant::now() + crate::local_ci::runner::PIPE_GRACE)).unwrap_or_default();
     if timed_out {
         return Err(format!(
             "Claude Code ran longer than {}s and was stopped.",

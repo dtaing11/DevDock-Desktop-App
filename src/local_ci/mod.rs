@@ -972,6 +972,11 @@ pub fn run_job_with(registry: &RunnerRegistry, repo_root: &Path, job: &Job) -> J
     if !job.env.contains_key("CI") {
         env.push(("CI".into(), "true".into()));
     }
+    // Nothing here can answer a prompt: a git dependency that wants a
+    // password fails at once rather than waiting for one until the timeout.
+    if !job.env.contains_key("GIT_TERMINAL_PROMPT") {
+        env.push(("GIT_TERMINAL_PROMPT".into(), "0".into()));
+    }
     match resolve_secrets(repo_root, job) {
         Ok(secrets) => env.extend(secrets),
         Err(message) => return fail(message),

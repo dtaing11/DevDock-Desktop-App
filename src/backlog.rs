@@ -357,7 +357,10 @@ pub fn pull_request_text(
             body.push_str(&format!("- {} `{}`\n", if c.ok { "✅" } else { "❌" }, c.name));
         }
         for name in skipped {
-            body.push_str(&format!("- ⏭ `{name}` — fails on the base branch and fails the same way after this change; not counted\n"));
+            match name.strip_suffix(UNFINISHED) {
+                Some(name) => body.push_str(&format!("- ⏭ `{name}` — does not finish on the base branch where the checks ran; not run\n")),
+                None => body.push_str(&format!("- ⏭ `{name}` — fails on the base branch and fails the same way after this change; not counted\n")),
+            }
         }
     }
     match reviewed_by {
@@ -537,6 +540,7 @@ fn work(
     // change's; holding it against the agent means every attempt fails the
     // same way. A check that fails differently, or newly, counts.
     let mut baseline: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let mut unfinished: Vec<String> = Vec::new();
     if !jobs.is_empty() {
         on_event("running the checks on the untouched tree first".into());
         for j in &jobs {
@@ -544,6 +548,21 @@ fn work(
             let result = run_check(&runners, wt.path(), j, on_event);
             if result.ok {
                 on_event(format!("`{}` passes on {} ({})", j.name, job.base, took(result.duration_secs)));
+                continue;
+            }
+            // It does not finish here, before any change: running it again
+            // after every round is that long again each time, for nothing
+            // it could say about the change.
+            if crate::local_ci::runner::timed_out(&result.output) {
+                let last = result.output.lines().rev().find(|l| !l.trim().is_empty() && !l.starts_with("--- ") && !crate::local_ci::runner::timed_out(l)).unwrap_or("no output").trim();
+                on_event(format!(
+                    "`{}` does not finish on {} where the checks run (stopped after {}; last line: {}); not run again in this run",
+                    j.name,
+                    job.base,
+                    took(result.duration_secs),
+                    last.chars().take(140).collect::<String>()
+                ));
+                unfinished.push(j.name.clone());
                 continue;
             }
             if let Some(why) = machine_failure(&result.output) {
@@ -568,6 +587,8 @@ fn work(
             baseline.insert(j.name.clone(), normalize_output(&result.output));
         }
     }
+    jobs.retain(|j| !unfinished.contains(&j.name));
+    let unfinished: Vec<String> = unfinished.into_iter().map(|name| format!("{name}{UNFINISHED}")).collect();
     let mut skipped: Vec<String> = Vec::new();
 
     let tracked = wt.tracked_files().map_err(|e| e.to_string())?;
@@ -705,7 +726,7 @@ fn work(
         // The checks, run here. The agent's word that they passed is not
         // what a draft pull request should rest on.
         checks.clear();
-        skipped.clear();
+        skipped.clone_from(&unfinished);
         let mut failed: Option<String> = None;
         for j in &jobs {
             on_event(format!("verifying: {}", j.name));
@@ -1137,6 +1158,10 @@ pub fn missing_program(output: &str) -> Option<String> {
     }
     None
 }
+
+/// How a skipped check that never finished on the base branch is told
+/// from one that failed there.
+const UNFINISHED: &str = " (did not finish)";
 
 /// A check that failed because of the machine it ran on, not the code:
 /// a linker or compiler killed for memory, a full disk. What to say.
@@ -1619,6 +1644,37 @@ mod tests {
         assert_eq!(fixed.checks, [CheckOutcome { name: "tests".into(), ok: true }]);
         let paths: Vec<&str> = fixed.changes.iter().map(|c| c.path.as_str()).collect();
         assert_eq!(paths, ["lib.py"], "neither the submodule nor node_modules is part of the change");
+    }
+
+    /// A check that hangs on the untouched tree — a dependency fetch that
+    /// never resolves — is stopped once, named, and not run again: the run
+    /// goes on with the checks that do finish.
+    #[test]
+    fn a_check_that_never_finishes_on_the_base_is_run_once() {
+        let (_tmp, repo) = setup("true");
+        fs::write(
+            repo.path().join(".git-manage-ci.toml"),
+            "[[job]]\nname = \"analyze\"\ntimeout_secs = 1\ncommands = [\"echo 'Resolving dependencies...' && sleep 30\"]\n\n[[job]]\nname = \"tests\"\ncommands = [\"grep -q 'return sum(xs)$' lib.py\"]\n",
+        )
+        .unwrap();
+        sh(repo.path(), &["commit", "-q", "-am", "a check that hangs"]);
+        sh(repo.path(), &["push", "-q", "origin", "main"]);
+        let engine = Engine::Harness(Box::new(fixing_provider()));
+        let mut log = Vec::new();
+        let started = std::time::Instant::now();
+        let fixed = fix(
+            &repo,
+            &engine,
+            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox: None, claim: None, rounds: 3, reviewer: None, ask: None },
+            &fake_pr,
+            &mut |line| log.push(line),
+        )
+        .unwrap_or_else(|e| panic!("{e}\n{log:#?}"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(20), "the hang was paid for once: {:?}", started.elapsed());
+        assert!(log.iter().any(|l| l.starts_with("`analyze` does not finish on main") && l.contains("Resolving dependencies...") && l.ends_with("not run again in this run")), "{log:#?}");
+        assert!(!log.iter().any(|l| l == "verifying: analyze"), "{log:#?}");
+        assert_eq!(fixed.skipped, ["analyze (did not finish)"]);
+        assert_eq!(fixed.checks, [CheckOutcome { name: "tests".into(), ok: true }]);
     }
 
     #[test]

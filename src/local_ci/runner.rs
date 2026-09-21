@@ -318,20 +318,8 @@ pub fn wait_with_timeout(
 ) -> Result<ExecOutput, String> {
     // Both pipes drained on their own threads: a child that fills one
     // while this thread waits on the other deadlocks.
-    let stdout = child.stdout.take().map(|mut pipe| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
-            buf
-        })
-    });
-    let stderr = child.stderr.take().map(|mut pipe| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
-            buf
-        })
-    });
+    let stdout = child.stdout.take().map(PipeReader::start);
+    let stderr = child.stderr.take().map(PipeReader::start);
     let deadline = timeout.map(|t| Instant::now() + t);
     let mut timed_out = false;
     let status = loop {
@@ -348,22 +336,67 @@ pub fn wait_with_timeout(
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    let collect = |handle: Option<std::thread::JoinHandle<Vec<u8>>>| {
-        handle
-            .and_then(|h| h.join().ok())
-            .map(|b| String::from_utf8_lossy(&b).into_owned())
-            .unwrap_or_default()
-    };
-    let mut err = collect(stderr);
+    // The command is over. Its pipes may not be: a daemon it started — a
+    // Gradle or Dart daemon, adb, an ssh connection kept for reuse — holds
+    // them open for as long as it lives, and waiting for end-of-file then
+    // is waiting for hours on a command that finished. What was written by
+    // now, plus a moment for the rest, is the output.
+    let until = Instant::now() + PIPE_GRACE;
+    let mut err = stderr.map(|r| r.finish(until)).unwrap_or_default();
     if timed_out {
         let secs = timeout.map(|t| t.as_secs()).unwrap_or(0);
-        err.push_str(&format!("\n[killed: the job ran longer than {secs}s]"));
+        err.push_str(&format!("\n{TIMEOUT_MARK} {secs}s]"));
     }
     Ok(ExecOutput {
         success: status.success() && !timed_out,
-        stdout: collect(stdout),
+        stdout: stdout.map(|r| r.finish(until)).unwrap_or_default(),
         stderr: err,
     })
+}
+
+/// How a job that outran its timeout is marked in its output.
+pub const TIMEOUT_MARK: &str = "[killed: the job ran longer than";
+
+/// Whether `output` is of a job that was killed for running too long.
+pub fn timed_out(output: &str) -> bool {
+    output.contains(TIMEOUT_MARK)
+}
+
+/// How long after a command ends its pipes are still read.
+pub const PIPE_GRACE: Duration = Duration::from_secs(3);
+
+/// A pipe read on a thread of its own into a buffer that can be taken
+/// before end-of-file — which, with a daemon holding the other end, may
+/// never come.
+pub struct PipeReader {
+    buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+impl PipeReader {
+    pub fn start(mut pipe: impl std::io::Read + Send + 'static) -> Self {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, done) = std::sync::mpsc::channel();
+        let sink = buf.clone();
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 8192];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => sink.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(&chunk[..n]),
+                }
+            }
+            let _ = tx.send(());
+        });
+        Self { buf, done }
+    }
+
+    /// Everything read by end-of-file or by `until`, whichever is first.
+    pub fn finish(self, until: Instant) -> String {
+        let _ = self.done.recv_timeout(until.saturating_duration_since(Instant::now()));
+        let bytes = self.buf.lock().unwrap_or_else(|e| e.into_inner());
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +449,27 @@ impl Default for RunnerRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A command that leaves a daemon behind holding its pipes: the
+    /// command is over when it exits, not when the daemon does.
+    #[cfg(unix)]
+    #[test]
+    fn a_daemon_holding_the_pipes_does_not_hold_the_job() {
+        let started = Instant::now();
+        let child = Command::new("sh")
+            .args(["-c", "echo done; echo warn >&2; (sleep 60 &) ; exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let out = wait_with_timeout(child, Some(Duration::from_secs(30)), || {}).unwrap();
+        assert!(out.success);
+        assert_eq!(out.stdout.trim(), "done");
+        assert_eq!(out.stderr.trim(), "warn");
+        assert!(started.elapsed() < Duration::from_secs(15), "took {:?}", started.elapsed());
+        assert!(!timed_out(&out.stderr));
+    }
 
     struct FakeRunner {
         ok: bool,

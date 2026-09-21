@@ -118,7 +118,8 @@ Asking: ask_developer puts one question to the developer and waits for the answe
 /// the run is resumed with the answer.
 pub const CLAUDE_CODE_ASK: &str = "If you need the developer to decide something before you can proceed — a \
     product choice, two reasonable readings of the task — do not guess: end your reply with a \
-    single line `QUESTION: <one specific question, with the options you see>` and stop without \
+    single line `QUESTION: <one specific question, with the options you see labelled (A), (B), \
+    (C) and which you recommend>` and stop without \
     changing anything more. You will be resumed with the answer. Ask only when it truly changes \
     what you would build.";
 

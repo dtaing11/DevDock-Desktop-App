@@ -731,7 +731,8 @@ impl Workspace {
                 description: "Ask the developer one specific question and wait for the answer. Only \
                               for something genuinely uncertain that changes what you would build \
                               — a product choice, two reasonable readings of the task, a value \
-                              nobody wrote down. Offer the options you see. Not for anything you \
+                              nobody wrote down. Offer the options you see, labelled (A), (B), (C), \
+                              and say which you recommend. Not for anything you \
                               can find out from the code or decide reasonably yourself. If no \
                               answer comes you are told so; then decide, and say what you assumed.",
                 schema: serde_json::json!({

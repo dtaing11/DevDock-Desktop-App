@@ -976,26 +976,7 @@ pub fn screenshots_folder_button(ui: &mut egui::Ui) {
 fn question_box(app: &mut App, ui: &mut egui::Ui) {
     let mut answer = false;
     if let Some(q) = app.coding.question.as_mut() {
-        egui::Frame::new()
-            .fill(theme::ember().linear_multiply(0.12))
-            .stroke(egui::Stroke::new(1.0_f32, theme::ember()))
-            .corner_radius(theme::RADIUS_MD as f32)
-            .inner_margin(egui::Margin::symmetric(10, 8))
-            .show(ui, |ui| {
-                ui.label(RichText::new("The agent asks:").font(theme::semibold(theme::TEXT)).color(theme::ember()));
-                ui.add(egui::Label::new(RichText::new(&q.question).color(theme::fg())).wrap());
-                super::views::prose_box(ui, &mut q.draft, 2, "Your answer — it is waiting");
-                ui.horizontal(|ui| {
-                    let ready = !q.draft.trim().is_empty();
-                    if ui.add_enabled(ready, egui::Button::new("Answer").fill(theme::ember())).clicked() {
-                        answer = true;
-                    }
-                    if ui.small_button("Let it decide").clicked() {
-                        q.draft.clear();
-                        answer = true;
-                    }
-                });
-            });
+        answer = super::question::show(ui, q) == super::question::Outcome::Answer;
         ui.add_space(theme::UNIT);
     }
     if answer {

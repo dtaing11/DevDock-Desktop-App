@@ -849,29 +849,13 @@ pub(super) fn run_card(ui: &mut egui::Ui, key: &str, title: &str, run: &mut Tick
                     ui.label(RichText::new(title).color(theme::fg()));
                 }
             });
-            // The agent is waiting on an answer: the question, a box, a button.
+            // The agent is waiting on an answer: the question, its choices,
+            // a box, a button.
             if let Some(q) = run.question.as_mut() {
                 ui.add_space(4.0);
-                egui::Frame::new()
-                    .fill(theme::ember().linear_multiply(0.12))
-                    .stroke(egui::Stroke::new(1.0_f32, theme::ember()))
-                    .corner_radius(theme::RADIUS_MD as f32)
-                    .inner_margin(egui::Margin::symmetric(10, 8))
-                    .show(ui, |ui| {
-                        ui.label(RichText::new("The agent asks:").font(theme::semibold(theme::TEXT)).color(theme::ember()));
-                        wrapped(ui, RichText::new(&q.question).color(theme::fg()));
-                        super::views::prose_box(ui, &mut q.draft, 2, "Your answer — it is waiting");
-                        ui.horizontal(|ui| {
-                            let ready = !q.draft.trim().is_empty();
-                            if ui.add_enabled(ready, egui::Button::new("Answer").fill(theme::ember())).clicked() {
-                                action = CardAction::Answer;
-                            }
-                            if ui.small_button("Let it decide").on_hover_text("Sends no answer; the agent decides and states its assumption.").clicked() {
-                                q.draft.clear();
-                                action = CardAction::Answer;
-                            }
-                        });
-                    });
+                if super::question::show(ui, q) == super::question::Outcome::Answer {
+                    action = CardAction::Answer;
+                }
             }
             if !expanded && !last.is_empty() {
                 wrapped(ui, RichText::new(clip(&last, 240)).monospace().size(theme::SMALL).color(theme::fg_dim()));

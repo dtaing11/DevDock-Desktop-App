@@ -353,9 +353,13 @@ fn seed_agent(app: &mut App, mode: &str) {
             asking.started = Some(std::time::Instant::now() - std::time::Duration::from_secs(77));
             asking.log = ["branch fix/abc-15-export-csv from main", "· read lib/report.py", "· asked you: Should the CSV include the archived rows too?"].iter().map(|l| l.to_string()).collect();
             let (tx, _rx) = std::sync::mpsc::channel();
-            asking.question = Some(git_manage::app::backlog::PendingQuestion { question: "Should the CSV include the archived rows too?".into(), draft: String::new(), reply: tx });
+            asking.question = Some(git_manage::app::backlog::PendingQuestion { question: "For data the app cannot shift with the field (parquet-backed visualizations, and soil grids / irrigation systems / visualizations that also cover fields not being moved), do you want (A) a pre-save confirmation listing what stays behind, with no schema change (my recommendation); (B) option A plus a persisted `needs_recalibration` flag shown in the soil grid, Data Analyzer and irrigation pages; or (C) a render-time offset stored on parquet visualization documents, with A or B for the shared data?".into(), draft: String::new(), reply: tx });
             session.backlog.runs.insert("ABC-15".into(), asking);
             app.sessions.insert("/Users/dina/Documents/billing-api".into(), session);
+            // `RUNS_FILTER=waiting` shows only the run with a question.
+            if std::env::var("RUNS_FILTER").as_deref() == Ok("waiting") {
+                app.runs_view.filter = git_manage::app::runs_tab::Filter::Waiting;
+            }
         }
         app.coding.worktree.enabled = true;
         app.coding.task = "make `devdock branches --json` list upstreams too".into();

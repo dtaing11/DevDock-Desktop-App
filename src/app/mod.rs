@@ -17,6 +17,7 @@ pub mod editor;
 pub mod graph;
 pub mod markdown;
 pub mod palette;
+pub mod question;
 pub mod runs_tab;
 pub mod shortcuts;
 pub mod syntax;

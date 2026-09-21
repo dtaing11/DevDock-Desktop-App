@@ -424,20 +424,9 @@ fn tree_card(ui: &mut egui::Ui, source: &mut Source<'_>, expanded: bool) -> Tree
             });
             if let Some(q) = coding.question.as_mut() {
                 ui.add_space(theme::UNIT);
-                egui::Frame::new()
-                    .fill(theme::ember().linear_multiply(0.12))
-                    .stroke(egui::Stroke::new(1.0_f32, theme::ember()))
-                    .corner_radius(theme::RADIUS_MD as f32)
-                    .inner_margin(egui::Margin::symmetric(10, 8))
-                    .show(ui, |ui| {
-                        ui.label(RichText::new("The agent asks:").font(theme::semibold(theme::TEXT)).color(theme::ember()));
-                        ui.add(egui::Label::new(RichText::new(&q.question).color(theme::fg())).wrap());
-                        super::views::prose_box(ui, &mut q.draft, 2, "Your answer — it is waiting");
-                        let ready = !q.draft.trim().is_empty();
-                        if ui.add_enabled(ready, egui::Button::new("Answer").fill(theme::ember())).clicked() {
-                            action = TreeAction::Answer;
-                        }
-                    });
+                if super::question::show(ui, q) == super::question::Outcome::Answer {
+                    action = TreeAction::Answer;
+                }
             }
             if expanded {
                 ui.add_space(theme::UNIT);

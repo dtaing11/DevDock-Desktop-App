@@ -440,7 +440,11 @@ than guessing. The built-in harness has an `ask_developer` tool; Claude
 Code ends its reply with a `QUESTION:` line and is resumed in the same
 session with the answer. Either way a box appears on the run's card (or at
 the top of the Agent panel for a run in this tree) with the question and a
-place to type. **Answer** sends it; **Let it decide** sends nothing, and
+place to type. A question that offers choices — `(A) …; (B) …; or (C) …`
+in a sentence, or a lettered or numbered list — is drawn as one: the lead
+as prose with its inline code, each choice on a row with a button that
+picks it, the one the agent recommends marked. Pick one, add to it if you
+like, or write your own answer. **Answer** sends it; **Let it decide** sends nothing, and
 the agent proceeds on its best assumption and says what it assumed. An
 unanswered question times out after half an hour the same way. Runs from
 the command line are unattended and have no such line: the agent decides.

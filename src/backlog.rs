@@ -470,6 +470,7 @@ fn work(
     on_event: &mut dyn FnMut(String),
 ) -> Result<Fixed, String> {
     let wt = Repo::open(dir).map_err(|e| e.to_string())?;
+    let budget = Budget::new();
     if job.sandbox.is_none() {
         if let Some(line) = share_cargo_target(wt.path(), repo.path()) {
             on_event(line);
@@ -544,8 +545,9 @@ fn work(
     if !jobs.is_empty() {
         on_event("running the checks on the untouched tree first".into());
         for j in &jobs {
+            budget.check("while checking the untouched tree")?;
             on_event(format!("checking `{}` on the untouched tree", j.name));
-            let result = run_check(&runners, wt.path(), j, on_event);
+            let result = run_check(&runners, wt.path(), &budget.fit(j), on_event);
             if result.ok {
                 on_event(format!("`{}` passes on {} ({})", j.name, job.base, took(result.duration_secs)));
                 continue;
@@ -656,6 +658,7 @@ fn work(
     let mut round = 0;
     loop {
         round += 1;
+        budget.check(&format!("before round {round}"))?;
         on_event(format!("round {round} of {rounds}"));
         let task = match &feedback {
             None => base_task.clone(),
@@ -729,8 +732,9 @@ fn work(
         skipped.clone_from(&unfinished);
         let mut failed: Option<String> = None;
         for j in &jobs {
+            budget.check(&format!("while verifying round {round}"))?;
             on_event(format!("verifying: {}", j.name));
-            let result = run_check(&runners, wt.path(), j, on_event);
+            let result = run_check(&runners, wt.path(), &budget.fit(j), on_event);
             if !result.ok {
                 if let Some(before) = baseline.get(&j.name) {
                     if *before == normalize_output(&result.output) {
@@ -1157,6 +1161,47 @@ pub fn missing_program(output: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The whole run's time: however many checks a repository has and however
+/// long each may take, a run ends within this, its attempt kept. Each
+/// check's own timeout is cut to what is left, so the last one cannot
+/// carry the run past it either.
+struct Budget {
+    started: std::time::Instant,
+    limit: std::time::Duration,
+}
+
+impl Budget {
+    /// Three hours, or `DEVDOCK_RUN_MINUTES`.
+    fn new() -> Self {
+        let minutes = std::env::var("DEVDOCK_RUN_MINUTES").ok().and_then(|v| v.parse::<u64>().ok()).filter(|m| *m > 0).unwrap_or(180);
+        Self { started: std::time::Instant::now(), limit: std::time::Duration::from_secs(minutes * 60) }
+    }
+
+    fn left(&self) -> std::time::Duration {
+        self.limit.saturating_sub(self.started.elapsed())
+    }
+
+    /// An error when the time is spent, saying at what.
+    fn check(&self, at: &str) -> Result<(), String> {
+        if self.left().is_zero() {
+            return Err(format!(
+                "the run reached its limit of {} minutes {at} and was stopped; what it had is kept. \
+                 A repository whose checks take this long wants a `.git-manage-ci.toml` naming only the ones that matter.",
+                self.limit.as_secs() / 60
+            ));
+        }
+        Ok(())
+    }
+
+    /// `j` with its timeout cut to the time left.
+    fn fit(&self, j: &crate::local_ci::Job) -> crate::local_ci::Job {
+        let mut j = j.clone();
+        let own = j.timeout_secs.unwrap_or(crate::local_ci::DEFAULT_TIMEOUT_SECS);
+        j.timeout_secs = Some(own.min(self.left().as_secs().max(60)));
+        j
+    }
 }
 
 /// How a skipped check that never finished on the base branch is told
@@ -1644,6 +1689,22 @@ mod tests {
         assert_eq!(fixed.checks, [CheckOutcome { name: "tests".into(), ok: true }]);
         let paths: Vec<&str> = fixed.changes.iter().map(|c| c.path.as_str()).collect();
         assert_eq!(paths, ["lib.py"], "neither the submodule nor node_modules is part of the change");
+    }
+
+    #[test]
+    fn a_run_has_a_limit_and_checks_are_cut_to_what_is_left() {
+        let budget = Budget { started: std::time::Instant::now(), limit: std::time::Duration::from_secs(600) };
+        assert!(budget.check("anywhere").is_ok());
+        let j = crate::local_ci::Job { name: "t".into(), ..Default::default() };
+        let fitted = budget.fit(&j).timeout_secs.unwrap();
+        assert!((590..=600).contains(&fitted), "the default half hour is cut to the ten minutes left: {fitted}");
+        let short = crate::local_ci::Job { timeout_secs: Some(30), ..j.clone() };
+        assert_eq!(budget.fit(&short).timeout_secs, Some(30), "a shorter timeout of its own stays");
+
+        let spent = Budget { started: std::time::Instant::now() - std::time::Duration::from_secs(61), limit: std::time::Duration::from_secs(60) };
+        let err = spent.check("before round 2").unwrap_err();
+        assert!(err.contains("limit of 1 minutes before round 2") && err.contains("kept"), "{err}");
+        assert_eq!(spent.fit(&j).timeout_secs, Some(60), "never less than a minute");
     }
 
     /// A check that hangs on the untouched tree — a dependency fetch that

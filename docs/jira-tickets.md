@@ -175,6 +175,11 @@ did not finish rather than that it passed. Checks run with
 `GIT_TERMINAL_PROMPT=0`, so a private git dependency fails at once
 instead of waiting for a password nobody can type.
 
+A whole run has a limit too: three hours (`DEVDOCK_RUN_MINUTES` changes
+it). It is checked before every check and every round, each check's own
+timeout is cut to the time left, and a run that reaches it stops with its
+attempt kept and says where it was.
+
 ### When the machine, not the change, fails a check
 
 A check that fails the machine's way — a linker or compiler killed for

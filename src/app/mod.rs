@@ -4233,6 +4233,7 @@ impl App {
         let repo_key = self.repo_key();
         let progress = self.worker.progress().for_repo(repo_key.clone());
         let run_task = task.clone();
+        let stop_root = std::path::PathBuf::from(&repo_key);
         self.worker.spawn_for(repo_key, move || {
             let result = (|| -> Result<AgentReport, String> {
                 let engine = agent_engine(&sel, &url)?;
@@ -4295,6 +4296,9 @@ impl App {
                 }
 
                 let engine_label = engine.label();
+                // A run starts unstopped, whatever happened to the last one
+                // here; Stop on the tab sets the token this clears.
+                crate::cancel::reset(repo.path());
                 let run = crate::agent::coding::run_with(
                     &engine,
                     &mut workspace,
@@ -4327,8 +4331,25 @@ impl App {
                     engine: engine_label,
                 })
             })();
+            // The tree is the developer's again: its checks must not find
+            // a stop left over from this run.
+            crate::cancel::reset(&stop_root);
             Msg::AgentDone { kind: AgentKind::Coding, result }
         });
+    }
+
+    /// The kill switch for the run in this tree: whatever it is doing —
+    /// a model turn, a command, a check — ends, and what it changed stays
+    /// for review.
+    pub fn stop_coding_agent(&mut self) {
+        let Some(repo) = self.repo.clone() else { return };
+        if !self.coding.running {
+            return;
+        }
+        crate::cancel::stop(repo.path());
+        // A question it is waiting on is answered by the stop.
+        self.coding.question = None;
+        self.coding.log.push("stopping…".into());
     }
 
     /// Guidance for the coding agent: the repository's own review
@@ -4575,7 +4596,7 @@ impl App {
 
     fn on_agent_run_progress(&mut self, key: String, line: String) {
         if let Some(run) = self.coding.worktree.runs.get_mut(&key) {
-            run.log.push(line);
+            run.note(line);
         }
     }
 
@@ -6320,8 +6341,8 @@ mod tests {
         assert!(app.backlog.selected.contains("T-1"));
 
         // Two agents in flight, by hand: starting one for real needs a model.
-        app.backlog.runs.insert("T-1".into(), TicketRun { title: "one".into(), state: RunState::Running, kept: None, question: None, log: Vec::new(), started: Some(Instant::now()), took: None });
-        app.backlog.runs.insert("T-2".into(), TicketRun { title: "two".into(), state: RunState::Running, kept: None, question: None, log: Vec::new(), started: Some(Instant::now()), took: None });
+        app.backlog.runs.insert("T-1".into(), TicketRun { title: "one".into(), state: RunState::Running, kept: None, question: None, log: Vec::new(), started: Some(Instant::now()), took: None, stopping: false });
+        app.backlog.runs.insert("T-2".into(), TicketRun { title: "two".into(), state: RunState::Running, kept: None, question: None, log: Vec::new(), started: Some(Instant::now()), took: None, stopping: false });
         app.handle(Msg::BacklogProgress { key: "T-1".into(), line: "· read a.rs".into() });
         assert_eq!(app.backlog.runs["T-1"].log, ["· read a.rs"]);
         assert_eq!(app.backlog.running(), 2);

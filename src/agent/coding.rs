@@ -238,10 +238,14 @@ pub fn task_prompt(
 /// Budgets for a coding run: longer than a review or a merge, because the
 /// work is open-ended and the verify loop costs turns.
 pub fn limits() -> Limits {
+    // No cap on turns, tool calls or reading: a coding task takes what it
+    // takes, and one cut off at turn sixty with the work half done has
+    // spent sixty turns for nothing. The transcript is compacted as it
+    // grows; what ends a run is its finishing, its time, or the kill switch.
     Limits {
-        max_turns: 60,
-        max_tool_calls: 200,
-        max_read_bytes: 1_500_000,
+        max_turns: usize::MAX,
+        max_tool_calls: usize::MAX,
+        max_read_bytes: usize::MAX,
         max_tokens: 8192,
         max_transcript_bytes: 800_000,
     }
@@ -469,7 +473,9 @@ fn run_claude_code(
         }
         prompt.push_str(&image_note(&paths));
     }
-    let mut config = claude_code::Config { max_turns: request.limits.max_turns, ..config.clone() };
+    // Claude Code's own cap is off when the run's is: zero passes none.
+    let max_turns = if request.limits.max_turns == usize::MAX { 0 } else { request.limits.max_turns };
+    let mut config = claude_code::Config { max_turns, ..config.clone() };
     // With a sandbox, Claude Code itself runs inside it: installed there
     // the first time, signed in with this machine's sign-in, kept after.
     if let Some(sandbox) = workspace.sandbox() {

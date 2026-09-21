@@ -202,6 +202,7 @@ fn seed_backlog(app: &mut App) {
         log: log.iter().map(|l| l.to_string()).collect(),
         started: Some(std::time::Instant::now() - std::time::Duration::from_secs(94)),
         took: None,
+        stopping: false,
     };
     app.backlog.runs.insert(
         "DEV-41".into(),
@@ -371,6 +372,7 @@ fn seed_agent(app: &mut App, mode: &str) {
             log: log.iter().map(|l| l.to_string()).collect(),
             started: Some(std::time::Instant::now() - std::time::Duration::from_secs(131)),
             took: None,
+            stopping: false,
         };
         app.coding.worktree.runs.insert(
             "agent/add-a-json-flag-to-devdock-status".into(),

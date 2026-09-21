@@ -363,10 +363,12 @@ pub fn run_with_images(
         on_event(event);
     };
 
+    let stop = crate::cancel::token(workspace.root());
     for turn in 0..limits.max_turns {
+        stop.check()?;
         let out_of_calls = workspace.calls_used() >= limits.max_tool_calls;
         let out_of_bytes = workspace.bytes_read() >= limits.max_read_bytes;
-        let last_turn = turn + 1 == limits.max_turns;
+        let last_turn = limits.max_turns != usize::MAX && turn + 1 == limits.max_turns;
         let withhold_tools = out_of_calls || out_of_bytes || last_turn;
 
         if withhold_tools && !truncated {

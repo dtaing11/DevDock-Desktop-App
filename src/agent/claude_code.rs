@@ -50,7 +50,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { model: String::new(), max_turns: 60, timeout: Duration::from_secs(30 * 60), sandbox: None }
+        Self { model: String::new(), max_turns: 0, timeout: Duration::from_secs(3 * 60 * 60), sandbox: None }
     }
 }
 
@@ -382,13 +382,17 @@ fn run_with_tools(
         "--verbose".into(),
         "--permission-mode".into(),
         "acceptEdits".into(),
-        "--max-turns".into(),
-        config.max_turns.to_string(),
         "--allowedTools".into(),
         allowed.to_string(),
         "--disallowedTools".into(),
         disallowed_tools(),
     ];
+    // No turn limit unless one is set: a task takes the turns it takes,
+    // and what ends a run that should end is its time, or the kill switch.
+    if config.max_turns > 0 {
+        args.push("--max-turns".into());
+        args.push(config.max_turns.to_string());
+    }
     let mcp = mcp_launch(root);
     if mcp.config.is_some() {
         let config_path = match &config.sandbox {
@@ -470,6 +474,7 @@ fn run_with_tools(
     let mut outcome = Outcome::default();
     let deadline = Instant::now() + config.timeout;
     let mut timed_out = false;
+    let stop = crate::cancel::token(root);
     let mut exited: Option<Instant> = None;
     loop {
         match rx.recv_timeout(Duration::from_millis(200)) {
@@ -488,6 +493,13 @@ fn run_with_tools(
                     break;
                 }
             }
+        }
+        if stop.is_stopped() {
+            #[cfg(unix)]
+            crate::local_ci::runner::kill_group(pid);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(crate::cancel::STOPPED.to_string());
         }
         if Instant::now() >= deadline {
             timed_out = true;

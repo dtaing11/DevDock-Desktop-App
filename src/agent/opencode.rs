@@ -36,7 +36,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { model: String::new(), timeout: Duration::from_secs(30 * 60), sandbox: None }
+        Self { model: String::new(), timeout: Duration::from_secs(3 * 60 * 60), sandbox: None }
     }
 }
 
@@ -222,6 +222,7 @@ pub fn run(config: &Config, root: &Path, launch: Launch<'_>, on_event: &mut dyn 
     let mut outcome = Outcome::default();
     let deadline = Instant::now() + config.timeout;
     let mut timed_out = false;
+    let stop = crate::cancel::token(root);
     let mut exited: Option<Instant> = None;
     loop {
         match rx.recv_timeout(Duration::from_millis(200)) {
@@ -240,6 +241,13 @@ pub fn run(config: &Config, root: &Path, launch: Launch<'_>, on_event: &mut dyn 
                     break;
                 }
             }
+        }
+        if stop.is_stopped() {
+            #[cfg(unix)]
+            crate::local_ci::runner::kill_group(pid);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(crate::cancel::STOPPED.to_string());
         }
         if Instant::now() >= deadline {
             timed_out = true;

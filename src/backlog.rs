@@ -423,6 +423,11 @@ pub fn fix(
     }
 
     let mut result = work(repo, engine, job, &branch, &dir, publish, on_event);
+    // Stopped is not failed: say so first, whatever step the stop landed in.
+    if crate::cancel::token(&dir).is_stopped() {
+        result = result.map_err(|e| if crate::cancel::was_stopped(&e) { e } else { format!("{}.\n{e}", crate::cancel::STOPPED) });
+    }
+    crate::cancel::reset(&dir);
 
     // A failed run's attempt is not thrown away: it is committed on the
     // branch, unpushed, so there is something to finish by hand or to send
@@ -470,7 +475,7 @@ fn work(
     on_event: &mut dyn FnMut(String),
 ) -> Result<Fixed, String> {
     let wt = Repo::open(dir).map_err(|e| e.to_string())?;
-    let budget = Budget::new();
+    let budget = Budget::new(wt.path());
     if job.sandbox.is_none() {
         if let Some(line) = share_cargo_target(wt.path(), repo.path()) {
             on_event(line);
@@ -548,6 +553,7 @@ fn work(
             budget.check("while checking the untouched tree")?;
             on_event(format!("checking `{}` on the untouched tree", j.name));
             let result = run_check(&runners, wt.path(), &budget.fit(j), on_event);
+            budget.stop.check()?;
             if result.ok {
                 on_event(format!("`{}` passes on {} ({})", j.name, job.base, took(result.duration_secs)));
                 continue;
@@ -735,6 +741,7 @@ fn work(
             budget.check(&format!("while verifying round {round}"))?;
             on_event(format!("verifying: {}", j.name));
             let result = run_check(&runners, wt.path(), &budget.fit(j), on_event);
+            budget.stop.check()?;
             if !result.ok {
                 if let Some(before) = baseline.get(&j.name) {
                     if *before == normalize_output(&result.output) {
@@ -1170,13 +1177,16 @@ pub fn missing_program(output: &str) -> Option<String> {
 struct Budget {
     started: std::time::Instant,
     limit: std::time::Duration,
+    /// The run's kill switch, looked at wherever the time is.
+    stop: crate::cancel::Token,
 }
 
 impl Budget {
     /// Three hours, or `DEVDOCK_RUN_MINUTES`.
-    fn new() -> Self {
+    fn new(root: &Path) -> Self {
+        crate::cancel::reset(root);
         let minutes = std::env::var("DEVDOCK_RUN_MINUTES").ok().and_then(|v| v.parse::<u64>().ok()).filter(|m| *m > 0).unwrap_or(180);
-        Self { started: std::time::Instant::now(), limit: std::time::Duration::from_secs(minutes * 60) }
+        Self { started: std::time::Instant::now(), limit: std::time::Duration::from_secs(minutes * 60), stop: crate::cancel::token(root) }
     }
 
     fn left(&self) -> std::time::Duration {
@@ -1185,6 +1195,7 @@ impl Budget {
 
     /// An error when the time is spent, saying at what.
     fn check(&self, at: &str) -> Result<(), String> {
+        self.stop.check()?;
         if self.left().is_zero() {
             return Err(format!(
                 "the run reached its limit of {} minutes {at} and was stopped; what it had is kept. \
@@ -1691,9 +1702,46 @@ mod tests {
         assert_eq!(paths, ["lib.py"], "neither the submodule nor node_modules is part of the change");
     }
 
+    /// The kill switch: a run in the middle of a check that would take
+    /// half a minute ends within a second or two of being stopped, says it
+    /// was stopped rather than that it failed, and spends no round on it.
+    #[test]
+    fn a_stopped_run_ends_where_it_is() {
+        let (_tmp, repo) = setup("sleep 30");
+        let engine = Engine::Harness(Box::new(fixing_provider()));
+        let mut log: Vec<String> = Vec::new();
+        let started = std::time::Instant::now();
+        let mut worktree: Option<std::path::PathBuf> = None;
+        let err = fix(
+            &repo,
+            &engine,
+            &Job { task: &task(), base: "main", auth: None, instructions: None, sandbox: None, claim: None, rounds: 3, reviewer: None, ask: None },
+            &fake_pr,
+            &mut |line| {
+                if let Some(path) = line.strip_prefix("worktree ") {
+                    worktree = Some(path.into());
+                }
+                // Stop is pressed a moment into the first check.
+                if line.starts_with("checking `tests`") {
+                    let root = worktree.clone().expect("the worktree is named before any check");
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(400));
+                        crate::cancel::stop(&root);
+                    });
+                }
+                log.push(line);
+            },
+        )
+        .unwrap_err();
+        assert!(crate::cancel::was_stopped(&err), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+        assert!(!log.iter().any(|l| l.starts_with("round ")), "no round was started: {log:#?}");
+        assert!(!crate::cancel::token(&worktree.unwrap()).is_stopped(), "the next run here starts clean");
+    }
+
     #[test]
     fn a_run_has_a_limit_and_checks_are_cut_to_what_is_left() {
-        let budget = Budget { started: std::time::Instant::now(), limit: std::time::Duration::from_secs(600) };
+        let budget = Budget { started: std::time::Instant::now(), limit: std::time::Duration::from_secs(600), stop: Default::default() };
         assert!(budget.check("anywhere").is_ok());
         let j = crate::local_ci::Job { name: "t".into(), ..Default::default() };
         let fitted = budget.fit(&j).timeout_secs.unwrap();
@@ -1701,7 +1749,7 @@ mod tests {
         let short = crate::local_ci::Job { timeout_secs: Some(30), ..j.clone() };
         assert_eq!(budget.fit(&short).timeout_secs, Some(30), "a shorter timeout of its own stays");
 
-        let spent = Budget { started: std::time::Instant::now() - std::time::Duration::from_secs(61), limit: std::time::Duration::from_secs(60) };
+        let spent = Budget { started: std::time::Instant::now() - std::time::Duration::from_secs(61), limit: std::time::Duration::from_secs(60), stop: Default::default() };
         let err = spent.check("before round 2").unwrap_err();
         assert!(err.contains("limit of 1 minutes before round 2") && err.contains("kept"), "{err}");
         assert_eq!(spent.fit(&j).timeout_secs, Some(60), "never less than a minute");

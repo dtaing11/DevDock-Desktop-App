@@ -420,7 +420,7 @@ impl Sandbox {
         }
         let child = cmd.spawn().map_err(|e| format!("could not start the sandbox command: {e}"))?;
         let pid = child.id();
-        crate::local_ci::runner::wait_with_timeout(child, timeout, || crate::local_ci::runner::kill_group(pid))
+        crate::local_ci::runner::wait_stoppable(child, timeout, Some(crate::cancel::token(&self.root)), || crate::local_ci::runner::kill_group(pid))
     }
 
     /// A command that runs `program args…` inside the sandbox, in `subdir`

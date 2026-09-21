@@ -394,6 +394,7 @@ fn harness(app: &mut App, ui: &mut egui::Ui) {
     let done = steps.iter().filter(|s| s.done).count();
     let log = app.coding.log.clone();
     let time = ui.input(|i| i.time) as f32;
+    let mut stop = false;
 
     egui::Frame::new()
         .fill(theme::panel2())
@@ -413,6 +414,15 @@ fn harness(app: &mut App, ui: &mut egui::Ui) {
                 ui.label(RichText::new(text).font(theme::semibold(theme::TEXT)).color(color));
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // The kill switch, where the run says what it is doing.
+                    if running
+                        && ui
+                            .add(egui::Button::new(RichText::new("Stop").color(egui::Color32::WHITE)).fill(theme::danger()))
+                            .on_hover_text("End this run now — whatever it is doing. What it changed so far stays for you to review.")
+                            .clicked()
+                    {
+                        stop = true;
+                    }
                     if let Some(elapsed) = elapsed(app) {
                         ui.label(
                             RichText::new(elapsed)
@@ -478,6 +488,9 @@ fn harness(app: &mut App, ui: &mut egui::Ui) {
             }
         });
 
+    if stop {
+        app.stop_coding_agent();
+    }
     if running {
         // Motion needs frames; without this the strip animates only when
         // something else happens to repaint.
@@ -1056,6 +1069,11 @@ fn worktree_runs(app: &mut App, ui: &mut egui::Ui) {
                 super::backlog::CardAction::Answer => {
                     if let Some(q) = app.coding.worktree.runs.get_mut(&key).and_then(|r| r.question.take()) {
                         q.answer();
+                    }
+                }
+                super::backlog::CardAction::Stop => {
+                    if let Some(run) = app.coding.worktree.runs.get_mut(&key) {
+                        run.stop();
                     }
                 }
             }

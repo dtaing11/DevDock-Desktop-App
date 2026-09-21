@@ -163,7 +163,7 @@ impl Runner for HostRunner {
             .spawn()
             .map_err(|e| format!("failed to start: {e}"))?;
         let pid = child.id();
-        wait_with_timeout(child, request.timeout, || kill_group(pid))
+        wait_stoppable(child, request.timeout, Some(crate::cancel::token(request.repo_root)), || kill_group(pid))
     }
 }
 
@@ -296,7 +296,7 @@ impl Runner for DockerRunner {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("failed to start docker: {e}"))?;
-        wait_with_timeout(child, request.timeout, || {
+        wait_stoppable(child, request.timeout, Some(crate::cancel::token(request.repo_root)), || {
             let _ = Command::new("docker").args(["rm", "-f", &name]).output();
         })
     }
@@ -311,9 +311,16 @@ fn container_name() -> String {
 /// Waits for a child, collecting its output, and kills it — through
 /// `teardown`, then directly — once `timeout` has passed. A timed-out job
 /// is a failed job whose stderr says so.
-pub fn wait_with_timeout(
+pub fn wait_with_timeout(child: Child, timeout: Option<Duration>, teardown: impl FnOnce()) -> Result<ExecOutput, String> {
+    wait_stoppable(child, timeout, None, teardown)
+}
+
+/// [`wait_with_timeout`], ended early — the same way, torn down and
+/// killed — when `stop` is set: the kill switch for a run.
+pub fn wait_stoppable(
     mut child: Child,
     timeout: Option<Duration>,
+    stop: Option<crate::cancel::Token>,
     teardown: impl FnOnce(),
 ) -> Result<ExecOutput, String> {
     // Both pipes drained on their own threads: a child that fills one
@@ -322,14 +329,17 @@ pub fn wait_with_timeout(
     let stderr = child.stderr.take().map(PipeReader::start);
     let deadline = timeout.map(|t| Instant::now() + t);
     let mut timed_out = false;
+    let mut was_stopped = false;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {}
             Err(e) => return Err(format!("waiting for the job: {e}")),
         }
-        if deadline.is_some_and(|d| Instant::now() >= d) {
-            timed_out = true;
+        let stopped = stop.as_ref().is_some_and(|s| s.is_stopped());
+        if stopped || deadline.is_some_and(|d| Instant::now() >= d) {
+            timed_out = !stopped;
+            was_stopped = stopped;
             teardown();
             let _ = child.kill();
             break child.wait().map_err(|e| format!("waiting for the job: {e}"))?;
@@ -347,8 +357,11 @@ pub fn wait_with_timeout(
         let secs = timeout.map(|t| t.as_secs()).unwrap_or(0);
         err.push_str(&format!("\n{TIMEOUT_MARK} {secs}s]"));
     }
+    if was_stopped {
+        err.push_str(&format!("\n[{}]", crate::cancel::STOPPED));
+    }
     Ok(ExecOutput {
-        success: status.success() && !timed_out,
+        success: status.success() && !timed_out && !was_stopped,
         stdout: stdout.map(|r| r.finish(until)).unwrap_or_default(),
         stderr: err,
     })
@@ -469,6 +482,31 @@ mod tests {
         assert_eq!(out.stderr.trim(), "warn");
         assert!(started.elapsed() < Duration::from_secs(15), "took {:?}", started.elapsed());
         assert!(!timed_out(&out.stderr));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stopped_job_is_killed_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let mine = crate::cancel::token(dir.path());
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo started; sleep 30"]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        {
+            use std::os::unix::process::CommandExt as _;
+            cmd.process_group(0);
+        }
+        let child = cmd.spawn().unwrap();
+        let pid = child.id();
+        let root = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            crate::cancel::stop(&root);
+        });
+        let started = Instant::now();
+        let out = wait_stoppable(child, Some(Duration::from_secs(60)), Some(mine), || kill_group(pid)).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+        assert!(!out.success && out.stdout.contains("started"));
+        assert!(crate::cancel::was_stopped(&out.stderr) && !timed_out(&out.stderr), "{}", out.stderr);
     }
 
     struct FakeRunner {

@@ -55,6 +55,9 @@ Linux (Windows too, egui being cross-platform).
   any app with a screenshot command under a virtual display — and shown on
   the card, kept in DevDock's own screenshots folder. A run without a
   sandbox gets one started for the pictures alone. Never on your screen.
+- **Stop, and no turn limit**: a run takes the turns it takes, and a Stop
+  button on every card — and Stop all — ends one at once, whatever it is
+  doing, with its attempt kept.
 - **Every run in one tab**: the Runs tab lists every agent across every
   repository the window has open — running, waiting on you, failed, done —
   each a card that unfolds to its log, with the same buttons as elsewhere.

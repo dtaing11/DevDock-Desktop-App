@@ -64,6 +64,9 @@ pub struct TicketRun {
     pub log: Vec<String>,
     pub started: Option<Instant>,
     pub took: Option<Duration>,
+    /// Stop was pressed before the run had a worktree to be stopped by:
+    /// it is stopped the moment it names one.
+    pub stopping: bool,
 }
 
 /// The branch a failed run's reason says the attempt was kept on. The
@@ -75,8 +78,54 @@ pub fn kept_branch(reason: &str) -> Option<String> {
 }
 
 impl TicketRun {
+    /// The worktree the run works in, once it has said so: the root its
+    /// kill switch is keyed by. The fixer writes that line; this reads it.
+    pub fn worktree(&self) -> Option<std::path::PathBuf> {
+        self.log.iter().find_map(|l| l.strip_prefix("worktree ")).map(std::path::PathBuf::from)
+    }
+
+    /// The kill switch. A running run is stopped where it is — model turn,
+    /// command, check — and ends as failed with its attempt kept; one that
+    /// has not started is simply not started. `true` when the caller should
+    /// also take it off a queue.
+    pub fn stop(&mut self) -> bool {
+        // A question it is waiting on is answered by the stop.
+        self.question = None;
+        match (&self.state, self.worktree()) {
+            (RunState::Running, Some(root)) => {
+                crate::cancel::stop(&root);
+                self.log.push("stopping…".into());
+                false
+            }
+            // Started, but not yet in a worktree: stopped the moment it
+            // names one, in [`Self::note`].
+            (RunState::Running, None) => {
+                self.stopping = true;
+                self.log.push("stopping…".into());
+                false
+            }
+            (RunState::Queued, _) => {
+                self.log.push(format!("failed: {}", crate::cancel::STOPPED));
+                self.state = RunState::Failed(crate::cancel::STOPPED.into());
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A line of progress from the run.
+    pub fn note(&mut self, line: String) {
+        self.log.push(line);
+        if self.stopping {
+            if let Some(root) = self.worktree() {
+                crate::cancel::stop(&root);
+                self.stopping = false;
+            }
+        }
+    }
+
     pub fn queued(title: impl Into<String>) -> Self {
-        Self { title: title.into(), state: RunState::Queued, kept: None, question: None, log: Vec::new(), started: None, took: None }
+        Self { title: title.into(), state: RunState::Queued, kept: None, question: None, log: Vec::new(), started: None, took: None, stopping: false }
     }
 
     pub fn is_running(&self) -> bool {
@@ -488,7 +537,7 @@ impl App {
 
     pub(super) fn on_backlog_progress(&mut self, key: String, line: String) {
         if let Some(run) = self.backlog.runs.get_mut(&key) {
-            run.log.push(line);
+            run.note(line);
         }
     }
 
@@ -762,6 +811,11 @@ fn agent_card(app: &mut App, ui: &mut egui::Ui, key: &str) {
                 q.answer();
             }
         }
+        CardAction::Stop => {
+            if app.backlog.runs.get_mut(key).is_some_and(|r| r.stop()) {
+                app.backlog.queue.retain(|k| k != key);
+            }
+        }
     }
 }
 
@@ -799,6 +853,8 @@ pub(super) enum CardAction {
     PublishAttempt(String),
     /// Send the answer typed into the card's question box.
     Answer,
+    /// The kill switch: end the run now, keeping what it has.
+    Stop,
 }
 
 /// One agent's card: its state, what it is doing or did, its log on
@@ -835,6 +891,14 @@ pub(super) fn run_card(ui: &mut egui::Ui, key: &str, title: &str, run: &mut Tick
                     let toggle = if expanded { "Hide log".to_string() } else { format!("Log ({})", run.log.len()) };
                     if ui.small_button(toggle).clicked() {
                         action = CardAction::ToggleLog;
+                    }
+                    if matches!(run.state, RunState::Running | RunState::Queued)
+                        && ui
+                            .add(egui::Button::new(RichText::new("Stop").size(theme::SMALL).color(egui::Color32::WHITE)).fill(theme::danger()).small())
+                            .on_hover_text("End this run now — whatever it is doing. What it changed is kept on its branch, unpushed.")
+                            .clicked()
+                    {
+                        action = CardAction::Stop;
                     }
                     if !run.log.is_empty()
                         && ui.small_button("Copy log").on_hover_text("The whole log, to paste somewhere").clicked()

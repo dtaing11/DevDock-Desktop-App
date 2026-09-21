@@ -389,6 +389,26 @@ It needs GitHub sign-in, because the outcome is a pull request. A prompt that
 needs a decision from you is not a fit: the agent is told nobody can answer,
 and to change nothing rather than guess.
 
+### Stop, and no turn limit
+
+A coding run has no cap on turns, tool calls or reading — for the
+built-in harness, Claude Code (no `--max-turns` is passed) or OpenCode. A
+task takes what it takes: one cut off at turn sixty with the work half
+done has spent sixty turns for nothing. The transcript is compacted as it
+grows. What ends a run is its finishing, its time — three hours for an
+engine, and for a whole worktree run (`DEVDOCK_RUN_MINUTES`) — or you.
+
+**Stop** is the kill switch: on every running or queued card, on the
+Agent tab's status strip for the run in this tree, and as **Stop all** in
+the Runs tab for every agent in every repository at once. It ends
+whatever the run is doing at that moment — a model turn, a command, a
+check, a command in the sandbox — by killing its process group, not by
+waiting for the step to finish. A stopped worktree run says it was
+stopped rather than that it failed, spends no further round, and keeps
+its attempt on its branch like any run that did not get through; a run
+in your tree leaves what it changed for you to review. A queued ticket
+is taken off the queue.
+
 ### Every run, in one tab
 
 The **Runs** tab lists every agent run the window knows of: the runs in

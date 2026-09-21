@@ -213,6 +213,15 @@ pub fn runs_sidebar(app: &mut App, ui: &mut egui::Ui) {
         ui.label(RichText::new(tally.line()).small().color(theme::fg_dim()));
         ui.add_space(theme::UNIT);
     }
+    let running: usize = tallies.iter().map(|(_, _, t)| t.running).sum();
+    if running > 0
+        && ui
+            .add(egui::Button::new(RichText::new(format!("Stop all ({running})")).color(egui::Color32::WHITE)).fill(theme::danger()))
+            .on_hover_text("The kill switch for everything: every running and queued agent, in every repository, ends now. Attempts are kept on their branches.")
+            .clicked()
+    {
+        stop_all(app);
+    }
     if finished > 0 && ui.small_button("Clear finished everywhere").on_hover_text("Drops every done and failed card, in every repository. Kept attempts stay on their branches.").clicked() {
         clear_finished(app);
     }
@@ -227,6 +236,32 @@ pub fn runs_sidebar(app: &mut App, ui: &mut egui::Ui) {
         .small()
         .color(theme::fg_dim()),
     );
+}
+
+/// The kill switch for everything: every run in every repository.
+pub fn stop_all(app: &mut App) {
+    fn stop_in(key: &str, coding: &mut CodingState, backlog: &mut BacklogState) {
+        if coding.running {
+            crate::cancel::stop(std::path::Path::new(key));
+            coding.question = None;
+            coding.log.push("stopping…".into());
+        }
+        for run in coding.worktree.runs.values_mut() {
+            run.stop();
+        }
+        let mut unqueue = Vec::new();
+        for (ticket, run) in backlog.runs.iter_mut() {
+            if run.stop() {
+                unqueue.push(ticket.clone());
+            }
+        }
+        backlog.queue.retain(|k| !unqueue.contains(k));
+    }
+    let current = app.repo_key();
+    stop_in(&current, &mut app.coding, &mut app.backlog);
+    for (key, session) in app.sessions.iter_mut() {
+        stop_in(key, &mut session.coding, &mut session.backlog);
+    }
 }
 
 fn clear_finished(app: &mut App) {
@@ -330,13 +365,15 @@ fn repository_section(
         let id = format!("{}\ntree", source.key);
         let expanded = view.expanded.as_deref() == Some(id.as_str());
         match tree_card(ui, source, expanded) {
-            TreeAction::None | TreeAction::Answer => {}
+            TreeAction::None | TreeAction::Answer | TreeAction::Stop => {}
             TreeAction::ToggleLog => view.expanded = if expanded { None } else { Some(id) },
             TreeAction::GoTo => pending.push(Pending::GoTo { repo: source.key.clone() }),
         }
         ui.add_space(theme::UNIT);
     }
 
+    // Tickets stopped before they started, to take off the backlog's queue.
+    let mut unqueue: Vec<String> = Vec::new();
     for (keys, runs, what) in [
         (worktree_keys, &mut source.coding.worktree.runs, "worktree"),
         (backlog_keys, &mut source.backlog.runs, "ticket"),
@@ -357,10 +394,16 @@ fn repository_section(
                         q.answer();
                     }
                 }
+                CardAction::Stop => {
+                    if runs.get_mut(&key).is_some_and(|r| r.stop()) {
+                        unqueue.push(key.clone());
+                    }
+                }
             }
             ui.add_space(theme::UNIT);
         }
     }
+    source.backlog.queue.retain(|k| !unqueue.contains(k));
     ui.add_space(theme::UNIT * 2.0);
     count
 }
@@ -370,6 +413,7 @@ enum TreeAction {
     ToggleLog,
     GoTo,
     Answer,
+    Stop,
 }
 
 /// The run in the repository's own tree: the Agent tab's, which is not a
@@ -421,6 +465,14 @@ fn tree_card(ui: &mut egui::Ui, source: &mut Source<'_>, expanded: bool) -> Tree
                 if ui.small_button("Agent tab").on_hover_text("The full view: the diff, the plan, the transcript").clicked() {
                     action = TreeAction::GoTo;
                 }
+                if coding.running
+                    && ui
+                        .add(egui::Button::new(RichText::new("Stop").size(theme::SMALL).color(egui::Color32::WHITE)).fill(theme::danger()).small())
+                        .on_hover_text("End this run now — whatever it is doing. What it changed so far stays for review.")
+                        .clicked()
+                {
+                    action = TreeAction::Stop;
+                }
             });
             if let Some(q) = coding.question.as_mut() {
                 ui.add_space(theme::UNIT);
@@ -444,6 +496,12 @@ fn tree_card(ui: &mut egui::Ui, source: &mut Source<'_>, expanded: bool) -> Tree
             }
         });
     // The answer: sent from here, the same as the Agent tab would.
+    if matches!(action, TreeAction::Stop) {
+        crate::cancel::stop(std::path::Path::new(&source.key));
+        coding.question = None;
+        coding.log.push("stopping…".into());
+        return TreeAction::None;
+    }
     if matches!(action, TreeAction::Answer) {
         if let Some(q) = coding.question.take() {
             q.answer();

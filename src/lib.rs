@@ -39,6 +39,7 @@ pub mod review;
 pub mod secure_store;
 pub mod stack;
 pub mod backlog;
+pub mod cancel;
 pub mod sandbox;
 pub mod screenshots;
 pub mod terminal;

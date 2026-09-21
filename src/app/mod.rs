@@ -1778,6 +1778,13 @@ impl App {
                         }
                         let session = self.sessions.remove(&path).unwrap_or_default();
                         self.restore_session(session);
+                        // The conversation from the last launch, when this
+                        // launch has not had one here yet.
+                        if self.coding.history.is_empty() && !self.coding.running {
+                            let saved = agent_tab::SavedChat::load(&path);
+                            self.coding.history = saved.history;
+                            self.coding.session = saved.session;
+                        }
                     }
                     self.repo = Some(repo);
                     self.dialog = Dialog::None;
@@ -2389,7 +2396,15 @@ impl App {
             },
             Msg::AgentEvent { kind, line } => match kind {
                 AgentKind::Conflict => self.agent.log.push(line),
-                AgentKind::Coding => self.coding.log.push(line),
+                // The engine's session, kept for the next message rather
+                // than shown: it is what a reply resumes, even when this
+                // run ends cut short.
+                AgentKind::Coding => match line.strip_prefix(crate::agent::SESSION_LINE) {
+                    Some(id) => {
+                        self.coding.session = Some(agent_tab::EngineSession { provider: self.coding.running_provider.clone(), id: id.trim().to_string() });
+                    }
+                    None => self.coding.log.push(line),
+                },
                 AgentKind::Tickets => self.tickets.log.push(line),
             },
             Msg::AgentDone { kind: AgentKind::Coding, result } => {
@@ -4194,6 +4209,14 @@ impl App {
 
         let live = self.coding.iterate;
         let history = self.coding.turns();
+        // The same engine as the message before: its own session is
+        // resumed, with everything it had read. Another engine goes by the
+        // conversation so far.
+        let resume = self.coding.session.as_ref().filter(|s| s.provider == sel.provider && !history.is_empty()).map(|s| s.id.clone());
+        if resume.is_none() {
+            self.coding.session = None;
+        }
+        self.coding.running_provider = sel.provider.clone();
         let images: Vec<crate::agent::Attachment> = self.coding.images.drain(..).map(|i| i.attachment).collect();
         let branch = self.status.as_ref().map(|s| s.branch.clone());
         let instructions = self.coding_instructions();
@@ -4309,6 +4332,7 @@ impl App {
                         instructions: instructions.as_deref(),
                         context: (!context.trim().is_empty()).then_some(context.as_str()),
                         images: &images,
+                        resume: resume.as_deref(),
                         limits: crate::agent::coding::limits(),
                     },
                     &mut |event| match event {
@@ -4420,25 +4444,47 @@ impl App {
     /// draft pull request, and the worktree removed. This tree is not
     /// touched, so several can run at once and the box is free again.
     pub fn start_worktree_run(&mut self) {
-        let Some(repo) = self.repo.clone() else { return };
         let prompt = self.coding.task.trim().to_string();
         if prompt.is_empty() {
             return;
         }
+        let mut task = crate::backlog::Task::from_prompt(&prompt).with_branch(&self.coding.worktree.branch);
+        task.images = self.coding.images.drain(..).map(|i| i.attachment).collect();
+        if self.launch_worktree_run(task, prompt) {
+            self.coding.task.clear();
+            self.coding.worktree.branch.clear();
+        }
+    }
+
+    /// A reply to a worktree run that did not get through: the same
+    /// branch, continued with what the attempt left, told what to do now.
+    pub fn reply_to_worktree_run(&mut self, branch: &str, reply: &str) {
+        let Some(run) = self.coding.worktree.runs.get(branch) else { return };
+        let backlog::RunState::Failed(why) = &run.state else { return };
+        if reply.trim().is_empty() {
+            return;
+        }
+        let original = if run.prompt.trim().is_empty() { run.title.clone() } else { run.prompt.clone() };
+        let task = crate::backlog::Task::reply_to(&original, branch, why, reply);
+        self.launch_worktree_run(task, original);
+    }
+
+    /// Starts `task` in a worktree of its own. `false` when it could not
+    /// be started, and the reason is on screen.
+    fn launch_worktree_run(&mut self, task: crate::backlog::Task, prompt: String) -> bool {
+        let Some(repo) = self.repo.clone() else { return false };
         let Some(sel) = self.ai_selection(worker::AiTarget::Coding) else {
             self.toast("No AI model selected. Pick one next to the task box.", true);
-            return;
+            return false;
         };
         if github::Client::from_store().is_none() {
             self.toast("Sign in to GitHub first: a worktree run ends as a draft pull request.", true);
-            return;
+            return false;
         }
-        let mut task = crate::backlog::Task::from_prompt(&prompt).with_branch(&self.coding.worktree.branch);
-        task.images = self.coding.images.drain(..).map(|i| i.attachment).collect();
         let key = task.branch.clone();
         if self.coding.worktree.runs.get(&key).is_some_and(|r| !r.is_finished()) {
             self.toast(format!("An agent is already working on {key}. Name another branch."), true);
-            return;
+            return false;
         }
         let url = self.effective_ollama_url();
         let token = self.gh_token();
@@ -4451,10 +4497,14 @@ impl App {
         let mut run = backlog::TicketRun::queued(task.title.clone());
         run.state = backlog::RunState::Running;
         run.started = Some(Instant::now());
+        run.prompt = prompt;
+        // A reply keeps the log of what it replies to above its own.
+        if let Some(before) = self.coding.worktree.runs.get(&key) {
+            run.log = before.log.clone();
+            run.log.push("— reply —".into());
+        }
         self.coding.worktree.runs.insert(key.clone(), run);
         self.coding.worktree.expanded = Some(key.clone());
-        self.coding.task.clear();
-        self.coding.worktree.branch.clear();
         self.tab = Tab::Agent;
 
         let repo_key = self.repo_key();
@@ -4491,6 +4541,7 @@ impl App {
             })();
             Msg::AgentRunDone { key: done_key, result: result.map(Box::new) }
         });
+        true
     }
 
     /// Checks a kept attempt's branch out — under `<repo>-attempts/`, so
@@ -4658,6 +4709,7 @@ impl App {
                     task,
                     summary: report.summary,
                     changed: self.coding.edits.len(),
+                    outcome: agent_tab::Outcome::Done,
                 });
                 // A live run already changed the working tree.
                 if self.coding.live {
@@ -4668,12 +4720,45 @@ impl App {
                 }
             }
             Err(e) => {
-                // Keep the task so it can be retried or edited.
-                self.coding.task = task;
+                // Part of the conversation, not a dead end: the next message
+                // — "continue", or what to do instead — picks it up with the
+                // task and what happened already said.
+                let stopped = crate::cancel::was_stopped(&e);
+                self.coding.history.push(agent_tab::Exchange {
+                    task,
+                    summary: e.lines().next().unwrap_or("").chars().take(300).collect(),
+                    changed: 0,
+                    outcome: if stopped { agent_tab::Outcome::Stopped } else { agent_tab::Outcome::Failed },
+                });
                 self.coding.error = Some(e.clone());
-                self.toast(e, true);
+                if self.coding.live {
+                    self.refresh();
+                }
+                self.toast(if stopped { "Stopped. Reply to continue, or say what to do instead.".to_string() } else { e }, !stopped);
             }
         }
+        let key = self.repo_key();
+        self.coding.saved().save(&key);
+    }
+
+    /// Sends the reply typed under the conversation as the next message.
+    pub fn send_coding_reply(&mut self, text: &str) {
+        if self.coding.running || text.trim().is_empty() {
+            return;
+        }
+        self.coding.task = text.trim().to_string();
+        self.coding.reply.clear();
+        self.start_coding_agent();
+    }
+
+    /// Starts a new conversation with the coding agent in this repository.
+    pub fn new_coding_chat(&mut self) {
+        if self.coding.running {
+            return;
+        }
+        self.coding.new_chat();
+        let key = self.repo_key();
+        self.coding.saved().save(&key);
     }
 
     /// Writes the proposals the user ticked (overlay mode).
@@ -5621,6 +5706,7 @@ mod tests {
             task: "earlier task".into(),
             summary: "earlier summary".into(),
             changed: 1,
+            outcome: Default::default(),
         });
         app.coding.edits = vec![ProposedEdit {
             edit: crate::agent::PendingEdit {
@@ -6341,8 +6427,8 @@ mod tests {
         assert!(app.backlog.selected.contains("T-1"));
 
         // Two agents in flight, by hand: starting one for real needs a model.
-        app.backlog.runs.insert("T-1".into(), TicketRun { title: "one".into(), state: RunState::Running, kept: None, question: None, log: Vec::new(), started: Some(Instant::now()), took: None, stopping: false });
-        app.backlog.runs.insert("T-2".into(), TicketRun { title: "two".into(), state: RunState::Running, kept: None, question: None, log: Vec::new(), started: Some(Instant::now()), took: None, stopping: false });
+        app.backlog.runs.insert("T-1".into(), TicketRun { title: "one".into(), state: RunState::Running, kept: None, question: None, log: Vec::new(), started: Some(Instant::now()), took: None, prompt: String::new(), reply: String::new(), stopping: false });
+        app.backlog.runs.insert("T-2".into(), TicketRun { title: "two".into(), state: RunState::Running, kept: None, question: None, log: Vec::new(), started: Some(Instant::now()), took: None, prompt: String::new(), reply: String::new(), stopping: false });
         app.handle(Msg::BacklogProgress { key: "T-1".into(), line: "· read a.rs".into() });
         assert_eq!(app.backlog.runs["T-1"].log, ["· read a.rs"]);
         assert_eq!(app.backlog.running(), 2);
@@ -6489,6 +6575,44 @@ mod tests {
         assert!(app.coding.worktree.runs.is_empty());
     }
 
+    /// The Agent tab is a conversation: a run that is cut short or stopped
+    /// is part of it, the engine's session is kept for the next message,
+    /// and that message resumes it only when the engine is the same one.
+    #[test]
+    fn a_cut_short_run_stays_in_the_conversation_and_its_session_is_kept() {
+        let ctx = egui::Context::default();
+        let mut app = App::new_for_test(&ctx);
+        app.coding.running = true;
+        app.coding.running_provider = "claude-code".into();
+        app.coding.task = "make every button green".into();
+
+        // The session arrives as a line; it is kept, not logged.
+        app.handle(Msg::AgentEvent { kind: AgentKind::Coding, line: "session abc-123".into() });
+        app.handle(Msg::AgentEvent { kind: AgentKind::Coding, line: "· edit theme.rs".into() });
+        assert_eq!(app.coding.log, ["· edit theme.rs"]);
+        assert_eq!(app.coding.session, Some(agent_tab::EngineSession { provider: "claude-code".into(), id: "abc-123".into() }));
+
+        app.handle(Msg::AgentDone { kind: AgentKind::Coding, result: Err("Claude Code ran longer than 1800s and was stopped.".into()) });
+        assert!(!app.coding.running);
+        assert_eq!(app.coding.history.len(), 1);
+        assert_eq!(app.coding.history[0].task, "make every button green");
+        assert_eq!(app.coding.history[0].outcome, agent_tab::Outcome::Failed);
+        assert!(app.coding.task.is_empty(), "the task is in the conversation now, not waiting to be re-sent");
+        let turns = app.coding.turns();
+        assert!(turns[0].summary.contains("cut short") && turns[0].summary.contains("ran longer"), "{}", turns[0].summary);
+
+        // Stopped by the kill switch reads as that.
+        app.coding.running = true;
+        app.coding.task = "continue".into();
+        app.handle(Msg::AgentDone { kind: AgentKind::Coding, result: Err(crate::cancel::STOPPED.into()) });
+        assert_eq!(app.coding.history[1].outcome, agent_tab::Outcome::Stopped);
+        assert!(app.coding.turns()[1].summary.contains("stopped you"));
+
+        // A new chat forgets both.
+        app.new_coding_chat();
+        assert!(app.coding.history.is_empty() && app.coding.session.is_none());
+    }
+
     /// An agent's question reaches the card of its run, the answer typed
     /// there reaches the agent, and the in-tab run has its own box.
     #[test]
@@ -6550,7 +6674,7 @@ mod tests {
         let (_tmp, mut app, _file) = app_with_repo();
         let a = app.repo_key();
         app.coding.task = "task for A".into();
-        app.coding.history.push(agent_tab::Exchange { task: "earlier".into(), summary: "done".into(), changed: 1 });
+        app.coding.history.push(agent_tab::Exchange { task: "earlier".into(), summary: "done".into(), changed: 1, outcome: Default::default() });
         let mut run = TicketRun::queued("run on A");
         run.state = RunState::Running;
         run.started = Some(Instant::now());

@@ -167,6 +167,11 @@ pub struct Task {
     pub triage: Option<Triage>,
     /// Images the developer attached to a prompt.
     pub images: Vec<crate::agent::Attachment>,
+    /// What was asked and what happened before this, on the same branch:
+    /// set when the task is a reply to a run that did not get through, and
+    /// the run then continues on that branch with what the attempt left
+    /// instead of refusing because the branch exists.
+    pub earlier: Vec<coding::Turn>,
 }
 
 impl Task {
@@ -181,6 +186,7 @@ impl Task {
             branch: branch_name(issue),
             triage: triage.cloned(),
             images: Vec::new(),
+            earlier: Vec::new(),
         }
     }
 
@@ -200,7 +206,26 @@ impl Task {
             branch: if slug.is_empty() { "agent/task".into() } else { format!("agent/{slug}") },
             triage: None,
             images: Vec::new(),
+            earlier: Vec::new(),
         }
+    }
+
+    /// This task as a reply to a run on `branch` that did not get through:
+    /// the same title, so the commit and the pull request are still named
+    /// for the work and not for "continue"; the reply added to the brief;
+    /// and what was asked and what happened as the conversation before it.
+    pub fn reply_to(original: &str, branch: &str, what_happened: &str, reply: &str) -> Self {
+        let mut task = Self::from_prompt(original);
+        task.branch = branch.to_string();
+        task.brief = format!("{}\n\nThe developer's follow-up, which is what to do now:\n{}", original.trim(), reply.trim());
+        task.earlier = vec![coding::Turn {
+            task: original.trim().to_string(),
+            summary: format!(
+                "(this did not get through: {}. What you had changed is on this branch, uncommitted — read it before redoing anything.)",
+                what_happened.lines().next().unwrap_or("").trim()
+            ),
+        }];
+        task
     }
 
     /// A branch name as a person typed it, made valid: spaces and other
@@ -407,13 +432,28 @@ pub fn fix(
     {
         let _guard = WORKTREE_LOCK.lock().map_err(|_| "worktree lock poisoned".to_string())?;
         let exists = repo.branches().map(|b| b.local.iter().any(|br| br.name == branch)).unwrap_or(false);
-        if exists {
+        if exists && job.task.earlier.is_empty() {
             return Err(format!(
-                "branch {branch} already exists; a previous attempt left it. Delete it \
-                 (git branch -D {branch}), finish it by hand, or open its pull request."
+                "branch {branch} already exists; a previous attempt left it. Reply on its card to \
+                 continue it, delete it (git branch -D {branch}), finish it by hand, or open its pull request."
             ));
         }
-        repo.worktree_add(&dir, &branch, Some(job.base)).map_err(|e| e.to_string())?;
+        if exists {
+            // A reply to a run that did not get through: the same branch,
+            // with what the attempt left. Its work-in-progress commit is
+            // taken back off, so the changes are the run's to finish and
+            // the branch ends with one real commit, not two.
+            repo.worktree_add(&dir, &branch, None).map_err(|e| format!("could not continue on {branch}: {e}"))?;
+            on_event(format!("continuing on {branch}, with what the last attempt left"));
+            if let Ok(wt) = Repo::open(&dir) {
+                let subject = wt.git(&["log", "-1", "--format=%s"]).unwrap_or_default();
+                if subject.starts_with(WIP_PREFIX) {
+                    let _ = wt.git(&["reset", "-q", "--mixed", "HEAD~1"]);
+                }
+            }
+        } else {
+            repo.worktree_add(&dir, &branch, Some(job.base)).map_err(|e| e.to_string())?;
+        }
     }
     on_event(format!("worktree {}", dir.display()));
     if let Some(claim) = job.claim {
@@ -654,7 +694,8 @@ fn work(
     // session — a second pair of eyes on the same model still helps.
     let advisor = job.reviewer.unwrap_or(engine);
     let mut feedback: Option<String> = None;
-    let mut history: Vec<coding::Turn> = Vec::new();
+    // A reply starts from the conversation before it.
+    let mut history: Vec<coding::Turn> = job.task.earlier.clone();
     let mut last_diff: Option<String> = None;
     let mut turns = 0;
     let mut summary;
@@ -1132,7 +1173,7 @@ fn keep_attempt(dir: &Path, task: &Task, why: &str) -> Option<String> {
     if changes.is_empty() {
         return None;
     }
-    let subject = format!("WIP: {} (not accepted)", truncate(&task.subject(), 50));
+    let subject = format!("{WIP_PREFIX}{} (not accepted)", truncate(&task.subject(), 50));
     let body = format!("The coding agent's attempt, kept for a person to finish.\n\nNot accepted because:\n{}", first_line(why));
     wt.commit(&subject, &body, false).ok()?;
     let branch = wt.git(&["rev-parse", "--abbrev-ref", "HEAD"]).ok()?.trim().to_string();
@@ -1214,6 +1255,9 @@ impl Budget {
         j
     }
 }
+
+/// How the commit that keeps a failed run's attempt starts.
+const WIP_PREFIX: &str = "WIP: ";
 
 /// How a skipped check that never finished on the base branch is told
 /// from one that failed there.
@@ -1700,6 +1744,54 @@ mod tests {
         assert_eq!(fixed.checks, [CheckOutcome { name: "tests".into(), ok: true }]);
         let paths: Vec<&str> = fixed.changes.iter().map(|c| c.path.as_str()).collect();
         assert_eq!(paths, ["lib.py"], "neither the submodule nor node_modules is part of the change");
+    }
+
+    /// A reply to a run that did not get through continues it: the same
+    /// branch, the attempt's changes still there and its work-in-progress
+    /// commit taken back off, the conversation before it in the prompt —
+    /// and one real commit at the end, named for the work, not the reply.
+    #[test]
+    fn a_reply_continues_a_kept_attempt_on_its_branch() {
+        // Passes only with the fix and a second file the first run never writes.
+        // It prints the file when it fails, so a failure after the change
+        // is not the same failure as before it.
+        let (_tmp, repo) = setup("test -f notes.txt && grep -q 'return sum(xs)$' lib.py || { cat lib.py; exit 1; }");
+        let prompt = "fix total() and note it\n\nIt adds one too many.";
+        let first = Task::from_prompt(prompt);
+        let branch = first.branch.clone();
+        let engine = Engine::Harness(Box::new(fixing_provider()));
+        let err = fix(&repo, &engine, &Job { task: &first, base: "main", auth: None, instructions: None, sandbox: None, claim: None, rounds: 1, reviewer: None, ask: None }, &fake_pr, &mut |_| {})
+            .unwrap_err();
+        assert_eq!(crate::app::backlog::kept_branch(&err).as_deref(), Some(branch.as_str()), "{err}");
+        assert!(repo.git(&["log", "-1", "--format=%s", &branch]).unwrap().starts_with(WIP_PREFIX));
+
+        // Without a reply, the branch is in the way — and the error says what to do.
+        let again = fix(&repo, &Engine::Harness(Box::new(fixing_provider())), &Job { task: &first, base: "main", auth: None, instructions: None, sandbox: None, claim: None, rounds: 1, reviewer: None, ask: None }, &fake_pr, &mut |_| {})
+            .unwrap_err();
+        assert!(again.contains("already exists") && again.contains("Reply on its card"), "{again}");
+
+        // The reply: the fix is already there; it only adds the note.
+        let reply = Task::reply_to(prompt, &branch, &err, "add notes.txt saying what changed");
+        assert_eq!(reply.title, first.title, "named for the work, not for the reply");
+        assert!(reply.brief.contains("add notes.txt") && reply.earlier[0].summary.contains("did not get through"));
+        let noting = Scripted(RefCell::new(vec![
+            Reply {
+                text: String::new(),
+                calls: vec![ToolCall { id: "1".into(), name: "write_file".into(), input: serde_json::json!({"path": "notes.txt", "content": "total() no longer adds one\n"}) }],
+                ..Default::default()
+            },
+            Reply { text: String::new(), calls: vec![ToolCall { id: "2".into(), name: "run_check".into(), input: serde_json::json!({"name": "tests"}) }], ..Default::default() },
+            Reply { text: "- notes.txt: says what changed\n\nVerified: tests".into(), ..Default::default() },
+        ]));
+        let mut log = Vec::new();
+        let fixed = fix(&repo, &Engine::Harness(Box::new(noting)), &Job { task: &reply, base: "main", auth: None, instructions: None, sandbox: None, claim: None, rounds: 1, reviewer: None, ask: None }, &fake_pr, &mut |l| log.push(l))
+            .unwrap_or_else(|e| panic!("{e}\n{log:#?}"));
+        assert!(log.iter().any(|l| l == &format!("continuing on {branch}, with what the last attempt left")), "{log:#?}");
+        let paths: Vec<&str> = fixed.changes.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, ["lib.py", "notes.txt"], "the attempt's change and the reply's, together");
+        let subjects = repo.git(&["log", "--format=%s", &format!("main..{branch}")]).unwrap();
+        assert_eq!(subjects.lines().count(), 1, "one real commit, the WIP one gone: {subjects}");
+        assert!(!subjects.contains("WIP") && subjects.contains("fix total() and note it"), "{subjects}");
     }
 
     /// The kill switch: a run in the middle of a check that would take

@@ -321,11 +321,17 @@ struct Outcome {
 /// `step_finish`, `reasoning`, `error`.
 fn parse_line(line: &str, root: &Path, outcome: &mut Outcome) -> Vec<Event> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else { return Vec::new() };
+    // Said once, the first time it is known: a run that ends cut short
+    // still leaves the session a reply can pick up.
+    let mut new_session = None;
     if let Some(id) = value.get("sessionID").and_then(|s| s.as_str()) {
+        if outcome.session_id.as_deref() != Some(id) {
+            new_session = Some(id.to_string());
+        }
         outcome.session_id = Some(id.to_string());
     }
     let part = value.get("part").cloned().unwrap_or_default();
-    let mut events = Vec::new();
+    let mut events: Vec<Event> = new_session.map(Event::Session).into_iter().collect();
     match value.get("type").and_then(|t| t.as_str()).unwrap_or("") {
         "text" => {
             if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
@@ -471,6 +477,11 @@ mod tests {
             events.extend(parse_line(line, root, &mut outcome));
         }
         let lines: Vec<String> = events.iter().map(|e| e.line()).collect();
+        // The session is said once, first, so a reply can resume it even
+        // when the run ends cut short.
+        assert_eq!(lines[0], "session ses_1");
+        assert_eq!(lines.iter().filter(|l| l.starts_with("session ")).count(), 1);
+        let lines = &lines[1..];
         assert_eq!(lines[0], "· run `echo permitted`");
         assert!(lines[1].starts_with("! tool error: run `git push origin main`: denied by DevDock's rules"), "{}", lines[1]);
         assert_eq!(lines[2], "· read src/lib.rs");

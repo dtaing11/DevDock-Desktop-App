@@ -55,6 +55,11 @@ Linux (Windows too, egui being cross-platform).
   any app with a screenshot command under a virtual display — and shown on
   the card, kept in DevDock's own screenshots folder. A run without a
   sandbox gets one started for the pictures alone. Never on your screen.
+- **A chat, not a form**: the Agent tab keeps the conversation — per
+  repository, between launches — and a reply box under it. A run that was
+  cut short, failed or stopped is part of it: reply "continue" and it
+  picks up where it was, resuming the engine's own session. A failed
+  worktree run is continued on its branch the same way.
 - **Stop, and no turn limit**: a run takes the turns it takes, and a Stop
   button on every card — and Stop all — ends one at once, whatever it is
   doing, with its attempt kept.

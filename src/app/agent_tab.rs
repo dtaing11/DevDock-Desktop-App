@@ -25,12 +25,81 @@ use super::{theme, App, ProposedEdit};
 use egui::{RichText, ScrollArea};
 use std::collections::BTreeMap;
 
-/// One completed exchange, shown in the transcript.
+/// One exchange of the conversation: what was asked, and how it went —
+/// whether it finished or not. One that was cut short is part of the
+/// conversation too: the next message continues it instead of starting
+/// over with everything explained again.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Exchange {
     pub task: String,
+    /// What the agent reported; for one cut short, why.
     pub summary: String,
     /// How many files it changed, for the collapsed line.
     pub changed: usize,
+    #[serde(default)]
+    pub outcome: Outcome,
+}
+
+/// How an exchange ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum Outcome {
+    #[default]
+    Done,
+    Failed,
+    /// By the kill switch.
+    Stopped,
+}
+
+/// The engine's own session behind the conversation, resumed by the next
+/// message when the same engine is still the one chosen.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EngineSession {
+    pub provider: String,
+    pub id: String,
+}
+
+/// A conversation as it is kept between launches, per repository.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct SavedChat {
+    pub history: Vec<Exchange>,
+    pub session: Option<EngineSession>,
+}
+
+/// Where a repository's conversation is kept: DevDock's own directory,
+/// never the repository.
+fn chat_file(repo_key: &str) -> std::path::PathBuf {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    repo_key.hash(&mut hasher);
+    let name = std::path::Path::new(repo_key).file_name().and_then(|n| n.to_str()).unwrap_or("repo");
+    crate::secure_store::config_dir().join("chats").join(format!("{name}-{:016x}.json", hasher.finish()))
+}
+
+impl SavedChat {
+    pub fn load(repo_key: &str) -> Self {
+        // Tests run against the developer's real config directory.
+        if cfg!(test) {
+            return Self::default();
+        }
+        std::fs::read_to_string(chat_file(repo_key)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+    }
+
+    pub fn save(&self, repo_key: &str) {
+        if cfg!(test) || repo_key.is_empty() {
+            return;
+        }
+        let file = chat_file(repo_key);
+        if self.history.is_empty() {
+            let _ = std::fs::remove_file(file);
+            return;
+        }
+        if let Some(dir) = file.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(text) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(file, text);
+        }
+    }
 }
 
 /// Everything the agent tab owns.
@@ -78,6 +147,12 @@ pub struct CodingState {
     pub question: Option<super::backlog::PendingQuestion>,
     /// Images attached to the next task.
     pub images: Vec<PromptImage>,
+    /// The engine session the conversation is in, once a run has named it.
+    pub session: Option<EngineSession>,
+    /// The provider of the run in progress, to file its session under.
+    pub running_provider: String,
+    /// The reply being typed under the conversation.
+    pub reply: String,
     /// What the last run's result looks like, photographed in a sandbox.
     pub screenshots: Vec<std::path::PathBuf>,
     /// Why a picture was not taken, for each that was not.
@@ -176,9 +251,25 @@ impl CodingState {
             .iter()
             .map(|e| crate::agent::coding::Turn {
                 task: e.task.clone(),
-                summary: e.summary.clone(),
+                summary: match e.outcome {
+                    Outcome::Done => e.summary.clone(),
+                    Outcome::Failed => format!("(this was cut short before you finished: {}. What you had changed by then is in the tree.)", e.summary),
+                    Outcome::Stopped => "(the developer stopped you before you finished. What you had changed by then is in the tree.)".to_string(),
+                },
             })
             .collect()
+    }
+
+    /// The conversation as it is kept between launches.
+    pub fn saved(&self) -> SavedChat {
+        SavedChat { history: self.history.clone(), session: self.session.clone() }
+    }
+
+    /// A new conversation: nothing said before, no session to resume.
+    pub fn new_chat(&mut self) {
+        self.history.clear();
+        self.session = None;
+        self.reply.clear();
     }
 
     pub fn pending_count(&self) -> usize {
@@ -224,6 +315,126 @@ pub fn agent_sidebar(app: &mut App, ui: &mut egui::Ui) {
     );
 }
 
+/// The conversation so far: what you asked and how each went, oldest
+/// first, the latest open. The exchange in progress is the harness below.
+fn conversation(app: &mut App, ui: &mut egui::Ui) {
+    if app.coding.history.is_empty() {
+        return;
+    }
+    let mut new_chat = false;
+    ui.horizontal(|ui| {
+        ui.label(theme::overline("CONVERSATION"));
+        let resumes = app.coding.session.is_some();
+        ui.label(
+            RichText::new(if resumes { "the next message resumes the engine's own session" } else { "the next message carries what was said" })
+                .size(theme::SMALL)
+                .color(theme::fg_dim()),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add_enabled(!app.coding.running, egui::Button::new("New chat").small())
+                .on_hover_text("Forget this conversation and start another. Nothing in the tree changes.")
+                .clicked()
+            {
+                new_chat = true;
+            }
+        });
+    });
+    let last = app.coding.history.len() - 1;
+    let width = ui.available_width();
+    // The whole page when the conversation is all there is; the top of it
+    // when a run and its diffs are below.
+    let alone = !app.coding.running && app.coding.log.is_empty() && app.coding.summary.is_empty() && app.coding.edits.is_empty();
+    let height = if alone { ui.available_height() - 8.0 } else { (ui.available_height() * 0.4).max(120.0) };
+    ScrollArea::vertical().id_salt("agent-conversation").max_height(height).auto_shrink([false, true]).stick_to_bottom(true).show(ui, |ui| {
+        ui.set_min_width(width - 12.0);
+        for (i, exchange) in app.coding.history.iter().enumerate() {
+            // You, on the right-hand tint; the agent's answer under it.
+            egui::Frame::new()
+                .fill(theme::ember().linear_multiply(0.14))
+                .corner_radius(theme::RADIUS_MD as f32)
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.set_min_width(width - 40.0);
+                    ui.label(RichText::new("You").size(theme::SMALL).color(theme::ember()));
+                    ui.add(egui::Label::new(RichText::new(exchange.task.trim()).color(theme::fg())).wrap());
+                });
+            ui.add_space(2.0);
+            egui::Frame::new()
+                .fill(theme::panel())
+                .corner_radius(theme::RADIUS_MD as f32)
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.set_min_width(width - 40.0);
+                    let (who, color) = match exchange.outcome {
+                        Outcome::Done => (format!("Agent · {} file(s)", exchange.changed), theme::add()),
+                        Outcome::Failed => ("Agent · cut short".to_string(), theme::danger()),
+                        Outcome::Stopped => ("Agent · stopped by you".to_string(), theme::warn()),
+                    };
+                    ui.label(RichText::new(who).size(theme::SMALL).color(color));
+                    // The latest in full; the ones before it by their start.
+                    let text = exchange.summary.trim();
+                    if i == last {
+                        ui.scope(|ui| super::markdown::render(ui, text));
+                    } else {
+                        let short: String = text.lines().take(3).collect::<Vec<_>>().join("\n");
+                        ui.add(egui::Label::new(RichText::new(short).size(theme::SMALL).color(theme::fg_dim())).wrap());
+                    }
+                });
+            ui.add_space(theme::UNIT * 2.0);
+        }
+    });
+    ui.add_space(theme::UNIT);
+    if new_chat {
+        app.new_coding_chat();
+    }
+}
+
+/// The reply box under the conversation: the next message, sent with
+/// everything before it already said — and quick answers for a run that
+/// was cut short.
+fn reply_bar(app: &mut App, ui: &mut egui::Ui) {
+    let running = app.coding.running;
+    let cut_short = app.coding.history.last().is_some_and(|e| e.outcome != Outcome::Done);
+    let mut send: Option<String> = None;
+    egui::TopBottomPanel::bottom("agent-reply").resizable(false).show_separator_line(true).frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(0, 8))).show_inside(ui, |ui| {
+        if cut_short && !running {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("It did not finish:").size(theme::SMALL).color(theme::fg_dim()));
+                if ui.small_button("Continue where you left off").clicked() {
+                    send = Some("Continue where you left off and finish the task. Check what is already in the tree before redoing anything.".into());
+                }
+                if ui.small_button("Try a different approach").clicked() {
+                    send = Some("That approach did not get through. Look at what is in the tree, say briefly what went wrong, and finish the task a different way.".into());
+                }
+            });
+            ui.add_space(theme::UNIT);
+        }
+        ui.horizontal(|ui| {
+            let hint = if running { "The agent is working — Stop is on the strip above" } else { "Reply — it already knows what was said: \"now fix the failing test\", \"continue\", \"undo the rename\"…" };
+            let width = (ui.available_width() - 76.0).max(120.0);
+            let response = ui.add_enabled(
+                !running,
+                egui::TextEdit::multiline(&mut app.coding.reply).desired_rows(2).desired_width(width).hint_text(super::views::dim_hint(hint)),
+            );
+            // Enter sends; Shift+Enter is a new line.
+            let enter = response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+            if enter {
+                let trimmed = app.coding.reply.trim_end_matches('\n').to_string();
+                app.coding.reply = trimmed;
+            }
+            let ready = !running && !app.coding.reply.trim().is_empty();
+            let clicked = ui.add_enabled(ready, egui::Button::new(RichText::new("Send").color(egui::Color32::BLACK)).fill(theme::ember()).min_size(egui::vec2(64.0, 30.0))).clicked();
+            if ready && (clicked || enter) {
+                send = Some(app.coding.reply.clone());
+            }
+        });
+    });
+    if let Some(text) = send {
+        app.send_coding_reply(&text);
+    }
+}
+
 /// The agent's viewport: the harness at work, what it said, and every change
 /// it made — at a size a diff can actually be read at.
 ///
@@ -235,9 +446,15 @@ pub fn agent_viewport(app: &mut App, ui: &mut egui::Ui) {
     if app.repo.is_none() {
         return;
     }
+    // The reply box first, pinned to the bottom: the conversation above it
+    // scrolls, the place to answer does not move.
+    if !app.coding.history.is_empty() || app.coding.running {
+        reply_bar(app, ui);
+    }
     let idle = !app.coding.running
         && app.coding.summary.trim().is_empty()
-        && app.coding.edits.is_empty();
+        && app.coding.edits.is_empty()
+        && app.coding.history.is_empty();
     if idle {
         if !app.coding.worktree.runs.is_empty() {
             worktree_runs(app, ui);
@@ -253,6 +470,11 @@ pub fn agent_viewport(app: &mut App, ui: &mut egui::Ui) {
         return;
     }
 
+    conversation(app, ui);
+    // Nothing run in this launch yet: the conversation is the page.
+    if !app.coding.running && app.coding.log.is_empty() && app.coding.summary.is_empty() && app.coding.edits.is_empty() {
+        return;
+    }
     harness(app, ui);
 
     // While it works and has nothing to show yet, the viewport is the run:
@@ -827,7 +1049,7 @@ fn task_panel(app: &mut App, ui: &mut egui::Ui) {
                 .on_hover_text("Forget the conversation so far")
                 .clicked()
         {
-            app.coding.history.clear();
+            app.new_coding_chat();
             app.coding.summary.clear();
             app.coding.log.clear();
         }
@@ -1076,6 +1298,7 @@ fn worktree_runs(app: &mut App, ui: &mut egui::Ui) {
                         run.stop();
                     }
                 }
+                super::backlog::CardAction::Reply(text) => app.reply_to_worktree_run(&key, &text),
             }
             ui.add_space(theme::UNIT);
         }
@@ -1351,6 +1574,7 @@ mod tests {
     fn the_transcript_becomes_the_harness_history() {
         let state = CodingState {
             history: vec![Exchange {
+                outcome: Outcome::Done,
                 task: "add a flag".into(),
                 summary: "done".into(),
                 changed: 2,

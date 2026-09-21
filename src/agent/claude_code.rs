@@ -572,10 +572,16 @@ fn parse_line(line: &str, root: &Path, outcome: &mut Outcome) -> Vec<Event> {
         return Vec::new();
     };
     let kind = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    // Said once, the first time it is known: a run that ends cut short
+    // still leaves the session a reply can pick up.
+    let mut new_session = None;
     if let Some(id) = value.get("session_id").and_then(|s| s.as_str()) {
+        if outcome.session_id.as_deref() != Some(id) {
+            new_session = Some(id.to_string());
+        }
         outcome.session_id = Some(id.to_string());
     }
-    let mut events = Vec::new();
+    let mut events: Vec<Event> = new_session.map(Event::Session).into_iter().collect();
     match kind {
         "assistant" => {
             let blocks = value.pointer("/message/content").and_then(|c| c.as_array());

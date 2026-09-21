@@ -273,7 +273,13 @@ pub enum Event {
     /// Which harness is doing the work, announced first so a log can never
     /// leave the question open.
     Engine(String),
+    /// The engine's own session, as soon as it has one: what a later
+    /// message resumes, even when this run ends cut short.
+    Session(String),
 }
+
+/// How [`Event::Session`] reads in a log, for whoever keeps the id.
+pub const SESSION_LINE: &str = "session ";
 
 impl Event {
     /// One line for a progress log.
@@ -295,6 +301,7 @@ impl Event {
             Self::Nudge(why) => format!("! not finished yet: {}", first_line(why)),
             Self::Compacted { freed } => format!("· trimmed {freed} bytes of old tool output"),
             Self::Engine(label) => format!("engine: {label}"),
+            Self::Session(id) => format!("{SESSION_LINE}{id}"),
         }
     }
 }

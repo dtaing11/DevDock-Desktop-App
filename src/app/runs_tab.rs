@@ -181,6 +181,8 @@ enum Pending {
     PublishAttempt { repo: String, branch: String },
     /// Show the repository's Agent tab.
     GoTo { repo: String },
+    /// Continue a worktree run that did not get through.
+    Reply { repo: String, branch: String, text: String },
 }
 
 /// The sidebar: the filter, and each repository's counts.
@@ -321,6 +323,15 @@ pub fn runs_viewport(app: &mut App, ui: &mut egui::Ui) {
         match action {
             Pending::OpenAttempt { repo, branch } => app.open_attempt_in_vscode_of(&repo, &branch),
             Pending::PublishAttempt { repo, branch } => app.publish_attempt_of(&repo, &branch),
+            // A run is started in the repository on screen: its engine,
+            // its settings, its sign-in. One kept aside is shown first.
+            Pending::Reply { repo, branch, text } => {
+                if repo == app.repo_key() {
+                    app.reply_to_worktree_run(&branch, &text);
+                } else {
+                    app.toast("Press Show on that repository first, then reply: a run starts in the repository on screen.", true);
+                }
+            }
             Pending::GoTo { repo } => {
                 if repo != app.repo_key() {
                     app.open_repo(&repo);
@@ -399,6 +410,7 @@ fn repository_section(
                         unqueue.push(key.clone());
                     }
                 }
+                CardAction::Reply(text) => pending.push(Pending::Reply { repo: source.key.clone(), branch: key.clone(), text }),
             }
             ui.add_space(theme::UNIT);
         }

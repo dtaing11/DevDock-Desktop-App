@@ -541,9 +541,33 @@ the panel says so.
 
 ### Following up
 
-The tab is a conversation. Each task and the summary it produced stay listed,
-and the next task is sent with them, so "now do the same for the other
-module" works. **New session** forgets the thread.
+The tab is a chat. The conversation is at the top of the viewport — what
+you asked, what the agent answered, how many files it changed — and a
+reply box is pinned under it: type "now do the same for the other module"
+or "fix the failing test" and press Enter (Shift+Enter for a new line).
+You never explain the task again.
+
+- **A run that did not finish is part of the conversation.** Cut short,
+  failed, or stopped by you, it is listed with why, and the reply box
+  offers **Continue where you left off** and **Try a different approach**.
+  The next message tells the agent what was asked, that it did not finish,
+  and that what it had changed is in the tree.
+- **The engine's own session is resumed.** Claude Code and OpenCode name
+  their session as soon as they start; DevDock keeps it, and the next
+  message resumes it — with everything the agent had read — even when the
+  run before was cut short. A session that is gone, or a different engine
+  picked for the next message, goes by the conversation instead, and the
+  log says so. The built-in harness always goes by the conversation.
+- **It is kept between launches**, per repository, in DevDock's own
+  directory (`chats/`), never in the repository. **New chat** — or **New
+  session** in the sidebar — forgets it.
+- **A worktree run can be replied to as well.** A run that did not get
+  through keeps its attempt on its branch; its card has the same quick
+  replies and a box. The reply continues on that branch with what the
+  attempt left — its work-in-progress commit taken back off, so the branch
+  ends with one real commit named for the work, not for "continue" —
+  instead of refusing because the branch exists. Its log continues under
+  the log it replies to.
 
 Starting a new task while changes are unreviewed is flagged: two runs' edits
 in one list would be impossible to untangle.

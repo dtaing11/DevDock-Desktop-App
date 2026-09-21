@@ -126,6 +126,12 @@ pub const CLAUDE_CODE_ASK: &str = "If you need the developer to decide something
 /// Where a run's attached images are put for Claude Code to read.
 pub const IMAGE_DIR: &str = ".devdock/prompt-images";
 
+/// The image paragraph of a prompt that has one, for a reply that is sent
+/// without the rest of the prompt.
+fn image_note_of(prompt: &str) -> String {
+    prompt.find("\n\nThe developer attached").map(|at| prompt[at..].to_string()).unwrap_or_default()
+}
+
 /// The paragraph that points Claude Code at the attached images.
 pub fn image_note(paths: &[String]) -> String {
     format!(
@@ -265,6 +271,10 @@ pub struct Request<'a> {
     pub context: Option<&'a str>,
     /// Images the developer attached to the task.
     pub images: &'a [super::Attachment],
+    /// The engine's session from the message before, to pick up where it
+    /// left off with everything it had read — Claude Code and OpenCode.
+    /// The harness, and a session that is gone, go by `history` instead.
+    pub resume: Option<&'a str>,
     pub limits: Limits,
 }
 
@@ -275,6 +285,7 @@ impl<'a> Request<'a> {
             task,
             images: &[],
             history: &[],
+            resume: None,
             branch: None,
             instructions: None,
             context: None,
@@ -384,7 +395,14 @@ fn run_opencode(
     let outcome = opencode::run(
         &config,
         workspace.root(),
-        Launch { task: &prompt, instructions: Some(&extra), permissions: Permissions::Full, files: &files, resume: None, collect_edits: true },
+        Launch {
+            task: if request.resume.is_some() { request.task } else { &prompt },
+            instructions: Some(&extra),
+            permissions: Permissions::Full,
+            files: &files,
+            resume: request.resume,
+            collect_edits: true,
+        },
         on_event,
     );
     if !request.images.is_empty() {
@@ -485,7 +503,21 @@ fn run_claude_code(
         log("Claude Code runs inside the sandbox".into());
         config.sandbox = Some(sandbox);
     }
-    let outcome = claude_code::run(&config, workspace.root(), &prompt, Some(&extra), &checks, on_event);
+    // A reply picks the session up where it stopped; one that is gone —
+    // expired, another machine's — is started over with the history.
+    let outcome = match request.resume {
+        Some(session) => {
+            let reply = format!("{}{}", request.task.trim(), if prompt.contains(IMAGE_DIR) { image_note_of(&prompt) } else { String::new() });
+            claude_code::resume(&config, workspace.root(), session, &reply, Some(&extra), on_event).or_else(|e| {
+                if crate::cancel::was_stopped(&e) {
+                    return Err(e);
+                }
+                on_event(Event::Tool { summary: "the earlier session could not be resumed; starting over with what was said".into(), is_error: false });
+                claude_code::run(&config, workspace.root(), &prompt, Some(&extra), &checks, on_event)
+            })
+        }
+        None => claude_code::run(&config, workspace.root(), &prompt, Some(&extra), &checks, on_event),
+    };
     if !request.images.is_empty() {
         let _ = std::fs::remove_dir_all(&image_dir);
         // And the parent, when nothing else of DevDock's is in it.

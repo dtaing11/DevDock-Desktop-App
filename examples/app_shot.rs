@@ -6,7 +6,7 @@
 //!
 //! `DIALOG=stack|worktrees|pr|tickets` opens a dialog over the app before the
 //! picture is taken.
-//! `AGENT_DEMO=running|changes|worktree|runs` fills the coding agent with
+//! `AGENT_DEMO=running|changes|worktree|runs|chat` fills the coding agent with
 //! state, since a real run needs a model and a screenshot needs neither;
 //! `runs` adds a second repository kept aside, for the Runs tab.
 //! `COMMIT_DEMO=1` fills the commit box with a long generated message.
@@ -203,6 +203,8 @@ fn seed_backlog(app: &mut App) {
         started: Some(std::time::Instant::now() - std::time::Duration::from_secs(94)),
         took: None,
         stopping: false,
+        prompt: String::new(),
+        reply: String::new(),
     };
     app.backlog.runs.insert(
         "DEV-41".into(),
@@ -336,6 +338,17 @@ fn seed_agent(app: &mut App, mode: &str) {
     if mode != "runs" {
         app.tab = Tab::Agent;
     }
+    if mode == "chat" {
+        // A conversation: one exchange that finished, one cut short, and
+        // the reply box waiting under them.
+        use git_manage::app::agent_tab::{Exchange, Outcome};
+        app.coding.history = vec![
+            Exchange { task: "make every button green, in both palettes".into(), summary: "- `src/app/theme.rs`: one `green()` token, solid for primary actions, a wash for the rest\n- Destructive buttons keep `danger()`\n\nVerified: lint, tests".into(), changed: 6, outcome: Outcome::Done },
+            Exchange { task: "now the hover state is too dark in the light palette — fix that too".into(), summary: "Claude Code ran longer than 10800s and was stopped.".into(), changed: 0, outcome: Outcome::Failed },
+        ];
+        app.coding.reply = "the contrast check is in theme.rs::tests — make hover pass it".into();
+        return;
+    }
     if mode == "worktree" || mode == "runs" {
         // Two prompts sent to worktrees of their own: the tab's tree idle,
         // the runs in the viewport. For the Runs tab, a second repository
@@ -373,6 +386,8 @@ fn seed_agent(app: &mut App, mode: &str) {
             started: Some(std::time::Instant::now() - std::time::Duration::from_secs(131)),
             took: None,
             stopping: false,
+            prompt: String::new(),
+            reply: String::new(),
         };
         app.coding.worktree.runs.insert(
             "agent/add-a-json-flag-to-devdock-status".into(),

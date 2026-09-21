@@ -64,6 +64,11 @@ pub struct TicketRun {
     pub log: Vec<String>,
     pub started: Option<Instant>,
     pub took: Option<Duration>,
+    /// What was asked, in full, for a reply to be made of; the title is
+    /// only its first line.
+    pub prompt: String,
+    /// The reply being typed on a card whose run did not get through.
+    pub reply: String,
     /// Stop was pressed before the run had a worktree to be stopped by:
     /// it is stopped the moment it names one.
     pub stopping: bool,
@@ -125,7 +130,7 @@ impl TicketRun {
     }
 
     pub fn queued(title: impl Into<String>) -> Self {
-        Self { title: title.into(), state: RunState::Queued, kept: None, question: None, log: Vec::new(), started: None, took: None, stopping: false }
+        Self { title: title.into(), state: RunState::Queued, kept: None, question: None, log: Vec::new(), started: None, took: None, prompt: String::new(), reply: String::new(), stopping: false }
     }
 
     pub fn is_running(&self) -> bool {
@@ -816,6 +821,8 @@ fn agent_card(app: &mut App, ui: &mut egui::Ui, key: &str) {
                 app.backlog.queue.retain(|k| k != key);
             }
         }
+        // Tickets carry no prompt, so their cards offer no reply.
+        CardAction::Reply(_) => {}
     }
 }
 
@@ -855,6 +862,8 @@ pub(super) enum CardAction {
     Answer,
     /// The kill switch: end the run now, keeping what it has.
     Stop,
+    /// Continue the kept attempt on its branch, told this.
+    Reply(String),
 }
 
 /// One agent's card: its state, what it is doing or did, its log on
@@ -870,6 +879,9 @@ pub(super) fn run_card(ui: &mut egui::Ui, key: &str, title: &str, run: &mut Tick
     let elapsed = run.elapsed().map(mmss);
     let last = run.log.last().cloned().unwrap_or_default();
     let mut action = CardAction::None;
+    // A run started from a prompt can be replied to; a ticket is rerun
+    // from the backlog, where its triage and claim live.
+    let replies = !run.prompt.is_empty();
 
     let width = ui.available_width();
     egui::Frame::new()
@@ -1026,6 +1038,26 @@ pub(super) fn run_card(ui: &mut egui::Ui, key: &str, title: &str, run: &mut Tick
                             }
                             ui.label(RichText::new(format!("kept on {branch}, not pushed")).monospace().size(theme::SMALL).color(theme::fg_dim()));
                         });
+                    }
+                    // The conversation goes on: a reply continues on the same
+                    // branch with what the attempt left, already knowing what
+                    // was asked and how it went.
+                    if replies {
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new("Reply to continue it:").size(theme::SMALL).color(theme::fg_dim()));
+                            if ui.small_button("Continue where you left off").clicked() {
+                                action = CardAction::Reply("Continue where you left off and finish the task. Read what is already on the branch before redoing anything.".into());
+                            }
+                            if ui.small_button("Try a different approach").clicked() {
+                                action = CardAction::Reply("That approach did not get through. Read what is on the branch, say briefly what went wrong, and finish the task a different way.".into());
+                            }
+                        });
+                        super::views::prose_box(ui, &mut run.reply, 2, "…or say what to do now: \"the test fails because the fixture is stale — regenerate it\"");
+                        let ready = !run.reply.trim().is_empty();
+                        if ui.add_enabled(ready, egui::Button::new(RichText::new("Send").color(egui::Color32::BLACK)).fill(theme::ember())).clicked() {
+                            action = CardAction::Reply(std::mem::take(&mut run.reply));
+                        }
                     }
                 }
                 _ => {}

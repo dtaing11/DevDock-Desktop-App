@@ -114,6 +114,18 @@ const MAX_COMMAND_RUNS: usize = 40;
 /// state it does not expect — and, on the host, `sudo`. In a sandbox the
 /// machine is the run's own, and root is how it installs things.
 pub fn refused_command(command: &str, sandboxed: bool) -> Option<String> {
+    refused_command_with(command, sandboxed, false)
+}
+
+/// What stays refused even when the developer has let the run commit and
+/// push: what cannot be taken back, or takes someone else's work with it.
+pub const GIT_NEVER_NOTE: &str = "Never force-push, delete a remote branch, `git reset --hard`, `git clean`, rebase, or \
+    rewrite history that is pushed: those are refused.";
+
+/// [`refused_command`], with `allow_git` for a run in the developer's own
+/// tree that they have let commit and push. Everything that cannot be
+/// taken back stays refused either way.
+pub fn refused_command_with(command: &str, sandboxed: bool, allow_git: bool) -> Option<String> {
     const GIT_WRITES: &[&str] = &[
         "commit", "push", "reset", "checkout", "switch", "rebase", "merge", "stash", "cherry-pick",
         "revert", "tag", "am", "filter-branch", "clean", "worktree", "remote", "branch",
@@ -137,6 +149,23 @@ pub fn refused_command(command: &str, sandboxed: bool) -> Option<String> {
                     sub = Some(w);
                     break;
                 }
+            }
+            if let (Some(sub), true) = (sub, allow_git) {
+                let args: Vec<&str> = segment.split_whitespace().collect();
+                let has = |flags: &[&str]| args.iter().any(|a| flags.iter().any(|f| a == f || a.starts_with(&format!("{f}="))));
+                let never = match sub {
+                    "push" => has(&["--force", "-f", "--force-with-lease", "--force-if-includes", "--delete", "-d", "--mirror", "--prune"]) || args.iter().any(|a| a.starts_with(':') || a.starts_with('+')),
+                    "reset" => has(&["--hard", "--merge", "--keep"]),
+                    "clean" | "rebase" | "filter-branch" | "worktree" | "am" => true,
+                    "branch" => has(&["-D", "-M"]),
+                    "checkout" | "switch" => has(&["--force", "-f", "--discard-changes"]),
+                    "stash" => args.iter().any(|a| *a == "drop" || *a == "clear"),
+                    _ => false,
+                };
+                if never {
+                    return Some(format!("`{}` is not allowed even here: it cannot be taken back. {GIT_NEVER_NOTE}", segment.trim()));
+                }
+                continue;
             }
             if let Some(sub) = sub {
                 if GIT_WRITES.contains(&sub) {
@@ -185,6 +214,8 @@ pub struct Workspace {
     /// Whether the model may run commands of its own (build, test, format,
     /// install) besides the named checks. Live tree only.
     commands: bool,
+    /// The developer let this run commit and push.
+    git: bool,
     command_runs: usize,
     /// Where checks and commands run when not on the host, for the tool
     /// text: "Lima VM devdock", "Docker (ubuntu:24.04)".
@@ -237,6 +268,7 @@ impl Workspace {
             checks: Vec::new(),
             check_runs: 0,
             commands: false,
+            git: false,
             command_runs: 0,
             sandbox: None,
             sandbox_handle: None,
@@ -280,6 +312,18 @@ impl Workspace {
     pub fn with_commands(mut self, enabled: bool) -> Self {
         self.commands = enabled;
         self
+    }
+
+    /// Lets the run commit and push — a run in the developer's own tree
+    /// that they asked to. A worktree run never gets this: its commit, its
+    /// push and its pull request are made for it, once, when it is done.
+    pub fn with_git(mut self, allowed: bool) -> Self {
+        self.git = allowed;
+        self
+    }
+
+    pub fn allows_git(&self) -> bool {
+        self.git
     }
 
     /// Runs every check and command inside a sandbox — described by
@@ -1765,7 +1809,7 @@ impl Workspace {
         if command.is_empty() {
             return Err("command is empty".into());
         }
-        if let Some(why) = refused_command(&command, self.sandbox.is_some()) {
+        if let Some(why) = refused_command_with(&command, self.sandbox.is_some(), self.git) {
             return Err(why);
         }
         let timeout = input
@@ -2721,6 +2765,16 @@ mod tests {
         assert!(refused_command("sudo apt-get install -y curl", false).is_some());
         assert!(refused_command("sudo apt-get install -y curl", true).is_none(), "root is the point of a sandbox");
         assert!(refused_command("git push", true).is_some(), "history is still the harness's");
+
+        // Let commit and push: the everyday commands go through, a
+        // submodule's included; what cannot be taken back does not.
+        for allowed in ["git commit -m x", "git push -u origin feat/x", "cd schemas && git add gen/ && git commit -m y && git push", "git checkout -b fix", "git stash", "git add schemas"] {
+            assert!(refused_command_with(allowed, false, true).is_none(), "{allowed}");
+        }
+        for never in ["git push --force", "git push -f origin main", "git push origin main --force-with-lease", "git push origin :old", "git push origin +main", "git push --delete origin old", "git reset --hard HEAD~1", "git clean -fd", "git rebase -i main", "git branch -D x", "git checkout -f", "git stash drop", "sudo git push"] {
+            assert!(refused_command_with(never, false, true).is_some(), "{never}");
+        }
+        assert!(refused_command_with("git reset --soft HEAD~1", false, true).is_none());
 
         // A read-only run gets no command tool, whatever was asked for.
         let (_tmp, ws) = fixture(Access::ReadOnly);

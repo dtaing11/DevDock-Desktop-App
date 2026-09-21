@@ -123,6 +123,20 @@ pub const CLAUDE_CODE_ASK: &str = "If you need the developer to decide something
     changing anything more. You will be resumed with the answer. Ask only when it truly changes \
     what you would build.";
 
+/// What a run is told when the developer has let it commit and push: said
+/// last, because it takes back what the engine was told before it.
+pub fn git_allowed_note() -> String {
+    format!(
+        "Git: the developer has let this run commit and push, in their own working tree. That \
+         replaces what was said above about git being denied and done for you — nothing is \
+         committed for you here. Commit and push only what they asked for in this \
+         conversation, with a message that says what changed. A submodule is a repository of \
+         its own: commit and push inside it first, on a branch, then commit the new pointer in \
+         the parent. Say exactly what you committed and pushed, and where. {}",
+        super::workspace::GIT_NEVER_NOTE
+    )
+}
+
 /// Where a run's attached images are put for Claude Code to read.
 pub const IMAGE_DIR: &str = ".devdock/prompt-images";
 
@@ -354,10 +368,15 @@ fn run_opencode(
         extra.push_str("\n\nProject-specific instructions:\n");
         extra.push_str(instructions);
     }
+    if workspace.allows_git() {
+        extra.push_str("\n\n");
+        extra.push_str(&git_allowed_note());
+    }
     let overview = workspace.overview();
     let prompt = task_prompt(request.task, request.history, request.branch, Some(&overview), request.context);
 
     let mut config = config.clone();
+    config.allow_git = workspace.allows_git();
     if let Some(sandbox) = workspace.sandbox() {
         let mut log = |line: String| on_event(Event::Tool { summary: line, is_error: false });
         sandbox.provision(&["opencode"], &mut log)?;
@@ -475,6 +494,10 @@ fn run_claude_code(
         extra.push_str("\n\nProject-specific instructions:\n");
         extra.push_str(instructions);
     }
+    if workspace.allows_git() {
+        extra.push_str("\n\n");
+        extra.push_str(&git_allowed_note());
+    }
     let overview = workspace.overview();
     let mut prompt = task_prompt(request.task, request.history, request.branch, Some(&overview), request.context);
     // Claude Code takes no image in its prompt, but reads image files:
@@ -493,7 +516,7 @@ fn run_claude_code(
     }
     // Claude Code's own cap is off when the run's is: zero passes none.
     let max_turns = if request.limits.max_turns == usize::MAX { 0 } else { request.limits.max_turns };
-    let mut config = claude_code::Config { max_turns, ..config.clone() };
+    let mut config = claude_code::Config { max_turns, allow_git: workspace.allows_git(), ..config.clone() };
     // With a sandbox, Claude Code itself runs inside it: installed there
     // the first time, signed in with this machine's sign-in, kept after.
     if let Some(sandbox) = workspace.sandbox() {
@@ -575,6 +598,12 @@ pub fn run(
             instructions.push_str("\n\n");
         }
         instructions.push_str(extra);
+    }
+    if workspace.allows_git() {
+        if !instructions.is_empty() {
+            instructions.push_str("\n\n");
+        }
+        instructions.push_str(&git_allowed_note());
     }
     let system = system_prompt(
         workspace.write_mode(),

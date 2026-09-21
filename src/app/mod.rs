@@ -4208,6 +4208,7 @@ impl App {
         }
 
         let live = self.coding.iterate;
+        let allow_git = self.coding.allow_git;
         let history = self.coding.turns();
         // The same engine as the message before: its own session is
         // resumed, with everything it had read. Another engine goes by the
@@ -4301,6 +4302,7 @@ impl App {
                 })
                 .with_checks(checks)
                 .with_commands(live)
+                .with_git(live && allow_git)
                 .with_asker(progress.asker(None));
                 // The repository's MCP servers, on this machine.
                 let mut servers = Vec::new();

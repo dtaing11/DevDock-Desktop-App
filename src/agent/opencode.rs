@@ -30,13 +30,15 @@ pub struct Config {
     /// `provider/model`, as OpenCode names them; empty means its default.
     pub model: String,
     pub timeout: Duration,
+    /// The developer let this run commit and push.
+    pub allow_git: bool,
     /// Run inside this sandbox instead of on this machine.
     pub sandbox: Option<std::sync::Arc<crate::sandbox::Sandbox>>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { model: String::new(), timeout: Duration::from_secs(3 * 60 * 60), sandbox: None }
+        Self { model: String::new(), timeout: Duration::from_secs(3 * 60 * 60), sandbox: None, allow_git: false }
     }
 }
 
@@ -83,6 +85,11 @@ pub enum Permissions {
 /// The config DevDock hands OpenCode for one run: permissions, the
 /// repository's MCP servers, no sharing, no updates.
 pub fn run_config(root: &Path, permissions: Permissions, sandboxed: bool) -> serde_json::Value {
+    run_config_with(root, permissions, sandboxed, false)
+}
+
+/// [`run_config`], for a run the developer may have let commit and push.
+pub fn run_config_with(root: &Path, permissions: Permissions, sandboxed: bool, allow_git: bool) -> serde_json::Value {
     let mut bash = serde_json::Map::new();
     match permissions {
         Permissions::Full => {
@@ -99,7 +106,13 @@ pub fn run_config(root: &Path, permissions: Permissions, sandboxed: bool) -> ser
             }
         }
     }
-    for denied in ["git commit", "git push", "git reset", "git checkout", "git switch", "git rebase", "git merge", "git stash", "git cherry-pick", "git revert", "git tag", "git clean", "git worktree", "git remote", "git branch -d", "git branch -D", "git branch -m"] {
+    let denied: &[&str] = if allow_git && permissions == Permissions::Full {
+        // What cannot be taken back stays denied.
+        &["git push --force", "git push -f", "git push * --force", "git push * -f", "git push --delete", "git push --mirror", "git reset --hard", "git clean", "git rebase", "git filter-branch", "git worktree", "git branch -D"]
+    } else {
+        &["git commit", "git push", "git reset", "git checkout", "git switch", "git rebase", "git merge", "git stash", "git cherry-pick", "git revert", "git tag", "git clean", "git worktree", "git remote", "git branch -d", "git branch -D", "git branch -m"]
+    };
+    for denied in denied {
         bash.insert(format!("{denied}*"), "deny".into());
     }
     if !sandboxed {
@@ -161,7 +174,7 @@ pub fn run(config: &Config, root: &Path, launch: Launch<'_>, on_event: &mut dyn 
     // staged (.devdock is an artifact directory).
     let config_path = root.join(CONFIG_FILE);
     std::fs::create_dir_all(config_path.parent().unwrap()).map_err(|e| e.to_string())?;
-    std::fs::write(&config_path, serde_json::to_string_pretty(&run_config(root, launch.permissions, sandboxed)).unwrap()).map_err(|e| e.to_string())?;
+    std::fs::write(&config_path, serde_json::to_string_pretty(&run_config_with(root, launch.permissions, sandboxed, config.allow_git)).unwrap()).map_err(|e| e.to_string())?;
     let config_inner = match &config.sandbox {
         Some(sandbox) => format!("{}/{CONFIG_FILE}", sandbox.inner_root()),
         None => config_path.display().to_string(),

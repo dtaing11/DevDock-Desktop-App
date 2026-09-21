@@ -389,6 +389,28 @@ It needs GitHub sign-in, because the outcome is a pull request. A prompt that
 needs a decision from you is not a fit: the agent is told nobody can answer,
 and to change nothing rather than guess.
 
+### Commit and push
+
+By default an agent cannot run git commands that commit, push, switch
+branches or rewrite history, whichever engine it is: in a worktree or
+backlog run DevDock makes the commit, the push and the pull request
+itself, once, when the checks have passed, and an agent doing its own
+would bypass all of that. A refused command says so, and the agent tells
+you what it could not do.
+
+For a run **in your own tree** you can lift that: **Let it commit and
+push**, under "Let it iterate". The agent may then commit and push when
+you ask it to — including inside a submodule, which is a repository of its
+own: it commits and pushes there first, then commits the new pointer in
+the parent. It is told to do only what you asked for and to say exactly
+what it committed and where. What cannot be taken back stays refused
+either way: force-push, deleting a remote branch, `reset --hard`,
+`clean`, rebase. (For Claude Code and OpenCode those rules match a
+command by how it starts, so a `--force` at the very end of a command is
+held back by the instructions rather than by the rule; the built-in
+harness parses the command and refuses it wherever the flag is.) A
+worktree run never gets the switch.
+
 ### Stop, and no turn limit
 
 A coding run has no cap on turns, tool calls or reading — for the

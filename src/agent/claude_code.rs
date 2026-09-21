@@ -46,11 +46,13 @@ pub struct Config {
     pub model: String,
     pub max_turns: usize,
     pub timeout: Duration,
+    /// The developer let this run commit and push.
+    pub allow_git: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { model: String::new(), max_turns: 0, timeout: Duration::from_secs(3 * 60 * 60), sandbox: None }
+        Self { model: String::new(), max_turns: 0, timeout: Duration::from_secs(3 * 60 * 60), sandbox: None, allow_git: false }
     }
 }
 
@@ -149,7 +151,32 @@ fn denied_mcp_server(text: &str) -> Option<String> {
 
 /// The `--disallowedTools` value.
 pub fn disallowed_tools() -> String {
-    DENIED_TOOLS.join(",")
+    disallowed_tools_for(false)
+}
+
+/// What stays denied for a run the developer let commit and push: what
+/// cannot be taken back. Claude Code matches these by prefix, so a flag
+/// that comes late in a command is covered by the prompt, not the rule.
+const GIT_NEVER: &[&str] = &[
+    "Bash(git push --force:*)",
+    "Bash(git push -f:*)",
+    "Bash(git push --force-with-lease:*)",
+    "Bash(git push --delete:*)",
+    "Bash(git push --mirror:*)",
+    "Bash(git reset --hard:*)",
+    "Bash(git clean:*)",
+    "Bash(git rebase:*)",
+    "Bash(git filter-branch:*)",
+    "Bash(git worktree:*)",
+    "Bash(git branch -D:*)",
+];
+
+/// [`disallowed_tools`], for a run that may or may not commit and push.
+pub fn disallowed_tools_for(allow_git: bool) -> String {
+    if !allow_git {
+        return DENIED_TOOLS.join(",");
+    }
+    DENIED_TOOLS.iter().filter(|rule| !rule.starts_with("Bash(git ")).chain(GIT_NEVER.iter()).copied().collect::<Vec<_>>().join(",")
 }
 
 /// The `--allowedTools` value: the editing and reading tools, and `Bash` —
@@ -385,7 +412,7 @@ fn run_with_tools(
         "--allowedTools".into(),
         allowed.to_string(),
         "--disallowedTools".into(),
-        disallowed_tools(),
+        disallowed_tools_for(config.allow_git),
     ];
     // No turn limit unless one is set: a task takes the turns it takes,
     // and what ends a run that should end is its time, or the kill switch.
@@ -809,6 +836,11 @@ mod tests {
         assert!(allowed.contains("Read,Edit,Write"));
         assert!(allowed.ends_with(",Bash"), "{allowed}");
         let denied = disallowed_tools();
+        let with_git = disallowed_tools_for(true);
+        assert!(!with_git.contains("Bash(git commit:*)") && !with_git.contains("Bash(git push:*)"), "{with_git}");
+        for rule in ["WebFetch", "Bash(sudo:*)", "Bash(git push --force:*)", "Bash(git reset --hard:*)", "Bash(git clean:*)"] {
+            assert!(with_git.split(',').any(|r| r == rule), "{rule} stays denied: {with_git}");
+        }
         for rule in ["WebFetch", "Bash(git push:*)", "Bash(git commit:*)", "Bash(git reset:*)", "Bash(sudo:*)"] {
             assert!(denied.contains(rule), "{denied}");
         }

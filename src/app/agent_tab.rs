@@ -153,6 +153,9 @@ pub struct CodingState {
     pub running_provider: String,
     /// The reply being typed under the conversation.
     pub reply: String,
+    /// Let a run in this tree commit and push. Off until ticked; a
+    /// worktree run never gets it, since its commit is made for it.
+    pub allow_git: bool,
     /// What the last run's result looks like, photographed in a sandbox.
     pub screenshots: Vec<std::path::PathBuf>,
     /// Why a picture was not taken, for each that was not.
@@ -990,6 +993,17 @@ fn task_panel(app: &mut App, ui: &mut egui::Ui) {
             ui.label(RichText::new(note).small().color(theme::fg_dim()));
         }
     });
+    // Its own row, and only for a run in this tree: a worktree run's
+    // commit, push and pull request are made for it.
+    if app.coding.iterate && !app.coding.worktree.enabled {
+        ui.add_enabled(!busy, egui::Checkbox::new(&mut app.coding.allow_git, "Let it commit and push")).on_hover_text(
+            "Off, the agent cannot run git commands that commit, push, switch branches or \
+             rewrite history — it changes files and you do the rest. On, a run in this tree \
+             may commit and push when you ask it to, a submodule's repository included. \
+             What cannot be taken back stays refused either way: force-push, deleting a \
+             remote branch, reset --hard, clean, rebase.",
+        );
+    }
 
     // Grows with the prompt up to a cap, then scrolls inside itself: a long
     // prompt must not push the Run button out of the panel.

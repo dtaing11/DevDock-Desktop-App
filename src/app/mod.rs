@@ -3886,11 +3886,7 @@ impl App {
                         .unwrap_or_else(|| "shell".into()),
                     self.terminal.sessions.len() + 1
                 );
-                self.terminal.sessions.push(terminal_panel::Session {
-                    pty,
-                    title,
-                    finished: false,
-                });
+                self.terminal.sessions.push(terminal_panel::Session::new(pty, title));
                 self.terminal.active = self.terminal.sessions.len() - 1;
             }
             Err(e) => self.toast(e, true),
@@ -5128,8 +5124,17 @@ impl App {
             return;
         }
         let bindings = self.config.shortcuts.clone();
+        // While the keyboard is the shell's, its keys are the shell's:
+        // Ctrl+R searches history there, it does not refresh here. Only
+        // the shortcut that shows and hides the terminal still answers.
+        let in_terminal = self.terminal.open && self.terminal.focused;
         let (actions, escape) = ctx.input_mut(|i| {
-            (bindings.pressed(i), i.key_pressed(egui::Key::Escape))
+            if in_terminal {
+                let toggle = bindings.get(shortcuts::Action::Terminal).consume(i);
+                (if toggle { vec![shortcuts::Action::Terminal] } else { Vec::new() }, false)
+            } else {
+                (bindings.pressed(i), i.key_pressed(egui::Key::Escape))
+            }
         });
         for action in actions {
             use shortcuts::Action;

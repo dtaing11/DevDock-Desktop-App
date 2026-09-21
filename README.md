@@ -98,6 +98,12 @@ Linux (Windows too, egui being cross-platform).
   after any branch changes, push and open every PR in one action, and sync
   after something merges. Needs `gh extension install github/gh-stack`.
   See [docs/stacked-prs.md](docs/stacked-prs.md).
+- **A terminal** (Ctrl+`): login shells in tabs at the bottom of the window,
+  on a full emulator — `git log`, `less`, `vim` and other full-screen
+  programs work, as do colours, wide characters and scroll regions. Tab,
+  the arrows and Escape go to the shell; paste is bracketed; drag selects
+  and the copy shortcut copies; the wheel scrolls the history, or a pager.
+  While you type there the app's own shortcuts stand aside.
 - **Worktrees**: check a branch out in its own directory and open it in a
   second window — its own working tree, agent, and terminal — so two branches
   can be worked on at once, or a coding agent run on each of several branches

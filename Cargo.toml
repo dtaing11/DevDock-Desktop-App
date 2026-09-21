@@ -29,6 +29,7 @@ toml = "0.8"
 aes-gcm = "0.10"
 regex = "1"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
+vt100 = "0.16"
 
 # The integrated terminal needs a pty: openpty, ioctl(TIOCSWINSZ), waitpid.
 [target.'cfg(unix)'.dependencies]

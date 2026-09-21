@@ -98,11 +98,18 @@ impl Pty {
 
                 // A terminal that says it is dumb gets no colours; one that
                 // claims too much gets sequences we do not implement.
-                let term = std::ffi::CString::new("TERM=xterm-256color").unwrap();
-                libc::putenv(term.into_raw());
+                for var in ["TERM=xterm-256color", "COLORTERM=truecolor", "TERM_PROGRAM=DevDock"] {
+                    libc::putenv(std::ffi::CString::new(var).unwrap().into_raw());
+                }
 
+                // A login shell, the way a terminal app starts one — argv[0]
+                // with a leading dash — so the profile that sets PATH runs
+                // and `flutter`, `cargo`, `node` are found here as they are
+                // in any other terminal.
                 let program = std::ffi::CString::new(command).unwrap_or_default();
-                let argv = [program.as_ptr(), std::ptr::null()];
+                let name = command.rsplit('/').next().unwrap_or(command);
+                let argv0 = std::ffi::CString::new(format!("-{name}")).unwrap_or_default();
+                let argv = [argv0.as_ptr(), std::ptr::null()];
                 libc::execvp(program.as_ptr(), argv.as_ptr());
                 // exec only returns on failure, and this is a forked child:
                 // it must not unwind back into the parent's code.
@@ -126,8 +133,14 @@ impl Pty {
                 match file.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(n) => {
-                        if let Ok(mut screen) = reader_screen.lock() {
-                            screen.feed(&buffer[..n]);
+                        let replies = match reader_screen.lock() {
+                            Ok(mut screen) => screen.feed(&buffer[..n]),
+                            Err(_) => Vec::new(),
+                        };
+                        // What the program asked the terminal — where the
+                        // cursor is — answered on the same pty it reads.
+                        if !replies.is_empty() {
+                            let _ = file.write_all(&replies);
                         }
                         if let Some(notify) = &on_output {
                             notify();

@@ -1,26 +1,36 @@
-//! A terminal screen, and enough of the VT100/xterm sequences to drive it.
+//! A terminal screen.
 //!
-//! This is not a complete emulator, and does not pretend to be. It covers
-//! what command-line *output* uses — colours, cursor movement, erasing,
-//! carriage returns, tabs — so that `ls`, `git`, `cargo`, and a shell
-//! prompt all look right. Full-screen programs that take over the display
-//! (`vim`, `top`) switch to the alternate screen; that is detected and
-//! reported rather than half-rendered, because a half-drawn `vim` is worse
-//! than an honest "this needs a full terminal".
+//! The emulation is the `vt100` crate's: a complete parser and screen —
+//! the alternate screen that `less`, `vim` and `git log` draw on, scroll
+//! regions, wide characters, UTF-8 that arrives split across reads,
+//! character-set selection, the modes a program sets for the keyboard. An
+//! emulator written here covered what command *output* uses and nothing
+//! a program that draws needs; every gap was a bug somebody met.
+//!
+//! This module is what the rest of the app sees of it: cells with the
+//! app's own colour names, a window onto the history, the modes the
+//! keyboard has to honour, and the answers a terminal owes a program
+//! that asks where the cursor is.
 //!
 //! Everything here is pure: bytes in, screen out. The pty lives next door
-//! in [`super`], and the parser can be tested without one.
+//! in [`super`], and this can be tested without one.
 
 /// One character cell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cell {
     pub ch: char,
+    /// What follows `ch` in the same cell: combining marks, the rest of an
+    /// emoji sequence. Empty for almost every cell.
+    pub more: String,
     pub style: Style,
+    /// Two columns wide; the next cell is its second half and is not drawn.
+    pub wide: bool,
+    pub continuation: bool,
 }
 
 impl Default for Cell {
     fn default() -> Self {
-        Self { ch: ' ', style: Style::default() }
+        Self { ch: ' ', more: String::new(), style: Style::default(), wide: false, continuation: false }
     }
 }
 
@@ -59,10 +69,6 @@ pub enum Color {
 impl Color {
     /// The named colour for an index 0-7, for callers mapping a palette.
     pub fn from_index(code: u8) -> Self {
-        Self::from_ansi(code)
-    }
-
-    fn from_ansi(code: u8) -> Self {
         match code % 8 {
             0 => Self::Black,
             1 => Self::Red,
@@ -74,40 +80,74 @@ impl Color {
             _ => Self::White,
         }
     }
-}
 
-/// The parser's state between bytes, since input arrives in arbitrary chunks.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum State {
-    Ground,
-    /// Saw ESC.
-    Escape,
-    /// Inside a CSI sequence, collecting parameters.
-    Csi { params: String, intermediate: String },
-    /// Inside an OSC string, waiting for BEL or ST.
-    Osc { saw_esc: bool },
+    fn from_vt(color: vt100::Color) -> Option<Self> {
+        match color {
+            vt100::Color::Default => None,
+            vt100::Color::Idx(n @ 0..=7) => Some(Self::from_index(n)),
+            vt100::Color::Idx(n @ 8..=15) => Some(Self::Bright(n - 8)),
+            vt100::Color::Idx(n) => Some(Self::Indexed(n)),
+            vt100::Color::Rgb(r, g, b) => Some(Self::Rgb(r, g, b)),
+        }
+    }
 }
 
 /// Cap on scrollback, so a `cargo build` on a big workspace cannot grow
 /// without limit.
 const MAX_SCROLLBACK: usize = 5_000;
 
+/// What the parser hands back besides the screen: the title a program
+/// set, and what the terminal must answer.
+#[derive(Default)]
+struct Events {
+    title: Option<String>,
+    replies: Vec<u8>,
+}
+
+impl vt100::Callbacks for Events {
+    fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
+        self.title = Some(String::from_utf8_lossy(title).into_owned());
+    }
+
+    /// The questions a program asks its terminal and then waits on: where
+    /// the cursor is (shells and prompts, to find out whether the last
+    /// output ended its line), whether the terminal is there at all, what
+    /// kind it is. Unanswered, the program waits out a timeout every time.
+    fn unhandled_csi(&mut self, screen: &mut vt100::Screen, i1: Option<u8>, _i2: Option<u8>, params: &[&[u16]], c: char) {
+        let first = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
+        match (i1, c, first) {
+            (None, 'n', 6) => {
+                let (row, col) = screen.cursor_position();
+                self.replies.extend_from_slice(format!("\x1b[{};{}R", row + 1, col + 1).as_bytes());
+            }
+            (None, 'n', 5) => self.replies.extend_from_slice(b"\x1b[0n"),
+            // Primary device attributes: a VT220 with nothing special.
+            (None, 'c', 0) => self.replies.extend_from_slice(b"\x1b[?62;22c"),
+            (Some(b'>'), 'c', 0) => self.replies.extend_from_slice(b"\x1b[>1;10;0c"),
+            _ => {}
+        }
+    }
+}
+
+/// The part of the screen and its history that fits the window, for drawing.
+pub struct View {
+    pub rows: Vec<Vec<Cell>>,
+    /// The cursor's row and column in `rows`; `None` when the program hid
+    /// it or the window is scrolled away from it.
+    pub cursor: Option<(usize, usize)>,
+    /// How far back the window is, in lines, after clamping.
+    pub offset: usize,
+    /// How many lines of history there are to scroll back through.
+    pub history: usize,
+}
+
 /// A terminal screen: a grid, a cursor, and the lines that have scrolled off.
 pub struct Screen {
+    parser: vt100::Parser<Events>,
     pub cols: usize,
     pub rows: usize,
-    grid: Vec<Vec<Cell>>,
-    scrollback: Vec<Vec<Cell>>,
-    cursor: (usize, usize),
-    saved_cursor: (usize, usize),
-    style: Style,
-    state: State,
-    /// Set while a full-screen program has taken over.
-    alternate: bool,
     /// Bumped on every change, so a UI can tell whether to repaint.
     pub epoch: u64,
-    /// The title the program set, if any.
-    pub title: Option<String>,
 }
 
 impl Screen {
@@ -115,37 +155,20 @@ impl Screen {
         let cols = cols.max(1);
         let rows = rows.max(1);
         Self {
+            parser: vt100::Parser::new_with_callbacks(rows as u16, cols as u16, MAX_SCROLLBACK, Events::default()),
             cols,
             rows,
-            grid: vec![vec![Cell::default(); cols]; rows],
-            scrollback: Vec::new(),
-            cursor: (0, 0),
-            saved_cursor: (0, 0),
-            style: Style::default(),
-            state: State::Ground,
-            alternate: false,
             epoch: 0,
-            title: None,
         }
     }
 
-    /// Whether a full-screen program is currently in control.
-    pub fn alternate_screen(&self) -> bool {
-        self.alternate
-    }
-
-    /// Every line, scrollback first, for rendering.
-    pub fn lines(&self) -> Vec<&[Cell]> {
-        self.scrollback
-            .iter()
-            .map(|row| row.as_slice())
-            .chain(self.grid.iter().map(|row| row.as_slice()))
-            .collect()
-    }
-
-    /// The cursor's position within [`Self::lines`].
-    pub fn cursor_position(&self) -> (usize, usize) {
-        (self.scrollback.len() + self.cursor.0, self.cursor.1)
+    /// Feeds output from the program. What comes back is what the terminal
+    /// owes the program in answer — a cursor position it asked for — to be
+    /// written to it.
+    pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.parser.process(bytes);
+        self.epoch += 1;
+        std::mem::take(&mut self.parser.callbacks_mut().replies)
     }
 
     /// Rows and columns, keeping the content that fits.
@@ -155,338 +178,149 @@ impl Screen {
         if cols == self.cols && rows == self.rows {
             return;
         }
-        for row in &mut self.grid {
-            row.resize(cols, Cell::default());
+        // A shorter window keeps the line the cursor is on: what no longer
+        // fits goes off the top into the history, as in any terminal. Left
+        // to the grid alone, the bottom rows — the prompt — are the ones cut.
+        let (cursor_row, _) = self.parser.screen().cursor_position();
+        let over = (cursor_row as usize + 1).saturating_sub(rows);
+        if over > 0 && !self.alternate_screen() {
+            let scroll = format!("\x1b7\x1b[{};1H{}\x1b8\x1b[{over}A", self.rows, "\n".repeat(over));
+            self.parser.process(scroll.as_bytes());
         }
-        // Growing adds blank rows; shrinking pushes the top into scrollback,
-        // which is what a real terminal does and what keeps output readable.
-        while self.grid.len() > rows {
-            let line = self.grid.remove(0);
-            self.push_scrollback(line);
-            self.cursor.0 = self.cursor.0.saturating_sub(1);
-        }
-        while self.grid.len() < rows {
-            self.grid.push(vec![Cell::default(); cols]);
-        }
+        self.parser.screen_mut().set_size(rows as u16, cols as u16);
         self.cols = cols;
         self.rows = rows;
-        self.cursor.0 = self.cursor.0.min(rows - 1);
-        self.cursor.1 = self.cursor.1.min(cols - 1);
         self.epoch += 1;
     }
 
-    /// Feeds output from the program.
-    pub fn feed(&mut self, bytes: &[u8]) {
-        // Decode lossily: a program that emits invalid UTF-8 should not stop
-        // the terminal, and the replacement character is the honest result.
-        let text = String::from_utf8_lossy(bytes);
-        for ch in text.chars() {
-            self.feed_char(ch);
-        }
-        self.epoch += 1;
+    /// The title the program set, if any.
+    pub fn title(&self) -> Option<&str> {
+        self.parser.callbacks().title.as_deref()
     }
 
-    fn feed_char(&mut self, ch: char) {
-        match std::mem::replace(&mut self.state, State::Ground) {
-            State::Ground => self.ground(ch),
-            State::Escape => match ch {
-                '[' => {
-                    self.state = State::Csi {
-                        params: String::new(),
-                        intermediate: String::new(),
+    /// Whether a full-screen program is currently in control.
+    pub fn alternate_screen(&self) -> bool {
+        self.parser.screen().alternate_screen()
+    }
+
+    /// The program asked for arrow keys in their application form.
+    pub fn application_cursor(&self) -> bool {
+        self.parser.screen().application_cursor()
+    }
+
+    /// The program wants a paste marked as one, so it is not run line by
+    /// line as though typed.
+    pub fn bracketed_paste(&self) -> bool {
+        self.parser.screen().bracketed_paste()
+    }
+
+    /// The program is listening for the mouse: the wheel is its to handle.
+    pub fn mouse_reporting(&self) -> bool {
+        self.parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None
+    }
+
+    /// How many lines have scrolled off the top.
+    pub fn history(&mut self) -> usize {
+        let screen = self.parser.screen_mut();
+        screen.set_scrollback(usize::MAX);
+        let history = screen.scrollback();
+        screen.set_scrollback(0);
+        history
+    }
+
+    /// The window `offset` lines back from the live screen.
+    pub fn view(&mut self, offset: usize) -> View {
+        let history = self.history();
+        let offset = offset.min(history);
+        let screen = self.parser.screen_mut();
+        screen.set_scrollback(offset);
+        let rows = (0..self.rows).map(|row| Self::row_of(screen, row as u16, self.cols)).collect();
+        screen.set_scrollback(0);
+        let cursor = (offset == 0 && !screen.hide_cursor()).then(|| {
+            let (row, col) = screen.cursor_position();
+            (row as usize, (col as usize).min(self.cols.saturating_sub(1)))
+        });
+        View { rows, cursor, offset, history }
+    }
+
+    fn row_of(screen: &vt100::Screen, row: u16, cols: usize) -> Vec<Cell> {
+        (0..cols as u16)
+            .map(|col| match screen.cell(row, col) {
+                Some(cell) => {
+                    let mut chars = cell.contents().chars();
+                    Cell {
+                        ch: chars.next().unwrap_or(' '),
+                        more: chars.collect(),
+                        style: Style {
+                            fg: Color::from_vt(cell.fgcolor()),
+                            bg: Color::from_vt(cell.bgcolor()),
+                            bold: cell.bold(),
+                            italic: cell.italic(),
+                            underline: cell.underline(),
+                            inverse: cell.inverse(),
+                            dim: cell.dim(),
+                        },
+                        wide: cell.is_wide(),
+                        continuation: cell.is_wide_continuation(),
                     }
                 }
-                ']' => self.state = State::Osc { saw_esc: false },
-                // Save/restore cursor, the non-CSI forms.
-                '7' => self.saved_cursor = self.cursor,
-                '8' => self.cursor = self.saved_cursor,
-                'M' => self.reverse_index(),
-                // Anything else is a sequence we do not implement; dropping
-                // the escape is better than printing it as text.
-                _ => {}
-            },
-            State::Csi { mut params, mut intermediate } => {
-                match ch {
-                    // Parameter bytes are 0x30-0x3F, which is `0-9:;<=>?` —
-                    // the private markers `<`, `=`, `>` and `?` included.
-                    // Stopping at `?` alone ends the sequence early and
-                    // prints the rest of it as text.
-                    '0'..='?' => {
-                        params.push(ch);
-                        self.state = State::Csi { params, intermediate };
-                    }
-                    ' '..='/' => {
-                        intermediate.push(ch);
-                        self.state = State::Csi { params, intermediate };
-                    }
-                    _ => self.csi(&params, ch),
-                }
-            }
-            State::Osc { saw_esc } => match (saw_esc, ch) {
-                // BEL or ST ends the string.
-                (_, '\u{7}') => {}
-                (true, '\\') => {}
-                (_, '\u{1b}') => self.state = State::Osc { saw_esc: true },
-                _ => self.state = State::Osc { saw_esc: false },
-            },
-        }
+                None => Cell::default(),
+            })
+            .collect()
     }
 
-    fn ground(&mut self, ch: char) {
-        match ch {
-            '\u{1b}' => self.state = State::Escape,
-            '\n' => self.newline(),
-            '\r' => self.cursor.1 = 0,
-            '\u{8}' => self.cursor.1 = self.cursor.1.saturating_sub(1),
-            '\t' => {
-                let next = ((self.cursor.1 / 8) + 1) * 8;
-                self.cursor.1 = next.min(self.cols - 1);
-            }
-            '\u{7}' => {} // bell
-            ch if (ch as u32) < 0x20 => {}
-            ch => self.put(ch),
-        }
+    /// Every line, history first: for tests and for copying out. Drawing
+    /// uses [`Self::view`], which reads only what the window shows.
+    pub fn lines(&self) -> Vec<Vec<Cell>> {
+        let mut screen = self.parser.screen().clone();
+        screen.set_scrollback(usize::MAX);
+        let history = screen.scrollback();
+        (0..history + self.rows).map(|line| Self::line_of(&mut screen, line, history, self.cols)).collect()
     }
 
-    fn put(&mut self, ch: char) {
-        if self.cursor.1 >= self.cols {
-            self.newline();
-            self.cursor.1 = 0;
-        }
-        let (row, col) = self.cursor;
-        self.grid[row][col] = Cell { ch, style: self.style };
-        self.cursor.1 += 1;
-    }
-
-    fn newline(&mut self) {
-        if self.cursor.0 + 1 < self.rows {
-            self.cursor.0 += 1;
-            return;
-        }
-        let line = self.grid.remove(0);
-        self.push_scrollback(line);
-        self.grid.push(vec![Cell::default(); self.cols]);
-    }
-
-    fn reverse_index(&mut self) {
-        if self.cursor.0 == 0 {
-            self.grid.insert(0, vec![Cell::default(); self.cols]);
-            self.grid.truncate(self.rows);
+    /// Line `line` of history-then-screen.
+    fn line_of(screen: &mut vt100::Screen, line: usize, history: usize, cols: usize) -> Vec<Cell> {
+        if line < history {
+            screen.set_scrollback(history - line);
+            Self::row_of(screen, 0, cols)
         } else {
-            self.cursor.0 -= 1;
+            screen.set_scrollback(0);
+            Self::row_of(screen, (line - history) as u16, cols)
         }
     }
 
-    fn push_scrollback(&mut self, line: Vec<Cell>) {
-        // The alternate screen is transient by definition: nothing a
-        // full-screen program draws belongs in the history.
-        if self.alternate {
-            return;
+    /// The text from `start` to `end` — `(line, column)` in
+    /// history-then-screen lines, both included — for copying a selection.
+    pub fn text_between(&self, start: (usize, usize), end: (usize, usize)) -> String {
+        let (start, end) = if start <= end { (start, end) } else { (end, start) };
+        let mut screen = self.parser.screen().clone();
+        screen.set_scrollback(usize::MAX);
+        let history = screen.scrollback();
+        let last = (history + self.rows).saturating_sub(1);
+        let mut out = Vec::new();
+        for line in start.0..=end.0.min(last) {
+            let row = Self::line_of(&mut screen, line, history, self.cols);
+            let from = if line == start.0 { start.1.min(row.len()) } else { 0 };
+            let to = if line == end.0 { (end.1 + 1).min(row.len()) } else { row.len() };
+            out.push(cells_text(&row[from..to.max(from)]).trim_end().to_string());
         }
-        self.scrollback.push(line);
-        if self.scrollback.len() > MAX_SCROLLBACK {
-            let excess = self.scrollback.len() - MAX_SCROLLBACK;
-            self.scrollback.drain(..excess);
-        }
-    }
-
-    fn csi(&mut self, params: &str, final_byte: char) {
-        let private = params.starts_with('?');
-        let numbers: Vec<usize> = params
-            .trim_start_matches(['?', '<', '=', '>'])
-            .split(';')
-            .map(|p| p.split(':').next().unwrap_or("").parse().unwrap_or(0))
-            .collect();
-        let first = numbers.first().copied().unwrap_or(0);
-        let at_least_one = first.max(1);
-
-        match final_byte {
-            'A' => self.cursor.0 = self.cursor.0.saturating_sub(at_least_one),
-            'B' => self.cursor.0 = (self.cursor.0 + at_least_one).min(self.rows - 1),
-            'C' => self.cursor.1 = (self.cursor.1 + at_least_one).min(self.cols - 1),
-            'D' => self.cursor.1 = self.cursor.1.saturating_sub(at_least_one),
-            'E' => {
-                self.cursor.0 = (self.cursor.0 + at_least_one).min(self.rows - 1);
-                self.cursor.1 = 0;
-            }
-            'F' => {
-                self.cursor.0 = self.cursor.0.saturating_sub(at_least_one);
-                self.cursor.1 = 0;
-            }
-            'G' => self.cursor.1 = (at_least_one - 1).min(self.cols - 1),
-            'd' => self.cursor.0 = (at_least_one - 1).min(self.rows - 1),
-            'H' | 'f' => {
-                let row = numbers.first().copied().unwrap_or(1).max(1) - 1;
-                let col = numbers.get(1).copied().unwrap_or(1).max(1) - 1;
-                self.cursor = (row.min(self.rows - 1), col.min(self.cols - 1));
-            }
-            'J' => self.erase_display(first),
-            'K' => self.erase_line(first),
-            'L' => {
-                for _ in 0..at_least_one {
-                    self.grid.insert(self.cursor.0, vec![Cell::default(); self.cols]);
-                    self.grid.truncate(self.rows);
-                }
-            }
-            'M' => {
-                for _ in 0..at_least_one {
-                    if self.cursor.0 < self.grid.len() {
-                        self.grid.remove(self.cursor.0);
-                        self.grid.push(vec![Cell::default(); self.cols]);
-                    }
-                }
-            }
-            'P' => {
-                let row = &mut self.grid[self.cursor.0];
-                for _ in 0..at_least_one {
-                    if self.cursor.1 < row.len() {
-                        row.remove(self.cursor.1);
-                        row.push(Cell::default());
-                    }
-                }
-            }
-            'X' => {
-                let (row, col) = self.cursor;
-                for i in 0..at_least_one {
-                    if col + i < self.cols {
-                        self.grid[row][col + i] = Cell::default();
-                    }
-                }
-            }
-            'm' => self.sgr(&numbers, params),
-            's' => self.saved_cursor = self.cursor,
-            'u' => self.cursor = self.saved_cursor,
-            // 1049/47/1047: the alternate screen. Track it so the UI can
-            // say a full-screen program is running.
-            'h' | 'l'
-                if private && numbers.iter().any(|n| matches!(n, 1049 | 1047 | 47)) =>
-            {
-                self.alternate = final_byte == 'h';
-                self.clear_grid();
-                self.cursor = (0, 0);
-            }
-            _ => {}
-        }
-    }
-
-    fn erase_display(&mut self, mode: usize) {
-        match mode {
-            // To the end of the screen.
-            0 => {
-                self.erase_line(0);
-                for row in self.cursor.0 + 1..self.rows {
-                    self.grid[row] = vec![Cell::default(); self.cols];
-                }
-            }
-            1 => {
-                self.erase_line(1);
-                for row in 0..self.cursor.0 {
-                    self.grid[row] = vec![Cell::default(); self.cols];
-                }
-            }
-            // 2 clears the screen, 3 also clears scrollback.
-            _ => {
-                self.clear_grid();
-                if mode == 3 {
-                    self.scrollback.clear();
-                }
-            }
-        }
-    }
-
-    fn clear_grid(&mut self) {
-        self.grid = vec![vec![Cell::default(); self.cols]; self.rows];
-    }
-
-    fn erase_line(&mut self, mode: usize) {
-        let (row, col) = self.cursor;
-        let line = &mut self.grid[row];
-        match mode {
-            0 => {
-                for cell in line.iter_mut().skip(col) {
-                    *cell = Cell::default();
-                }
-            }
-            1 => {
-                for cell in line.iter_mut().take(col + 1) {
-                    *cell = Cell::default();
-                }
-            }
-            _ => *line = vec![Cell::default(); self.cols],
-        }
-    }
-
-    /// Select Graphic Rendition: colours and attributes.
-    fn sgr(&mut self, numbers: &[usize], raw: &str) {
-        if raw.is_empty() {
-            self.style = Style::default();
-            return;
-        }
-        let mut i = 0;
-        while i < numbers.len() {
-            match numbers[i] {
-                0 => self.style = Style::default(),
-                1 => self.style.bold = true,
-                2 => self.style.dim = true,
-                3 => self.style.italic = true,
-                4 => self.style.underline = true,
-                7 => self.style.inverse = true,
-                22 => {
-                    self.style.bold = false;
-                    self.style.dim = false;
-                }
-                23 => self.style.italic = false,
-                24 => self.style.underline = false,
-                27 => self.style.inverse = false,
-                30..=37 => self.style.fg = Some(Color::from_ansi(numbers[i] as u8 - 30)),
-                39 => self.style.fg = None,
-                40..=47 => self.style.bg = Some(Color::from_ansi(numbers[i] as u8 - 40)),
-                49 => self.style.bg = None,
-                90..=97 => self.style.fg = Some(Color::Bright(numbers[i] as u8 - 90)),
-                100..=107 => self.style.bg = Some(Color::Bright(numbers[i] as u8 - 100)),
-                // 38/48 take an extended colour: 5;n for the palette, 2;r;g;b.
-                38 | 48 => {
-                    let foreground = numbers[i] == 38;
-                    let color = match numbers.get(i + 1) {
-                        Some(5) => {
-                            let value = numbers.get(i + 2).copied().unwrap_or(0) as u8;
-                            i += 2;
-                            Some(Color::Indexed(value))
-                        }
-                        Some(2) => {
-                            let r = numbers.get(i + 2).copied().unwrap_or(0) as u8;
-                            let g = numbers.get(i + 3).copied().unwrap_or(0) as u8;
-                            let b = numbers.get(i + 4).copied().unwrap_or(0) as u8;
-                            i += 4;
-                            Some(Color::Rgb(r, g, b))
-                        }
-                        _ => None,
-                    };
-                    if foreground {
-                        self.style.fg = color;
-                    } else {
-                        self.style.bg = color;
-                    }
-                }
-                _ => {}
-            }
-            i += 1;
-        }
+        out.join("\n")
     }
 
     /// The screen as plain text, for tests and for copying.
     pub fn text(&self) -> String {
-        self.lines()
-            .iter()
-            .map(|row| {
-                let line: String = row.iter().map(|c| c.ch).collect();
-                line.trim_end().to_string()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-            .trim_end()
-            .to_string()
+        self.lines().iter().map(|row| cells_text(row).trim_end().to_string()).collect::<Vec<_>>().join("\n").trim_end().to_string()
     }
+}
+
+/// The characters of a run of cells, a wide character counted once.
+fn cells_text(cells: &[Cell]) -> String {
+    let mut text = String::new();
+    for cell in cells.iter().filter(|c| !c.continuation) {
+        text.push(cell.ch);
+        text.push_str(&cell.more);
+    }
+    text
 }
 
 #[cfg(test)]
@@ -649,5 +483,82 @@ mod tests {
     fn unknown_sequences_are_dropped_rather_than_printed() {
         let screen = screen("\x1b[>4;2m\x1b[?2004hprompt");
         assert_eq!(screen.text(), "prompt");
+    }
+
+    /// What the old emulator got wrong, one by one.
+    #[test]
+    fn the_sequences_real_programs_send_are_handled() {
+        // `tput sgr0` ends with a character-set selection; its last byte is
+        // not text.
+        assert_eq!(screen("\x1b[1mbold\x1b(B\x1b[m plain").text(), "bold plain");
+
+        // A character split across two reads is one character.
+        let mut split = Screen::new(20, 3);
+        let bytes = "│ café ✓".as_bytes();
+        split.feed(&bytes[..2]);
+        split.feed(&bytes[2..9]);
+        split.feed(&bytes[9..]);
+        assert_eq!(split.text(), "│ café ✓");
+
+        // A wide character takes two columns and is copied once.
+        let wide = screen("日本 ok");
+        let line = &wide.lines()[0];
+        assert!(line[0].wide && line[1].continuation && line[4].ch == ' ', "{line:?}");
+        assert_eq!(wide.text(), "日本 ok");
+
+        // A full-screen program gets a screen of its own, and what was
+        // there before it comes back when it leaves.
+        let mut pager = Screen::new(20, 4);
+        pager.feed(b"$ git log\r\n");
+        pager.feed(b"\x1b[?1049h\x1b[H\x1b[2Jcommit abc\r\n:");
+        assert!(pager.alternate_screen());
+        assert_eq!(pager.view(0).rows[0][0].ch, 'c');
+        pager.feed(b"\x1b[?1049l");
+        assert_eq!(pager.text(), "$ git log");
+
+        // A scroll region: the status line at the bottom stays put.
+        let mut region = Screen::new(10, 4);
+        region.feed(b"\x1b[4;1Hstatus\x1b[1;3r\x1b[1;1Ha\r\nb\r\nc\r\nd");
+        let view = region.view(0);
+        let text: Vec<String> = view.rows.iter().map(|r| cells_text(r).trim_end().to_string()).collect();
+        assert_eq!(text, ["b", "c", "d", "status"]);
+    }
+
+    #[test]
+    fn a_program_that_asks_the_terminal_gets_an_answer() {
+        let mut screen = Screen::new(20, 5);
+        assert!(screen.feed(b"plain").is_empty());
+        assert_eq!(screen.feed(b"\r\nab\x1b[6n"), b"\x1b[2;3R");
+        assert_eq!(screen.feed(b"\x1b[5n"), b"\x1b[0n");
+        assert!(screen.feed(b"\x1b[c").starts_with(b"\x1b[?"));
+        screen.feed(b"\x1b]0;my title\x07");
+        assert_eq!(screen.title(), Some("my title"));
+    }
+
+    #[test]
+    fn the_modes_the_keyboard_honours_are_reported() {
+        let mut screen = Screen::new(20, 5);
+        assert!(!screen.application_cursor() && !screen.bracketed_paste() && !screen.mouse_reporting());
+        screen.feed(b"\x1b[?1h\x1b[?2004h\x1b[?1000h");
+        assert!(screen.application_cursor() && screen.bracketed_paste() && screen.mouse_reporting());
+    }
+
+    #[test]
+    fn the_window_scrolls_back_through_history_and_a_selection_copies() {
+        let mut screen = Screen::new(10, 2);
+        screen.feed(b"one\r\ntwo\r\nthree\r\nfour");
+        assert_eq!(screen.history(), 2);
+        let live = screen.view(0);
+        assert_eq!(live.cursor, Some((1, 4)));
+        assert_eq!(cells_text(&live.rows[0]).trim_end(), "three");
+        let back = screen.view(99);
+        assert_eq!((back.offset, back.history, back.cursor), (2, 2, None));
+        assert_eq!(cells_text(&back.rows[0]).trim_end(), "one");
+        // Scrolling back is a view: the screen itself has not moved.
+        assert_eq!(cells_text(&screen.view(0).rows[1]).trim_end(), "four");
+
+        assert_eq!(screen.text_between((0, 1), (2, 2)), "ne\ntwo\nthr");
+        assert_eq!(screen.text_between((3, 0), (3, 99)), "four");
+        assert_eq!(screen.text_between((2, 2), (0, 1)), "ne\ntwo\nthr", "either direction");
     }
 }

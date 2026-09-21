@@ -254,3 +254,58 @@ fn a_command_that_does_not_exist_fails_rather_than_hanging() {
     }
     assert!(!pty.alive(), "a failed exec should end the session");
 }
+
+/// A pager takes the screen over and gives it back: `git log`, `man`, and
+/// `less` are what a terminal in a git client is used for most.
+#[test]
+fn a_pager_draws_on_a_screen_of_its_own_and_gives_it_back() {
+    if !std::path::Path::new("/usr/bin/less").exists() {
+        eprintln!("no less here; skipping");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let pty = Pty::spawn("/bin/sh", dir.path(), 80, 24, None).unwrap();
+    pty.write(b"mark=before; echo $mark-the-pager\n");
+    eventually(&pty, "the line before the pager", |t| t.contains("before-the-pager"));
+
+    pty.write(b"seq 1 500 | LESS= less\n");
+    eventually_screen(&pty, "the pager to take the screen", |s: &Screen| s.alternate_screen());
+    // It draws the top of its input, and the history is not what it draws on.
+    eventually_screen(&pty, "the pager's first page", |s: &Screen| {
+        let mut s2 = s.lines();
+        let last = s2.split_off(s2.len() - 24);
+        last.iter().any(|row| row.iter().map(|c| c.ch).collect::<String>().trim() == "23")
+    });
+    // Page down, the way the keyboard sends it, moves it.
+    pty.write(b" ");
+    eventually_screen(&pty, "the second page", |s: &Screen| {
+        let lines = s.lines();
+        lines[lines.len() - 24..].iter().any(|row| row.iter().map(|c| c.ch).collect::<String>().trim() == "40")
+    });
+
+    pty.write(b"q");
+    eventually_screen(&pty, "the pager to leave", |s: &Screen| !s.alternate_screen());
+    let text = pty.text();
+    assert!(text.contains("before-the-pager"), "what was there before the pager is back:\n{text}");
+    assert!(!text.contains("\n40\n"), "and nothing the pager drew is in the history:\n{text}");
+}
+
+/// A program that asks where the cursor is gets told — shells and prompts
+/// do, and wait on the answer.
+#[test]
+fn a_cursor_position_query_is_answered() {
+    if !std::path::Path::new("/bin/bash").exists() {
+        eprintln!("no bash here; skipping");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let pty = Pty::spawn("/bin/bash", dir.path(), 80, 24, None).unwrap();
+    // Raw input so the answer is read as it arrives; `read -d R` takes it
+    // up to its final byte, and what is printed is rebuilt from it so the
+    // echoed command cannot satisfy the wait.
+    pty.write(b"stty -icanon -echo; printf '\\033[6n'; IFS= read -r -d R pos; stty sane; echo \"cursor-at=${pos#*[}\"\n");
+    let text = eventually(&pty, "the cursor position answer", |t| {
+        t.lines().any(|l| l.starts_with("cursor-at=") && l.contains(';') && l["cursor-at=".len()..].split(';').all(|n| n.parse::<u16>().is_ok()))
+    });
+    assert!(text.contains("cursor-at="), "{text}");
+}

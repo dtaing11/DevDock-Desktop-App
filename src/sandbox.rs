@@ -324,7 +324,10 @@ impl Sandbox {
                 ))
             }
         };
-        if inside.stdout.trim() == json.trim() {
+        // Only when this machine's is the newer: the sandbox's own Claude
+        // Code refreshes what it has, and an older copy written over a
+        // fresher token would be the staleness this guards against.
+        if inside.stdout.trim() == json.trim() || credential_expiry(&inside.stdout) >= credential_expiry(&json) {
             return Ok(false);
         }
         let mut cmd = self.command(
@@ -613,12 +616,22 @@ pub fn host_claude_signin() -> Result<(), String> {
     if value.get("apiKey").is_some() {
         return Ok(());
     }
-    let expires_ms = value.pointer("/claudeAiOauth/expiresAt").and_then(|v| v.as_f64()).unwrap_or(f64::MAX);
+    let expires_ms = credential_expiry(&json);
     let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as f64).unwrap_or(0.0);
     if expires_ms < now_ms {
         return Err("this machine's Claude Code sign-in has expired, so the sandbox's would be too: open a terminal, run `claude`, let it refresh or sign in again, then run the task again".into());
     }
     Ok(())
+}
+
+/// When a Claude Code credential runs out, in ms since the epoch; zero
+/// for none, and unbounded for an API key, which does not.
+fn credential_expiry(json: &str) -> f64 {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json.trim()) else { return 0.0 };
+    if value.get("apiKey").is_some() {
+        return f64::MAX;
+    }
+    value.pointer("/claudeAiOauth/expiresAt").and_then(|v| v.as_f64()).unwrap_or(0.0)
 }
 
 fn host_claude_credentials() -> Option<String> {
@@ -688,6 +701,15 @@ impl Runner for SandboxRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fresher_sign_in_is_the_one_kept() {
+        let older = r#"{"claudeAiOauth":{"accessToken":"a","expiresAt":1000}}"#;
+        let newer = r#"{"claudeAiOauth":{"accessToken":"b","expiresAt":2000}}"#;
+        assert!(credential_expiry(newer) > credential_expiry(older));
+        assert_eq!(credential_expiry(""), 0.0, "nothing inside: anything is fresher");
+        assert_eq!(credential_expiry(r#"{"apiKey":"k"}"#), f64::MAX, "a key does not run out");
+    }
 
     #[test]
     fn a_spec_is_a_runtime_name_or_an_image() {

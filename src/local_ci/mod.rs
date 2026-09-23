@@ -977,6 +977,11 @@ pub fn run_job_with(registry: &RunnerRegistry, repo_root: &Path, job: &Job) -> J
     if !job.env.contains_key("GIT_TERMINAL_PROMPT") {
         env.push(("GIT_TERMINAL_PROMPT".into(), "0".into()));
     }
+    // Nor an ssh prompt: a git dependency fetched over ssh with no key here
+    // fails at once rather than waiting on a passphrase or a host-key answer.
+    if !job.env.contains_key("GIT_SSH_COMMAND") {
+        env.push(("GIT_SSH_COMMAND".into(), "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new".into()));
+    }
     match resolve_secrets(repo_root, job) {
         Ok(secrets) => env.extend(secrets),
         Err(message) => return fail(message),
@@ -1001,13 +1006,22 @@ pub fn run_job_with(registry: &RunnerRegistry, repo_root: &Path, job: &Job) -> J
                 text.push_str("\n--- stderr ---\n");
                 text.push_str(&out.stderr);
             }
+            // Too long: the middle goes, not the end — the end is where
+            // the error, and the mark of a job killed for its time, are.
             if text.len() > MAX_OUTPUT {
-                let mut end = MAX_OUTPUT;
-                while !text.is_char_boundary(end) {
-                    end -= 1;
+                let keep_tail = MAX_OUTPUT / 4;
+                let mut head_end = MAX_OUTPUT - keep_tail;
+                while !text.is_char_boundary(head_end) {
+                    head_end -= 1;
                 }
-                text.truncate(end);
-                text.push_str("\n[output truncated]");
+                let mut tail_start = text.len() - keep_tail;
+                while !text.is_char_boundary(tail_start) {
+                    tail_start += 1;
+                }
+                let tail = text[tail_start..].to_string();
+                text.truncate(head_end);
+                text.push_str("\n[… output truncated …]\n");
+                text.push_str(&tail);
             }
             JobResult {
                 name: job.display_name(),
@@ -1118,6 +1132,22 @@ pub fn hook_installed(repo_root: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A job that prints more than is kept loses its middle, never its end:
+    /// the end is where the error is, and the mark of a job killed for its
+    /// time — the difference between "fails on main" and "never finishes".
+    #[test]
+    fn long_output_keeps_its_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = runner::RunnerRegistry::with_builtins();
+        let job = Job { name: "loud".into(), commands: vec!["yes 'a line of output that goes on' | head -c 200000; echo; echo THE-LAST-LINE; sleep 5".into()], timeout_secs: Some(1), ..Default::default() };
+        let result = run_job_with(&registry, dir.path(), &job);
+        assert!(!result.ok);
+        assert!(result.output.len() < MAX_OUTPUT + 200, "{}", result.output.len());
+        assert!(result.output.contains("[… output truncated …]"));
+        assert!(result.output.contains("THE-LAST-LINE"), "the end is kept");
+        assert!(runner::timed_out(&result.output), "and so is the mark:\n…{}", &result.output[result.output.len() - 200..]);
+    }
 
     #[test]
     fn checks_are_inferred_from_the_toolchain() {

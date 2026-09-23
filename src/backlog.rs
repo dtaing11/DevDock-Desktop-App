@@ -551,6 +551,12 @@ fn work(
         }
         None => None,
     };
+    // What the first model call would fail on, found out now — not after
+    // half an hour of checks: Claude Code in the sandbox runs on a copy of
+    // this machine's sign-in.
+    if sandbox.is_some() && matches!(engine, Engine::ClaudeCode(_)) {
+        crate::sandbox::host_claude_signin()?;
+    }
     let mut runners = crate::local_ci::runner::RunnerRegistry::with_builtins();
     if let Some(sandbox) = &sandbox {
         runners.register(Box::new(crate::sandbox::SandboxRunner(sandbox.clone())));
@@ -587,7 +593,23 @@ fn work(
     // same way. A check that fails differently, or newly, counts.
     let mut baseline: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     let mut unfinished: Vec<String> = Vec::new();
-    if !jobs.is_empty() {
+    // The untouched tree is the base commit, and how its checks went is
+    // the same for every run from it: remembered, so a reply — or the next
+    // ticket — does not pay a half-hour hang again.
+    let remembered = BaselineCache::key(repo, job.base, &jobs, sandbox.is_some());
+    let mut fresh = BaselineCache::default();
+    if let Some(cached) = remembered.as_deref().and_then(BaselineCache::load) {
+        on_event(format!("checks on the untouched {} remembered from the last run at this commit: {}", job.base, cached.summary()));
+        for (name, outcome) in &cached.checks {
+            match outcome {
+                CheckBaseline::Pass => {}
+                CheckBaseline::Fail(output) => {
+                    baseline.insert(name.clone(), output.clone());
+                }
+                CheckBaseline::Unfinished => unfinished.push(name.clone()),
+            }
+        }
+    } else if !jobs.is_empty() {
         on_event("running the checks on the untouched tree first".into());
         for j in &jobs {
             budget.check("while checking the untouched tree")?;
@@ -596,6 +618,7 @@ fn work(
             budget.stop.check()?;
             if result.ok {
                 on_event(format!("`{}` passes on {} ({})", j.name, job.base, took(result.duration_secs)));
+                fresh.checks.insert(j.name.clone(), CheckBaseline::Pass);
                 continue;
             }
             // It does not finish here, before any change: running it again
@@ -611,6 +634,7 @@ fn work(
                     last.chars().take(140).collect::<String>()
                 ));
                 unfinished.push(j.name.clone());
+                fresh.checks.insert(j.name.clone(), CheckBaseline::Unfinished);
                 continue;
             }
             if let Some(why) = machine_failure(&result.output) {
@@ -633,6 +657,10 @@ fn work(
                 first.chars().take(140).collect::<String>()
             ));
             baseline.insert(j.name.clone(), normalize_output(&result.output));
+            fresh.checks.insert(j.name.clone(), CheckBaseline::Fail(normalize_output(&result.output)));
+        }
+        if let Some(key) = &remembered {
+            fresh.save(key);
         }
     }
     jobs.retain(|j| !unfinished.contains(&j.name));
@@ -1253,6 +1281,76 @@ impl Budget {
         let own = j.timeout_secs.unwrap_or(crate::local_ci::DEFAULT_TIMEOUT_SECS);
         j.timeout_secs = Some(own.min(self.left().as_secs().max(60)));
         j
+    }
+}
+
+/// How one check went on the untouched base commit.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum CheckBaseline {
+    Pass,
+    /// Its normalized output, to tell the same failure from a new one.
+    Fail(String),
+    /// Ran into its timeout.
+    Unfinished,
+}
+
+/// The checks' outcomes on one base commit, kept in DevDock's own
+/// directory: `baselines/<key>.json`, one per repository, commit, check
+/// list and where they ran.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct BaselineCache {
+    checks: std::collections::BTreeMap<String, CheckBaseline>,
+}
+
+impl BaselineCache {
+    /// `None` when the base cannot be resolved to a commit.
+    fn key(repo: &Repo, base: &str, jobs: &[crate::local_ci::Job], sandboxed: bool) -> Option<String> {
+        use std::hash::{Hash as _, Hasher as _};
+        let sha = repo.git(&["rev-parse", "--verify", &format!("{base}^{{commit}}")]).ok()?.trim().to_string();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        repo.path().hash(&mut hasher);
+        for j in jobs {
+            j.name.hash(&mut hasher);
+            j.commands.hash(&mut hasher);
+            j.dir.hash(&mut hasher);
+        }
+        sandboxed.hash(&mut hasher);
+        Some(format!("{}-{:016x}", &sha[..sha.len().min(12)], hasher.finish()))
+    }
+
+    fn file(key: &str) -> PathBuf {
+        crate::secure_store::config_dir().join("baselines").join(format!("{key}.json"))
+    }
+
+    fn load(key: &str) -> Option<Self> {
+        if cfg!(test) {
+            return None;
+        }
+        let text = std::fs::read_to_string(Self::file(key)).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    fn save(&self, key: &str) {
+        if cfg!(test) {
+            return;
+        }
+        let file = Self::file(key);
+        if let Some(dir) = file.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(text) = serde_json::to_string(self) {
+            let _ = std::fs::write(file, text);
+        }
+    }
+
+    fn summary(&self) -> String {
+        let count = |want: fn(&CheckBaseline) -> bool| self.checks.values().filter(|c| want(c)).count();
+        format!(
+            "{} pass, {} fail there already, {} never finish",
+            count(|c| matches!(c, CheckBaseline::Pass)),
+            count(|c| matches!(c, CheckBaseline::Fail(_))),
+            count(|c| matches!(c, CheckBaseline::Unfinished))
+        )
     }
 }
 

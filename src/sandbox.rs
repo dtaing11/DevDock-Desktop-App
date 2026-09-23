@@ -308,17 +308,25 @@ impl Sandbox {
     /// Without a sign-in on this machine, the way in is a one-time
     /// `claude` login inside the sandbox, and the error says so.
     pub fn seed_claude_credentials(&self, log: &mut dyn FnMut(String)) -> Result<bool, String> {
-        let probe = self.exec("test -s \"$HOME/.claude/.credentials.json\" && echo HAVE", "", &[], Some(Duration::from_secs(30)))?;
-        if probe.stdout.contains("HAVE") {
+        // This machine's sign-in is the one that stays fresh: its Claude
+        // Code refreshes the token, and a refresh retires the old one, so a
+        // copy made earlier goes stale for good. Copied whenever it differs.
+        let inside = self.exec("cat \"$HOME/.claude/.credentials.json\" 2>/dev/null", "", &[], Some(Duration::from_secs(30)))?;
+        let host = host_claude_credentials();
+        let json = match host {
+            Some(json) => json,
+            None if !inside.stdout.trim().is_empty() => return Ok(false),
+            None => {
+                return Err(format!(
+                    "the sandbox's Claude Code is not signed in, and no Claude Code sign-in was found on \
+                     this machine to copy. Sign in once inside it: `{}` then `/login`.",
+                    self.login_hint()
+                ))
+            }
+        };
+        if inside.stdout.trim() == json.trim() {
             return Ok(false);
         }
-        let json = host_claude_credentials().ok_or_else(|| {
-            format!(
-                "the sandbox's Claude Code is not signed in, and no Claude Code sign-in was found on \
-                 this machine to copy. Sign in once inside it: `{}` then `/login`.",
-                self.login_hint()
-            )
-        })?;
         let mut cmd = self.command(
             "sh",
             &["-c".to_string(), "mkdir -p \"$HOME/.claude\" && umask 077 && cat > \"$HOME/.claude/.credentials.json\"".to_string()],
@@ -596,6 +604,23 @@ java -version >/dev/null 2>&1
 /// Claude Code's own credentials on this machine, as the JSON its Linux
 /// build reads from `~/.claude/.credentials.json`: from the file when
 /// there is one, else from the macOS Keychain item it keeps them in.
+/// Whether this machine's Claude Code sign-in is good to copy into a
+/// sandbox: present, and not past its expiry. Checked before a run spends
+/// half an hour on checks only to be told at the first model call.
+pub fn host_claude_signin() -> Result<(), String> {
+    let json = host_claude_credentials().ok_or("no Claude Code sign-in on this machine to run inside the sandbox with: open a terminal, run `claude`, and sign in")?;
+    let value: serde_json::Value = serde_json::from_str(&json).map_err(|e| format!("this machine's Claude Code credentials could not be read: {e}"))?;
+    if value.get("apiKey").is_some() {
+        return Ok(());
+    }
+    let expires_ms = value.pointer("/claudeAiOauth/expiresAt").and_then(|v| v.as_f64()).unwrap_or(f64::MAX);
+    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as f64).unwrap_or(0.0);
+    if expires_ms < now_ms {
+        return Err("this machine's Claude Code sign-in has expired, so the sandbox's would be too: open a terminal, run `claude`, let it refresh or sign in again, then run the task again".into());
+    }
+    Ok(())
+}
+
 fn host_claude_credentials() -> Option<String> {
     if let Some(home) = dirs::home_dir() {
         if let Ok(text) = std::fs::read_to_string(home.join(".claude/.credentials.json")) {

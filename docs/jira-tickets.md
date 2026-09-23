@@ -175,6 +175,17 @@ did not finish rather than that it passed. Checks run with
 `GIT_TERMINAL_PROMPT=0`, so a private git dependency fails at once
 instead of waiting for a password nobody can type.
 
+How the checks went on the untouched base commit is remembered — per
+repository, commit, check list and where they ran, under DevDock's own
+`baselines/` — so a reply to a run, or the next ticket from the same
+commit, reuses it instead of paying for a half-hour hang again. The log
+says when it did. It is forgotten when the base moves.
+
+A run of Claude Code in the sandbox checks this machine's Claude Code
+sign-in first, and copies it in again whenever it has changed: a token
+refreshed here retires the copy made earlier. A sign-in that has expired
+ends the run at once with what to do, before any check is run.
+
 A whole run has a limit too: three hours (`DEVDOCK_RUN_MINUTES` changes
 it). It is checked before every check and every round, each check's own
 timeout is cut to the time left, and a run that reaches it stops with its

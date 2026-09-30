@@ -205,6 +205,7 @@ fn seed_backlog(app: &mut App) {
         stopping: false,
         prompt: String::new(),
         reply: String::new(),
+        screenshots: Vec::new(),
     };
     app.backlog.runs.insert(
         "DEV-41".into(),
@@ -388,6 +389,7 @@ fn seed_agent(app: &mut App, mode: &str) {
             stopping: false,
             prompt: String::new(),
             reply: String::new(),
+            screenshots: Vec::new(),
         };
         app.coding.worktree.runs.insert(
             "agent/add-a-json-flag-to-devdock-status".into(),

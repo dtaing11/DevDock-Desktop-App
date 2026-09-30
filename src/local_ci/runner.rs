@@ -318,8 +318,20 @@ pub fn wait_with_timeout(child: Child, timeout: Option<Duration>, teardown: impl
 /// [`wait_with_timeout`], ended early — the same way, torn down and
 /// killed — when `stop` is set: the kill switch for a run.
 pub fn wait_stoppable(
+    child: Child,
+    timeout: Option<Duration>,
+    stop: Option<crate::cancel::Token>,
+    teardown: impl FnOnce(),
+) -> Result<ExecOutput, String> {
+    wait_watched(child, timeout, idle_limit(), stop, teardown)
+}
+
+/// [`wait_stoppable`] with the silence it will put up with given rather
+/// than read from the environment.
+pub fn wait_watched(
     mut child: Child,
     timeout: Option<Duration>,
+    idle_limit: Option<Duration>,
     stop: Option<crate::cancel::Token>,
     teardown: impl FnOnce(),
 ) -> Result<ExecOutput, String> {
@@ -330,16 +342,27 @@ pub fn wait_stoppable(
     let deadline = timeout.map(|t| Instant::now() + t);
     let mut timed_out = false;
     let mut was_stopped = false;
+    let mut stalled = false;
+    // Silence is measured from the last byte either pipe produced.
+    let mut written = 0usize;
+    let mut last_output = Instant::now();
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {}
             Err(e) => return Err(format!("waiting for the job: {e}")),
         }
+        let now = stdout.as_ref().map_or(0, PipeReader::len) + stderr.as_ref().map_or(0, PipeReader::len);
+        if now != written {
+            written = now;
+            last_output = Instant::now();
+        }
         let stopped = stop.as_ref().is_some_and(|s| s.is_stopped());
-        if stopped || deadline.is_some_and(|d| Instant::now() >= d) {
-            timed_out = !stopped;
+        let idle = idle_limit.is_some_and(|l| last_output.elapsed() >= l);
+        if stopped || idle || deadline.is_some_and(|d| Instant::now() >= d) {
+            timed_out = !stopped && !idle;
             was_stopped = stopped;
+            stalled = idle;
             teardown();
             let _ = child.kill();
             break child.wait().map_err(|e| format!("waiting for the job: {e}"))?;
@@ -357,11 +380,15 @@ pub fn wait_stoppable(
         let secs = timeout.map(|t| t.as_secs()).unwrap_or(0);
         err.push_str(&format!("\n{TIMEOUT_MARK} {secs}s]"));
     }
+    if stalled {
+        let minutes = idle_limit.map(|l| l.as_secs() / 60).unwrap_or(0);
+        err.push_str(&format!("\n{STALL_MARK} {minutes} minutes, so it was taken as stuck and stopped]"));
+    }
     if was_stopped {
         err.push_str(&format!("\n[{}]", crate::cancel::STOPPED));
     }
     Ok(ExecOutput {
-        success: status.success() && !timed_out && !was_stopped,
+        success: status.success() && !timed_out && !was_stopped && !stalled,
         stdout: stdout.map(|r| r.finish(until)).unwrap_or_default(),
         stderr: err,
     })
@@ -370,9 +397,33 @@ pub fn wait_stoppable(
 /// How a job that outran its timeout is marked in its output.
 pub const TIMEOUT_MARK: &str = "[killed: the job ran longer than";
 
-/// Whether `output` is of a job that was killed for running too long.
+/// How a job killed for saying nothing at all is marked.
+pub const STALL_MARK: &str = "[killed: no output for";
+
+/// Whether `output` is of a job that did not finish: it ran past its
+/// timeout, or went silent long enough to count as stuck.
 pub fn timed_out(output: &str) -> bool {
-    output.contains(TIMEOUT_MARK)
+    output.contains(TIMEOUT_MARK) || output.contains(STALL_MARK)
+}
+
+/// Whether a job was killed for going silent, rather than for its total
+/// time — a different thing to tell the developer.
+pub fn stalled(output: &str) -> bool {
+    output.contains(STALL_MARK)
+}
+
+/// How long a job may say nothing before it is taken as stuck.
+///
+/// A dependency resolver that cannot reach what it wants, a prompt nobody
+/// can answer, a lock nobody will release: all of them sit silent until
+/// the total timeout, which is half an hour. Work that is really
+/// happening says so — compilers name files, test runners name tests,
+/// package managers count packages — so silence this long is the surest
+/// sign nothing is happening. `DEVDOCK_IDLE_MINUTES` changes it; 0 turns
+/// it off.
+pub fn idle_limit() -> Option<Duration> {
+    let minutes = std::env::var("DEVDOCK_IDLE_MINUTES").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(10);
+    (minutes > 0).then(|| Duration::from_secs(minutes * 60))
 }
 
 /// How long after a command ends its pipes are still read.
@@ -402,6 +453,12 @@ impl PipeReader {
             let _ = tx.send(());
         });
         Self { buf, done }
+    }
+
+    /// How much has arrived so far, to tell a job that is working from
+    /// one that has gone silent.
+    fn len(&self) -> usize {
+        self.buf.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Everything read by end-of-file or by `until`, whichever is first.
@@ -482,6 +539,42 @@ mod tests {
         assert_eq!(out.stderr.trim(), "warn");
         assert!(started.elapsed() < Duration::from_secs(15), "took {:?}", started.elapsed());
         assert!(!timed_out(&out.stderr));
+    }
+
+    /// A job that says nothing is stopped long before its total timeout,
+    /// and says which of the two it was — the difference between "this
+    /// repository's tests are slow" and "this is stuck".
+    #[cfg(unix)]
+    #[test]
+    fn a_silent_job_is_taken_as_stuck() {
+        assert_eq!(idle_limit(), Some(Duration::from_secs(600)), "ten minutes unless the environment says otherwise");
+
+        let run = |script: &str, idle: Duration| {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", script]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            {
+                use std::os::unix::process::CommandExt as _;
+                cmd.process_group(0);
+            }
+            let child = cmd.spawn().unwrap();
+            let pid = child.id();
+            let started = Instant::now();
+            let out = wait_watched(child, Some(Duration::from_secs(1800)), Some(idle), None, || kill_group(pid)).unwrap();
+            (out, started.elapsed())
+        };
+
+        // Silent: stopped at the idle limit, nowhere near the half hour.
+        let (out, took) = run("echo Resolving dependencies...; sleep 300", Duration::from_secs(2));
+        assert!(took < Duration::from_secs(60), "{took:?}");
+        assert!(!out.success);
+        assert!(out.stdout.contains("Resolving dependencies"), "what it last said is kept");
+        assert!(stalled(&out.stderr) && timed_out(&out.stderr), "{}", out.stderr);
+        assert!(!out.stderr.contains(TIMEOUT_MARK), "it was silence, not the total time: {}", out.stderr);
+
+        // Talking, slowly: left alone, and finishes.
+        let (out, _) = run("for i in 1 2 3 4 5 6; do echo line $i; sleep 0.5; done", Duration::from_secs(2));
+        assert!(out.success && !stalled(&out.stderr), "{}", out.stderr);
+        assert_eq!(out.stdout.lines().count(), 6);
     }
 
     #[cfg(unix)]

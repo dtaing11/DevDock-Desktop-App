@@ -175,6 +175,15 @@ did not finish rather than that it passed. Checks run with
 `GIT_TERMINAL_PROMPT=0`, so a private git dependency fails at once
 instead of waiting for a password nobody can type.
 
+A job that says nothing for ten minutes is taken as stuck and stopped,
+whatever its own timeout allows (`DEVDOCK_IDLE_MINUTES`; 0 turns it off).
+Work that is really happening says so — compilers name files, test
+runners name tests, package managers count packages — so a long silence
+is the surest sign of a dependency that cannot be reached, a prompt
+nobody can answer, or a lock nobody will release. The log says it went
+silent rather than that it ran out of time, and names the dependency
+fetch when that is where it stopped.
+
 How the checks went on the untouched base commit is remembered — per
 repository, commit, check list and where they ran, under DevDock's own
 `baselines/` — so a reply to a run, or the next ticket from the same
@@ -208,7 +217,10 @@ directory of its own.
 
 ### A screenshot of the result
 
-A run that passes its checks photographs what it changed, where the
+A run that did not get through is photographed too, once its attempt is
+kept and before its worktree goes, and the pictures are on its card under
+"What it got to" — unless you stopped it, since stopping means now. A run
+that passes its checks photographs what it changed, where the
 checks ran — in the sandbox, never on your screen — and shows the images
 on its card under "What it looks like", with Open for the file and Folder
 for where they all are. The files are kept in DevDock's own directory,

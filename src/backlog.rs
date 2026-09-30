@@ -473,8 +473,17 @@ pub fn fix(
     // branch, unpushed, so there is something to finish by hand or to send
     // back. Only the worktree goes.
     if let Err(why) = &result {
-        if let Some(line) = keep_attempt(&dir, job.task, why) {
+        let kept = keep_attempt(&dir, job.task, why);
+        if let Some(line) = kept {
             on_event(line.clone());
+            // What it did get to, before the worktree goes: a run that did
+            // not get through still changed something worth looking at.
+            // Not when the developer stopped it — stop means now, not
+            // after minutes of rendering.
+            if !crate::cancel::was_stopped(why) {
+                let runners = crate::local_ci::runner::RunnerRegistry::with_builtins();
+                crate::screenshots::capture_anywhere(&dir, &runners, None, &branch, on_event);
+            }
             result = Err(format!("{why}\n\n{line}"));
         }
     }
@@ -626,12 +635,27 @@ fn work(
             // it could say about the change.
             if crate::local_ci::runner::timed_out(&result.output) {
                 let last = result.output.lines().rev().find(|l| !l.trim().is_empty() && !l.starts_with("--- ") && !crate::local_ci::runner::timed_out(l)).unwrap_or("no output").trim();
+                let last: String = last.chars().take(140).collect();
+                let why = if crate::local_ci::runner::stalled(&result.output) {
+                    // Silence at a dependency fetch is the common one, and
+                    // the common cause is a dependency the sandbox cannot
+                    // reach: worth naming, since nothing else will say it.
+                    let fetching = last.contains("Resolving dependencies") || last.contains("Downloading") || last.contains("Fetching") || last.contains("Cloning");
+                    format!(
+                        "went silent for {} and was taken as stuck{}",
+                        crate::local_ci::runner::idle_limit().map(|l| format!("{} minutes", l.as_secs() / 60)).unwrap_or_default(),
+                        if fetching {
+                            " — it stopped at a dependency fetch, which usually means one it cannot reach from where the checks run: a private git dependency needs its credentials there"
+                        } else {
+                            ""
+                        }
+                    )
+                } else {
+                    format!("ran past its {} limit", took(result.duration_secs))
+                };
                 on_event(format!(
-                    "`{}` does not finish on {} where the checks run (stopped after {}; last line: {}); not run again in this run",
-                    j.name,
-                    job.base,
-                    took(result.duration_secs),
-                    last.chars().take(140).collect::<String>()
+                    "`{}` does not finish on {} where the checks run ({why}; last line: {last}); not run again in this run",
+                    j.name, job.base
                 ));
                 unfinished.push(j.name.clone());
                 fresh.checks.insert(j.name.clone(), CheckBaseline::Unfinished);

@@ -6429,8 +6429,8 @@ mod tests {
         assert!(app.backlog.selected.contains("T-1"));
 
         // Two agents in flight, by hand: starting one for real needs a model.
-        app.backlog.runs.insert("T-1".into(), TicketRun { title: "one".into(), state: RunState::Running, kept: None, question: None, log: Vec::new(), started: Some(Instant::now()), took: None, prompt: String::new(), reply: String::new(), stopping: false });
-        app.backlog.runs.insert("T-2".into(), TicketRun { title: "two".into(), state: RunState::Running, kept: None, question: None, log: Vec::new(), started: Some(Instant::now()), took: None, prompt: String::new(), reply: String::new(), stopping: false });
+        app.backlog.runs.insert("T-1".into(), TicketRun { title: "one".into(), state: RunState::Running, kept: None, question: None, log: Vec::new(), started: Some(Instant::now()), took: None, prompt: String::new(), reply: String::new(), screenshots: Vec::new(), stopping: false });
+        app.backlog.runs.insert("T-2".into(), TicketRun { title: "two".into(), state: RunState::Running, kept: None, question: None, log: Vec::new(), started: Some(Instant::now()), took: None, prompt: String::new(), reply: String::new(), screenshots: Vec::new(), stopping: false });
         app.handle(Msg::BacklogProgress { key: "T-1".into(), line: "· read a.rs".into() });
         assert_eq!(app.backlog.runs["T-1"].log, ["· read a.rs"]);
         assert_eq!(app.backlog.running(), 2);

@@ -69,6 +69,9 @@ pub struct TicketRun {
     pub prompt: String,
     /// The reply being typed on a card whose run did not get through.
     pub reply: String,
+    /// Pictures the run took, read back from its log, so a run that did
+    /// not get through shows them too — its `Fixed` never arrives.
+    pub screenshots: Vec<std::path::PathBuf>,
     /// Stop was pressed before the run had a worktree to be stopped by:
     /// it is stopped the moment it names one.
     pub stopping: bool,
@@ -118,8 +121,17 @@ impl TicketRun {
         }
     }
 
+    /// A picture's path, from the line the capture logs for each one.
+    fn screenshot_in(line: &str) -> Option<std::path::PathBuf> {
+        let (_, path) = line.strip_prefix("screenshot (")?.split_once("): ")?;
+        Some(std::path::PathBuf::from(path))
+    }
+
     /// A line of progress from the run.
     pub fn note(&mut self, line: String) {
+        if let Some(path) = Self::screenshot_in(&line) {
+            self.screenshots.push(path);
+        }
         self.log.push(line);
         if self.stopping {
             if let Some(root) = self.worktree() {
@@ -130,7 +142,7 @@ impl TicketRun {
     }
 
     pub fn queued(title: impl Into<String>) -> Self {
-        Self { title: title.into(), state: RunState::Queued, kept: None, question: None, log: Vec::new(), started: None, took: None, prompt: String::new(), reply: String::new(), stopping: false }
+        Self { title: title.into(), state: RunState::Queued, kept: None, question: None, log: Vec::new(), started: None, took: None, prompt: String::new(), reply: String::new(), screenshots: Vec::new(), stopping: false }
     }
 
     pub fn is_running(&self) -> bool {
@@ -1016,6 +1028,22 @@ pub(super) fn run_card(ui: &mut egui::Ui, key: &str, title: &str, run: &mut Tick
                 RunState::Failed(e) => {
                     ui.add_space(4.0);
                     wrapped(ui, RichText::new(e.lines().take(6).collect::<Vec<_>>().join("\n")).size(theme::SMALL).color(theme::danger()));
+                    // What it did get to, even though it did not get through.
+                    if !run.screenshots.is_empty() {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("What it got to").font(theme::semibold(theme::SMALL)).color(theme::fg_dim()));
+                            super::agent_tab::screenshots_folder_button(ui);
+                        });
+                        for path in &run.screenshots {
+                            if let Some(texture) = shots.get(ui.ctx(), path) {
+                                let max_w = (ui.available_width() - 20.0).max(120.0);
+                                let size = texture.size_vec2();
+                                let scale = (max_w / size.x).min(1.0);
+                                ui.add(egui::Image::from_texture(&texture).fit_to_exact_size(size * scale).corner_radius(theme::RADIUS_MD as f32));
+                            }
+                        }
+                    }
                     if let Some(branch) = &run.kept {
                         ui.horizontal_wrapped(|ui| {
                             if ui
@@ -1177,4 +1205,27 @@ fn ticket_row(app: &mut App, ui: &mut egui::Ui, issue: &BacklogIssue) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_runs_pictures_are_read_back_from_its_log() {
+        let mut run = TicketRun::queued("t");
+        run.note("worktree /tmp/wt".into());
+        run.note("screenshot (changes-tab): /Users/d/Library/Application Support/devdock/screenshots/b-changes-tab.png".into());
+        run.note("screenshot (web home): /tmp/shots/b-web-home.png".into());
+        run.note("· edit src/lib.rs".into());
+        assert_eq!(
+            run.screenshots,
+            [
+                std::path::PathBuf::from("/Users/d/Library/Application Support/devdock/screenshots/b-changes-tab.png"),
+                std::path::PathBuf::from("/tmp/shots/b-web-home.png")
+            ]
+        );
+        assert_eq!(run.log.len(), 4, "every line is still in the log");
+        assert_eq!(TicketRun::screenshot_in("no screenshot of the web pages: they are served inside the sandbox"), None);
+    }
 }

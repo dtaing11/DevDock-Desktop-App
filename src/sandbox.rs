@@ -149,6 +149,29 @@ pub struct Sandbox {
     git_token: Option<String>,
 }
 
+/// What the VM is worth giving, from what this machine has: half the
+/// cores and half the memory, within what a build actually needs. Kept
+/// well clear of the whole machine — the developer is still using it.
+fn wanted_size() -> (u32, u32) {
+    let cpus = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(4);
+    let gib = host_memory_gib().unwrap_or(8);
+    ((cpus / 2).clamp(2, 8), (gib / 2).clamp(4, 12))
+}
+
+/// This machine's memory in GiB.
+fn host_memory_gib() -> Option<u32> {
+    let out = if cfg!(target_os = "macos") {
+        Command::new("sysctl").args(["-n", "hw.memsize"]).output().ok()?
+    } else {
+        // Linux: MemTotal is in kB.
+        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let kb: u64 = text.lines().find_map(|l| l.strip_prefix("MemTotal:"))?.split_whitespace().next()?.parse().ok()?;
+        return Some((kb / (1 << 20)) as u32);
+    };
+    let bytes: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    Some((bytes / (1 << 30)) as u32)
+}
+
 /// The environment variable the sandbox's git credential helper reads.
 const GIT_TOKEN_VAR: &str = "DEVDOCK_GIT_TOKEN";
 
@@ -200,19 +223,34 @@ impl Sandbox {
     }
 
     fn start_lima(root: PathBuf, log: &mut dyn FnMut(String)) -> Result<Sandbox, String> {
-        let list = run("limactl", &["list", "--format", "{{.Name}} {{.Status}}"])?;
-        let status = list
-            .lines()
-            .find_map(|l| l.strip_prefix(&format!("{LIMA_INSTANCE} ")))
-            .map(|s| s.trim().to_string());
+        let (cpus, memory) = wanted_size();
+        let list = run("limactl", &["list", "--format", "{{.Name}} {{.Status}} {{.CPUs}} {{.Memory}}"])?;
+        let row = list.lines().find_map(|l| l.strip_prefix(&format!("{LIMA_INSTANCE} "))).map(|s| s.trim().to_string());
+        let mut fields = row.as_deref().unwrap_or_default().split_whitespace();
+        let status = row.as_ref().map(|_| fields.next().unwrap_or("").to_string());
+        let has_cpus: u32 = fields.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let has_gib: u32 = fields.next().and_then(|v| v.parse::<u64>().ok()).map(|b| (b / (1 << 30)) as u32).unwrap_or(0);
+        // Lima's own default is four cores and 4 GiB, which a release build
+        // of anything sizeable runs out of: the linker is one process and
+        // wants the memory all at once.
+        let too_small = row.is_some() && (has_cpus < cpus || has_gib < memory);
         match status.as_deref() {
+            Some("Running") if too_small => log(format!(
+                "the {LIMA_INSTANCE} VM has {has_cpus} cpu(s) and {has_gib} GiB, which is small for a build — \
+                 builds may be killed for memory. It is resized when it is next started: \
+                 `limactl stop {LIMA_INSTANCE}` and run again"
+            )),
             Some("Running") => {}
             Some(_) => {
+                if too_small {
+                    log(format!("giving the {LIMA_INSTANCE} VM {cpus} cpu(s) and {memory} GiB (it had {has_cpus} and {has_gib})"));
+                    run("limactl", &["edit", LIMA_INSTANCE, "--cpus", &cpus.to_string(), "--memory", &memory.to_string(), "--tty=false"])?;
+                }
                 log(format!("starting the {LIMA_INSTANCE} VM"));
                 run("limactl", &["start", LIMA_INSTANCE, "--tty=false"])?;
             }
             None => {
-                log(format!("creating the {LIMA_INSTANCE} VM (Ubuntu; the first time downloads an image)"));
+                log(format!("creating the {LIMA_INSTANCE} VM (Ubuntu, {cpus} cpu(s), {memory} GiB; the first time downloads an image)"));
                 // Home writable, and the temp trees a worktree may be in.
                 run(
                     "limactl",
@@ -220,6 +258,10 @@ impl Sandbox {
                         "create",
                         &format!("--name={LIMA_INSTANCE}"),
                         "--tty=false",
+                        "--cpus",
+                        &cpus.to_string(),
+                        "--memory",
+                        &memory.to_string(),
                         "--set",
                         ".mounts[0].writable = true | .mounts += [{\"location\":\"/private/tmp\",\"writable\":true},{\"location\":\"/private/var/folders\",\"writable\":true}]",
                         "template:default",
@@ -760,6 +802,20 @@ impl Runner for SandboxRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_vm_is_sized_from_this_machine() {
+        let (cpus, gib) = wanted_size();
+        assert!((2..=8).contains(&cpus), "{cpus}");
+        assert!((4..=12).contains(&gib), "{gib}");
+        // Whatever this machine is, the VM is never given all of it.
+        let host_cpus = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(4);
+        assert!(cpus <= host_cpus.max(2), "{cpus} of {host_cpus}");
+        if let Some(host_gib) = host_memory_gib() {
+            assert!(host_gib > 0);
+            assert!(gib <= host_gib.max(4), "{gib} of {host_gib}");
+        }
+    }
 
     #[test]
     fn a_git_token_rides_in_the_environment_and_not_in_a_file() {

@@ -678,7 +678,7 @@ fn work(
                     result.output.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")
                 ));
             }
-            let first = result.output.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+            let first = result.output.lines().find(|l| !l.trim().is_empty() && !l.starts_with("--- ")).unwrap_or("").trim();
             on_event(format!(
                 "`{}` already fails on {} before any change ({}): {}",
                 j.name,

@@ -4397,13 +4397,16 @@ impl App {
         self.coding.screenshots.clear();
         self.coding.no_screenshots.clear();
         self.coding.screenshotting = true;
+        let auth = self.gh_token();
         let repo_key = self.repo_key();
         let progress = self.worker.progress().for_repo(repo_key.clone());
         let label = format!("agent-{}", self.status.as_ref().map(|s| s.branch.clone()).unwrap_or_else(|| "tree".into()));
         self.worker.spawn_for(repo_key, move || {
             let result = (|| -> Result<crate::screenshots::Report, String> {
                 let mut log = |line: String| progress.send(Msg::AgentEvent { kind: AgentKind::Coding, line });
-                let sandbox = std::sync::Arc::new(crate::sandbox::Sandbox::start(&crate::sandbox::Spec::default(), &root, &mut log)?);
+                let sandbox = crate::sandbox::Sandbox::start(&crate::sandbox::Spec::default(), &root, &mut log)?.with_git_token(auth.as_deref());
+                sandbox.configure_git(&mut log)?;
+                let sandbox = std::sync::Arc::new(sandbox);
                 let programs: Vec<&str> = crate::local_ci::toolchain_commands(&root);
                 sandbox.provision(&programs, &mut log)?;
                 let mut runners = crate::local_ci::runner::RunnerRegistry::with_builtins();

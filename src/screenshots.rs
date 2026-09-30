@@ -369,6 +369,7 @@ pub fn capture_anywhere(
     root: &Path,
     runners: &RunnerRegistry,
     sandbox: Option<std::sync::Arc<crate::sandbox::Sandbox>>,
+    auth: Option<&str>,
     label: &str,
     log: &mut dyn FnMut(String),
 ) -> Report {
@@ -380,6 +381,10 @@ pub fn capture_anywhere(
     }
     log("the run had no sandbox; starting one for the screenshots".into());
     let started = crate::sandbox::Sandbox::start(&crate::sandbox::Spec::default(), root, log).and_then(|sandbox| {
+        // The same sign-in the checks get: rendering a screen means
+        // building the app, and that fetches the same dependencies.
+        let sandbox = sandbox.with_git_token(auth);
+        sandbox.configure_git(log)?;
         let programs: Vec<&str> = crate::local_ci::toolchain_commands(root);
         sandbox.provision(&programs, log)?;
         Ok(std::sync::Arc::new(sandbox))
@@ -731,7 +736,7 @@ mod tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let runners = RunnerRegistry::with_builtins();
         let mut log = |l: String| eprintln!("  {l}");
-        let report = capture_anywhere(root, &runners, None, "live-anywhere", &mut log);
+        let report = capture_anywhere(root, &runners, None, None, "live-anywhere", &mut log);
         let names: Vec<String> = report.shots.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
         println!("{names:?} missed: {:?}", report.missed);
         assert!(report.missed.is_empty(), "{:?}", report.missed);

@@ -482,7 +482,7 @@ pub fn fix(
             // after minutes of rendering.
             if !crate::cancel::was_stopped(why) {
                 let runners = crate::local_ci::runner::RunnerRegistry::with_builtins();
-                crate::screenshots::capture_anywhere(&dir, &runners, None, &branch, on_event);
+                crate::screenshots::capture_anywhere(&dir, &runners, None, job.auth, &branch, on_event);
             }
             result = Err(format!("{why}\n\n{line}"));
         }
@@ -547,7 +547,13 @@ fn work(
     // commands and the verification here, gone when this returns.
     let sandbox = match job.sandbox {
         Some(spec) => {
-            let sandbox = crate::sandbox::Sandbox::start(spec, wt.path(), on_event)?;
+            // The sign-in DevDock opens pull requests with, given to git
+            // inside so a private dependency can be fetched there: without
+            // it, a `flutter pub get` or `npm ci` that wants one sits at a
+            // prompt nobody can answer until the watchdog stops it.
+            let auth = job.auth.filter(|_| std::env::var("DEVDOCK_SANDBOX_GIT_AUTH").as_deref() != Ok("0"));
+            let sandbox = crate::sandbox::Sandbox::start(spec, wt.path(), on_event)?.with_git_token(auth);
+            sandbox.configure_git(on_event)?;
             // What the checks and the repository's toolchains run, installed
             // where they will run. A plain image has none of it.
             let mut programs: Vec<&str> = crate::local_ci::toolchain_commands(wt.path());
@@ -967,7 +973,7 @@ fn work(
     // where the checks ran — or in a sandbox started for it when the run
     // had none and the tree needs one — kept outside the repository,
     // never part of the change.
-    let shots = crate::screenshots::capture_anywhere(wt.path(), &runners, sandbox.clone(), branch, on_event);
+    let shots = crate::screenshots::capture_anywhere(wt.path(), &runners, sandbox.clone(), job.auth, branch, on_event);
 
     // Commit and push.
     stage_change(&wt)?;

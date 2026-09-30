@@ -143,7 +143,14 @@ pub struct Sandbox {
     /// Where the worktree is inside: `/work`, or the same path in a VM.
     inner_root: String,
     image: String,
+    /// A GitHub token for fetching private dependencies inside. Passed in
+    /// the environment of each command and never written to a file there,
+    /// so nothing of it is left behind when the run ends.
+    git_token: Option<String>,
 }
+
+/// The environment variable the sandbox's git credential helper reads.
+const GIT_TOKEN_VAR: &str = "DEVDOCK_GIT_TOKEN";
 
 fn container_name() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -232,7 +239,7 @@ impl Sandbox {
             ));
         }
         log(format!("sandbox: Lima VM {LIMA_INSTANCE}, network on, worktree at {inner_root}; what it installs stays"));
-        Ok(Sandbox { kind: Kind::Lima, name: LIMA_INSTANCE.into(), root, inner_root, image: String::new() })
+        Ok(Sandbox { kind: Kind::Lima, name: LIMA_INSTANCE.into(), root, inner_root, image: String::new(), git_token: None })
     }
 
     fn start_container(program: &str, kind: Kind, image: &str, root: PathBuf, log: &mut dyn FnMut(String)) -> Result<Sandbox, String> {
@@ -252,7 +259,7 @@ impl Sandbox {
             "sandbox: {} {image}, network on, worktree at {MOUNT}; toolchains persist in the {TOOLCHAIN_VOLUME} volume",
             kind.label()
         ));
-        Ok(Sandbox { kind, name, root, inner_root: MOUNT.into(), image: image.to_string() })
+        Ok(Sandbox { kind, name, root, inner_root: MOUNT.into(), image: image.to_string(), git_token: None })
     }
 
     /// Installs what the repository's toolchains need and the sandbox does
@@ -382,7 +389,54 @@ impl Sandbox {
     /// host's `target/` and is there again next run.
     fn base_env(&self) -> Vec<(String, String)> {
         let slug: String = self.inner_root.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
-        vec![("CARGO_TARGET_DIR".into(), format!("$HOME/.devdock-cargo-target/{}", slug.trim_matches('-')))]
+        let mut env = vec![("CARGO_TARGET_DIR".into(), format!("$HOME/.devdock-cargo-target/{}", slug.trim_matches('-')))];
+        if let Some(token) = &self.git_token {
+            env.push((GIT_TOKEN_VAR.into(), token.clone()));
+        }
+        env
+    }
+
+    /// The token git inside will fetch private dependencies with — the
+    /// same one DevDock opens pull requests with. Taken per run: it lives
+    /// in the environment of the commands DevDock starts, never in a file
+    /// inside, so the sandbox keeps none of it afterwards.
+    pub fn with_git_token(mut self, token: Option<&str>) -> Self {
+        self.git_token = token.filter(|t| !t.trim().is_empty()).map(str::to_string);
+        self
+    }
+
+    /// Teaches git inside to use that token for github.com, and to reach
+    /// github over https even where a dependency asks for ssh — there is
+    /// no key in here, and a dependency written `git@github.com:` would
+    /// otherwise sit at a prompt nobody can answer until it is killed.
+    ///
+    /// What is written inside holds no secret: the helper reads the
+    /// token from the environment, which only DevDock's own commands
+    /// carry.
+    pub fn configure_git(&self, log: &mut dyn FnMut(String)) -> Result<(), String> {
+        if self.git_token.is_none() {
+            return Ok(());
+        }
+        let helper = format!(
+            "!f() {{ test \"$1\" = get && test -n \"${GIT_TOKEN_VAR}\" && \
+             printf 'username=x-access-token\\npassword=%s\\n' \"${GIT_TOKEN_VAR}\"; }}; f"
+        );
+        // Written again on every run, so it must not care what the run
+        // before it left: a plain set refuses a key that already has the
+        // two values, which is what a second run would find.
+        let script = format!(
+            "git config --global --replace-all credential.https://github.com.helper {} && \
+             {{ git config --global --unset-all url.https://github.com/.insteadOf || true; }} && \
+             git config --global --add url.https://github.com/.insteadOf git@github.com: && \
+             git config --global --add url.https://github.com/.insteadOf ssh://git@github.com/",
+            shell_quote(&helper)
+        );
+        let out = self.exec(&script, "", &[], Some(Duration::from_secs(60)))?;
+        if !out.success {
+            return Err(format!("could not give git your GitHub sign-in inside the sandbox: {}", out.stderr.trim()));
+        }
+        log("sandbox: git signs in to github.com with your DevDock GitHub token, for private dependencies".into());
+        Ok(())
     }
 
     /// Runs `script` with `sh -lc` in `subdir` of the worktree, inside.
@@ -396,15 +450,8 @@ impl Sandbox {
                 let mut c = Command::new("limactl");
                 c.args(["shell", "--workdir", &workdir, &self.name]);
                 // Environment goes in the script: ssh does not carry it.
-                let mut prefix = String::new();
-                for (k, v) in env {
-                    // `$HOME`-relative values expand; anything else is quoted.
-                    if let Some(rest) = v.strip_prefix("$HOME/") {
-                        prefix.push_str(&format!("export {k}=\"$HOME\"/{}; ", shell_quote(rest)));
-                    } else {
-                        prefix.push_str(&format!("export {k}={}; ", shell_quote(v)));
-                    }
-                }
+                // `$HOME`-relative values expand; anything else is quoted.
+                let prefix: String = env.iter().map(|(k, v)| export_line(k, v)).collect();
                 c.args(["sh", "-lc", &format!("{prefix}{script}")]);
                 c
             }
@@ -445,8 +492,11 @@ impl Sandbox {
                 let mut c = Command::new("limactl");
                 c.args(["shell", "--workdir", &workdir, &self.name]);
                 let mut script = String::new();
-                for (k, v) in env {
-                    script.push_str(&format!("export {k}={}; ", shell_quote(v)));
+                // The same environment `exec` gives: a command started this
+                // way — Claude Code, an MCP server — and everything it
+                // spawns needs the token for a private dependency too.
+                for (k, v) in self.base_env().iter().map(|(k, v)| (k, v)).chain(env.iter()) {
+                    script.push_str(&export_line(k, v));
                 }
                 script.push_str("exec ");
                 script.push_str(&shell_quote(program));
@@ -658,6 +708,15 @@ fn host_claude_credentials() -> Option<String> {
     None
 }
 
+/// `export K=V; ` for a shell, with a `$HOME`-relative value expanded
+/// rather than quoted whole.
+fn export_line(key: &str, value: &str) -> String {
+    match value.strip_prefix("$HOME/") {
+        Some(rest) => format!("export {key}=\"$HOME\"/{}; ", shell_quote(rest)),
+        None => format!("export {key}={}; ", shell_quote(value)),
+    }
+}
+
 /// `program args…` as one shell line, each word quoted.
 pub fn shell_words(words: &[String]) -> String {
     words.iter().map(|w| shell_quote(w)).collect::<Vec<_>>().join(" ")
@@ -701,6 +760,25 @@ impl Runner for SandboxRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_git_token_rides_in_the_environment_and_not_in_a_file() {
+        // Lima: dropping one of these stops nothing, so a test may make them.
+        let fake = || Sandbox { kind: Kind::Lima, name: "x".into(), root: PathBuf::from("/w"), inner_root: "/w".into(), image: String::new(), git_token: None };
+        let plain = fake();
+        assert!(!plain.base_env().iter().any(|(k, _)| k == GIT_TOKEN_VAR));
+        assert!(plain.configure_git(&mut |_| {}).is_ok(), "nothing to do, and nothing run, without a token");
+
+        let signed_in = fake().with_git_token(Some("ghp_secret"));
+        assert_eq!(signed_in.base_env().iter().find(|(k, _)| k == GIT_TOKEN_VAR).map(|(_, v)| v.as_str()), Some("ghp_secret"));
+        assert!(fake().with_git_token(Some("  ")).git_token.is_none(), "blank is no token");
+        assert!(fake().with_git_token(None).git_token.is_none());
+
+        // A command started for a long-lived process carries it too, and
+        // the value is exported rather than pasted into the command.
+        assert_eq!(export_line("A", "b c"), "export A='b c'; ");
+        assert_eq!(export_line("A", "$HOME/x"), "export A=\"$HOME\"/'x'; ");
+    }
 
     #[test]
     fn a_fresher_sign_in_is_the_one_kept() {
@@ -749,6 +827,52 @@ mod tests {
         }
         assert!(recipe_for("frobnicate").is_none());
         assert_eq!(recipe_for("dart").unwrap().name, "Flutter");
+    }
+
+    /// Git inside really signs in with the token, and really reaches
+    /// github over https where a dependency asks for ssh. A made-up token
+    /// is enough: what is being tested is that git asks for it and where
+    /// it sends the request, not that GitHub accepts it.
+    /// `cargo test --lib sandbox::tests::live_git_auth -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_git_auth_reaches_github_over_https_with_the_token() {
+        if installed().is_empty() {
+            eprintln!("no runtime installed; skipping");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::start(&Spec::default(), tmp.path(), &mut |l| println!("  {l}")).unwrap().with_git_token(Some("not-a-real-token"));
+        sandbox.configure_git(&mut |l| println!("  {l}")).unwrap();
+
+        // git asks the helper, and the helper answers from the environment.
+        let filled = sandbox
+            .exec("printf 'protocol=https\nhost=github.com\n\n' | git credential fill", "", &[], Some(Duration::from_secs(60)))
+            .unwrap();
+        assert!(filled.success, "{}{}", filled.stdout, filled.stderr);
+        assert!(filled.stdout.contains("username=x-access-token"), "{}", filled.stdout);
+        assert!(filled.stdout.contains("password=not-a-real-token"), "the token reaches git from the environment");
+
+        // A dependency written for ssh goes over https instead: there is no
+        // key inside, so over ssh this would fail on the key or sit at a
+        // host-key prompt. Reaching a repository proves it did not.
+        let over_ssh = sandbox
+            .exec("git ls-remote git@github.com:dtaing11/DevDock-Desktop-App.git 2>&1 | head -5", "", &[], Some(Duration::from_secs(120)))
+            .unwrap();
+        let said = format!("{}{}", over_ssh.stdout, over_ssh.stderr);
+        assert!(!said.contains("publickey") && !said.contains("Host key verification"), "it went over ssh:\n{said}");
+        assert!(over_ssh.success && said.contains("refs/heads/"), "the rewritten url reached github:\n{said}");
+
+        // Nothing of the token is left inside afterwards.
+        let left = sandbox.exec("cat ~/.gitconfig", "", &[], Some(Duration::from_secs(30))).unwrap();
+        assert!(!left.stdout.contains("not-a-real-token"), "the config holds no secret:\n{}", left.stdout);
+        assert!(left.stdout.contains("insteadOf"), "{}", left.stdout);
+
+        // Run again over what the last run left: every run writes this, so
+        // the second must not trip over the first.
+        sandbox.configure_git(&mut |l| println!("  {l}")).unwrap();
+        let twice = sandbox.exec("git config --global --get-all url.https://github.com/.insteadOf", "", &[], Some(Duration::from_secs(30))).unwrap();
+        assert_eq!(twice.stdout.lines().count(), 2, "no duplicates piled up:\n{}", twice.stdout);
     }
 
     /// The Claude Code CLI provisioned inside the sandbox and runnable

@@ -175,6 +175,18 @@ did not finish rather than that it passed. Checks run with
 `GIT_TERMINAL_PROMPT=0`, so a private git dependency fails at once
 instead of waiting for a password nobody can type.
 
+Git inside the sandbox signs in to github.com with the same token
+DevDock opens pull requests with, so a private dependency — a git
+`pubspec.yaml` dependency, a private npm or Go module — can be fetched
+there; and github over ssh is rewritten to https, since there is no key
+inside and a `git@github.com:` dependency would otherwise sit at a
+prompt nobody can answer. The token is passed in the environment of the
+commands DevDock starts and never written to a file inside, so the
+sandbox keeps none of it after the run — but while a run is going, code
+running inside can read it, the agent included, which is the same trust
+the sandbox's Claude Code sign-in already asks for.
+`DEVDOCK_SANDBOX_GIT_AUTH=0` turns it off.
+
 A job that says nothing for ten minutes is taken as stuck and stopped,
 whatever its own timeout allows (`DEVDOCK_IDLE_MINUTES`; 0 turns it off).
 Work that is really happening says so — compilers name files, test

@@ -202,6 +202,11 @@ repository, commit, check list and where they ran, under DevDock's own
 commit, reuses it instead of paying for a half-hour hang again. The log
 says when it did. It is forgotten when the base moves.
 
+The Claude Code inside the sandbox is kept no older than this machine's:
+it is installed the first time and would otherwise stay that version for
+good, until the API refuses it a model the newer one here knows —
+"version 2.1.280 or newer is required", after the round has been spent.
+
 A run of Claude Code in the sandbox checks this machine's Claude Code
 sign-in first, and copies it in again whenever it has changed: a token
 refreshed here retires the copy made earlier. A sign-in that has expired

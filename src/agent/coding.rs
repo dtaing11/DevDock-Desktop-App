@@ -522,6 +522,7 @@ fn run_claude_code(
     if let Some(sandbox) = workspace.sandbox() {
         let mut log = |line: String| on_event(Event::Tool { summary: line, is_error: false });
         sandbox.provision(&["claude"], &mut log)?;
+        sandbox.update_claude_if_older(&mut log)?;
         sandbox.seed_claude_credentials(&mut log)?;
         log("Claude Code runs inside the sandbox".into());
         config.sandbox = Some(sandbox);

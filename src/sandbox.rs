@@ -149,6 +149,13 @@ pub struct Sandbox {
     git_token: Option<String>,
 }
 
+/// The version in `claude --version` output: `2.1.286 (Claude Code)`.
+fn version_of(text: &str) -> Option<(u32, u32, u32)> {
+    let field = text.split_whitespace().find(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit()) && w.contains('.'))?;
+    let mut parts = field.split('.').map(|p| p.trim_matches(|c: char| !c.is_ascii_digit()).parse::<u32>().unwrap_or(0));
+    Some((parts.next()?, parts.next().unwrap_or(0), parts.next().unwrap_or(0)))
+}
+
 /// What the VM is worth giving, from what this machine has: half the
 /// cores and half the memory, within what a build actually needs. Kept
 /// well clear of the whole machine — the developer is still using it.
@@ -345,6 +352,37 @@ impl Sandbox {
                 return Err(format!("could not install {} in the sandbox:\n{tail}", recipe.name));
             }
             log(format!("sandbox: {} installed", recipe.name));
+        }
+        Ok(())
+    }
+
+    /// Keeps the sandbox's Claude Code no older than this machine's.
+    ///
+    /// The recipe installs it the first time and never again, so months
+    /// later the copy inside is refused by the API for a model the newer
+    /// one on this machine knows: "version 2.1.280 or newer is required",
+    /// after the round has already been spent. Checked before the run.
+    pub fn update_claude_if_older(&self, log: &mut dyn FnMut(String)) -> Result<(), String> {
+        let host = Command::new("claude").arg("--version").stdin(Stdio::null()).output().ok().map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+        let Some(host) = host.as_deref().and_then(version_of) else { return Ok(()) };
+        let inside = self.exec("claude --version 2>/dev/null", "", &[], Some(Duration::from_secs(60)))?;
+        let Some(there) = version_of(&inside.stdout) else { return Ok(()) };
+        if there >= host {
+            return Ok(());
+        }
+        let show = |v: (u32, u32, u32)| format!("{}.{}.{}", v.0, v.1, v.2);
+        log(format!("sandbox: updating Claude Code, {} inside against {} here", show(there), show(host)));
+        // Its own updater first; the installer again if that is not there.
+        let out = self.exec(
+            "claude update >/dev/null 2>&1 || curl -fsSL https://claude.ai/install.sh | bash >/dev/null 2>&1; claude --version",
+            "",
+            &[],
+            Some(Duration::from_secs(600)),
+        )?;
+        match version_of(&out.stdout) {
+            Some(now) if now >= host => log(format!("sandbox: Claude Code is {} now", show(now))),
+            Some(now) => log(format!("sandbox: Claude Code is still {} — a model this machine can use may be refused inside", show(now))),
+            None => log("sandbox: Claude Code did not say its version after updating".into()),
         }
         Ok(())
     }
@@ -804,6 +842,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_claude_code_version_is_read_and_compared() {
+        assert_eq!(version_of("2.1.286 (Claude Code)\n"), Some((2, 1, 286)));
+        assert_eq!(version_of("  2.1.276 (Claude Code)"), Some((2, 1, 276)));
+        assert_eq!(version_of("Claude Code 2.10.3"), Some((2, 10, 3)));
+        assert_eq!(version_of(""), None);
+        assert_eq!(version_of("command not found"), None);
+        // The comparison the update turns on: newer wins, and 276 < 286.
+        assert!(version_of("2.1.276 (Claude Code)") < version_of("2.1.286 (Claude Code)"));
+        assert!(version_of("2.2.0 (Claude Code)") > version_of("2.1.286 (Claude Code)"));
+        assert!(version_of("2.1.286 (Claude Code)") >= version_of("2.1.286 (Claude Code)"));
+    }
+
+    #[test]
     fn the_vm_is_sized_from_this_machine() {
         let (cpus, gib) = wanted_size();
         assert!((2..=8).contains(&cpus), "{cpus}");
@@ -929,6 +980,30 @@ mod tests {
         sandbox.configure_git(&mut |l| println!("  {l}")).unwrap();
         let twice = sandbox.exec("git config --global --get-all url.https://github.com/.insteadOf", "", &[], Some(Duration::from_secs(30))).unwrap();
         assert_eq!(twice.stdout.lines().count(), 2, "no duplicates piled up:\n{}", twice.stdout);
+    }
+
+    /// After the check, the Claude Code inside is no older than this
+    /// machine's — whatever it was before.
+    /// `cargo test --lib sandbox::tests::live_claude_is_kept -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_claude_is_kept_up_to_date_with_this_machine() {
+        if installed().is_empty() || Command::new("claude").arg("--version").output().is_err() {
+            eprintln!("no runtime, or no Claude Code here; skipping");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::start(&Spec::default(), tmp.path(), &mut |l| println!("  {l}")).unwrap();
+        sandbox.provision(&["claude"], &mut |l| println!("  {l}")).unwrap();
+        let before = version_of(&sandbox.exec("claude --version", "", &[], Some(Duration::from_secs(60))).unwrap().stdout);
+        println!("  inside before: {before:?}");
+
+        sandbox.update_claude_if_older(&mut |l| println!("  {l}")).unwrap();
+
+        let host = version_of(&String::from_utf8_lossy(&Command::new("claude").arg("--version").output().unwrap().stdout)).unwrap();
+        let after = version_of(&sandbox.exec("claude --version", "", &[], Some(Duration::from_secs(60))).unwrap().stdout).unwrap();
+        println!("  inside after: {after:?}, this machine: {host:?}");
+        assert!(after >= host, "the copy inside is behind this machine: {after:?} < {host:?}");
     }
 
     /// The Claude Code CLI provisioned inside the sandbox and runnable

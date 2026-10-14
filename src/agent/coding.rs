@@ -123,6 +123,29 @@ pub const CLAUDE_CODE_ASK: &str = "If you need the developer to decide something
     changing anything more. You will be resumed with the answer. Ask only when it truly changes \
     what you would build.";
 
+/// Whether an engine stopped because the account is over a limit, rather
+/// than because anything about the task was wrong.
+pub fn rate_limited(error: &str) -> bool {
+    let lower = error.to_lowercase();
+    lower.contains("429")
+        || lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("usage limit")
+        || lower.contains("quota")
+        || lower.contains("overloaded")
+}
+
+/// The same error, said as what it is: nothing about the change, and what
+/// the developer can do about it.
+pub fn rate_limit_note(error: &str) -> String {
+    format!(
+        "your Claude account is over its limit, so the agent could not run — nothing about the \
+         change is wrong, and the attempt is kept. The weekly cap on Opus and Sonnet is not \
+         cleared by waiting; Haiku has a far higher one and was tried. Fewer agents at once, or \
+         a smaller model in the picker, is what gets through.\n{error}"
+    )
+}
+
 /// What a run is told when the developer has let it commit and push: said
 /// last, because it takes back what the engine was told before it.
 pub fn git_allowed_note() -> String {
@@ -549,7 +572,19 @@ fn run_claude_code(
             let _ = std::fs::remove_dir(parent);
         }
     }
-    let mut run = outcome?;
+    // Rate limited: the weekly cap on Opus and Sonnet is not something
+    // waiting clears, so the useful move is the one the built-in harness
+    // already makes — the same work on Haiku, whose cap is far higher —
+    // rather than spending the run saying no.
+    let outcome = match outcome {
+        Err(e) if rate_limited(&e) && !config.model.contains("haiku") => {
+            on_event(Event::Tool { summary: format!("rate limited on {}; running it on Haiku instead, whose limit is far higher", if config.model.is_empty() { "the chosen model" } else { &config.model }), is_error: true });
+            let smaller = claude_code::Config { model: "haiku".into(), ..config.clone() };
+            claude_code::run(&smaller, workspace.root(), &prompt, Some(&extra), &checks, on_event)
+        }
+        other => other,
+    };
+    let mut run = outcome.map_err(|e| if rate_limited(&e) { rate_limit_note(&e) } else { e })?;
     // A question at the end of the reply: put it to the developer, resume
     // the same session with the answer, and let it finish. A few times at
     // most; after that it decides.
@@ -661,6 +696,27 @@ mod tests {
         assert!(bare.contains("Reusable over ad hoc") && full.contains("One responsibility per unit"), "the standard is in every prompt");
         assert!(full.contains("write to the developer's working tree immediately"));
         assert!(full.contains("Never touch vendor/."));
+    }
+
+    #[test]
+    fn a_rate_limit_is_told_from_a_real_failure() {
+        for over in [
+            "API Error: 429 {\"type\":\"rate_limit_error\"}",
+            "Claude Code reported an error: API Error: 429 rate limit exceeded",
+            "usage limit reached for this week",
+            "API Error: 529 overloaded_error",
+        ] {
+            assert!(rate_limited(over), "{over}");
+        }
+        for real in [
+            "the check `tests` fails: assertion failed",
+            "Claude Code ran longer than 1800s and was stopped.",
+            "API Error: 400 does not support this model; version 2.1.280 or newer is required",
+        ] {
+            assert!(!rate_limited(real), "{real}");
+        }
+        let note = rate_limit_note("API Error: 429");
+        assert!(note.contains("nothing about the") && note.contains("attempt is kept") && note.contains("API Error: 429"), "{note}");
     }
 
     #[test]

@@ -411,6 +411,17 @@ held back by the instructions rather than by the rule; the built-in
 harness parses the command and refuses it wherever the flag is.) A
 worktree run never gets the switch.
 
+### When the account is over its limit
+
+A 429 is the account's cap, not anything about the task. The built-in
+harness has always answered one by falling back to Haiku, whose cap is
+far higher, since the weekly cap on Opus and Sonnet is not something
+waiting clears. A Claude Code run now does the same: the work is tried
+again on Haiku, the log says so, and if that is also refused the run
+ends saying what it was — the attempt kept, nothing about the change
+wrong. Fewer agents at once, or a smaller model in the picker, is what
+gets through a cap.
+
 ### Stop, and no turn limit
 
 A coding run has no cap on turns, tool calls or reading — for the
